@@ -7,7 +7,7 @@ import asyncio
 from collections import defaultdict, Counter, deque
 import asyncpg
 import ccxt.async_support as ccxt
-import ccxt.async_support as ccxt_async
+
 import json
 import signal
 import logging
@@ -38,7 +38,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import warnings
-import numba  # Mantenido para @jit en bootstrap (experimental)
+import numba  
 from fastapi import FastAPI, WebSocket, Depends, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -1384,34 +1384,7 @@ class DbIntf:
         finally:
             if conn:
                 await self.pool.release(conn)
-                
-    def get_recent_trades_sync(self) -> List[Dict]:
-        """Synchronous version for dashboard (avoids loop mismatch). Uses psycopg2 for thread-safety."""
-        if not self.connected:
-            return []
-        import psycopg2
-        from psycopg2.extras import RealDictCursor
-        conn = None
-        try:
-            conn = psycopg2.connect(
-                user=CONFIG['default']['db_user'],
-                password=CONFIG['default']['db_password'],
-                database=CONFIG['default']['db_name'],
-                host=CONFIG['default']['db_host'],
-                port=CONFIG['default']['db_port'],
-                connect_timeout=10
-            )
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute('SELECT * FROM trades ORDER BY created_at DESC LIMIT 20')
-                rows = cur.fetchall()
-                return [dict(row) for row in rows]
-        except Exception as e:
-            logger.error(f"Sync error fetching recent trades: {e}")
-            return []
-        finally:
-            if conn:
-                conn.close()
-
+    
 async def fetch_top_performers(exchange: ExchIntf) -> Tuple[List[str], Dict[str, float]]:
     global top_performers, top_changes, last_top_fetch
     now = time.time()
@@ -6184,13 +6157,8 @@ async def main_application(args):
                                   
             
             # Await only main loop (dashboard parallel)
-            await auto_trade_loop(exchange, db)
+            await auto_trade_loop(exchange, db)            
             
-            # Cleanup dashboard if started
-            if dashboard_thread_started:
-                shutdown_event.set()  # FIXED: Set event para stop thread
-                dashboard_thread.join(timeout=5)  # Wait graceful, timeout 5s
-                logger.info("Dashboard thread stopped")
     except asyncio.CancelledError:
         logger.info("Main application cancelled, initiating cleanup...")
     except KeyboardInterrupt:
