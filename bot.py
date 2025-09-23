@@ -1,4 +1,3 @@
-# Part 1:
 import pickle
 import tkinter as tk
 from tkinter import ttk
