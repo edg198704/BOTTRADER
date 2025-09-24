@@ -1483,6 +1483,30 @@ class ModelMgr:
         key = self._get_model_key(symbol, timeframe)
         return (time.time() - self.last_train.get(key, 0)) > CONFIG['default']['retrain_int']
 
+    def online_update(self, symbol: str, timeframe: str, new_features: np.ndarray, new_label: int) -> bool:
+    key = self._get_model_key(symbol, timeframe)
+    if key not in self.models or len(new_features) < 1:
+        return False
+    from river import compose, linear_model, metrics, preprocessing
+    scaler = self.scalers.get(key)
+    if scaler is None:
+        return False
+    # River pipeline: Scale + Logistic (online)
+    model_river = compose.Pipeline(
+        preprocessing.StandardScaler(),
+        linear_model.LogisticRegression(),
+        metrics.Accuracy()
+    )
+    # Adapt scaler to new data (online)
+    new_features_scaled = scaler.transform(new_features.reshape(1, -1))
+    self.models[key].partial_fit(new_features_scaled, [new_label])  # Online fit en RF (compatible)
+    # River metrics for drift detection
+    y_proba = self.models[key].predict_proba(new_features_scaled)[0]
+    drift_detected = model_river['Accuracy'].get() < 0.6  # Simple drift check
+    if drift_detected:
+        logger.warning(f"Drift detected for {key}; full retrain recommended")
+    return True
+
     def get_model_accuracy(self, symbol: str, timeframe: str) -> float:
         """Obtiene la accuracy guardada del modelo para checks rápidos de calidad."""
         try:
@@ -1789,13 +1813,28 @@ async def fetch_top_performers(exchange: ExchIntf) -> Tuple[List[str], Dict[str,
         logger.error(f"Error fetching top performers: {e}")
         return top_performers, top_changes
 
+@numba.jit(nopython=True)
+def _rsi_core(gains: np.ndarray, losses: np.ndarray, period: int) -> np.ndarray:
+    n = len(gains)
+    rsi = np.full(n, 50.0)
+    avg_gain = np.mean(gains[:period]) if period < n else 0.0
+    avg_loss = np.mean(losses[:period]) if period < n else 0.0
+    for i in range(period, n):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        if avg_loss == 0:
+            rsi[i] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi[i] = 100 - (100 / (1 + rs))
+    return rsi
+
 def calculate_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
-    delta = prices.diff()
-    gain = delta.where(delta > 0, 0).rolling(window=period, min_periods=1).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period, min_periods=1).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
+    delta = prices.diff().values
+    gains = np.maximum(delta, 0)
+    losses = np.abs(np.minimum(delta, 0))
+    rsi_values = _rsi_core(gains, losses, period)
+    return pd.Series(rsi_values, index=prices.index).fillna(50)
 
 def calculate_bollinger_bands(prices: pd.Series, period: int = 20, std_dev: int = 2) -> Tuple[pd.Series, pd.Series, pd.Series]:
     sma = prices.rolling(window=period, min_periods=1).mean()
@@ -1812,6 +1851,16 @@ def calculate_macd(prices: pd.Series, fast: int = 12, slow: int = 26, signal: in
     return macd.fillna(0), macd_sig.fillna(0)
 
 async def prepare_features(df: pd.DataFrame, tf_config: Dict[str, Any]) -> pd.DataFrame:
+    max_bars = CONFIG['default']['max_bars']
+    chunk_size = CONFIG['default']['chunk_size']
+    if len(df) > max_bars:
+        logger.info(f"Downsampling {len(df)} bars to {max_bars} with Dask for efficiency")
+        import dask.dataframe as dd
+        ddf = dd.from_pandas(df, npartitions=4)  # Parallel partitions
+        # Compute rolling stats in parallel (e.g., volatility)
+        ddf['returns'] = ddf['close'].pct_change()
+        ddf['volatility_chunk'] = ddf['returns'].rolling(chunk_size).std().compute()  # Chunked compute
+        df = ddf.tail(max_bars).compute()  # Final compute    
     min_rows = max(50, max(tf_config.get('rsi_period', 14), tf_config.get('vol_window', 20)))
     if len(df) < min_rows:
         return pd.DataFrame()
@@ -2114,14 +2163,37 @@ class LSTMSignalModel(nn.Module):
         super().__init__()
         input_dim = len(FEATURE_COLS)
         hidden = 64
-        self.lstm = nn.LSTM(input_dim, hidden, num_layers=CONFIG['default']['lstm_layers'], batch_first=True)
-        self.attn = nn.MultiheadAttention(hidden, CONFIG['default']['attention_heads'])
+        self.lstm = nn.LSTM(input_dim, hidden, num_layers=CONFIG['default']['lstm_layers'], batch_first=True, dropout=0.2 if CONFIG['default']['lstm_layers'] > 1 else 0)
+        self.attn = nn.MultiheadAttention(hidden, CONFIG['default']['attention_heads'], dropout=0.1, batch_first=True)
         self.fc = nn.Linear(hidden, 3)
+        self.dropout = nn.Dropout(0.3)
 
     def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        attn_out, _ = self.attn(lstm_out, lstm_out, lstm_out)
-        return self.fc(attn_out.mean(1))
+        lstm_out, (hidden, cell) = self.lstm(x)  # Retorna hidden/cell para bidirectional si needed
+        attn_out, attn_weights = self.attn(lstm_out, lstm_out, lstm_out)  # Attention completa con weights
+        attn_out = self.dropout(attn_out.mean(1))  # Global avg pooling + dropout
+        return self.fc(attn_out), attn_weights  # Retorna weights para interpretabilidad
+
+    def train_model(self, X_train, y_train, epochs=CONFIG['default']['gan_epochs'] // 5, lr=0.001):
+        self.train()
+        optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=1e-5)  # L2 reg para estabilidad
+        criterion = nn.CrossEntropyLoss()
+        dataset = torch.utils.data.TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long))
+        loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True)
+        for epoch in range(epochs):
+            total_loss = 0
+            for batch_x, batch_y in loader:
+                batch_x = batch_x.unsqueeze(1)  # Seq len=1 para features
+                optimizer.zero_grad()
+                out, _ = self(batch_x)
+                loss = criterion(out, batch_y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)  # Gradient clipping
+                optimizer.step()
+                total_loss += loss.item()
+            if epoch % 10 == 0:
+                logger.debug(f"LSTM+Attn Epoch {epoch}: Loss {total_loss / len(loader):.4f}")
+        return total_loss / len(loader)
 
 class VAE(nn.Module):
     def __init__(self, input_dim):
@@ -2129,48 +2201,118 @@ class VAE(nn.Module):
         latent_dim = CONFIG['default']['vae_latent_dim']
         self.encoder = nn.Sequential(nn.Linear(input_dim, 128), nn.ReLU(), nn.Linear(128, latent_dim * 2))
         self.decoder = nn.Sequential(nn.Linear(latent_dim, 128), nn.ReLU(), nn.Linear(128, input_dim))
-        
+        self.latent_dim = latent_dim
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
     def forward(self, x):
         mu_logvar = self.encoder(x)
         mu, logvar = mu_logvar.chunk(2, dim=1)
-        z = mu + torch.exp(0.5 * logvar) * torch.randn_like(logvar)
+        z = self.reparameterize(mu, logvar)
         recon = self.decoder(z)
         return recon, mu, logvar
+
+    def vae_loss(self, recon, x, mu, logvar):
+        recon_loss = nn.functional.mse_loss(recon, x, reduction='sum')
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        return recon_loss + kl_loss
+
+    def evolve_features(self, features: torch.Tensor, topk: int = CONFIG['default']['evolve_features_topk'], epochs=20):
+        optimizer = optim.Adam(self.parameters(), lr=0.001)
+        for epoch in range(epochs):
+            recon, mu, logvar = self(features)
+            loss = self.vae_loss(recon, features, mu, logvar)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        # Evolve: TopK latents como new features
+        _, mu, _ = self(features)
+        evolved = mu[:, :topk].detach().numpy()
+        return evolved
+    
+class CodeGASnippets:
+    def __init__(self):
+        creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+        creator.create("Individual", list, fitness=creator.FitnessMax)
+        self.toolbox = base.Toolbox()
+        self.toolbox.register("attr_bool", random.randint, 0, 1)
+        self.toolbox.register("individual", tools.initRepeat, creator.Individual, self.toolbox.attr_bool, n=10)  # Snippet length
+        self.toolbox.register("population", tools.initRepeat, list, self.toolbox.individual)
+        self.toolbox.register("evaluate", self._eval_snippet)
+        self.toolbox.register("mate", tools.cxTwoPoint)
+        self.toolbox.register("mutate", tools.mutFlipBit, indpb=0.05)
+        self.toolbox.register("select", tools.selTournament, tournsize=3)
+
+    def _eval_snippet(self, individual):
+        # Eval: Simulate snippet perf (e.g., mock backtest score)
+        score = sum(individual) * np.random.uniform(0.5, 1.5)  # Mock: bits * random perf
+        return score,
+
+    def evolve(self, generations=CONFIG['default']['ga_generations'], pop_size=CONFIG['default']['ga_population']):
+        pop = self.toolbox.population(n=pop_size)
+        algorithms.eaSimple(pop, self.toolbox, cxpb=CONFIG['default']['ga_cxpb'], mutpb=0.2, ngen=generations, verbose=False)
+        best = tools.selBest(pop, 1)[0]
+        return [i for i, b in enumerate(best) if b == 1]  # Best snippet bits
+
+# Uso en SupBot: self.code_ga = CodeGASnippets(); evolved_snippet = self.code_ga.evolve()
 
 class GANMC:
     def __init__(self, context: AppContext):
         self.context = context
-        self.generator = nn.Sequential(nn.Linear(CONFIG['default']['noise_dim'] + 1, 128), nn.ReLU(), nn.Linear(128, 96))
-        self.discriminator = nn.Sequential(nn.Linear(96, 128), nn.ReLU(), nn.Linear(128, 1), nn.Sigmoid())
+        noise_dim = CONFIG['default']['noise_dim']
+        cond_dim = 4  # Regime encoding (very_low, low, etc.)
+        self.generator = nn.Sequential(
+            nn.Linear(noise_dim + cond_dim, 128), nn.ReLU(),
+            nn.Linear(128, 96), nn.ReLU()
+        )
+        self.discriminator = nn.Sequential(
+            nn.Linear(96 + cond_dim, 128), nn.ReLU(),  # Conditional disc
+            nn.Linear(128, 1), nn.Sigmoid()
+        )
 
-    @numba.jit(nopython=True)
-    def train(self, historical_paths, regime):
-        optimizer_g = optim.Adam(self.generator.parameters(), lr=0.001)
-        optimizer_d = optim.Adam(self.discriminator.parameters(), lr=0.001)
-        loss_fn = nn.BCELoss()
+    def _robust_loss(self, real_pred, fake_pred, is_gen=False):
+        # Robust: Huber loss para outliers en paths
+        criterion = nn.HuberLoss(reduction='mean')
+        if is_gen:
+            return criterion(fake_pred, torch.ones_like(fake_pred))
+        else:
+            real_loss = criterion(real_pred, torch.ones_like(real_pred))
+            fake_loss = criterion(fake_pred, torch.zeros_like(fake_pred))
+            return real_loss + fake_loss
+
+    def train(self, historical_paths: np.ndarray, regime: str) -> float:
+        regime_map = {'very_low': [1,0,0,0], 'low': [0,1,0,0], 'normal': [0,0,1,0], 'high': [0,0,0,1]}  # One-hot
+        cond = torch.tensor(regime_map.get(regime, [0,0,1,0]), dtype=torch.float32).unsqueeze(0).repeat(len(historical_paths), 1)
+        optimizer_g = optim.Adam(self.generator.parameters(), lr=0.0002, betas=(0.5, 0.999))  # Stable Adam
+        optimizer_d = optim.Adam(self.discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
         for epoch in range(CONFIG['default']['gan_epochs']):
-            noise = torch.randn(len(historical_paths), CONFIG['default']['noise_dim'] + 1)
-            cond = torch.full((len(historical_paths), 1), regime)  # Conditional on regime
-            fake = self.generator(torch.cat((noise, cond), dim=1))
-            real = torch.tensor(historical_paths, dtype=torch.float32)
-            d_real = self.discriminator(real)
-            d_fake = self.discriminator(fake.detach())
-            loss_d = loss_fn(d_real, torch.ones_like(d_real)) + loss_fn(d_fake, torch.zeros_like(d_fake))
+            noise = torch.randn(len(historical_paths), CONFIG['default']['noise_dim'])
+            fake_input = torch.cat((noise, cond), dim=1)
+            fake = self.generator(fake_input)
+            real_input = torch.cat((torch.tensor(historical_paths, dtype=torch.float32), cond), dim=1)
+            d_real = self.discriminator(real_input)
+            d_fake = self.discriminator(torch.cat((fake.detach(), cond), dim=1))
+            loss_d = self._robust_loss(d_real, d_fake)
             optimizer_d.zero_grad()
             loss_d.backward()
             optimizer_d.step()
-            g_fake = self.discriminator(fake)
-            loss_g = loss_fn(g_fake, torch.ones_like(g_fake))
+            g_fake = self.discriminator(torch.cat((fake, cond), dim=1))
+            loss_g = self._robust_loss(g_fake, None, is_gen=True)
             optimizer_g.zero_grad()
             loss_g.backward()
             optimizer_g.step()
         return loss_g.item()
 
-    def generate_paths(self, num: int, regime: int) -> np.ndarray:
-        noise = torch.randn(num, CONFIG['default']['noise_dim'] + 1)
-        cond = torch.full((num, 1), regime)
+    def generate_paths(self, num: int, regime: str) -> np.ndarray:
+        regime_map = {'very_low': [1,0,0,0], 'low': [0,1,0,0], 'normal': [0,0,1,0], 'high': [0,0,0,1]}
+        cond = torch.tensor(regime_map.get(regime, [0,0,1,0]), dtype=torch.float32).unsqueeze(0).repeat(num, 1)
+        noise = torch.randn(num, CONFIG['default']['noise_dim'])
+        fake_input = torch.cat((noise, cond), dim=1)
         with torch.no_grad():
-            paths = self.generator(torch.cat((noise, cond), dim=1)).numpy()
+            paths = self.generator(fake_input).numpy()
         return paths
 
 def bayesian_signal_strength(conf: float, hist_win: float) -> float:
@@ -2193,17 +2335,29 @@ class CausalEngine:
         return gml
 
     def analyze_missed(self, missed_symbol, reason, hist_data: pd.DataFrame):
+        if len(hist_data) < 50:
+            return  # Guard: insufficient data
         gml = self.build_causal_graph(hist_data)
-        data = pd.DataFrame({
-            'min_conf': hist_data['min_conf'],
-            'win_rate': hist_data['win_rate'],
-            'regime': hist_data['regime']
-        })
-        model = CausalModel(data=data, treatment='min_conf', outcome='win_rate', graph=gml)
-        identified = model.identify_effect()
-        estimate = model.estimate_effect(identified, method_name="backdoor.propensity_score_matching")
-        if estimate.value < -0.1:
-            self.supervisor_bot.intervene('min_conf', 0.9 * CONFIG['default']['min_conf_score'])
+        data = hist_data[['min_conf', 'win_rate', 'regime']].copy()  # Select causal vars
+        data['treatment'] = data['min_conf']  # Explicit treatment
+        data['outcome'] = data['win_rate']
+        model = CausalModel(
+            data=data,
+            treatment='min_conf',
+            outcome='win_rate',
+            graph=gml.replace('regime', 'common_cause')  # Robust graph
+        )
+        identified = model.identify_effect(method_name="backdoor.causal_inference")
+        if identified is not None:
+            estimate = model.estimate_effect(
+                identified,
+                method_name="backdoor.propensity_score_matching",
+                target_units="ate"  # Average treatment effect
+            )
+            refutation = model.refute_estimate(identified, estimate, method_name="random_common_cause")
+            if estimate.value < -0.1 and refutation.p_value > 0.05:  # Causal if robust
+                self.supervisor_bot.intervene('min_conf', 0.9 * CONFIG['default']['min_conf_score'])
+                logger.info(f"Causal intervention: min_conf reduced due to {estimate.value:.3f} effect on win_rate")
             
 class ParamOpt:
     def __init__(self):
@@ -3190,18 +3344,20 @@ class BtMgr:
         vols = [df['volatility'].std() if 'volatility' in df else 0.02 for df in ohlcv_cache.values() if not df.empty]
         if len(vols) < 10:
             return TIMEFRAMES
-        kmeans = KMeans(n_clusters=CONFIG['default']['tf_clusters'])
+        vol_std = np.std(vols)
+        dynamic_clusters = max(2, min(CONFIG['default']['tf_clusters'] + int(vol_std * 10), 8))  # Dynamic: +clusters si high vol std
+        kmeans = KMeans(n_clusters=dynamic_clusters)
         clusters = kmeans.fit_predict(np.array(vols).reshape(-1, 1))
         unique_clusters = np.unique(clusters)
         for c in unique_clusters:
             cluster_vols = [v for i, v in enumerate(vols) if clusters[i] == c]
             if np.std(cluster_vols) > CONFIG['default']['auto_tf_min_vol']:
-                tf_minutes = int(15 * (1 + c))
+                tf_minutes = int(15 * (1 + c * (1 + vol_std)))  # Dynamic scale con vol_std
                 TIMEFRAMES.append({
                     'name': f'auto_{tf_minutes}m',
                     'binance_interval': f'{tf_minutes}m',
                     'label_lookahead': max(4, tf_minutes // 15),
-                    'label_threshold': 0.01 * (1 + c),
+                    'label_threshold': 0.01 * (1 + c * vol_std),  # Threshold dinámico
                     'confidence_threshold': 0.6,
                     'min_data_points': 500 + 100 * c,
                     'rsi_period': 14 + c * 2,
@@ -4902,7 +5058,17 @@ class SupBot:
         
         return proposals
 
-    
+    async def deep_causal_analysis(self, missed: List[Tuple[str, str]], metrics: Dict) -> Dict[str, float]:
+        causal_engine = CausalEngine(self)
+        interventions = {}
+        hist_data = pd.DataFrame(metrics)  # From metrics to DF
+        for symbol, reason in missed[:5]:  # Top 5 missed
+            causal_engine.analyze_missed(symbol, reason, hist_data)
+            if reason == 'low confidence':
+                interventions['min_conf_score'] = CONFIG['default']['min_conf_score'] * 0.85
+        if interventions:
+            logger.info(f"Deep causal: Interventions {interventions}")
+        return interventions
 
     async def _analyze_execution_quality(self) -> Dict[str, bool]:
         """Analyze execution quality from recent trades"""
