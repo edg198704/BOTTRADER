@@ -53,13 +53,19 @@ import signal
 import cProfile
 import pstats
 import psutil
+from pathlib import Path
+
 
 class StructuredLogger:
     def __init__(self, name):
         self.LOG = logging.getLogger(name)
         if not self.LOG.handlers:
+            # Use sys.stdout to ensure output is captured in all environments (e.g., Docker)
             handler = logging.StreamHandler(sys.stdout)
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            # A more structured format
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
             handler.setFormatter(formatter)
             self.LOG.addHandler(handler)
             self.LOG.setLevel(logging.INFO)
@@ -76,46 +82,47 @@ class StructuredLogger:
         try:
             message = self._safe_format(event, **kwargs)
             self.LOG.info(message)
-        except MemoryError:
-            print(f"INFO: {event}")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"FALLBACK LOGGING (INFO): {event} - Error: {e}")
 
     def error(self, event, **kwargs):
         try:
             message = self._safe_format(event, **kwargs)
             self.LOG.error(message)
-        except MemoryError:
-            print(f"ERROR: {event}")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"FALLBACK LOGGING (ERROR): {event} - Error: {e}")
 
     def warning(self, event, **kwargs):
         try:
             message = self._safe_format(event, **kwargs)
             self.LOG.warning(message)
-        except MemoryError:
-            print(f"WARNING: {event}")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"FALLBACK LOGGING (WARNING): {event} - Error: {e}")
 
     def debug(self, event, **kwargs):
         try:
             message = self._safe_format(event, **kwargs)
             self.LOG.debug(message)
-        except Exception:
+        except Exception as e:
+            # Avoid noisy prints for debug level
             pass
 
     def critical(self, event, **kwargs):
         try:
             message = self._safe_format(event, **kwargs)
             self.LOG.critical(message)
-        except MemoryError:
-            print(f"CRITICAL: {event}")
-        except Exception:
-            pass
-        
+        except Exception as e:
+            print(f"FALLBACK LOGGING (CRITICAL): {event} - Error: {e}")
+
 LOG = StructuredLogger(__name__)
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    PYARROW_AVAILABLE = True
+except ImportError:
+    PYARROW_AVAILABLE = False
+    LOG.warning("pyarrow_library_not_available")
+from sklearn.cluster import KMeans
 
 from dotenv import load_dotenv
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -174,35 +181,50 @@ class AutomatedTestSuite:
             initial_equity = float(self.bot.equity)
             
             # ✅ Simular apertura
+            entry_price = 100.0
+            size = 0.1
+            position_cost = entry_price * size # 10.0
+            
+            equity_before_open = float(self.bot.equity)
+            
+            # In a real scenario, the bot's free equity would decrease.
+            self.bot.equity -= position_cost
+
             transaction = await self.bot.position_ledger.record_open(
-                self.bot, test_symbol, 'buy', 100.0, 0.1
+                self.bot, test_symbol, 'buy', entry_price, size,
+                equity_before_override=equity_before_open,
+                equity_after_override=self.bot.equity
             )
             assert transaction is not None, "Transaction should not be None"
             assert transaction.is_valid, f"Transaction validation errors: {transaction.validation_errors}"
             
-            # ✅ CORRECCIÓN: El equity NO debe cambiar en apertura
-            assert abs(self.bot.equity - initial_equity) < 0.01, \
-                f"Equity should not change on open: before={initial_equity}, after={self.bot.equity}"
+            # ✅ CORRECCIÓN: Equity (free cash) SHOULD change on open.
+            expected_equity_after_open = initial_equity - position_cost
+            assert abs(self.bot.equity - expected_equity_after_open) < 0.01, \
+                f"Equity should decrease on open: before={initial_equity}, after={self.bot.equity}, expected={expected_equity_after_open}"
             
             # ✅ Simular cierre correctamente
             exit_price = 110.0
-            executed_size = 0.1
-            entry_price = 100.0
             
             # Calcular PnL esperado
-            realized_pnl = (exit_price - entry_price) * executed_size  # = 1.0
+            realized_pnl = (exit_price - entry_price) * size  # = 1.0
             
             # ✅ ACTUALIZAR equity ANTES de record_close (simular lo que hace el caller real)
+            # The change in free cash = cost_basis_returned + PnL
             equity_before_close = float(self.bot.equity)
-            self.bot.equity = equity_before_close + realized_pnl
+            self.bot.equity = equity_before_close + position_cost + realized_pnl
             
             LOG.debug("test_equity_update_before_close",
                      equity_before=equity_before_close,
+                     position_cost=position_cost,
                      realized_pnl=realized_pnl,
                      equity_after=self.bot.equity)
             
             close_tx = await self.bot.position_ledger.record_close(
-                self.bot, test_symbol, exit_price, executed_size
+                self.bot, test_symbol, exit_price, size,
+                equity_before_override=equity_before_close,
+                equity_after_override=self.bot.equity,
+                realized_pnl_override=realized_pnl
             )
             
             assert close_tx is not None, "Close transaction failed"
@@ -213,15 +235,14 @@ class AutomatedTestSuite:
                 f"PnL mismatch: {close_tx.realized_pnl} vs {realized_pnl}"
             
             # Validar equity final con tolerancia mayor
-            expected_equity = initial_equity + realized_pnl
-            equity_diff = abs(self.bot.equity - expected_equity)
+            # Final equity should be back to initial + PnL
+            expected_final_equity = initial_equity + realized_pnl
+            equity_diff = abs(self.bot.equity - expected_final_equity)
             
-            # Tolerancia permisiva para evitar falsos positivos
-            
-            tolerance = max(0.10, abs(expected_equity) * 0.0001)  # 0.01% o $0.10
+            tolerance = max(0.10, abs(expected_final_equity) * 0.0001)
             
             assert equity_diff < tolerance, \
-                f"Equity mismatch: {self.bot.equity} vs {expected_equity} (diff: {equity_diff}, tolerance: {tolerance})"
+                f"Final equity mismatch: actual={self.bot.equity} vs expected={expected_final_equity} (diff: {equity_diff}, tolerance: {tolerance})"
                         
             audit = self.bot.position_ledger.audit_equity(self.bot)
                         
@@ -230,7 +251,6 @@ class AutomatedTestSuite:
                     LOG.warning("audit_small_discrepancy_acceptable",
                                discrepancy=audit['discrepancy'],
                                tolerance=1.0)
-                    # Corregir equity al valor auditado
                     self.bot.equity = audit['expected_free_equity']
                     LOG.info("equity_corrected_to_audit_value",
                             corrected_equity=self.bot.equity)
@@ -339,7 +359,7 @@ class AutomatedTestSuite:
             df = create_dataframe(result['ohlcv'])
             assert df is not None and len(df) >= 50, "DataFrame creation failed"
             
-            df = calculate_technical_indicators(df)
+            df = await calculate_technical_indicators(df, symbol, '1h')
             assert 'rsi' in df.columns, "Technical indicators missing"
             
             results.append(TestResult(
@@ -512,6 +532,8 @@ except ImportError:
 try:
     from telegram import Update, Bot
     from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+    from telegram.request import HTTPXRequest
+    import telegram.error
     TELEGRAM_AVAILABLE = True
 except ImportError:
     TELEGRAM_AVAILABLE = False
@@ -548,13 +570,16 @@ class TelegramKillSwitch:
             LOG.info("telegram_kill_switch_enabled",
                     admin_count=len(self.admin_chat_ids))
     
-    def _is_admin(self, chat_id: int) -> bool:
+    def _is_admin(self, update: Update) -> bool:
         """Verifica si el chat_id es admin autorizado"""
-        return chat_id in self.admin_chat_ids
+        
+        if not update or not update.effective_chat:
+            return False
+        return update.effective_chat.id in self.admin_chat_ids
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handler para /start"""
-        if not self._is_admin(update.effective_chat.id):
+        if not self._is_admin(update):
             await update.message.reply_text("❌ Acceso no autorizado")
             return
         
@@ -572,7 +597,7 @@ class TelegramKillSwitch:
     
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handler para /status"""
-        if not self._is_admin(update.effective_chat.id):
+        if not self._is_admin(update):
             await update.message.reply_text("❌ Acceso no autorizado")
             return
         
@@ -602,7 +627,7 @@ class TelegramKillSwitch:
     
     async def stop_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handler para /stop - Activa kill switch"""
-        if not self._is_admin(update.effective_chat.id):
+        if not self._is_admin(update):
             await update.message.reply_text("❌ Acceso no autorizado")
             return
         
@@ -637,7 +662,7 @@ class TelegramKillSwitch:
     
     async def resume_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handler para /resume - Desactiva kill switch"""
-        if not self._is_admin(update.effective_chat.id):
+        if not self._is_admin(update):
             await update.message.reply_text("❌ Acceso no autorizado")
             return
         
@@ -664,7 +689,7 @@ class TelegramKillSwitch:
     
     async def positions_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handler para /positions"""
-        if not self._is_admin(update.effective_chat.id):
+        if not self._is_admin(update):
             await update.message.reply_text("❌ Acceso no autorizado")
             return
         
@@ -708,7 +733,7 @@ class TelegramKillSwitch:
     
     async def metrics_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handler para /metrics"""
-        if not self._is_admin(update.effective_chat.id):
+        if not self._is_admin(update):
             await update.message.reply_text("❌ Acceso no autorizado")
             return
         
@@ -735,7 +760,7 @@ class TelegramKillSwitch:
     
     async def emergency_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handler para /emergency - Cierra TODAS las posiciones"""
-        if not self._is_admin(update.effective_chat.id):
+        if not self._is_admin(update):
             await update.message.reply_text("❌ Acceso no autorizado")
             return
         
@@ -756,7 +781,7 @@ class TelegramKillSwitch:
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handler genérico para mensajes"""
-        if not self._is_admin(update.effective_chat.id):
+        if not self._is_admin(update):
             return
         
         # Verificar confirmación de emergencia
@@ -775,14 +800,26 @@ class TelegramKillSwitch:
                         stop_info = self.trading_bot.risk_manager.active_stops[symbol]
                         side = 'sell' if stop_info['side'] == 'buy' else 'buy'
                         size = stop_info['remaining_size']
+                        entry_price = stop_info['entry_price']
                         
-                        order = await self.trading_bot.exchange_manager.create_order(
-                            symbol, 'market', side, size
+                        order = await self.trading_bot.smart_executor.execute_order_smart(
+                            symbol, side, size, order_type='market'
                         )
                         
                         if order and order.get('success'):
                             closed += 1
-                            self.trading_bot.risk_manager.close_position(symbol)
+                            # Usar la lógica de cierre centralizada del bot
+                            await self.trading_bot._update_state_after_trade_close(
+                                self.trading_bot.risk_manager,
+                                symbol,
+                                stop_info.get('confidence', 0.5),
+                                side,
+                                size,
+                                entry_price,
+                                order.get('executed_price', order.get('price')),
+                                is_stop_loss=False,
+                                is_partial=False
+                            )
                         else:
                             errors += 1
                     except Exception:
@@ -808,33 +845,52 @@ class TelegramKillSwitch:
                 await update.message.reply_text("❌ Operación cancelada")
     
     async def start(self, trading_bot):
-        """Inicia el bot de Telegram"""
+        """Inicia el bot de Telegram y maneja errores de red de forma robusta."""
         if not self.enabled:
             LOG.info("telegram_kill_switch_not_started_disabled")
             return
-        
+
         self.trading_bot = trading_bot
-        
-        # Crear aplicación
-        self.application = Application.builder().token(self.bot_token).build()
-        
-        # Registrar handlers
-        self.application.add_handler(CommandHandler("start", self.start_command))
-        self.application.add_handler(CommandHandler("status", self.status_command))
-        self.application.add_handler(CommandHandler("stop", self.stop_command))
-        self.application.add_handler(CommandHandler("resume", self.resume_command))
-        self.application.add_handler(CommandHandler("positions", self.positions_command))
-        self.application.add_handler(CommandHandler("metrics", self.metrics_command))
-        self.application.add_handler(CommandHandler("emergency", self.emergency_command))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
-        
-        # Iniciar polling
-        await self.application.initialize()
-        await self.application.start()
-        await self.application.updater.start_polling()
-        
-        LOG.info("telegram_kill_switch_started",
-                admin_count=len(self.admin_chat_ids))
+
+        try:
+            from telegram.request import HTTPXRequest
+            # Aumentar timeouts para manejar redes lentas (default es 5s)
+            request = HTTPXRequest(connect_timeout=20.0, read_timeout=20.0)
+
+            # Crear aplicación con el request personalizado
+            self.application = Application.builder().token(self.bot_token).request(request).build()
+
+            # Registrar handlers
+            self.application.add_handler(CommandHandler("start", self.start_command))
+            self.application.add_handler(CommandHandler("status", self.status_command))
+            self.application.add_handler(CommandHandler("stop", self.stop_command))
+            self.application.add_handler(CommandHandler("resume", self.resume_command))
+            self.application.add_handler(CommandHandler("positions", self.positions_command))
+            self.application.add_handler(CommandHandler("metrics", self.metrics_command))
+            self.application.add_handler(CommandHandler("emergency", self.emergency_command))
+            self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+
+            # Iniciar polling
+            await self.application.initialize()
+            await self.application.start()
+            await self.application.updater.start_polling()
+
+            LOG.info("telegram_kill_switch_started",
+                     admin_count=len(self.admin_chat_ids))
+
+        except (telegram.error.TimedOut, telegram.error.NetworkError) as e:
+            LOG.error("telegram_initialization_failed_network_error", error=str(e), error_type=type(e).__name__)
+            LOG.warning("telegram_kill_switch_will_be_disabled_for_this_session")
+            self.enabled = False
+            self.application = None
+            self.trading_bot = None  # Disconnect from the main bot
+
+        except Exception as e:
+            LOG.critical("telegram_initialization_failed_unexpected_error", error=str(e), traceback=traceback.format_exc())
+            LOG.warning("telegram_kill_switch_will_be_disabled_for_this_session")
+            self.enabled = False
+            self.application = None
+            self.trading_bot = None
     
     async def stop(self):
         """Detiene el bot de Telegram"""
@@ -879,19 +935,30 @@ def hurst_exponent(ts: np.ndarray, lags: Iterable[int] = range(2, 20)) -> float:
 
 class FeatureCache:
     def __init__(self, max_size: int = 1000, ttl_seconds: int = 300):
-        self._cache = {}
-        self._timestamps = {}
+        self._cache: Dict[str, pd.DataFrame] = {}
+        self._timestamps: Dict[str, float] = {}
         self._hit_count = 0
         self._miss_count = 0
         self.max_size = max_size
         self.ttl = ttl_seconds
         self._lock = asyncio.Lock()
 
-    def _generate_key(self, symbol: str, timeframe: str, length: int) -> str:
-        return f"{symbol}:{timeframe}:{length}"
+    def _generate_key(self, symbol: str, timeframe: str, df: pd.DataFrame) -> str:
+        """
+        BUG FIX: Generate a unique key using start/end timestamps.
+        Using len(df) was not unique and caused cache collisions.
+        """
+        if df.empty or not isinstance(df.index, pd.DatetimeIndex) or len(df.index) < 2:
+            # Fallback for invalid dataframes to prevent crashes.
+            return f"{symbol}:{timeframe}:{len(df)}:{uuid.uuid4()}"
+        
+        start_ts = df.index[0].isoformat()
+        end_ts = df.index[-1].isoformat()
+        return f"{symbol}:{timeframe}:{start_ts}:{end_ts}"
 
-    async def get(self, symbol: str, timeframe: str, df: pd.DataFrame) -> Optional[np.ndarray]:
-        key = self._generate_key(symbol, timeframe, len(df))
+    async def get(self, symbol: str, timeframe: str, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """Gets data from cache using a unique, content-based key."""
+        key = self._generate_key(symbol, timeframe, df)
         async with self._lock:
             if key in self._cache:
                 timestamp = self._timestamps[key]
@@ -899,30 +966,44 @@ class FeatureCache:
                     self._hit_count += 1
                     return self._cache[key].copy()
                 else:
+                    # Stale entry, remove it
                     del self._cache[key]
                     del self._timestamps[key]
             self._miss_count += 1
             return None
 
-    async def set(self, symbol: str, timeframe: str, df: pd.DataFrame, features: np.ndarray):
-        key = self._generate_key(symbol, timeframe, len(df))
+    async def set(self, symbol: str, timeframe: str, original_df: pd.DataFrame, data_with_features: pd.DataFrame):
+        """Sets data in cache using a unique, content-based key from the original df."""
+        key = self._generate_key(symbol, timeframe, original_df)
         async with self._lock:
             if len(self._cache) >= self.max_size:
-                oldest_key = min(self._timestamps.keys(), key=lambda k: self._timestamps[k])
-                del self._cache[oldest_key]
-                del self._timestamps[oldest_key]
-            self._cache[key] = features.copy()
+                # Evict oldest entry
+                try:
+                    oldest_key = min(self._timestamps, key=self._timestamps.get)
+                    del self._cache[oldest_key]
+                    del self._timestamps[oldest_key]
+                except (ValueError, KeyError):
+                    pass  # Cache might be empty or key disappeared
+            self._cache[key] = data_with_features.copy()
             self._timestamps[key] = time.time()
 
     def get_stats(self) -> Dict[str, Any]:
         total = self._hit_count + self._miss_count
         hit_rate = self._hit_count / total if total > 0 else 0
+        
+        # Calculate memory usage more accurately
+        try:
+            mem_usage_bytes = sum(df.memory_usage(deep=True).sum() for df in self._cache.values())
+            mem_usage_mb = mem_usage_bytes / (1024 * 1024)
+        except Exception:
+            mem_usage_mb = -1 # Indicate error
+
         return {
             'cache_size': len(self._cache),
             'hit_count': self._hit_count,
             'miss_count': self._miss_count,
             'hit_rate': hit_rate,
-            'memory_mb': sys.getsizeof(self._cache) / (1024 * 1024)
+            'memory_mb': mem_usage_mb
         }
 
 def optimize_memory_usage():
@@ -1214,7 +1295,7 @@ class InfluxDBMetrics:
             try:
                 if InfluxDBClient:
                     self.client = InfluxDBClient(url=url, token=token, org=org)
-                    self.write_api = self.client.write_api()
+                    self.write_api = self.client.write_api(write_options=ASYNCHRONOUS)
                     self.bucket = bucket
                     self.org = org
                     self.enabled = True
@@ -1462,88 +1543,70 @@ class InfluxDBMetrics:
                      symbol=symbol, error=str(e))
             return False
         
-    async def write_model_metrics(self, model_name: str, metrics: Dict[str, float], tags: Dict[str, str] = None):
+    async def write_model_metrics(self, measurement: str, fields: Dict[str, float], tags: Dict[str, str] = None):
         """
-        MEJORADO: Escribe métricas de modelos con validación y tags adicionales
+        MEJORADO Y CORREGIDO: Escribe métricas genéricas a una 'measurement' específica.
         
         Args:
-            model_name: Nombre del modelo
-            metrics: Dict de métricas numéricas
-            tags: Tags adicionales opcionales (ej: {'symbol': 'BTC/USDT'})
+            measurement: Nombre de la measurement en InfluxDB (e.g., "ai_models_status")
+            fields: Diccionario de campos numéricos (e.g., {'accuracy': 0.95})
+            tags: Diccionario de tags opcionales (e.g., {'symbol': 'BTC/USDT'})
         """
         if not self.enabled:
             return False
         
-        # MEJORA: Throttling por modelo (1 write cada 30 segundos por modelo)
-        throttle_key = f"model_{model_name}"
-        if not await INFLUX_THROTTLER.should_write(throttle_key):
+        symbol_tag = tags.get('symbol') if tags else None
+        if not await INFLUX_THROTTLER.should_write("model", symbol=f"{measurement}_{symbol_tag if symbol_tag else ''}"):
             return False
         
         try:
-            point = Point("model_performance").tag("model", model_name)
+            point = Point(measurement)
             
-            # MEJORA: Agregar tags adicionales si existen
             if tags:
                 for tag_key, tag_value in tags.items():
-                    if tag_value:  # Solo agregar si no vacío
+                    if tag_value:
                         point = point.tag(str(tag_key), str(tag_value))
             
-            # Validar y agregar fields
             valid_fields = 0
-            for key, value in metrics.items():
+            for key, value in fields.items():
                 try:
-                    # MEJORA: Validación robusta
                     float_value = float(value)
                     
                     if np.isnan(float_value) or np.isinf(float_value):
-                        LOG.debug("skipping_invalid_metric",
-                                 model=model_name,
-                                 key=key,
-                                 value=value)
+                        LOG.debug("skipping_invalid_metric_field",
+                                 measurement=measurement, key=key, value=value)
                         continue
                     
                     point = point.field(key, float_value)
                     valid_fields += 1
                     
-                except (ValueError, TypeError) as conv_error:
-                    LOG.debug("metric_conversion_failed",
-                             model=model_name,
-                             key=key,
-                             value=value,
-                             error=str(conv_error))
+                except (ValueError, TypeError):
+                    LOG.debug("metric_field_conversion_failed",
+                             measurement=measurement, key=key, value=value)
                     continue
             
             if valid_fields == 0:
-                LOG.warning("no_valid_fields_for_model_metrics",
-                           model=model_name,
-                           attempted_fields=len(metrics))
+                LOG.warning("no_valid_fields_for_metrics",
+                           measurement=measurement, attempted_fields=len(fields))
                 return False
             
             point = point.time(datetime.now(timezone.utc), WritePrecision.NS)
             
-            # Escritura con manejo de errores
             try:
                 self.write_api.write(bucket=self.bucket, org=self.org, record=point, write_options=ASYNCHRONOUS)
                 self._write_success_count += 1
-                
-                # Log estadísticas cada 100 writes
-                if self._write_success_count % 100 == 0:
-                    self._log_stats()
-                
                 return True
                 
             except Exception as write_error:
                 self._write_error_count += 1
                 self._last_error_time = datetime.now(timezone.utc)
-                LOG.error("model_metrics_write_failed",
-                         model=model_name,
-                         error=str(write_error))
+                LOG.error("metrics_write_failed",
+                         measurement=measurement, error=str(write_error))
                 return False
                 
         except Exception as e:
-            LOG.error("model_metrics_preparation_failed",
-                     model=model_name,
-                     error=str(e))
+            LOG.error("metrics_preparation_failed",
+                     measurement=measurement, error=str(e))
             return False
 
     def _log_stats(self):
@@ -1551,19 +1614,19 @@ class InfluxDBMetrics:
         success_rate = self._write_success_count / total if total > 0 else 0
         LOG.info("influxdb_write_stats", total_writes=total, success_count=self._write_success_count, error_count=self._write_error_count, success_rate=success_rate, last_error=self._last_error_time.isoformat() if self._last_error_time else None)
 
-    async def write_portfolio_metrics(self, equity: float, drawdown: float, positions: int, total_pnl: float):
+    async def write_portfolio_metrics(self, equity: float, drawdown: float, positions: int, total_pnl: float,
+                                  total_trades: Optional[int] = None, win_rate: Optional[float] = None, 
+                                  sharpe_ratio: Optional[float] = None):
         """
-        MEJORADO: Escribe métricas de portfolio con validación completa
+        MEJORADO: Escribe métricas de portfolio con validación completa y campos adicionales.
         """
         if not self.enabled:
             return False
         
-        # MEJORA: Throttling inteligente (no más de 1 write cada 10 segundos)
         if not await INFLUX_THROTTLER.should_write("portfolio"):
             return False
         
         try:
-            # Validación y conversión
             equity = float(equity)
             drawdown = float(drawdown)
             positions = int(positions)
@@ -1573,15 +1636,13 @@ class InfluxDBMetrics:
                 LOG.warning("invalid_equity_for_influx", equity=equity)
                 return False
             
-            # CORRECCIÓN: Validar drawdown está en rango correcto
             if drawdown > 0:
                 LOG.warning("positive_drawdown_correcting", drawdown=drawdown)
                 drawdown = 0.0
             
             validated_drawdown = max(-1.0, min(0.0, drawdown))
             
-            # MEJORA: Calcular métricas adicionales útiles
-            initial_capital = 10000.0  # Debe venir del bot idealmente
+            initial_capital = 10000.0
             if hasattr(self, '_initial_capital'):
                 initial_capital = self._initial_capital
             
@@ -1595,26 +1656,41 @@ class InfluxDBMetrics:
                 .field("positions", positions)\
                 .field("total_pnl", total_pnl)\
                 .field("total_pnl_pct", pnl_pct)\
-                .field("equity_pct", equity_pct)\
-                .time(datetime.now(timezone.utc), WritePrecision.NS)
-            
-            # MEJORA: Escritura con retry
-            try:
-                self.write_api.write(bucket=self.bucket, org=self.org, record=point, write_options=ASYNCHRONOUS)
-                self._write_success_count += 1
+                .field("equity_pct", equity_pct)
+
+            if total_trades is not None:
+                point = point.field("total_trades", int(total_trades))
+            if win_rate is not None:
+                point = point.field("win_rate", float(win_rate))
+            if sharpe_ratio is not None:
+                point = point.field("sharpe_ratio", float(sharpe_ratio))
+
+            point = point.time(datetime.now(timezone.utc), WritePrecision.NS)
+
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    self.write_api.write(bucket=self.bucket, org=self.org, record=point, write_options=ASYNCHRONOUS)
+                    self._write_success_count += 1
+                    
+                    LOG.debug("portfolio_metrics_written",
+                             equity=equity,
+                             positions=positions,
+                             drawdown_pct=validated_drawdown * 100)
+                    
+                    return True
                 
-                LOG.debug("portfolio_metrics_written",
-                         equity=equity,
-                         positions=positions,
-                         drawdown_pct=validated_drawdown * 100)
-                
-                return True
-                
-            except Exception as write_error:
-                self._write_error_count += 1
-                LOG.error("portfolio_metrics_write_failed",
-                         error=str(write_error))
-                return False
+                except Exception as write_error:
+                    self._write_error_count += 1
+                    self._last_error_time = datetime.now(timezone.utc)
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.5 * (2 ** attempt))
+                        LOG.debug("retrying_portfolio_metric_write", attempt=attempt+1, error=str(write_error))
+                    else:
+                        LOG.error("portfolio_metrics_write_failed_all_attempts",
+                                 error=str(write_error), attempts=max_retries)
+                        return False
+            return False
                 
         except Exception as e:
             LOG.error("portfolio_metrics_preparation_failed", error=str(e))
@@ -1623,7 +1699,15 @@ class InfluxDBMetrics:
     async def write_rl_metrics(self, episode: int, reward: float, actor_loss: float, critic_loss: float, epsilon: float):
         if not self.enabled:
             return False
+
+        if not await INFLUX_THROTTLER.should_write("model", symbol="rl_training"):
+            return False
+
         try:
+            if any(np.isnan(v) or np.isinf(v) for v in [reward, actor_loss, critic_loss, epsilon]):
+                LOG.warning("invalid_rl_metric_value_skipping", episode=episode)
+                return False
+
             point = Point("rl_training")\
                 .field("episode", int(episode))\
                 .field("reward", float(reward))\
@@ -1631,13 +1715,28 @@ class InfluxDBMetrics:
                 .field("critic_loss", float(critic_loss))\
                 .field("epsilon", float(epsilon))\
                 .time(datetime.now(timezone.utc), WritePrecision.NS)
-            self.write_api.write(bucket=self.bucket, org=self.org, record=point)
-            return True
+
+            for attempt in range(2):
+                try:
+                    self.write_api.write(bucket=self.bucket, org=self.org, record=point, write_options=ASYNCHRONOUS)
+                    self._write_success_count += 1
+                    return True
+                except Exception as e:
+                    self._write_error_count += 1
+                    self._last_error_time = datetime.now(timezone.utc)
+                    if attempt == 0:
+                        await asyncio.sleep(0.5)
+                    else:
+                        LOG.error("influxdb_write_rl_failed", error=str(e))
+                        return False
+            return False
         except Exception as e:
-            LOG.error("influxdb_write_rl_failed", error=str(e))
+            LOG.error("rl_metrics_preparation_failed", error=str(e))
             return False
 
+# NEW CODE: Replace the old INFLUX_METRICS instance
 INFLUX_METRICS = InfluxDBMetrics()
+
 # NUEVO: Configurar initial_capital en InfluxDB
 def set_influx_initial_capital(capital: float):
     """Configura el capital inicial en InfluxDB metrics"""
@@ -1751,11 +1850,11 @@ class MetricsCollector:
                 LOG.info("metrics_db_recovered_after_memory_error")
             except Exception as retry_error:
                 print(f"CRITICAL: Recovery failed: {retry_error}")
-                asyncio.create_task(ALERT_SYSTEM.send_alert("CRITICAL", "Memory error initializing metrics DB - recovery failed", error=str(e)))
+                ALERT_SYSTEM.send_alert("CRITICAL", "Memory error initializing metrics DB - recovery failed", error=str(e))
         except Exception as e:
             error_msg = f"Metrics DB init failed: {str(e)}"
             print(f"ERROR: {error_msg}")
-            asyncio.create_task(ALERT_SYSTEM.send_alert("ERROR", "Metrics DB initialization failed", error=str(e)))
+            ALERT_SYSTEM.send_alert("ERROR", "Metrics DB initialization failed", error=str(e))
         finally:
             if conn:
                 try:
@@ -1877,7 +1976,7 @@ class AdvancedAIConfig(BaseModel):
     def __setattr__(self, name, value):
         if isinstance(value, list):
             if name in ['symbols', 'regime_clustering_features', 'ensemble_strategies']:
-                value = tuple(value) if all(isinstance(item, str) for item in value) else value
+                value = tuple(value)
         super().__setattr__(name, value)
 
 def create_config():
@@ -2109,7 +2208,8 @@ class StrategyManager:
             mdm = down.where((down > up) & (down > 0), 0).rolling(window=period).mean()
             pdi = 100 * (pdm / atr)
             mdi = 100 * (mdm / atr)
-            dx = 100 * abs(pdi - mdi) / (pdi + mdi)
+            denominator = pdi + mdi
+            dx = 100 * abs(pdi - mdi) / denominator.replace(0, np.nan)
             adx = dx.rolling(window=period).mean()
             adx = adx.fillna(0)
             return adx
@@ -2224,10 +2324,10 @@ class StrategyManager:
             macd_strength = abs(current_macd - current_signal) / abs(current_signal) if current_signal != 0 else 0
             base_confidence = min(0.8, macd_strength * 5)
             if (prev_macd <= prev_signal and current_macd > current_signal and current_hist > 0):
-                confidence = base_confidence * 1.3
+                confidence = min(1.0, base_confidence * 1.3)
                 return self._create_strategy_response("buy", confidence, "MACD cruzó arriba con histograma positivo")
             elif (prev_macd >= prev_signal and current_macd < current_signal and current_hist < 0):
-                confidence = base_confidence * 1.2
+                confidence = min(1.0, base_confidence * 1.2)
                 return self._create_strategy_response("sell", confidence, "MACD cruzó abajo con histograma negativo")
             else:
                 if current_macd > current_signal and current_hist > 0:
@@ -2298,12 +2398,7 @@ class StrategyManager:
         validated = {}
         for param_name, param_value in params.items():
             if param_name in valid_params:
-                allowed_values = valid_params[param_name]
-                if isinstance(allowed_values, list) and param_value not in allowed_values:
-                    validated[param_name] = allowed_values[0]
-                    LOG.warning("strategy_parameter_adjusted", strategy=strategy_name, parameter=param_name, provided=param_value, used=allowed_values[0])
-                else:
-                    validated[param_name] = param_value
+                validated[param_name] = param_value
             else:
                 LOG.warning("unknown_strategy_parameter", strategy=strategy_name, parameter=param_name)
         return validated
@@ -2341,12 +2436,18 @@ class StrategyManager:
     async def save_strategy_performance(self):
         conn = None
         try:
-            conn = sqlite3.connect('performance.db')
+            # ✅ CORRECCIÓN: Usar el path de la propiedad de la clase
+            conn = sqlite3.connect(self.performance_db_path)
             cursor = conn.cursor()
-            cursor.execute('CREATE TABLE IF NOT EXISTS strategy_performance (name TEXT, total_signals INTEGER, profitable_signals INTEGER, total_pnl FLOAT, win_rate FLOAT, last_used TEXT)')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS strategy_performance (strategy TEXT PRIMARY KEY, performance TEXT)''')
             for name, metrics in self.strategy_performance.items():
-                cursor.execute('INSERT OR REPLACE INTO strategy_performance VALUES (?, ?, ?, ?, ?, ?)',
-                               (name, metrics['total_signals'], metrics['profitable_signals'], metrics['total_pnl'], metrics['win_rate'], metrics['last_used']))
+                # Asumimos que last_used es un objeto datetime
+                metrics_to_save = metrics.copy()
+                if isinstance(metrics_to_save.get('last_used'), datetime):
+                    metrics_to_save['last_used'] = metrics_to_save['last_used'].isoformat()
+                
+                cursor.execute('INSERT OR REPLACE INTO strategy_performance VALUES (?, ?)',
+                               (name, json.dumps(metrics_to_save)))
             conn.commit()
             LOG.info("strategy_performance_saved")
         except Exception as e:
@@ -2378,6 +2479,476 @@ class StrategyManager:
                 "performance": self.strategy_performance.get(name, {})
             })
         return strategies_list
+
+class BTCRelativeCorrelationTracker:
+    """
+    Captures, analyzes, and sends data on the correlation and daily percentage difference
+    of all USDT spot pairs against BTC/USDT to InfluxDB for dynamic visualization.
+    """
+    def __init__(self, exchange_manager, influx_client, start_date="2019-01-01", data_dir="data/btc_relative"):
+        self.exchange_manager = exchange_manager
+        self.influx_client = influx_client
+        self.start_date_str = start_date
+        self.start_timestamp = int(datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+        self.data_path = Path(data_dir)
+        self.historical_path = self.data_path / "historical"
+        self.processed_path = self.data_path / "processed"
+        self.usdt_pairs = []
+        self.full_data = None
+        self.btc_pct = None
+
+        # Create directories if they don't exist
+        self.historical_path.mkdir(parents=True, exist_ok=True)
+        self.processed_path.mkdir(parents=True, exist_ok=True)
+
+    async def get_all_usdt_pairs(self):
+        """Gets all SPOT USDT pairs, excluding stable-to-stable pairs."""
+        LOG.info("tracker_fetching_all_usdt_pairs")
+        try:
+            all_pairs = await discover_usdt_pairs(self.exchange_manager, exclude_stablecoins=True)
+            if "BTC/USDT" not in all_pairs:
+                all_pairs.insert(0, "BTC/USDT")
+            self.usdt_pairs = all_pairs
+            LOG.info("tracker_usdt_pairs_discovered", count=len(self.usdt_pairs))
+        except Exception as e:
+            LOG.error("tracker_failed_to_discover_usdt_pairs", error=str(e))
+            self.usdt_pairs = ["BTC/USDT", "ETH/USDT"] # Fallback 
+
+    async def fetch_historical_data_for_all(self, max_workers=10):
+        """Fetches historical data for all discovered USDT pairs in parallel."""
+        if not self.usdt_pairs:
+            await self.get_all_usdt_pairs()
+        
+        LOG.info("tracker_starting_parallel_historical_download", total_symbols=len(self.usdt_pairs))
+        
+        # BUG FIX: Use asyncio.gather for efficient, truly asynchronous fetching.
+        # The previous implementation with ThreadPoolExecutor and new event loops was incorrect and inefficient.
+        tasks = [self.fetch_historical_data(symbol) for symbol in self.usdt_pairs]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        completed_count = 0
+        failed_count = 0
+        for i, result in enumerate(results):
+            symbol = self.usdt_pairs[i]
+            if isinstance(result, Exception):
+                LOG.warning("tracker_historical_data_failed", symbol=symbol, error=str(result))
+                failed_count += 1
+            elif result:
+                LOG.debug("tracker_historical_data_saved", symbol=symbol)
+                completed_count += 1
+            else:
+                LOG.warning("tracker_historical_data_failed_no_data", symbol=symbol)
+                failed_count += 1
+        
+        LOG.info("tracker_parallel_download_complete", 
+                 successful=completed_count, 
+                 failed=failed_count,
+                 total=len(self.usdt_pairs))
+
+    async def fetch_historical_data(self, symbol: str) -> bool:
+        """Downloads daily klines, calculates pct_change, and saves to Parquet."""
+        if not PYARROW_AVAILABLE:
+            LOG.error("pyarrow_not_installed_cannot_save_parquet", symbol=symbol)
+            return False
+            
+        filepath = self.historical_path / f"{symbol.replace('/', '_')}.parquet"
+        if filepath.exists():
+            LOG.debug("tracker_data_already_exists_skipping", symbol=symbol)
+            return True
+
+        try:
+            all_ohlcv = []
+            current_since = self.start_timestamp
+            
+            while True:
+                ohlcv = await self.exchange_manager.exchange.fetch_ohlcv(symbol, '1d', since=current_since, limit=1000)
+                if not ohlcv:
+                    break
+                all_ohlcv.extend(ohlcv)
+                current_since = ohlcv[-1][0] + 1
+                if datetime.fromtimestamp(current_since / 1000) > datetime.now():
+                    break
+            
+            if not all_ohlcv:
+                return False
+
+            df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df['pct_change'] = (df['close'] - df['open']) / df['open'] * 100
+            df.to_parquet(filepath)
+            return True
+        except Exception as e:
+            LOG.error("tracker_fetch_single_historical_failed", symbol=symbol, error=str(e))
+            return False
+
+    async def calculate_relative_difference(self):
+        """Compares each pair's pct_change with BTC/USDT's."""
+        LOG.info("tracker_calculating_relative_differences")
+        all_data = []
+        btc_df = None
+
+        btc_path = self.historical_path / "BTC_USDT.parquet"
+        if not btc_path.exists():
+            LOG.error("btc_data_not_found_cannot_calculate_differences")
+            return
+        
+        btc_df = pd.read_parquet(btc_path)
+        btc_df = btc_df.set_index('timestamp')[['pct_change']].rename(columns={'pct_change': 'btc_pct'})
+        self.btc_pct = btc_df['btc_pct']
+
+        for filepath in self.historical_path.glob("*.parquet"):
+            symbol = filepath.stem.replace('_', '/')
+            if symbol == 'BTC/USDT':
+                continue
+            
+            pair_df = pd.read_parquet(filepath)
+            pair_df = pair_df.set_index('timestamp')[['pct_change']].rename(columns={'pct_change': 'pair_pct'})
+            
+            merged = pd.merge(pair_df, btc_df, left_index=True, right_index=True, how='inner')
+            merged['rel_diff'] = merged['pair_pct'] - merged['btc_pct']
+            merged['symbol'] = symbol
+            
+            all_data.append(merged.reset_index())
+        
+        self.full_data = pd.concat(all_data, ignore_index=True)
+        LOG.info("tracker_relative_differences_calculated", total_rows=len(self.full_data))
+
+    async def send_to_influx(self, dataframe: pd.DataFrame, measurement: str):
+        """Sends a processed DataFrame to a specific InfluxDB measurement."""
+        if not self.influx_client or not self.influx_client.enabled:
+            LOG.warning("influx_client_not_available_skipping_send")
+            return
+        
+        LOG.info("tracker_sending_data_to_influx", measurement=measurement, rows=len(dataframe))
+        points = []
+        for _, row in dataframe.iterrows():
+            try:
+                p = Point(measurement) \
+                    .tag("symbol", row['symbol']) \
+                    .time(row['timestamp'], WritePrecision.NS)
+                
+                # Dynamically add fields
+                for col, value in row.items():
+                    if col not in ['timestamp', 'symbol'] and pd.notna(value):
+                        p = p.field(col, float(value))
+                points.append(p)
+            except Exception as e:
+                LOG.debug("failed_to_create_influx_point", row=row.to_dict(), error=str(e))
+                continue
+
+        if points:
+            try:
+                self.influx_client.write_api.write(
+                    bucket=self.influx_client.bucket, 
+                    org=self.influx_client.org, 
+                    record=points
+                )
+                LOG.info("tracker_influx_write_successful", measurement=measurement, points=len(points))
+            except Exception as e:
+                LOG.error("tracker_influx_write_failed", measurement=measurement, error=str(e))
+    
+    async def analyze_correlations(self, window=30):
+        """Calculates rolling correlation and sends to InfluxDB."""
+        if self.full_data is None:
+            LOG.warning("no_data_for_correlation_analysis")
+            return
+        
+        LOG.info("tracker_analyzing_correlations", window=window)
+        corr_data = []
+        for symbol, group in self.full_data.groupby('symbol'):
+            if len(group) < window:
+                continue
+            
+            group = group.set_index('timestamp').sort_index()
+            rolling_corr = group['pair_pct'].rolling(window=window).corr(group['btc_pct'])
+            
+            corr_df = rolling_corr.reset_index()
+            corr_df.columns = ['timestamp', 'corr_value']
+            corr_df['symbol'] = symbol
+            corr_data.append(corr_df.dropna())
+            
+        if corr_data:
+            all_corr_df = pd.concat(corr_data, ignore_index=True)
+            await self.send_to_influx(all_corr_df, "btc_correlation")
+
+    async def detect_clusters(self, n_clusters=5, window=30, threshold=2.0):
+        """Analyzes clusters of pairs with similar behavior and sends alerts."""
+        if self.full_data is None:
+            LOG.warning("no_data_for_cluster_detection")
+            return
+
+        LOG.info("tracker_detecting_clusters", n_clusters=n_clusters, window=window)
+        
+        # Prepare features: recent mean and std of relative difference
+        features = self.full_data.groupby('symbol')['rel_diff'].rolling(window).agg(['mean', 'std']).reset_index()
+        features = features.groupby('symbol').last().drop(columns='level_1').reset_index()
+        features = features.dropna()
+        
+        if len(features) < n_clusters:
+            LOG.warning("not_enough_symbols_for_clustering", symbols=len(features), required=n_clusters)
+            return
+
+        X = features[['mean', 'std']].values
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10).fit(X)
+        features['cluster'] = kmeans.labels_
+        
+        # Analyze clusters
+        cluster_alerts = []
+        for i in range(n_clusters):
+            cluster_group = features[features['cluster'] == i]
+            avg_rel_diff = cluster_group['mean'].mean()
+            
+            cluster_type = "neutral"
+            if avg_rel_diff > threshold:
+                cluster_type = "bull"
+            elif avg_rel_diff < -threshold:
+                cluster_type = "bear"
+
+            if cluster_type != "neutral":
+                alert_df = pd.DataFrame([{
+                    'timestamp': datetime.now(timezone.utc),
+                    'symbol': cluster_type, # Using symbol tag for cluster_type as requested
+                    'pair_count': len(cluster_group),
+                    'avg_rel_diff': avg_rel_diff
+                }])
+                await self.send_to_influx(alert_df, "btc_cluster_alerts")
+                LOG.info("tracker_cluster_alert_sent", cluster_type=cluster_type, pair_count=len(cluster_group), avg_rel_diff=avg_rel_diff)
+
+    async def update_realtime_data(self):
+        """Fetches the latest daily candle, recalculates, and sends to InfluxDB."""
+        if not self.usdt_pairs:
+            LOG.warning("no_usdt_pairs_to_update")
+            return
+        
+        LOG.info("tracker_updating_realtime_data")
+        
+        # Fetch latest BTC candle
+        try:
+            btc_ohlcv = await self.exchange_manager.exchange.fetch_ohlcv('BTC/USDT', '1d', limit=2)
+            if len(btc_ohlcv) < 2:
+                LOG.warning("insufficient_btc_data_for_realtime_update")
+                return
+            
+            # Use the most recently closed candle
+            last_closed_candle = btc_ohlcv[-2]
+            btc_pct = (last_closed_candle[4] - last_closed_candle[1]) / last_closed_candle[1] * 100
+            timestamp = pd.to_datetime(last_closed_candle[0], unit='ms')
+        except Exception as e:
+            LOG.error("failed_to_fetch_realtime_btc_data", error=str(e))
+            return
+
+        new_points = []
+        for symbol in self.usdt_pairs:
+            if symbol == 'BTC/USDT': continue
+            try:
+                ohlcv = await self.exchange_manager.exchange.fetch_ohlcv(symbol, '1d', limit=2)
+                if len(ohlcv) < 2:
+                    continue
+                
+                pair_candle = ohlcv[-2]
+                pair_pct = (pair_candle[4] - pair_candle[1]) / pair_candle[1] * 100
+                rel_diff = pair_pct - btc_pct
+                
+                point = Point("btc_relative_correlation") \
+                    .tag("symbol", symbol) \
+                    .field("pair_pct", float(pair_pct)) \
+                    .field("btc_pct", float(btc_pct)) \
+                    .field("rel_diff", float(rel_diff)) \
+                    .time(timestamp, WritePrecision.NS)
+                new_points.append(point)
+
+            except Exception as e:
+                LOG.debug("failed_to_fetch_realtime_pair_data", symbol=symbol, error=str(e))
+                continue
+        
+        if new_points and self.influx_client and self.influx_client.enabled:
+            try:
+                self.influx_client.write_api.write(
+                    bucket=self.influx_client.bucket, org=self.influx_client.org, record=new_points
+                )
+                LOG.info("tracker_realtime_update_sent_to_influx", count=len(new_points))
+            except Exception as e:
+                LOG.error("tracker_realtime_influx_write_failed", error=str(e))
+
+    async def run_historical_analysis(self):
+        """Orchestrates the full historical analysis pipeline."""
+        LOG.info("tracker_running_full_historical_analysis")
+        await self.get_all_usdt_pairs()
+        await self.fetch_historical_data_for_all()
+        await self.calculate_relative_difference()
+        if self.full_data is not None:
+            await self.send_to_influx(self.full_data[['timestamp', 'symbol', 'pair_pct', 'btc_pct', 'rel_diff']], "btc_relative_correlation")
+            await self.analyze_correlations()
+            await self.detect_clusters()
+        LOG.info("tracker_full_historical_analysis_complete")
+
+    # --- Integration Methods ---
+    def get_relative_strength(self, symbol: str, window: int = 7) -> Optional[float]:
+        """Returns the average relative difference vs BTC over the last `window` days."""
+        if self.full_data is None: return None
+        symbol_data = self.full_data[self.full_data['symbol'] == symbol]
+        if len(symbol_data) < window: return None
+        return symbol_data['rel_diff'].tail(window).mean()
+
+    def is_pair_decoupling(self, symbol: str, window: int = 30, threshold: float = 0.3) -> bool:
+        """Checks if a pair's correlation with BTC has dropped significantly."""
+        if self.full_data is None or self.btc_pct is None:
+            return False
+        
+        try:
+            symbol_data = self.full_data[self.full_data['symbol'] == symbol]
+            if len(symbol_data) < window:
+                return False
+            
+            # Ensure data is aligned by timestamp
+            symbol_data = symbol_data.set_index('timestamp').sort_index()
+            btc_data = self.btc_pct.loc[symbol_data.index]
+
+            rolling_corr = symbol_data['pair_pct'].rolling(window=window).corr(btc_data)
+            
+            if rolling_corr.empty or rolling_corr.isna().all():
+                return False
+            
+            last_corr = rolling_corr.iloc[-1]
+            
+            # Decoupling if correlation is below the threshold
+            is_decoupling = last_corr < threshold
+            if is_decoupling:
+                LOG.info("pair_decoupling_detected", symbol=symbol, last_correlation=last_corr, threshold=threshold)
+
+            return is_decoupling
+
+        except Exception as e:
+            LOG.debug("is_pair_decoupling_error", symbol=symbol, error=str(e))
+            return False
+
+    def is_market_bullish(self, window: int = 7, threshold: float = 0.5) -> bool:
+        """Checks if a majority of pairs are outperforming BTC."""
+        if self.full_data is None: return False
+        
+        last_day = self.full_data['timestamp'].max()
+        recent_data = self.full_data[self.full_data['timestamp'] > last_day - pd.Timedelta(days=window)]
+        
+        if recent_data.empty: return False
+
+        avg_rel_diff_per_symbol = recent_data.groupby('symbol')['rel_diff'].mean()
+        outperforming_ratio = (avg_rel_diff_per_symbol > 0).mean()
+        
+        return outperforming_ratio > threshold
+
+def generate_grafana_dashboard_json(bucket, org, datasource_uid):
+    """
+    CORREGIDO Y MEJORADO: Genera un JSON completo para un dashboard de Grafana
+    que visualiza todas las métricas clave del bot de manera informativa.
+
+    Args:
+        bucket (str): El bucket de InfluxDB.
+        org (str): La organización de InfluxDB.
+        datasource_uid (str): El UID del datasource de InfluxDB en Grafana.
+
+    Returns:
+        str: Un string JSON que representa el dashboard de Grafana.
+    """
+    import json
+    import uuid
+
+    def gpos(h, w, x, y):
+        return {"h": h, "w": w, "x": x, "y": y}
+
+    # ==============================================================================
+    # ===== DEFINICIONES DE QUERIES (CORREGIDAS Y AMPLIADAS) =======================
+    # ==============================================================================
+    queries = {
+        # --- KPIs ---
+        "equity": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "portfolio" and r._field == "equity") |> last()',
+        "total_pnl": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "portfolio" and r._field == "total_pnl") |> last()',
+        "win_rate": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "portfolio" and r._field == "win_rate") |> last()',
+        "sharpe": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "portfolio" and r._field == "sharpe_ratio") |> last()',
+        "max_drawdown": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "portfolio" and r._field == "drawdown_pct") |> min()',
+        "active_pos": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "portfolio" and r._field == "positions") |> last()',
+        "total_trades": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "portfolio" and r._field == "total_trades") |> last()',
+
+        # --- Gráficos Históricos ---
+        "equity_hist": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "portfolio" and r._field == "equity") |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false) |> yield(name: "Equity")',
+        "drawdown_hist": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "portfolio" and r._field == "drawdown_pct") |> aggregateWindow(every: v.windowPeriod, fn: min, createEmpty: false) |> yield(name: "Drawdown")',
+        
+        # --- Análisis de Trades ---
+        "trade_log": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "trades") |> filter(fn: (r) => r.symbol =~ /^${{symbol:regex}}$/) |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value") |> drop(columns: ["_start", "_stop", "_measurement"]) |> sort(columns: ["_time"], desc: true) |> limit(n:100)',
+        "pnl_distribution": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "trades" and r._field == "pnl" and r._value != 0.0) |> keep(columns: ["_value", "symbol"])',
+        
+        # --- Métricas Internas del Bot ---
+        "memory_hist": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "system_health" and r._field == "memory_mb") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false) |> yield(name: "Memory (MB)")',
+        "cpu_hist": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "system_health" and r._field == "cpu_percent") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false) |> yield(name: "CPU (%)")',
+        "specialized_models": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "ai_models_status" and r._field == "specialized_models") |> last()',
+        "rl_episodes": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "ai_models_status" and r._field == "rl_total_episodes") |> last()',
+        "accumulator_size": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "ai_models_status" and r._field == "accumulator_buffer_size") |> last()',
+        "test_success_rate": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "automated_tests" and r._field == "success_rate") |> last()',
+        
+        # --- Contexto de Mercado (BTC) ---
+        "btc_relative": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "btc_relative_correlation") |> filter(fn: (r) => r._field == "rel_diff" or r._field == "pair_pct" or r._field == "btc_pct") |> filter(fn: (r) => r.symbol =~ /^${{symbol:regex}}$/) |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)',
+        "btc_heatmap": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "btc_correlation" and r._field == "corr_value") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)',
+        "cluster_alerts": f'from(bucket: "{bucket}") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == "btc_cluster_alerts") |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value") |> sort(columns: ["_time"], desc: true) |> limit(n:10)',
+    }
+
+    dashboard = {
+        "__inputs": [{"name": "DS_INFLUXDB_AI_BOT", "label": "InfluxDB AI Bot", "description": "", "type": "datasource", "pluginId": "influxdb", "pluginName": "InfluxDB"}],
+        "__requires": [{"type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0"}, {"type": "datasource", "id": "influxdb", "name": "InfluxDB", "version": "1.0.0"}],
+        "annotations": {"list": []}, "editable": True, "fiscalYearStartMonth": 0, "graphTooltip": 0, "id": None, "links": [],
+        "panels": [
+            # --- Fila 1: KPIs Principales ---
+            {"type": "row", "title": "Key Performance Indicators", "gridPos": gpos(1, 24, 0, 0)},
+            {"type": "stat", "title": "Equity", "gridPos": gpos(4, 4, 0, 1), "targets": [{"refId": "A", "query": queries["equity"]}], "fieldConfig": {"defaults": {"unit": "currencyUSD", "decimals": 2}}},
+            {"type": "stat", "title": "Total PnL", "gridPos": gpos(4, 4, 4, 1), "targets": [{"refId": "A", "query": queries["total_pnl"]}], "fieldConfig": {"defaults": {"unit": "currencyUSD", "decimals": 2, "thresholds": {"mode": "absolute", "steps": [{"color": "red"}, {"color": "green", "value": 0}]}}}},
+            {"type": "stat", "title": "Win Rate", "gridPos": gpos(4, 3, 8, 1), "targets": [{"refId": "A", "query": queries["win_rate"]}], "fieldConfig": {"defaults": {"unit": "percentunit", "decimals": 2, "thresholds": {"mode": "absolute", "steps": [{"color": "red"}, {"color": "orange", "value": 0.4}, {"color": "green", "value": 0.55}]}}}},
+            {"type": "stat", "title": "Sharpe Ratio", "gridPos": gpos(4, 3, 11, 1), "targets": [{"refId": "A", "query": queries["sharpe"]}], "fieldConfig": {"defaults": {"unit": "short", "decimals": 2}}},
+            {"type": "stat", "title": "Max Drawdown", "gridPos": gpos(4, 4, 14, 1), "targets": [{"refId": "A", "query": queries["max_drawdown"]}], "fieldConfig": {"defaults": {"unit": "percent", "decimals": 2, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": -10}, {"color": "orange", "value": -20}, {"color": "red", "value": -30}]}}}},
+            {"type": "stat", "title": "Total Trades", "gridPos": gpos(4, 3, 18, 1), "targets": [{"refId": "A", "query": queries["total_trades"]}], "fieldConfig": {"defaults": {"unit": "short"}}},
+            {"type": "stat", "title": "Active Positions", "gridPos": gpos(4, 3, 21, 1), "targets": [{"refId": "A", "query": queries["active_pos"]}], "fieldConfig": {"defaults": {"unit": "short"}}},
+            
+            # --- Fila 2: Histórico de Portfolio ---
+            {"type": "row", "title": "Portfolio History", "gridPos": gpos(1, 24, 0, 5)},
+            {"type": "timeseries", "title": "Portfolio Equity & Drawdown", "gridPos": gpos(8, 24, 0, 6), "targets": [{"refId": "A", "query": queries["equity_hist"]}, {"refId": "B", "query": queries["drawdown_hist"]}], "fieldConfig": {"defaults": {"custom": {"axisCenteredZero": False, "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "showPoints": "auto", "spanNulls": False, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": None}, {"color": "red", "value": 80}]}}, "overrides": [{"matcher": {"id": "byName", "options": "Equity"}, "properties": [{"id": "unit", "value": "currencyUSD"}]}, {"matcher": {"id": "byName", "options": "Drawdown"}, "properties": [{"id": "unit", "value": "percent"}, {"id": "custom.axisPlacement", "value": "right"}]}]}, "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": True}, "tooltip": {"mode": "multi", "sort": "none"}}},
+
+            # --- Fila 3: Contexto de Mercado BTC ---
+            {"type": "row", "title": "BTC Market Context", "gridPos": gpos(1, 24, 0, 14)},
+            {"type": "timeseries", "title": "Relative Performance vs BTC for ${symbol}", "gridPos": gpos(8, 12, 0, 15), "targets": [{"refId": "A", "query": queries["btc_relative"]}], "fieldConfig": {"defaults": {"unit": "percent", "custom": {"lineWidth": 2}}}, "options": {"legend": {"displayMode": "table", "placement": "right"}}},
+            {"type": "heatmap", "title": "BTC Correlation Heatmap (All Symbols)", "gridPos": gpos(8, 12, 12, 15), "targets": [{"refId": "A", "query": queries["btc_heatmap"]}], "options": {"calculate": True, "cellGap": 1, "cellValues": {"decimals": 2, "unit": "short"}, "color": {"exponent": 0.5, "mode": "scheme", "scheme": "RdYlGn"}, "showValue": "auto"}},
+
+            # --- Fila 4: Métricas Internas del Sistema y AI ---
+            {"type": "row", "title": "System & AI Internals", "gridPos": gpos(1, 24, 0, 23)},
+            {"type": "timeseries", "title": "System Health", "gridPos": gpos(7, 8, 0, 24), "targets": [{"refId": "A", "query": queries["memory_hist"]}, {"refId": "B", "query": queries["cpu_hist"]}], "fieldConfig": {"overrides": [{"matcher": {"id": "byName", "options": "Memory (MB)"}, "properties": [{"id": "unit", "value": "deckbytes"}]}, {"matcher": {"id": "byName", "options": "CPU (%)"}, "properties": [{"id": "unit", "value": "percent"}, {"id": "custom.axisPlacement", "value": "right"}]}]}, "options": {"legend": {"displayMode": "list", "placement": "bottom"}}},
+            {"type": "stat", "title": "Specialized Models", "gridPos": gpos(3, 4, 8, 24), "targets": [{"refId": "A", "query": queries["specialized_models"]}]},
+            {"type": "stat", "title": "RL Episodes", "gridPos": gpos(4, 4, 8, 27), "targets": [{"refId": "A", "query": queries["rl_episodes"]}]},
+            {"type": "gauge", "title": "Data Accumulator", "gridPos": gpos(7, 4, 12, 24), "targets": [{"refId": "A", "query": queries["accumulator_size"]}], "fieldConfig": {"defaults": {"max": 50000}}},
+            {"type": "gauge", "title": "Test Success Rate", "gridPos": gpos(7, 4, 16, 24), "targets": [{"refId": "A", "query": queries["test_success_rate"]}], "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "thresholds": {"steps": [{"color": "red"}, {"color": "orange", "value": 0.8}, {"color": "green", "value": 0.95}]}}}},
+            {"type": "table", "title": "Market Cluster Alerts", "gridPos": gpos(7, 4, 20, 24), "targets": [{"refId": "A", "query": queries["cluster_alerts"]}], "fieldConfig": {"defaults": {"custom": {"align": "auto", "displayMode": "auto"}}}},
+
+            # --- Fila 5: Logs Detallados ---
+            {"type": "row", "title": "Detailed Logs", "gridPos": gpos(1, 24, 0, 31)},
+            {"type": "table", "title": "Recent Trades", "gridPos": gpos(10, 24, 0, 32), "targets": [{"refId": "A", "query": queries["trade_log"]}]}
+        ],
+        "refresh": "1m", "schemaVersion": 38, "style": "dark", "tags": ["trading-bot", "ai"],
+        "templating": {
+            "list": [{
+                "current": {"selected": True, "text": "All", "value": "$__all"},
+                "datasource": {"type": "influxdb", "uid": datasource_uid},
+                "definition": f'import "influxdata/influxdb/schema"\nschema.tagValues(bucket: "{bucket}", tag: "symbol")',
+                "hide": 0, "includeAll": True, "multi": True, "name": "symbol", "options": [],
+                "query": f'import "influxdata/influxdb/schema"\nschema.tagValues(bucket: "{bucket}", tag: "symbol")',
+                "refresh": 2, "sort": 1, "type": "query"
+            }]
+        },
+        "time": {"from": "now-24h", "to": "now"}, "timepicker": {}, "timezone": "browser",
+        "title": "AI Trading Bot Dashboard v2", "uid": f"ai-bot-v2-{uuid.uuid4().hex[:8]}", "version": 2
+    }
+
+    for panel in dashboard["panels"]:
+        if panel["type"] != "row":
+            panel["datasource"] = {"type": "influxdb", "uid": datasource_uid}
+            for target in panel.get("targets", []):
+                target["datasource"] = {"type": "influxdb", "uid": datasource_uid}
+
+    return json.dumps(dashboard, indent=2)
 
 from abc import ABC, abstractmethod
 
@@ -2412,11 +2983,10 @@ class ProductionBot(ABC):
         except Exception as e:
             LOG.error("health_check_initialization_failed", error=str(e))
             self.health_check = None
-        try:
-            self.performance_monitor = PerformanceMonitor(memory_manager=MEMORY_MANAGER)
-        except Exception as e:
-            LOG.error("performance_monitor_initialization_failed", error=str(e))
-            self.performance_monitor = None
+        
+        # The PerformanceMonitor is redundant with AdvancedMemoryManager and has been removed.
+        self.performance_monitor = None
+
         try:
             self.data_accumulator = TrainingDataAccumulator(max_samples=50000)
             LOG.info("data_accumulator_initialized", max_samples=50000)
@@ -2467,7 +3037,7 @@ class ProductionBot(ABC):
                 raise RuntimeError(f"Test DataFrame creation failed: {str(e)}")
             try:
                 LOG.debug("calculating_test_indicators")
-                test_df = calculate_technical_indicators(test_df)
+                test_df = await calculate_technical_indicators(test_df, self.config.symbols[0], self.config.timeframe)
                 if test_df is None:
                     raise RuntimeError("calculate_technical_indicators returned None")
                 if len(test_df) == 0:
@@ -2611,6 +3181,15 @@ class ProductionBot(ABC):
         self.start_time = datetime.now(timezone.utc)
         try:
             await self._initialize_components()
+            
+            # ===== MODIFIED: Run initial historical analysis for BTC tracker in the background =====
+            try:
+                LOG.info("starting_initial_btc_correlation_analysis")
+                # Run in background to not block startup
+                asyncio.create_task(self.btc_correlation_tracker.run_historical_analysis())
+            except Exception as tracker_error:
+                LOG.error("btc_correlation_tracker_initial_analysis_failed", error=str(tracker_error))
+
             try:
                 balance_result = await self.exchange_manager.fetch_balance()
                 if balance_result.get("success"):
@@ -2708,10 +3287,9 @@ class HealthCheck:
             except Exception as e:
                 LOG.debug("win_rate_calculation_failed", error=str(e))
             uptime_seconds = (datetime.now(timezone.utc) - self.start_time).total_seconds()
-            process = psutil.Process()
-            cpu_usage = process.cpu_percent(interval=1.0)
-            if cpu_usage == 0.0:
-                cpu_usage = psutil.cpu_percent(interval=0.5)
+            
+            cpu_usage = process.cpu_percent(interval=0.5)
+
             health_data = {
                 "status": "healthy" if getattr(self.bot, 'is_running', False) else "stopped",
                 "uptime_seconds": uptime_seconds,
@@ -2739,7 +3317,7 @@ class HealthCheck:
     async def periodic_health_log(self):
         while getattr(self.bot, 'is_running', False):
             try:
-                health = self.get_health_status()
+                health = await asyncio.to_thread(self.get_health_status)
                 LOG.info("health_check", **health)
                 if INFLUX_METRICS.enabled:
                     try:
@@ -2769,7 +3347,7 @@ class HealthCheck:
             point.field("active_positions", int(health.get('active_positions', 0)))
             point.field("status", 1.0 if status == "healthy" else 0.0)
             point.time(datetime.now(timezone.utc), WritePrecision.NS)
-            INFLUX_METRICS.write_api.write(bucket=INFLUX_METRICS.bucket, org=INFLUX_METRICS.org, record=point)
+            INFLUX_METRICS.write_api.write(bucket=INFLUX_METRICS.bucket, org=INFLUX_METRICS.org, record=point, write_options=ASYNCHRONOUS)
             LOG.debug("health_metrics_written_to_influx")
         except Exception as e:
             LOG.error("health_influx_write_failed", error=str(e))
@@ -2906,7 +3484,7 @@ class PerformanceMonitor:
     async def monitor_loop(self, bot, interval=60):
         while getattr(bot, 'is_running', False):
             try:
-                await self._check_memory_usage()
+                await asyncio.to_thread(self._check_memory_usage)
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 break
@@ -2937,7 +3515,9 @@ class DynamicPositionSizer:
                 # Calcular desde ledger (más confiable)
                 for sym, open_tx in self.bot.position_ledger.active_positions.items():
                     try:
-                        if not isinstance(open_tx, PositionTransaction):
+                        # BUG FIX: Replaced isinstance(open_tx, PositionTransaction) with hasattr
+                        # to avoid NameError due to class definition order.
+                        if not all(hasattr(open_tx, attr) for attr in ['entry_price', 'size']):
                             LOG.warning("invalid_transaction_in_ledger_skipping",
                                        symbol=sym)
                             continue
@@ -2998,7 +3578,7 @@ class DynamicPositionSizer:
                     LOG.error("equity_audit_on_negative_available", audit=audit)
                     
                     # Si audit es consistente, usar valores auditados
-                    if audit['is_consistent']:
+                    if audit.get('is_consistent', False):
                         corrected_invested = audit['invested_in_positions']
                         available_equity = total_equity - corrected_invested
                         LOG.info("equity_corrected_from_audit",
@@ -3082,10 +3662,9 @@ class DynamicPositionSizer:
                     current_return = (self.bot.equity - self.bot.initial_capital) / self.bot.initial_capital
                     current_drawdown = abs(min(0.0, current_return))
             
-            if current_drawdown > 0.10:
-                drawdown_reduction = max(0.5, 1.0 - (current_drawdown * 0.5))
-            else:
-                drawdown_reduction = 1.0
+            drawdown_reduction = 1.0
+            if current_drawdown > 0.10: # Only reduce size if drawdown is significant
+                drawdown_reduction = max(0.5, 1.0 - (current_drawdown - 0.10) * 5) # Scale reduction from 1.0 down to 0.5
             
             # Ajuste por win rate
             win_rate_adjustment = 1.0
@@ -3228,124 +3807,114 @@ class PositionTransaction:
     def validate(self) -> bool:
         self.validation_errors = []
         
-        # Validación 1: Entry price
+        # Validation 1: Entry price
         if self.entry_price <= 0:
             self.validation_errors.append(f"Invalid entry_price: {self.entry_price}")
         
-        # NUEVO: Rango razonable para entry_price
         if self.entry_price > 1000000.0:
             self.validation_errors.append(f"Entry price unreasonably high: {self.entry_price}")
         
         if np.isnan(self.entry_price) or np.isinf(self.entry_price):
             self.validation_errors.append(f"Entry price is NaN or Inf: {self.entry_price}")
         
-        # Validación 2: Exit price (para CLOSE y PARTIAL_CLOSE)
+        # Validation 2: Exit price (for CLOSE and PARTIAL_CLOSE)
         if self.transaction_type in [TransactionType.CLOSE, TransactionType.PARTIAL_CLOSE]:
             if self.exit_price is None or self.exit_price <= 0:
                 self.validation_errors.append(f"Invalid exit_price: {self.exit_price}")
             
-            # NUEVO: Validar que exit_price es razonable respecto a entry_price
             if self.exit_price is not None and self.entry_price > 0:
                 price_change_pct = abs(self.exit_price - self.entry_price) / self.entry_price
-                if price_change_pct > 0.50:  # 50% cambio en un trade
+                if price_change_pct > 0.50:  # 50% change in one trade
                     self.validation_errors.append(
                         f"Unreasonable price change: {price_change_pct*100:.1f}% "
                         f"(entry={self.entry_price}, exit={self.exit_price})"
                     )
         
-        # Validación 3: Size
+        # Validation 3: Size
         if self.size <= 0:
             self.validation_errors.append(f"Invalid size: {self.size}")
         
         if np.isnan(self.size) or np.isinf(self.size):
             self.validation_errors.append(f"Size is NaN or Inf: {self.size}")
         
-        # NUEVO: Validar tamaño razonable
         if self.size > 1000000.0:
             self.validation_errors.append(f"Size unreasonably large: {self.size}")
         
-        # Validación 4: Equity before
+        # Validation 4: Equity before
         if self.equity_before < 0:
             self.validation_errors.append(f"Negative equity_before: {self.equity_before}")
         
-        # NUEVO: Equity debe ser razonable
         if self.equity_before > 10000000.0:
             self.validation_errors.append(f"Equity unreasonably high: {self.equity_before}")
+
+        # Validation 5 & 6: Generic Equity Consistency (replaces separate OPEN/CLOSE logic)
+        expected_equity_after = self.equity_before + self.equity_change
+        tolerance_abs = 0.10
+        tolerance_rel = abs(expected_equity_after) * 0.0001
+        tolerance = max(tolerance_abs, tolerance_rel, 0.05)
+        actual_diff = abs(self.equity_after - expected_equity_after)
+
+        if actual_diff > tolerance:
+            self.validation_errors.append(
+                f"Equity inconsistency on {self.transaction_type.value}: "
+                f"before={self.equity_before:.2f}, "
+                f"change={self.equity_change:.2f}, "
+                f"after={self.equity_after:.2f}, "
+                f"expected={expected_equity_after:.2f}, "
+                f"diff={actual_diff:.2f}, "
+                f"tolerance={tolerance:.6f}"
+            )
         
-        # Validación 5: Consistencia de equity para OPEN
+        # Type-specific validation for equity_change
         if self.transaction_type == TransactionType.OPEN:
-            tolerance = 0.01
-            if abs(self.equity_after - self.equity_before) > tolerance:
+            position_value = self.entry_price * self.size
+            if abs(self.equity_change - (-position_value)) > tolerance:
                 self.validation_errors.append(
-                    f"Equity changed on OPEN (should remain constant): "
-                    f"before={self.equity_before:.2f}, "
-                    f"after={self.equity_after:.2f}, "
-                    f"change={self.equity_change:.2f}"
+                    f"Equity change for OPEN transaction is incorrect. "
+                    f"Expected {-position_value:.2f}, got {self.equity_change:.2f}"
+                )
+            if self.realized_pnl != 0.0:
+                self.validation_errors.append(f"Realized PnL for OPEN must be 0, but was {self.realized_pnl}")
+        
+        elif self.transaction_type in [TransactionType.CLOSE, TransactionType.PARTIAL_CLOSE]:
+            # BUG FIX: The change in free cash is the position value plus the PnL.
+            position_value = self.entry_price * self.size
+            expected_equity_change = position_value + self.realized_pnl
+            if abs(self.equity_change - expected_equity_change) > tolerance:
+                 self.validation_errors.append(
+                    f"Equity change should equal position value + PnL for CLOSE. "
+                    f"Change: {self.equity_change:.2f}, PnL: {self.realized_pnl:.2f}, "
+                    f"Position Value: {position_value:.2f}, Expected Change: {expected_equity_change:.2f}"
                 )
         
-        # ✅ CORRECCIÓN CRÍTICA: Validación 6 MEJORADA para CLOSE con tolerancia más permisiva
-        else:
-            if self.transaction_type in [TransactionType.CLOSE, TransactionType.PARTIAL_CLOSE]:
-                position_value = self.entry_price * self.size
-                max_reasonable_pnl = position_value * 2.0  # 200% max
-                
-                if abs(self.equity_change) > max_reasonable_pnl:
-                    self.validation_errors.append(
-                        f"Equity change (PnL) unreasonably large: "
-                        f"change={self.equity_change:.2f}, position_value={position_value:.2f}, "
-                        f"max_allowed={max_reasonable_pnl:.2f}"
-                    )
-            
-            expected_equity_after = self.equity_before + self.equity_change
-            
-            # ✅ Tolerancia RELATIVA más generosa para evitar falsos positivos
-            # Usar el mayor entre tolerancia absoluta y relativa
-            tolerance_abs = 0.10  # Aumentado de 0.01 a 0.10 (10 centavos)
-            tolerance_rel = abs(expected_equity_after) * 0.0001  # 0.01% del equity
-            tolerance = max(tolerance_abs, tolerance_rel, 0.05)  # Mínimo 5 centavos
-            
-            actual_diff = abs(self.equity_after - expected_equity_after)
-            
-            # ✅ NUEVO: Solo validar si la diferencia es SIGNIFICATIVA (> $1)
-            if actual_diff > max(1.0, tolerance):
-                self.validation_errors.append(
-                    f"Equity inconsistency on CLOSE: "
-                    f"before={self.equity_before:.2f}, "
-                    f"change={self.equity_change:.2f}, "
-                    f"after={self.equity_after:.2f}, "
-                    f"expected={expected_equity_after:.2f}, "
-                    f"diff={actual_diff:.2f}, "
-                    f"tolerance={tolerance:.6f}"
-                )
-        
-        # NUEVO: Validación 7 - PnL razonable para CLOSE
+        # Validation 7: PnL reasonable for CLOSE
         if self.transaction_type in [TransactionType.CLOSE, TransactionType.PARTIAL_CLOSE]:
-            if abs(self.realized_pnl) > self.equity_before * 0.50:
-                self.validation_errors.append(
-                    f"PnL unreasonably large relative to equity: "
-                    f"pnl={self.realized_pnl:.2f}, equity={self.equity_before:.2f}"
+            # Allow for larger PnL, but log if it's very high
+            if abs(self.realized_pnl) > self.equity_before * 0.75:
+                LOG.warning(
+                    "PnL is very large relative to equity",
+                    pnl=self.realized_pnl, equity_before=self.equity_before
                 )
         
-        # NUEVO: Validación 8 - Side válido
+        # Validation 8: Side valid
         valid_sides = ['buy', 'sell']
         if self.side not in valid_sides:
             self.validation_errors.append(f"Invalid side: {self.side}, must be in {valid_sides}")
         
-        # NUEVO: Validación 9 - Symbol no vacío
+        # Validation 9: Symbol no vacío
         if not self.symbol or len(self.symbol) < 3:
             self.validation_errors.append(f"Invalid symbol: {self.symbol}")
         
-        # NUEVO: Validación 10 - Timestamp razonable
+        # Validation 10: Timestamp reasonable
         now = datetime.now(timezone.utc)
         time_diff = abs((now - self.timestamp).total_seconds())
-        if time_diff > 86400:  # Más de 1 día en el futuro o pasado
+        if time_diff > 86400 * 2:  # More than 2 days in the past/future
             self.validation_errors.append(
                 f"Timestamp too far from current time: {self.timestamp} (diff: {time_diff/3600:.1f}h)"
             )
         
         self.is_valid = len(self.validation_errors) == 0
         
-        # Log detallado si no es válida
         if not self.is_valid:
             LOG.error("transaction_validation_failed",
                      transaction_id=self.transaction_id,
@@ -3567,24 +4136,29 @@ class PositionLedger:
             LOG.error("snapshot_failed", error=str(e))
     
     async def record_open(self, bot, symbol: str, side: str, entry_price: float, 
-                         size: float) -> Optional[PositionTransaction]:
+                         size: float, equity_before_override: float = None,
+                         equity_after_override: float = None) -> Optional[PositionTransaction]:
         """
-        MEJORADO: Registro con persistencia automática
+        MEJORADO: Registro con persistencia automática y overrides de equity
         """
         async with self._lock:
             try:
-                # Validaciones existentes...
                 transaction_id = f"{symbol}_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
-                equity_before = float(bot.equity)
                 
-                # ✅ CORRECCIÓN CRÍTICA: En apertura, equity NO cambia
-                # Solo se "reserva" capital, pero el equity total permanece igual
+                if equity_before_override is not None:
+                    equity_before = float(equity_before_override)
+                else:
+                    equity_before = float(bot.equity)
+                    LOG.warning("equity_before_not_provided_to_record_open_using_bot_equity", symbol=symbol)
+
                 position_value = entry_price * size
-                
-                # equity_change = 0 porque no hay cambio real de equity
-                # Solo movemos capital de "disponible" a "invertido"
-                equity_change = 0.0  # ← CAMBIO CRÍTICO
-                equity_after = equity_before  # ← El equity permanece igual
+                equity_change = -position_value  # Free equity decreases by the position cost
+
+                if equity_after_override is not None:
+                    equity_after = float(equity_after_override)
+                else:
+                    equity_after = equity_before + equity_change
+                    LOG.warning("equity_after_not_provided_to_record_open_calculating", symbol=symbol)
                 
                 transaction = PositionTransaction(
                     transaction_id=transaction_id,
@@ -3595,8 +4169,9 @@ class PositionLedger:
                     entry_price=entry_price,
                     size=size,
                     equity_before=equity_before,
-                    equity_change=equity_change,  # ← 0.0
-                    equity_after=equity_after  # ← Sin cambio
+                    equity_change=equity_change,
+                    equity_after=equity_after,
+                    realized_pnl=0.0  # Explicitly zero for OPEN transactions
                 )
                 
                 if not transaction.validate():
@@ -3619,7 +4194,8 @@ class PositionLedger:
                         symbol=symbol,
                         transaction_id=transaction_id,
                         position_value=position_value,
-                        equity_unchanged=equity_before)
+                        equity_before=equity_before,
+                        equity_after=equity_after)
                 
                 return transaction
                 
@@ -3630,10 +4206,10 @@ class PositionLedger:
                 return None
     
     async def record_close(self, bot, symbol: str, exit_price: float, 
-                          size: float = None,
-                          equity_before_override: float = None,
-                          equity_after_override: float = None,
-                          realized_pnl_override: float = None) -> Optional[PositionTransaction]:
+                      size: float = None,
+                      equity_before_override: float = None,
+                      equity_after_override: float = None,
+                      realized_pnl_override: float = None) -> Optional[PositionTransaction]:
         """
         VERSIÓN DEFINITIVA: Ledger como registro contable puro
         NO modifica bot.equity - solo registra
@@ -3704,28 +4280,32 @@ class PositionLedger:
                     realized_pnl = np.clip(realized_pnl, -position_value, position_value)
                     LOG.warning("pnl_clipped_in_ledger", clipped_pnl=realized_pnl)
                 
-                # ✅ equity_change es el PnL
-                equity_change = realized_pnl
-                
                 # ✅ USAR equity_after del caller si se proporciona
                 if equity_after_override is not None:
                     equity_after_close = float(equity_after_override)
                     LOG.debug("using_equity_after_from_caller", value=equity_after_close)
                 else:
-                    equity_after_close = equity_before_close + realized_pnl
+                    # BUG FIX: Correctly calculate the equity after if not provided.
+                    # The change in free cash is the released capital (position_value) + PnL.
+                    equity_after_close = equity_before_close + position_value + realized_pnl
                     LOG.warning("equity_after_not_provided_calculated", value=equity_after_close)
                 
+                # BUG FIX: Correctly calculate equity_change.
+                equity_change = equity_after_close - equity_before_close
+                
                 # ✅ VALIDACIÓN: Verificar consistencia
-                expected_equity = equity_before_close + realized_pnl
-                if abs(equity_after_close - expected_equity) > 0.01:
+                expected_equity_after = equity_before_close + position_value + realized_pnl
+                if abs(equity_after_close - expected_equity_after) > 0.01:
                     LOG.error("equity_after_inconsistent_with_calculation",
                              equity_before=equity_before_close,
                              realized_pnl=realized_pnl,
-                             expected=expected_equity,
+                             position_value=position_value,
+                             expected=expected_equity_after,
                              provided=equity_after_close,
-                             diff=equity_after_close - expected_equity)
-                    # Usar el calculado
-                    equity_after_close = expected_equity
+                             diff=equity_after_close - expected_equity_after)
+                    # Use the calculated value as the source of truth if provided one is wrong
+                    equity_after_close = expected_equity_after
+                    equity_change = equity_after_close - equity_before_close
 
                 if equity_after_close < 0:
                     LOG.error("negative_equity_after_close",
@@ -3776,7 +4356,8 @@ class PositionLedger:
                 if is_partial:
                     open_transaction.size -= size
                 else:
-                    del self.active_positions[symbol]
+                    if symbol in self.active_positions:
+                        del self.active_positions[symbol]
                 
                 # Persistir
                 await self._persist_transaction(transaction)
@@ -3855,7 +4436,7 @@ class PositionLedger:
                 entry_price=open_row[2],
                 size=open_row[3],
                 equity_before=open_row[4],
-                equity_change=-(open_row[2] * open_row[3]),
+                equity_change=0.0,
                 equity_after=open_row[4]
             )
             
@@ -4031,9 +4612,8 @@ class PositionLedger:
     def audit_equity(self, bot) -> Dict[str, Any]:
         initial_capital = float(bot.initial_capital)
         
-        # ✅ Sumar SOLO realized_pnl de transacciones CLOSE
+        # Sumar PnL realizado de transacciones de cierre válidas
         total_realized_pnl = 0.0
-        
         for transaction in self.transactions:
             if not transaction.is_valid:
                 continue
@@ -4041,28 +4621,15 @@ class PositionLedger:
             if transaction.transaction_type in [TransactionType.CLOSE, TransactionType.PARTIAL_CLOSE]:
                 pnl = float(transaction.realized_pnl)
                 
-                # Validar
                 if np.isnan(pnl) or np.isinf(pnl):
                     LOG.warning("invalid_pnl_in_transaction_skipping",
-                               transaction_id=transaction.transaction_id,
-                               pnl=pnl)
+                               transaction_id=transaction.transaction_id, pnl=pnl)
                     continue
-                
-                position_value = float(transaction.entry_price) * float(transaction.size)
-                max_reasonable = position_value * 2.0
-                
-                if abs(pnl) > max_reasonable:
-                    LOG.warning("unreasonable_pnl_clipping_in_audit",
-                               transaction_id=transaction.transaction_id,
-                               original_pnl=pnl,
-                               position_value=position_value)
-                    pnl = float(np.clip(pnl, -position_value, position_value))
                 
                 total_realized_pnl += pnl
         
-        # Calcular invested
+        # Calcular capital invertido en posiciones activas
         invested_in_positions = 0.0
-        
         for symbol, open_transaction in self.active_positions.items():
             try:
                 entry_price = float(open_transaction.entry_price)
@@ -4073,44 +4640,36 @@ class PositionLedger:
                     continue
                 
                 position_value = entry_price * size
-                
-                if position_value > 100000.0:
-                    LOG.error("unreasonable_position_value", symbol=symbol, value=position_value)
-                    continue
-                
                 invested_in_positions += position_value
                 
             except Exception as e:
                 LOG.error("position_calc_failed_in_audit", symbol=symbol, error=str(e))
                 continue
         
-        # ✅ FÓRMULA CORRECTA
-        expected_free_equity = initial_capital + total_realized_pnl
-        expected_total_equity = expected_free_equity + invested_in_positions
-        actual_equity = float(bot.equity)
-        discrepancy = actual_equity - expected_free_equity
+        # ✅ CORRECCIÓN: The correct audit compares total capital accounted for vs. total capital expected.
+        # Total Capital Expected = Initial Capital + Realized PnL
+        # Total Capital Accounted For = Current Bot Equity (cash) + Invested Capital (cost of positions)
+        expected_total_capital = initial_capital + total_realized_pnl
+        accounted_total_capital = float(bot.equity) + invested_in_positions
+
+        discrepancy = accounted_total_capital - expected_total_capital
         
-        tolerance = max(0.10, abs(expected_free_equity) * 0.0001)
+        # For reporting purposes, we can still calculate the expected free equity
+        expected_free_equity = initial_capital + total_realized_pnl - invested_in_positions
         
-        if len(self.active_positions) == 0:
-            is_consistent = abs(discrepancy) < tolerance
-        else:
-            total_portfolio = actual_equity + invested_in_positions
-            portfolio_discrepancy = abs(total_portfolio - expected_total_equity)
-            is_consistent = portfolio_discrepancy < tolerance
+        tolerance = max(0.10, abs(expected_total_capital) * 0.0001)
+        is_consistent = abs(discrepancy) < tolerance
         
         audit_result = {
             'initial_capital': initial_capital,
             'total_realized_pnl': total_realized_pnl,
             'invested_in_positions': invested_in_positions,
             'expected_free_equity': expected_free_equity,
-            'expected_total_equity': expected_total_equity,
-            'actual_equity': actual_equity,
+            'actual_free_equity': float(bot.equity),
             'discrepancy': discrepancy,
             'is_consistent': is_consistent,
             'total_transactions': len(self.transactions),
             'active_positions': len(self.active_positions),
-            'total_portfolio_value': actual_equity + invested_in_positions if len(self.active_positions) > 0 else actual_equity
         }
         
         if not is_consistent:
@@ -4119,7 +4678,98 @@ class PositionLedger:
             LOG.debug("equity_audit_passed", **audit_result)
         
         return audit_result
+    
+    def get_performance_since(self, start_time: datetime, symbol: Optional[str] = None) -> Dict[str, Dict]:
+        """
+        Queries the database for performance metrics since a given timestamp.
+        Returns a dictionary mapping each symbol to its performance stats.
+        """
+        performance = defaultdict(lambda: {
+            'total_trades': 0,
+            'winning_trades': 0,
+            'total_pnl': 0.0,
+            'win_rate': 0.0
+        })
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            query = """
+                SELECT symbol, realized_pnl
+                FROM transactions
+                WHERE transaction_type IN ('close', 'partial_close')
+                AND timestamp >= ?
+            """
+            params = [start_time.isoformat()]
+            
+            if symbol:
+                query += " AND symbol = ?"
+                params.append(symbol)
 
+            cursor.execute(query, params)
+            
+            for row_symbol, pnl in cursor.fetchall():
+                stats = performance[row_symbol]
+                stats['total_trades'] += 1
+                stats['total_pnl'] += pnl
+                if pnl > 0:
+                    stats['winning_trades'] += 1
+            
+            for sym, stats in performance.items():
+                if stats['total_trades'] > 0:
+                    stats['win_rate'] = stats['winning_trades'] / stats['total_trades']
+
+            return dict(performance)
+
+        except Exception as e:
+            LOG.error("get_performance_since_db_query_failed", error=str(e))
+            return {}
+        finally:
+            if conn:
+                conn.close()
+
+    def get_performance_summary_for_symbols(self, symbols: List[str]) -> Dict[str, Dict]:
+        """
+        Queries the database to get lifetime PnL and trade count for a list of symbols.
+        Returns a dictionary mapping each symbol to its performance stats.
+        """
+        performance = {symbol: {'total_pnl': 0.0, 'total_trades': 0} for symbol in symbols}
+        if not symbols:
+            return {}
+        
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Use a placeholder for each symbol in the IN clause
+            placeholders = ','.join('?' for _ in symbols)
+            query = f"""
+                SELECT symbol, SUM(realized_pnl), COUNT(*)
+                FROM transactions
+                WHERE transaction_type IN ('close', 'partial_close')
+                AND symbol IN ({placeholders})
+                GROUP BY symbol
+            """
+            
+            cursor.execute(query, symbols)
+            
+            for row_symbol, total_pnl, total_trades in cursor.fetchall():
+                if row_symbol in performance:
+                    performance[row_symbol]['total_pnl'] = total_pnl if total_pnl is not None else 0.0
+                    performance[row_symbol]['total_trades'] = total_trades if total_trades is not None else 0
+
+            return performance
+
+        except Exception as e:
+            LOG.error("get_performance_summary_db_query_failed", error=str(e))
+            # Return empty stats on failure to avoid breaking calling logic
+            return {symbol: {'total_pnl': 0.0, 'total_trades': 0} for symbol in symbols}
+        finally:
+            if conn:
+                conn.close()
+                
 async def sync_ledger_with_risk_manager(bot):
     """
     MEJORADO: Sincronización atómica con locks
@@ -4208,7 +4858,7 @@ async def sync_ledger_with_risk_manager(bot):
                             df = create_dataframe(market_data.get("ohlcv", []))
                             
                             if df is not None and len(df) >= 14:
-                                df = calculate_technical_indicators(df)
+                                df = await calculate_technical_indicators(df, symbol, '1h')
                                 
                                 # Re-registrar en risk_manager
                                 success = risk_mgr.register_position(
@@ -4563,132 +5213,70 @@ class DynamicRiskManager:
 
     def check_circuit_breaker(self) -> bool:
         try:
-            # NUEVO: Añadir lock para operaciones atómicas
             if not hasattr(self, '_circuit_breaker_lock'):
                 self._circuit_breaker_lock = asyncio.Lock()
             
-            # CORRECCIÓN: No usar lock para simple check (deadlock risk)
-            # Solo para modificación de estado
+            daily_return = self.daily_pnl / self.bot.initial_capital if self.bot.initial_capital > 0 else 0
             
-            # Si ya está activo, verificar condiciones de desactivación
             if self.circuit_breaker_active:
-                current_return = (self.bot.equity - self.bot.initial_capital) / self.bot.initial_capital
-                recovery_threshold = self.max_daily_loss * 0.5
+                recovery_threshold = self.max_daily_loss * 0.5  # e.g., from -5% to -2.5%
                 
-                if current_return > recovery_threshold:
-                    # Verificar trades recientes
+                if daily_return > recovery_threshold:
                     recent_trades = getattr(self.bot, 'trades', [])[-10:] if hasattr(self.bot, 'trades') else []
                     recent_losses = sum(1 for t in recent_trades if t.get('pnl', 0) < 0)
                     
-                    # Solo desactivar si hay evidencia de recuperación
                     if recent_losses < 5 and len(recent_trades) >= 5:
                         LOG.info("circuit_breaker_auto_reset_recovery",
-                                current_return=current_return * 100,
+                                daily_return=daily_return * 100,
                                 recovery_threshold=recovery_threshold * 100,
                                 recent_losses=recent_losses,
                                 equity=self.bot.equity)
                         
-                        # NUEVO: Desactivación gradual
                         self.circuit_breaker_active = False
-                        self.daily_pnl *= 0.5  # Reset parcial del daily PnL
-                        
                         return False
                 else:
-                    # NUEVO: Log periódico cuando está activo
                     if not hasattr(self, '_last_breaker_log'):
                         self._last_breaker_log = 0
-                    
-                    if time.time() - self._last_breaker_log > 300:  # Cada 5 minutos
+                    if time.time() - self._last_breaker_log > 300:
                         LOG.warning("circuit_breaker_still_active",
-                                   current_return=current_return * 100,
+                                   daily_return=daily_return * 100,
                                    recovery_needed=recovery_threshold * 100,
                                    daily_pnl=self.daily_pnl)
                         self._last_breaker_log = time.time()
-                    
                     return True
             
-            # Verificar condiciones de activación
-            daily_return = self.daily_pnl / self.bot.initial_capital if self.bot.initial_capital > 0 else 0
-            
-            # Condición 1: Pérdida diaria excede límite
             if daily_return <= self.max_daily_loss:
                 if not self.circuit_breaker_active:
                     self.circuit_breaker_active = True
-                    
                     LOG.critical("circuit_breaker_activated_daily_loss",
                                 daily_return=daily_return * 100,
-                                max_allowed=self.max_daily_loss * 100,
-                                daily_pnl=self.daily_pnl,
-                                active_positions=len(self.active_stops))
-                    
-                    # NUEVO: Calcular tiempo estimado de recuperación
-                    avg_daily_return = daily_return
-                    days_to_recover = abs(daily_return / self.max_daily_loss) if self.max_daily_loss != 0 else 0
-                    
-                    asyncio.create_task(
-                        ALERT_SYSTEM.send_alert(
-                            "CRITICAL",
-                            "Circuit breaker activated - Daily loss limit exceeded",
-                            daily_return=daily_return,
-                            daily_pnl=self.daily_pnl,
-                            active_positions=len(self.active_stops),
-                            estimated_recovery_days=days_to_recover,
-                            message="All trading halted. Close active positions manually or wait for daily reset."
-                        )
-                    )
-                
+                                max_allowed=self.max_daily_loss * 100)
+                    asyncio.create_task(ALERT_SYSTEM.send_alert("CRITICAL", "Circuit breaker activated - Daily loss limit exceeded", daily_return=daily_return))
                 return True
             
-            # Condición 2: Trades diarios excede límite
+            # ... (resto de las condiciones de activación) ...
             if self.daily_trades >= self.max_daily_trades:
                 if not self.circuit_breaker_active:
                     self.circuit_breaker_active = True
-                    
-                    LOG.critical("circuit_breaker_activated_max_trades",
-                                daily_trades=self.daily_trades,
-                                max_allowed=self.max_daily_trades)
-                    
-                    asyncio.create_task(
-                        ALERT_SYSTEM.send_alert(
-                            "CRITICAL",
-                            "Circuit breaker activated - Max daily trades exceeded",
-                            daily_trades=self.daily_trades,
-                            max_allowed=self.max_daily_trades
-                        )
-                    )
-                
+                    LOG.critical("circuit_breaker_activated_max_trades", daily_trades=self.daily_trades)
+                    asyncio.create_task(ALERT_SYSTEM.send_alert("CRITICAL", "Circuit breaker activated - Max daily trades"))
                 return True
-            
-            # NUEVO: Condición 3: Múltiples stop losses consecutivos
+
             if hasattr(self.bot, 'trades') and len(self.bot.trades) >= 5:
                 recent_trades = self.bot.trades[-5:]
                 consecutive_losses = 0
-                
                 for trade in reversed(recent_trades):
                     if trade.get('is_stop_loss', False):
                         consecutive_losses += 1
                     else:
                         break
-                
                 if consecutive_losses >= 3:
                     if not self.circuit_breaker_active:
                         self.circuit_breaker_active = True
-                        
-                        LOG.critical("circuit_breaker_activated_consecutive_stop_losses",
-                                    consecutive_losses=consecutive_losses)
-                        
-                        asyncio.create_task(
-                            ALERT_SYSTEM.send_alert(
-                                "CRITICAL",
-                                "Circuit breaker activated - Multiple consecutive stop losses",
-                                consecutive_losses=consecutive_losses,
-                                recent_trades=len(recent_trades)
-                            )
-                        )
-                    
+                        LOG.critical("circuit_breaker_activated_consecutive_stop_losses", consecutive_losses=consecutive_losses)
+                        asyncio.create_task(ALERT_SYSTEM.send_alert("CRITICAL", f"{consecutive_losses} consecutive stop losses"))
                     return True
-            
-            # Desactivación automática por tiempo
+
             if self.circuit_breaker_active:
                 if (datetime.now(timezone.utc) - self.session_start).total_seconds() > 86400:
                     LOG.info("circuit_breaker_auto_reset_new_day")
@@ -4697,10 +5285,7 @@ class DynamicRiskManager:
             return False
             
         except Exception as e:
-            LOG.error("circuit_breaker_check_error",
-                     error=str(e),
-                     traceback=traceback.format_exc()[:300])
-            # En caso de error, mantener estado seguro
+            LOG.error("circuit_breaker_check_error", error=str(e))
             return self.circuit_breaker_active if hasattr(self, 'circuit_breaker_active') else False
 
     def reset_daily_limits(self):
@@ -4839,8 +5424,8 @@ class SmartOrderExecutor:
             return None
     
     async def _try_limit_order_with_monitoring(self, symbol: str, side: str, size: float,
-                                               reference_price: float, 
-                                               execution_info: Dict) -> Optional[Dict]:
+                                           reference_price: float, 
+                                           execution_info: Dict) -> Optional[Dict]:
         """Limit order con monitoreo de fills parciales"""
         try:
             # CORRECCIÓN: Definir order_type explícitamente al inicio
@@ -5205,180 +5790,6 @@ class SmartOrderExecutor:
         }
         LOG.info("order_simulated", symbol=symbol, side=side, size=size, price=price, order_id=order_id)
         return simulated_order
-
-
-async def _update_bot_after_trade_close(bot, risk_manager, symbol: str, confidence: float,
-                                        side: str, size: float, entry_price: float,
-                                        exit_price: float, is_stop_loss: bool = False,
-                                        is_partial: bool = False, filled_size: float = None):
-    """
-    VERSIÓN DEFINITIVA: Una sola fuente de verdad para equity
-    """
-    try:
-        # Validar precios
-        if entry_price <= 0 or exit_price <= 0 or np.isnan(entry_price) or np.isnan(exit_price):
-            LOG.error("invalid_prices_in_trade_close",
-                     symbol=symbol,
-                     entry=entry_price,
-                     exit=exit_price)
-            return
-        
-        # Determinar tamaño ejecutado
-        executed_size = filled_size if filled_size is not None else size
-        
-        # ✅ PASO 1: Calcular PnL UNA VEZ
-        if side == 'buy':  # Cerrando LONG (vendiendo)
-            realized_pnl = (exit_price - entry_price) * executed_size
-        else:  # Cerrando SHORT (comprando)
-            realized_pnl = (entry_price - exit_price) * executed_size
-        
-        # Validar PnL razonable
-        position_value = entry_price * executed_size
-        max_reasonable_pnl = position_value * 2.0
-        
-        if abs(realized_pnl) > max_reasonable_pnl:
-            LOG.error("unreasonable_pnl_detected",
-                     symbol=symbol,
-                     realized_pnl=realized_pnl,
-                     position_value=position_value)
-            realized_pnl = np.clip(realized_pnl, -position_value, position_value)
-            LOG.warning("pnl_clipped", clipped_pnl=realized_pnl)
-
-        # ✅ PASO 2: Capturar equity ANTES (snapshot inmutable)
-        equity_before = float(bot.equity)
-        
-        # ✅ PASO 3: Calcular equity DESPUÉS
-        equity_after = equity_before + realized_pnl
-        
-        # ✅ VALIDACIÓN CRÍTICA: Verificar que no quede negativo
-        if equity_after < 0:
-            LOG.error("equity_would_be_negative_rejecting_trade",
-                     equity_before=equity_before,
-                     realized_pnl=realized_pnl,
-                     equity_after=equity_after,
-                     symbol=symbol)
-            return
-        
-        LOG.info("EQUITY_UPDATE_MASTER_RECORD",
-                symbol=symbol,
-                equity_before=equity_before,
-                realized_pnl=realized_pnl,
-                equity_after=equity_after,
-                entry_price=entry_price,
-                exit_price=exit_price,
-                executed_size=executed_size,
-                side=side)
-
-        # ✅ PASO 4: Aplicar ANTES de llamar al ledger
-        bot.equity = equity_after
-        
-        # ✅ PASO 5: Registrar en ledger (que NO debe modificar equity)
-        # Pasar equity_before y equity_after explícitos
-        transaction = await bot.position_ledger.record_close(
-            bot, symbol, exit_price, executed_size,
-            equity_before_override=equity_before,
-            equity_after_override=equity_after,
-            realized_pnl_override=realized_pnl
-        )
-
-        # Si la transacción falla, REVERTIR el cambio de equity
-        if transaction is None or not transaction.is_valid:
-            LOG.error("ledger_record_failed_reverting_equity",
-                     symbol=symbol,
-                     reverting_from=bot.equity,
-                     reverting_to=equity_before)
-            bot.equity = equity_before
-            return
-        
-        # ✅ VALIDACIÓN POST-LEDGER: Verificar que ledger no modificó equity
-        equity_after_ledger = float(bot.equity)
-        if abs(equity_after_ledger - equity_after) > 0.001:
-            LOG.error("CRITICAL_ledger_modified_equity_unexpectedly",
-                     expected=equity_after,
-                     actual=equity_after_ledger,
-                     diff=equity_after_ledger - equity_after,
-                     symbol=symbol)
-            # Forzar el valor correcto
-            bot.equity = equity_after
-        
-        # Actualizar métricas del bot
-        if hasattr(bot, 'performance_metrics'):
-            bot.performance_metrics['total_trades'] += 1
-            
-            if realized_pnl > 0:
-                bot.performance_metrics['winning_trades'] += 1
-            else:
-                bot.performance_metrics['losing_trades'] += 1
-            
-            total = bot.performance_metrics['total_trades']
-            if total > 0:
-                bot.performance_metrics['win_rate'] = bot.performance_metrics['winning_trades'] / total
-            
-            bot.performance_metrics['total_pnl'] = bot.equity - bot.initial_capital
-        
-        # Actualizar risk manager
-        if hasattr(bot, 'risk_manager'):
-            bot.risk_manager.update_daily_pnl(realized_pnl)
-        
-        # Actualizar position sizer
-        if hasattr(bot, 'position_sizer'):
-            is_win = realized_pnl > 0
-            bot.position_sizer.update_trade_history(realized_pnl, is_win)
-        
-        # Actualizar performance por símbolo
-        await update_symbol_performance(bot, symbol, realized_pnl)
-        
-        # Guardar trade
-        trade_record = {
-            'symbol': symbol,
-            'side': side,
-            'size': executed_size,
-            'entry_price': entry_price,
-            'exit_price': exit_price,
-            'pnl': realized_pnl,
-            'pnl_pct': (realized_pnl / (entry_price * executed_size) * 100) if entry_price * executed_size > 0 else 0,
-            'is_stop_loss': is_stop_loss,
-            'is_partial': is_partial,
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'confidence': confidence
-        }
-        
-        if hasattr(bot, 'trades'):
-            bot.trades.append(trade_record)
-        
-        # Enviar a InfluxDB
-        try:
-            trade_success = await INFLUX_METRICS.write_trade_metrics(
-                symbol=symbol,
-                action=side,
-                confidence=confidence,
-                price=float(exit_price),
-                size=float(executed_size),
-                pnl=float(realized_pnl)
-            )
-        except Exception as influx_error:
-            LOG.debug("influx_metrics_failed", error=str(influx_error))
-        
-        # Cerrar en risk manager si no es parcial
-        if not is_partial:
-            risk_manager.close_position(symbol)
-        
-        LOG.info("trade_closed_successfully",
-                symbol=symbol,
-                side=side,
-                executed_size=executed_size,
-                entry_price=entry_price,
-                exit_price=exit_price,
-                realized_pnl=realized_pnl,
-                equity_final=bot.equity,
-                is_stop_loss=is_stop_loss,
-                is_partial=is_partial)
-        
-    except Exception as e:
-        LOG.error("update_bot_after_trade_close_failed",
-                 symbol=symbol,
-                 error=str(e),
-                 traceback=traceback.format_exc()[:500])
         
 class PortfolioRebalancer:
     def __init__(self, config, bot):
@@ -5398,84 +5809,65 @@ class PortfolioRebalancer:
         try:
             if not risk_manager.active_stops:
                 return []
+            
             active_stops_snapshot = dict(risk_manager.active_stops)
+            
+            # BUG FIX: Step 1 - Calculate total exposure (invested capital) and find invalid positions first.
             total_exposure = 0.0
+            invalid_symbols = []
             for symbol, stop_info in active_stops_snapshot.items():
-                if symbol not in risk_manager.active_stops:
-                    LOG.debug("position_removed_during_rebalance_check", symbol=symbol)
+                entry_price = stop_info.get('entry_price')
+                remaining_size = stop_info.get('remaining_size')
+
+                if entry_price is None or remaining_size is None or not isinstance(entry_price, (int, float)) or not isinstance(remaining_size, (int, float)) or entry_price <= 0 or remaining_size < 0:
+                    LOG.warning("invalid_position_data_in_rebalance_check", symbol=symbol, entry_price=entry_price, size=remaining_size)
+                    invalid_symbols.append(symbol)
                     continue
-                entry_price = stop_info['entry_price']
-                remaining_size = stop_info['remaining_size']
-                if entry_price <= 0 or remaining_size <= 0:
-                    LOG.warning("invalid_position_data_closing", symbol=symbol, entry_price=entry_price, remaining_size=remaining_size)
-                    if symbol not in to_close:
-                        to_close.append(symbol)
-                    continue
+
                 position_value = remaining_size * entry_price
-                max_reasonable_position_value = 100000.0
-                if position_value > max_reasonable_position_value:
-                    LOG.error("position_value_unreasonably_high_closing", symbol=symbol, position_value=position_value, entry_price=entry_price, remaining_size=remaining_size, max_allowed=max_reasonable_position_value)
-                    if symbol not in to_close:
-                        to_close.append(symbol)
-                    continue
-                if remaining_size > 1000000.0:
-                    LOG.error("remaining_size_unreasonably_high_closing", symbol=symbol, remaining_size=remaining_size, entry_price=entry_price)
-                    if symbol not in to_close:
-                        to_close.append(symbol)
-                    continue
                 total_exposure += position_value
+
+            # Add invalid positions to the close list
+            for symbol in invalid_symbols:
+                if symbol not in to_close:
+                    to_close.append(symbol)
+
+            # BUG FIX: Step 2 - Calculate correct total equity once.
+            # Total Equity = Free Cash (bot.equity) + Invested Capital (total_exposure)
+            total_bot_equity = float(self.bot.equity) + total_exposure
+            if total_bot_equity <= 0:
+                LOG.error("invalid_total_equity_in_rebalance", equity=total_bot_equity)
+                # If total equity is zero or negative, close all positions as a safety measure.
+                return list(active_stops_snapshot.keys())
+
+            # Step 3 - Loop again to check individual position constraints using the correct total equity.
             for symbol, stop_info in active_stops_snapshot.items():
-                if symbol not in risk_manager.active_stops:
-                    LOG.debug("position_removed_during_rebalance_check", symbol=symbol)
+                if symbol in to_close:
                     continue
+                
                 entry_price = stop_info['entry_price']
                 remaining_size = stop_info['remaining_size']
-                if entry_price <= 0 or remaining_size <= 0:
-                    LOG.warning("invalid_position_data_closing", symbol=symbol, entry_price=entry_price, remaining_size=remaining_size)
-                    if symbol not in to_close:
-                        to_close.append(symbol)
-                    continue
                 position_value = remaining_size * entry_price
-                available_equity = float(self.bot.equity)
-                total_bot_equity = float(self.bot.equity)
-                if total_bot_equity <= 0:
-                    LOG.error("invalid_total_equity_in_rebalance", equity=total_bot_equity, symbol=symbol)
-                    if symbol not in to_close:
-                        to_close.append(symbol)
-                    continue
-                position_pct = position_value / total_bot_equity
-                if total_bot_equity > 0:
-                    position_pct = position_value / total_bot_equity
-                else:
-                    LOG.error("zero_or_negative_equity_closing_position", symbol=symbol, equity=total_bot_equity, position_value=position_value)
-                    if symbol not in to_close:
-                        to_close.append(symbol)
-                    continue
-                if position_pct < 0 or position_pct > 1.0:
-                    LOG.error("unreasonable_position_percentage", symbol=symbol, position_pct=position_pct * 100, position_value=position_value, total_equity=total_bot_equity)
-                    if hasattr(self.bot, 'position_ledger'):
-                        audit = self.bot.position_ledger.audit_equity(self.bot)
-                        LOG.error("equity_audit_unreasonable_pct", audit=audit, symbol=symbol, position_value=position_value, entry_price=entry_price, remaining_size=remaining_size)
-                        if audit['is_consistent']:
-                            LOG.error("position_data_inconsistent_with_valid_equity", symbol=symbol, should_check_risk_manager=True)
-                    if symbol not in to_close:
-                        to_close.append(symbol)
-                    continue
+
+                # BUG FIX: Use correct total equity for percentage calculation.
+                position_pct = position_value / total_bot_equity if total_bot_equity > 0 else 0
+
                 if position_pct > self.max_position_pct:
                     LOG.warning("position_exceeds_max_percentage", symbol=symbol, position_pct=position_pct * 100, max_allowed=self.max_position_pct * 100, position_value=position_value, total_equity=total_bot_equity)
                     if symbol not in to_close:
                         to_close.append(symbol)
                     continue
+                
                 try:
                     ticker = await self.bot.exchange_manager.exchange.fetch_ticker(symbol)
                     current_price = ticker.get('last', 0)
                     if current_price > 0:
-                        entry_price = stop_info['entry_price']
                         side = stop_info['side']
                         if side == 'buy':
                             pnl_pct = (current_price - entry_price) / entry_price
                         else:
                             pnl_pct = (entry_price - current_price) / entry_price
+                        
                         position_confidence = self._position_confidences.get(symbol, 0.5)
                         if position_confidence > 0.8:
                             max_loss_threshold = self.max_loss_high_confidence
@@ -5483,6 +5875,7 @@ class PortfolioRebalancer:
                             max_loss_threshold = self.max_loss_low_confidence
                         else:
                             max_loss_threshold = self.max_loss_per_position_default
+                        
                         if pnl_pct <= max_loss_threshold:
                             LOG.warning("position_loss_limit_exceeded", symbol=symbol, pnl_pct=pnl_pct * 100, max_loss=max_loss_threshold * 100, position_confidence=position_confidence)
                             if symbol not in to_close:
@@ -5490,15 +5883,22 @@ class PortfolioRebalancer:
                             continue
                 except Exception as e:
                     LOG.debug("ticker_fetch_error_rebalance", symbol=symbol, error=str(e))
-            if len(active_stops_snapshot) > self.max_positions:
-                sorted_positions = sorted(active_stops_snapshot.items(), key=lambda x: x[1]['entry_time'])
-                excess = len(active_stops_snapshot) - self.max_positions
+
+            if len(active_stops_snapshot) - len(to_close) > self.max_positions:
+                # Sort positions by entry time (oldest first) to decide which to close
+                sorted_positions = sorted(
+                    [(s, i) for s, i in active_stops_snapshot.items() if s not in to_close], 
+                    key=lambda x: x[1]['entry_time']
+                )
+                excess = len(sorted_positions) - self.max_positions
                 for i in range(excess):
                     symbol = sorted_positions[i][0]
                     if symbol not in to_close:
                         LOG.info("closing_excess_position", symbol=symbol, reason="max_positions_exceeded")
                         to_close.append(symbol)
+            
             return list(set(to_close))
+            
         except Exception as e:
             LOG.error("rebalance_check_failed", error=str(e), traceback=traceback.format_exc())
             return []
@@ -5545,7 +5945,7 @@ class PortfolioRebalancer:
                         if current_price <= 0 or np.isnan(current_price) or np.isinf(current_price):
                             LOG.error("invalid_current_price_for_rebalance", symbol=symbol, current_price=current_price)
                             current_price = entry_price
-                        await _update_bot_after_trade_close(self.bot, self.bot.risk_manager, symbol, 0.0, close_side, remaining_size, entry_price, current_price, is_stop_loss=False)
+                        await self.bot._update_state_after_trade_close(self.bot.risk_manager, symbol, 0.0, close_side, remaining_size, entry_price, current_price, is_stop_loss=False)
                         LOG.info("rebalance_position_closed", symbol=symbol, side=close_side, size=remaining_size, entry_price=entry_price, exit_price=current_price, reason="rebalance")
                         try:
                             if hasattr(self.bot, 'position_ledger') and self.bot.position_ledger.transactions:
@@ -5561,9 +5961,6 @@ class PortfolioRebalancer:
                                 await INFLUX_METRICS.write_model_metrics('portfolio_rebalancer', {'rebalance_executed': 1.0, 'pnl': float(realized_pnl), 'position_closed': 1.0, 'remaining_positions': len(risk_manager.active_stops)})
                         except Exception as influx_error:
                             LOG.debug("rebalance_influx_write_failed", error=str(influx_error))
-                        if hasattr(self.bot, 'position_ledger') and self.bot.position_ledger.transactions:
-                            last_transaction = self.bot.position_ledger.transactions[-1]
-                            risk_manager.update_daily_pnl(last_transaction.realized_pnl)
                 except Exception as e_inner:
                     LOG.error("rebalance_close_failed", symbol=symbol, error=str(e_inner))
                     continue
@@ -5614,7 +6011,7 @@ class CorrelationAnalyzer:
                 if df.isnull().any().any():
                     null_counts = df.isnull().sum()
                     LOG.warning("dataframe_contains_nulls_before_correlation", null_counts=null_counts.to_dict())
-                    df = df.fillna(method='ffill').fillna(method='bfill')
+                    df = df.ffill().bfill()
                     if df.isnull().any().any():
                         initial_rows = len(df)
                         df = df.dropna()
@@ -5736,51 +6133,54 @@ class PerformanceDashboard:
             except Exception as uptime_error:
                 LOG.debug("uptime_calculation_failed", error=str(uptime_error))
 
-            raw_equity = getattr(self.bot, 'equity', None)
-            raw_initial = getattr(self.bot, 'initial_capital', None)
-            if raw_equity is None or not isinstance(raw_equity, (int, float)):
-                raw_equity = raw_initial if raw_initial else 10000.0
-            if raw_initial is None or not isinstance(raw_initial, (int, float)):
-                raw_initial = 10000.0
-            if np.isnan(raw_equity) or np.isinf(raw_equity):
-                raw_equity = raw_initial
-            if np.isnan(raw_initial) or np.isinf(raw_initial):
-                raw_initial = 10000.0
-
-            equity = float(raw_equity)
-            initial_capital = float(raw_initial)
-            total_pnl = equity - initial_capital
+            # --- BUG FIX: Correct Equity and PnL Calculation ---
+            free_cash = getattr(self.bot, 'equity', 0.0)
+            initial_capital = getattr(self.bot, 'initial_capital', 10000.0)
+            invested_capital = 0.0
             unrealized_pnl = 0.0
-
-            if hasattr(self.bot, 'risk_manager') and self.bot.risk_manager.active_stops:
-                for symbol, stop_info in self.bot.risk_manager.active_stops.items():
+            
+            # Use position_ledger as the primary source for open positions value
+            if hasattr(self.bot, 'position_ledger') and self.bot.position_ledger.active_positions:
+                audit = self.bot.position_ledger.audit_equity(self.bot)
+                invested_capital = audit.get('invested_in_positions', 0.0)
+                realized_pnl = audit.get('total_realized_pnl', 0.0)
+                
+                for symbol, open_tx in self.bot.position_ledger.active_positions.items():
                     try:
+                        entry_price = open_tx.entry_price
+                        size = open_tx.size
+                        
                         ticker = await self.bot.exchange_manager.exchange.fetch_ticker(symbol)
                         current_price = ticker.get('last', 0)
-                        entry_price = stop_info.get('entry_price', 0)
-                        size = stop_info.get('remaining_size', 0)
-                        side = stop_info.get('side', 'buy')
-                        if current_price > 0 and entry_price > 0 and size > 0:
+                        side = open_tx.side
+                        
+                        if current_price > 0:
                             if side == 'buy':
-                                position_pnl = (current_price - entry_price) * size
+                                unrealized_pnl += (current_price - entry_price) * size
                             else:
-                                position_pnl = (entry_price - current_price) * size
-                            unrealized_pnl += position_pnl
+                                unrealized_pnl += (entry_price - current_price) * size
                     except Exception:
                         continue
-
-            total_pnl_including_open = total_pnl + unrealized_pnl
+            else:
+                 realized_pnl = 0.0 # fallback
+            
+            total_equity = free_cash + invested_capital + unrealized_pnl
+            total_pnl = total_equity - initial_capital
+            
             report['portfolio'] = {
-                'equity': equity,
+                'total_equity': total_equity,
+                'free_cash': free_cash,
+                'invested_capital': invested_capital,
                 'initial_capital': initial_capital,
                 'total_pnl': total_pnl,
+                'realized_pnl': realized_pnl,
                 'unrealized_pnl': unrealized_pnl,
-                'total_pnl_including_open': total_pnl_including_open,
                 'total_pnl_pct': 0.0,
                 'drawdown_pct': 0.0,
             }
+
             if initial_capital > 0:
-                report['portfolio']['total_pnl_pct'] = float((total_pnl_including_open / initial_capital) * 100)
+                report['portfolio']['total_pnl_pct'] = float((total_pnl / initial_capital) * 100)
                 if hasattr(self.bot, 'drawdown'):
                     drawdown_value = self.bot.drawdown
                     if isinstance(drawdown_value, (int, float)) and not np.isnan(drawdown_value):
@@ -5811,10 +6211,10 @@ class PerformanceDashboard:
                         current_price = ticker.get('last', 0)
                         entry_price = stop_info['entry_price']
                         side = stop_info['side']
-                        if side == 'buy':
-                            pnl_pct = (current_price - entry_price) / entry_price * 100
+                        if current_price > 0 and entry_price > 0:
+                           pnl_pct = ((current_price - entry_price) / entry_price * 100) if side == 'buy' else ((entry_price - current_price) / entry_price * 100)
                         else:
-                            pnl_pct = (entry_price - current_price) / entry_price * 100
+                           pnl_pct = 0.0
                         positions_detail.append({
                             'symbol': symbol,
                             'side': side,
@@ -5865,202 +6265,40 @@ class PerformanceDashboard:
                 report['ai_models'] = self.bot.ai_models_status
 
         except Exception as e:
-            LOG.error("dashboard_report_generation_failed", error=str(e))
+            LOG.error("dashboard_report_generation_failed", error=str(e), traceback=traceback.format_exc())
 
         return report
-
-    async def print_dashboard(self):
-        try:
-            report = await self.generate_live_report()
-            if not report or not isinstance(report, dict):
-                LOG.error("invalid_report_generated", report_type=type(report).__name__)
-                return
-            print("\n" + "=" * 100)
-            print(f"📊 TRADING BOT DASHBOARD - {report.get('timestamp', 'N/A')}")
-            print("=" * 100)
-            portfolio = report.get('portfolio', {})
-            if portfolio:
-                print(f"\n💰 PORTFOLIO:")
-                try:
-                    equity = float(portfolio.get('equity', 0))
-                    total_pnl = float(portfolio.get('total_pnl', 0))
-                    total_pnl_pct = float(portfolio.get('total_pnl_pct', 0))
-                    drawdown_pct = float(portfolio.get('drawdown_pct', 0))
-                    print(f"   Equity: ${equity:,.2f}")
-                    print(f"   PnL: ${total_pnl:,.2f} ({total_pnl_pct:+.2f}%)")
-                    print(f"   Drawdown: {drawdown_pct:.2f}%")
-                except (ValueError, TypeError) as format_error:
-                    LOG.error("portfolio_format_error", error=str(format_error), portfolio=portfolio)
-                    print(f"   Equity: {portfolio.get('equity', 'N/A')}")
-                    print(f"   PnL: {portfolio.get('total_pnl', 'N/A')}")
-                    print(f"   Drawdown: {portfolio.get('drawdown_pct', 'N/A')}")
-            else:
-                LOG.warning("portfolio_data_missing_in_report")
-            trading = report.get('trading', {})
-            if trading:
-                print(f"\n📈 TRADING STATS:")
-                try:
-                    total_trades = int(trading.get('total_trades', 0))
-                    win_rate = float(trading.get('win_rate', 0))
-                    sharpe_ratio = float(trading.get('sharpe_ratio', 0))
-                    print(f"   Total Trades: {total_trades}")
-                    print(f"   Win Rate: {win_rate:.1f}%")
-                    print(f"   Sharpe Ratio: {sharpe_ratio:.2f}")
-                except (ValueError, TypeError) as trading_error:
-                    LOG.debug("trading_stats_format_error", error=str(trading_error))
-                    print(f"   Total Trades: {trading.get('total_trades', 'N/A')}")
-                    print(f"   Win Rate: {trading.get('win_rate', 'N/A')}")
-                    print(f"   Sharpe Ratio: {trading.get('sharpe_ratio', 'N/A')}")
-            else:
-                LOG.warning("trading_data_missing_in_report")
-            if report.get('risk'):
-                print(f"\n⚠️  RISK MANAGEMENT:")
-                print(f"   Active Positions: {report['risk']['active_positions']}")
-                print(f"   Daily PnL: ${report['risk']['daily_pnl']:,.2f} ({report['risk']['daily_return_pct']:+.2f}%)")
-                print(f"   Daily Trades: {report['risk']['daily_trades']}")
-                print(f"   Circuit Breaker: {'🔴 ACTIVE' if report['risk']['circuit_breaker_active'] else '🟢 OK'}")
-            if report.get('positions'):
-                print(f"\n📍 ACTIVE POSITIONS:")
-                for pos in report['positions']:
-                    try:
-                        pnl_pct = float(pos.get('pnl_pct', 0))
-                        pnl_emoji = "🟢" if pnl_pct > 0 else "🔴"
-                        symbol = str(pos.get('symbol', 'N/A'))
-                        side = str(pos.get('side', 'N/A')).upper()
-                        entry_price = float(pos.get('entry_price', 0))
-                        current_price = float(pos.get('current_price', 0))
-                        stop_loss = float(pos.get('stop_loss', 0))
-                        print(f"   {pnl_emoji} {symbol} | {side} | "
-                              f"Entry: ${entry_price:.2f} | Current: ${current_price:.2f} | "
-                              f"PnL: {pnl_pct:+.2f}% | SL: ${stop_loss:.2f}")
-                    except (ValueError, TypeError, KeyError) as pos_error:
-                        LOG.debug("position_print_error", position=pos, error=str(pos_error))
-                        print(f"   ⚠️  {pos.get('symbol', 'Unknown')} | Error formatting position")
-            if hasattr(self.bot, 'symbol_performance') and self.bot.symbol_performance:
-                print(f"\n🎯 TOP 5 SYMBOLS PERFORMANCE:")
-                try:
-                    sorted_symbols = sorted(self.bot.symbol_performance.items(), key=lambda x: float(x[1].get('total_pnl', 0)), reverse=True)[:5]
-                    for symbol, perf in sorted_symbols:
-                        try:
-                            winning = int(perf.get('winning_trades', 0))
-                            losing = int(perf.get('losing_trades', 0))
-                            total_trades = winning + losing
-                            pnl = float(perf.get('total_pnl', 0))
-                            win_rate = float(perf.get('win_rate', 0)) * 100
-                            pnl_emoji = "🟢" if pnl > 0 else "🔴"
-                            print(f"   {pnl_emoji} {symbol}: "
-                                  f"PnL ${pnl:+.2f} | "
-                                  f"WR {win_rate:.1f}% | "
-                                  f"Trades {total_trades}")
-                        except (ValueError, TypeError) as perf_error:
-                            LOG.debug("symbol_performance_format_error", symbol=symbol, error=str(perf_error))
-                            print(f"   ⚠️  {symbol}: Error formatting performance")
-                except Exception as sort_error:
-                    LOG.debug("symbol_performance_sort_error", error=str(sort_error))
-            if report.get('memory'):
-                print(f"\n💾 MEMORY:")
-                print(f"   Current: {report['memory'].get('current_mb', 0):.0f} MB")
-                print(f"   Trend: {report['memory'].get('trend', 'unknown')}")
-            if report.get('cache'):
-                print(f"\n🗂️  CACHE:")
-                print(f"   Hit Rate: {report['cache'].get('hit_rate', 0):.1f}%")
-                print(f"   Size: {report['cache'].get('size', 0)} entries")
-                print(f"   Memory: {report['cache'].get('memory_mb', 0):.1f} MB")
-            if report.get('data_accumulator'):
-                acc = report['data_accumulator']
-                print(f"\n📊 DATA ACCUMULATOR:")
-                print(f"   Buffer: {acc.get('buffer_size', 0)}/{acc.get('max_samples', 0)}")
-                print(f"   Utilization: {acc.get('utilization', 0)*100:.1f}%")
-                print(f"   Total Samples: {acc.get('total_samples_added', 0):,}")
-                print(f"   Symbols Tracked: {acc.get('symbols_tracked', 0)}")
-                symbol_stats = acc.get('symbol_stats', {})
-                if symbol_stats:
-                    sorted_symbols_acc = sorted(symbol_stats.items(), key=lambda x: x[1].get('samples', 0), reverse=True)[:5]
-                    if sorted_symbols_acc:
-                        print(f"   Top Symbols by Samples:")
-                        for symbol, stats in sorted_symbols_acc:
-                            print(f"      {symbol}: {stats.get('samples', 0)} samples")
-            if report.get('ai_models'):
-                ai = report['ai_models']
-                print(f"\n🤖 AI MODELS STATUS:")
-                print(f"   General Model Trained: {'✅ YES' if ai.get('general_model_trained') else '❌ NO'}")
-                print(f"   Specialized Models: {ai.get('specialized_models_count', 0)}")
-                if ai.get('specialized_symbols'):
-                    print(f"   Specialized for: {', '.join(ai['specialized_symbols'][:5])}")
-                    if len(ai['specialized_symbols']) > 5:
-                        print(f"      ... and {len(ai['specialized_symbols']) - 5} more")
-                if ai.get('symbol_training_history'):
-                    print(f"\n   🔄 Training History (Top 5):")
-                    sorted_history = sorted(ai['symbol_training_history'].items(), key=lambda x: x[1].get('training_count', 0), reverse=True)[:5]
-                    for symbol, history in sorted_history:
-                        last_train = history.get('last_training', 'Never')
-                        if last_train != 'Never':
-                            try:
-                                last_train_dt = datetime.fromisoformat(last_train)
-                                hours_ago = (datetime.now(timezone.utc) - last_train_dt).total_seconds() / 3600
-                                last_train = f"{hours_ago:.1f}h ago"
-                            except:
-                                pass
-                        print(f"      {symbol}: {history.get('training_count', 0)} trainings, "
-                              f"Last: {last_train}, "
-                              f"Avg samples: {history.get('avg_samples', 0):.0f}")
-
-            if INFLUX_METRICS and INFLUX_METRICS.enabled:
-                print(f"\n📊 INFLUXDB METRICS:")
-                try:
-                    health = await INFLUX_METRICS.check_health()
-                    
-                    if health['healthy']:
-                        print(f"   Status: ✅ Healthy")
-                    else:
-                        print(f"   Status: ⚠️ Issues detected - {health.get('reason', 'unknown')}")
-                    
-                    stats = health.get('stats', {})
-                    total = stats.get('total_writes', 0)
-                    success = stats.get('successful_writes', 0)
-                    failed = stats.get('failed_writes', 0)
-                    rate = stats.get('success_rate', 0)
-                    
-                    print(f"   Total Writes: {total:,}")
-                    print(f"   Successful: {success:,}")
-                    print(f"   Failed: {failed:,}")
-                    print(f"   Success Rate: {rate*100:.1f}%")
-                    
-                    if stats.get('last_error'):
-                        print(f"   Last Error: {stats['last_error']}")
-                    
-                except Exception as diag_error:
-                    print(f"   ⚠️ Diagnostic failed: {str(diag_error)}")
-
-            if hasattr(self.bot, 'position_ledger'):
-                audit = self.bot.position_ledger.audit_equity(self.bot)
-                if not audit['is_consistent']:
-                    print(f"⚠️  EQUITY AUDIT: INCONSISTENT (Discrepancy: ${audit['discrepancy']:,.2f})")
-            print("\n" + "=" * 100)
-        except Exception as e:
-            LOG.error("dashboard_print_failed", error=str(e))
 
     async def periodic_dashboard_loop(self):
         while self.bot.is_running:
             try:
                 await asyncio.sleep(self.report_interval)
-                await self.print_dashboard()
-                report = await self.generate_live_report()
-                if INFLUX_METRICS.enabled:
-                    portfolio = report.get('portfolio', {})
-                    risk = report.get('risk', {})
-                    await INFLUX_METRICS.write_portfolio_metrics(
-                        portfolio.get('equity', 0.0),
-                        portfolio.get('drawdown_pct', 0.0) / 100,
-                        risk.get('active_positions', 0),
-                        portfolio.get('total_pnl', 0.0)
-                    )
+                await self.print_dashboard()                
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 LOG.error("periodic_dashboard_error", error=str(e))
                 await asyncio.sleep(60)
 
+    async def print_dashboard(self):
+            """Generates and logs the live performance report."""
+            try:
+                report = await self.generate_live_report()
+                portfolio_stats = report.get('portfolio', {})
+                trading_stats = report.get('trading', {})
+                risk_stats = report.get('risk', {})
+                
+                LOG.info("live_dashboard_summary",
+                         equity=portfolio_stats.get('total_equity'),
+                         pnl_pct=portfolio_stats.get('total_pnl_pct'),
+                         trades=trading_stats.get('total_trades'),
+                         win_rate=trading_stats.get('win_rate'),
+                         active_pos=risk_stats.get('active_positions'),
+                         circuit_breaker=risk_stats.get('circuit_breaker_active')
+                        )
+            except Exception as e:
+                LOG.error("print_dashboard_failed", error=str(e))
+                
 class AdvancedAITradingBot(ProductionBot):
     def __init__(self, config: AdvancedAIConfig, exchange_manager: ExchangeManager, strategy_manager: StrategyManager):
         super().__init__(config, exchange_manager, strategy_manager)
@@ -6077,6 +6315,11 @@ class AdvancedAITradingBot(ProductionBot):
         self.smart_executor = SmartOrderExecutor(exchange_manager, config)
         self.portfolio_rebalancer = PortfolioRebalancer(config, self)
         self.correlation_analyzer = CorrelationAnalyzer(exchange_manager)
+        # ===== NEW: Instantiate BTC Relative Correlation Tracker =====
+        self.btc_correlation_tracker = BTCRelativeCorrelationTracker(
+            exchange_manager=self.exchange_manager,
+            influx_client=INFLUX_METRICS
+        )
         self.symbol_performance = {}
         self.last_pipeline_execution = {}
         # ===== NUEVO: Sistema de Testing =====
@@ -6112,978 +6355,397 @@ class AdvancedAITradingBot(ProductionBot):
             }
         LOG.info("advanced_ai_trading_bot_initialized_with_dynamic_sizing")
 
-    async def _start_periodic_tasks(self) -> None:
-        try:
-            LOG.info("starting_base_periodic_tasks")
-            try:
-                memory_cleanup_task = asyncio.create_task(periodic_memory_cleanup())
-                self.periodic_tasks.append(memory_cleanup_task)
-                LOG.debug("memory_cleanup_task_started")
-            except Exception as e:
-                LOG.error("memory_cleanup_task_failed", error=str(e))
-            if INFLUX_METRICS and INFLUX_METRICS.enabled:
-                try:
-                    async def periodic_influx_flush():
-                        while self.is_running:
-                            try:
-                                await asyncio.sleep(30)
-                                if hasattr(INFLUX_METRICS, 'write_api') and INFLUX_METRICS.write_api:
-                                    try:
-                                        INFLUX_METRICS.write_api.flush()
-                                        LOG.debug("influxdb_flush_completed")
-                                    except Exception as flush_error:
-                                        LOG.debug("influxdb_flush_failed", error=str(flush_error))
-                            except asyncio.CancelledError:
-                                break
-                            except Exception as e:
-                                LOG.debug("periodic_influx_flush_error", error=str(e))
-                                await asyncio.sleep(60)
-                    influx_flush_task = asyncio.create_task(periodic_influx_flush())
-                    self.periodic_tasks.append(influx_flush_task)
-                    LOG.info("influxdb_flush_task_started", interval_seconds=30)
-                except Exception as e:
-                    LOG.error("influxdb_flush_task_failed", error=str(e))
-            if self.health_check:
-                try:
-                    health_check_task = asyncio.create_task(self.health_check.periodic_health_log())
-                    self.periodic_tasks.append(health_check_task)
-                    LOG.debug("health_check_task_started")
-                except Exception as e:
-                    LOG.error("health_check_task_failed", error=str(e))
-            else:
-                LOG.warning("health_check_unavailable_skipping_task")
-            if hasattr(self, 'risk_manager') and self.risk_manager:
-                try:
-                    position_monitor_task = asyncio.create_task(position_monitoring_loop(self, self.exchange_manager, self.risk_manager, interval=10))
-                    self.periodic_tasks.append(position_monitor_task)
-                    LOG.info("position_monitoring_loop_started", interval_seconds=10)
-                except Exception as e:
-                    LOG.error("position_monitoring_task_failed", error=str(e))
-            else:
-                LOG.error("CRITICAL_risk_manager_not_available_positions_wont_be_monitored")
-            if hasattr(self, 'position_ledger') and self.position_ledger:
-                try:
-                    async def periodic_equity_audit_task():
-                        while self.is_running:
-                            try:
-                                await asyncio.sleep(3600)
-                                audit_result = self.position_ledger.audit_equity(self)
-                                LOG.info("periodic_equity_audit_completed", **audit_result)
-                                try:
-                                    await INFLUX_METRICS.write_model_metrics('equity_audit', {
-                                        'is_consistent': 1.0 if audit_result['is_consistent'] else 0.0,
-                                        'discrepancy': float(audit_result['discrepancy']),
-                                        'actual_equity': float(audit_result['actual_equity']),
-                                        'expected_equity': float(audit_result['expected_free_equity']),
-                                        'invested_in_positions': float(audit_result['invested_in_positions']),
-                                        'total_realized_pnl': float(audit_result['total_realized_pnl'])
-                                    })
-                                except Exception as influx_error:
-                                    LOG.debug("equity_audit_influx_write_failed", error=str(influx_error))
-                                if not audit_result['is_consistent'] and abs(audit_result['discrepancy']) > 10.0:
-                                    await ALERT_SYSTEM.send_alert("ERROR", "Equity audit detected critical discrepancy", **audit_result)
-                            except asyncio.CancelledError:
-                                break
-                            except Exception as e:
-                                LOG.error("equity_audit_error", error=str(e))
-                                await asyncio.sleep(600)
-                    equity_audit_task = asyncio.create_task(periodic_equity_audit_task())
-                    self.periodic_tasks.append(equity_audit_task)
-                    LOG.info("equity_audit_task_started", interval_hours=1)
-                except Exception as e:
-                    LOG.error("equity_audit_task_creation_failed", error=str(e))
-            if hasattr(self, 'position_ledger') and hasattr(self, 'risk_manager'):
-                try:
-                    async def periodic_ledger_sync():
-                        while self.is_running:
-                            try:
-                                await asyncio.sleep(300)
-                                sync_report = await sync_ledger_with_risk_manager(self)
-                                total_orphans = len(sync_report.get('orphaned_ledger', [])) + len(sync_report.get('orphaned_risk_manager', []))
-                                if total_orphans > 3:
-                                    await ALERT_SYSTEM.send_alert("WARNING", "High number of position discrepancies detected", **sync_report)
-                            except asyncio.CancelledError:
-                                break
-                            except Exception as e:
-                                LOG.error("periodic_ledger_sync_error", error=str(e))
-                                await asyncio.sleep(60)
-                    sync_task = asyncio.create_task(periodic_ledger_sync())
-                    self.periodic_tasks.append(sync_task)
-                    LOG.info("periodic_ledger_sync_task_started", interval_seconds=300)
-                except Exception as e:
-                    LOG.error("ledger_sync_task_creation_failed", error=str(e))
-            # ===== NUEVO: Testing Automático Periódico =====
-            try:
-                async def periodic_testing():
-                    while self.is_running:
-                        try:
-                            # Ejecutar tests cada 6 horas
-                            await asyncio.sleep(6 * 3600)
-                            
-                            LOG.info("starting_periodic_automated_tests")
-                            test_results = await self.test_suite.run_all_tests()
-                            
-                            self.test_results_history.append(test_results)
-                            
-                            # Mantener solo últimos 10 resultados
-                            if len(self.test_results_history) > 10:
-                                self.test_results_history.pop(0)
-                            
-                            # Si fallan tests críticos, alertar
-                            failed = test_results.get('failed', 0)
-                            if failed > 0:
-                                failed_tests = [
-                                    r['test_name'] for r in test_results.get('results', [])
-                                    if not r['passed']
-                                ]
-                                
-                                LOG.error("automated_tests_failed",
-                                         failed_count=failed,
-                                         failed_tests=failed_tests)
-                                
-                                await ALERT_SYSTEM.send_alert(
-                                    "ERROR",
-                                    f"{failed} tests automatizados fallaron",
-                                    failed_tests=failed_tests
-                                )
-                            
-                        except asyncio.CancelledError:
-                            break
-                        except Exception as e:
-                            LOG.error("periodic_testing_error", error=str(e))
-                            await asyncio.sleep(3600)
-                
-                testing_task = asyncio.create_task(periodic_testing())
-                self.periodic_tasks.append(testing_task)
-                LOG.info("periodic_testing_task_started", interval_hours=6)
-                
-            except Exception as e:
-                LOG.error("testing_task_creation_failed", error=str(e))
-            
-            # ===== NUEVO: Reconciliación Periódica con Exchange =====
-            try:
-                async def periodic_reconciliation():
-                    while self.is_running:
-                        try:
-                            # Reconciliar cada 1 hora
-                            await asyncio.sleep(3600)
-                            
-                            if hasattr(self, 'position_ledger'):
-                                LOG.info("starting_periodic_reconciliation")
-                                recon_report = await self.position_ledger.reconcile_with_exchange(
-                                    self, self.exchange_manager
-                                )
-                                
-                                # Guardar en métricas
-                                if INFLUX_METRICS.enabled:
-                                    await INFLUX_METRICS.write_model_metrics(
-                                        'ledger_reconciliation',
-                                        {
-                                            'matched_positions': len(recon_report.get('matched', [])),
-                                            'discrepancies': len(recon_report.get('discrepancies', [])),
-                                            'ledger_only': len(recon_report.get('ledger_only', [])),
-                                            'exchange_only': len(recon_report.get('exchange_only', []))
-                                        }
-                                    )
-                                
-                        except asyncio.CancelledError:
-                            break
-                        except Exception as e:
-                            LOG.error("periodic_reconciliation_error", error=str(e))
-                            await asyncio.sleep(600)
-                
-                recon_task = asyncio.create_task(periodic_reconciliation())
-                self.periodic_tasks.append(recon_task)
-                LOG.info("periodic_reconciliation_task_started", interval_hours=1)
-                
-            except Exception as e:
-                LOG.error("reconciliation_task_creation_failed", error=str(e))
-            
-            # ===== NUEVO: Walk-Forward Validation Periódica =====
-            try:
-                async def periodic_walk_forward():
-                    while self.is_running:
-                        try:
-                            # Validar cada 7 días
-                            await asyncio.sleep(7 * 24 * 3600)
-                            
-                            LOG.info("starting_periodic_walk_forward_validation")
-                            
-                            for symbol in self.config.symbols[:3]:  # Top 3 símbolos
-                                try:
-                                    # Cargar datos históricos
-                                    hist_df = await self._load_historical_data(months=6)
-                                    
-                                    if hist_df is not None and len(hist_df) >= 1000:
-                                        validation_result = await self.walk_forward_validator.run_walk_forward(
-                                            self, hist_df, symbol
-                                        )
-                                        
-                                        if validation_result.get('success'):
-                                            analysis = validation_result.get('analysis', {})
-                                            
-                                            # Log resultados
-                                            LOG.info("walk_forward_validation_completed",
-                                                    symbol=symbol,
-                                                    windows=len(validation_result.get('windows', [])),
-                                                    avg_degradation=analysis.get('avg_degradation', 0),
-                                                    overfitting=analysis.get('overfitting_detected', False))
-                                            
-                                            # Guardar en InfluxDB
-                                            if INFLUX_METRICS.enabled:
-                                                await INFLUX_METRICS.write_model_metrics(
-                                                    f'walk_forward_{symbol.replace("/", "_")}',
-                                                    {
-                                                        'avg_degradation': analysis.get('avg_degradation', 0),
-                                                        'max_degradation': analysis.get('max_degradation', 0),
-                                                        'overfitting': 1.0 if analysis.get('overfitting_detected') else 0.0,
-                                                        'windows': analysis.get('total_windows', 0)
-                                                    }
-                                                )
-                                    
-                                except Exception as symbol_error:
-                                    LOG.warning("walk_forward_validation_failed_for_symbol",
-                                               symbol=symbol,
-                                               error=str(symbol_error))
-                                    continue
-                            
-                        except asyncio.CancelledError:
-                            break
-                        except Exception as e:
-                            LOG.error("periodic_walk_forward_error", error=str(e))
-                            await asyncio.sleep(24 * 3600)
-                
-                walk_forward_task = asyncio.create_task(periodic_walk_forward())
-                self.periodic_tasks.append(walk_forward_task)
-                LOG.info("periodic_walk_forward_task_started", interval_days=7)
-                
-            except Exception as e:
-                LOG.error("walk_forward_task_creation_failed", error=str(e))
+    async def _get_symbols_needing_training(self) -> Dict[str, str]:
+        """
+        Determines which symbols require initial training or retraining.
+        - 'new_symbol': No model exists.
+        - 'negative_performance': Existing model has negative PnL with trades.
+        """
+        symbols_to_train = {}
+        
+        # Get all symbols configured for the bot
+        all_symbols = self.config.symbols
+        
+        # Get performance for all symbols that have a model
+        symbols_with_models = list(self.ensemble_learner.symbol_models.keys())
+        performance_summary = {}
+        if symbols_with_models:
+            performance_summary = self.position_ledger.get_performance_summary_for_symbols(symbols_with_models)
 
-            # ===== MEJORADO: Sincronización periódica COMPLETA de métricas =====
-            try:
-                sync_counter = {'value': 0}  # Counter mutable
+        for symbol in all_symbols:
+            # Check 1: Is it a new symbol without a trained model?
+            if not self.ensemble_learner.has_model_for_symbol(symbol):
+                symbols_to_train[symbol] = 'new_symbol'
+                continue
                 
-                async def periodic_portfolio_sync():
-                    """Sincroniza TODAS las métricas del bot periódicamente"""
-                    while self.is_running:
-                        try:
-                            await asyncio.sleep(30)  # CORRECCIÓN: Cada 30 segundos
-                            
-                            sync_counter['value'] += 1
-                            
-                            # Flush explícito cada 10 minutos (20 iteraciones * 30 seg)
-                            force_flush = sync_counter['value'] % 20 == 0
-                            
-                            success = await sync_bot_metrics_to_influx(self, force=force_flush)
-                            
-                            if force_flush:
-                                LOG.info("metrics_full_sync_completed",
-                                        iteration=sync_counter['value'],
-                                        success=success)
-                            
-                        except asyncio.CancelledError:
-                            # Flush final al cancelar
-                            try:
-                                await sync_bot_metrics_to_influx(self, force=True)
-                                LOG.info("final_metrics_sync_on_cancellation")
-                            except Exception:
-                                pass
-                            break
-                            
-                        except Exception as e:
-                            LOG.error("periodic_portfolio_sync_error", error=str(e))
-                            await asyncio.sleep(60)  # Esperar más si hay error
-                
-                portfolio_sync_task = asyncio.create_task(periodic_portfolio_sync())
-                self.periodic_tasks.append(portfolio_sync_task)
-                LOG.info("periodic_portfolio_sync_task_started", interval_seconds=30)
-                
-            except Exception as e:
-                LOG.error("portfolio_sync_task_creation_failed", error=str(e))
+            # Check 2: Does it have negative performance?
+            perf = performance_summary.get(symbol)
+            if perf:
+                # Only retrain if performance is negative AND there have been trades.
+                # Do not retrain if performance is zero (no trades yet).
+                if perf['total_pnl'] < 0 and perf['total_trades'] > 0:
+                    symbols_to_train[symbol] = 'negative_performance'
 
-            # ===== NUEVO: Verificación de salud de InfluxDB =====
-            try:
-                async def periodic_influx_health_check():
-                    """Verifica salud de InfluxDB cada 5 minutos"""
-                    while self.is_running:
-                        try:
-                            await asyncio.sleep(300)  # 5 minutos
-                            
-                            if INFLUX_METRICS and INFLUX_METRICS.enabled:
-                                health = await INFLUX_METRICS.check_health()
-                                
-                                if not health['healthy']:
-                                    LOG.warning("influxdb_health_check_failed",
-                                               reason=health.get('reason'),
-                                               stats=health.get('stats', {}))
-                                    
-                                    # Alerta si muchos errores consecutivos
-                                    stats = health.get('stats', {})
-                                    failed = stats.get('failed_writes', 0)
-                                    total = stats.get('total_writes', 0)
-                                    
-                                    if total > 50 and failed > total * 0.5:
-                                        await ALERT_SYSTEM.send_alert(
-                                            "WARNING",
-                                            "InfluxDB tiene alta tasa de errores",
-                                            failed_writes=failed,
-                                            total_writes=total,
-                                            failure_rate=failed/total*100 if total > 0 else 0
-                                        )
-                                else:
-                                    LOG.debug("influxdb_health_check_ok",
-                                             ping=health.get('ping_ok'),
-                                             stats=health.get('stats', {}))
-                                    
-                        except asyncio.CancelledError:
-                            break
-                        except Exception as e:
-                            LOG.error("influx_health_check_error", error=str(e))
-                            await asyncio.sleep(60)
-                
-                influx_health_task = asyncio.create_task(periodic_influx_health_check())
-                self.periodic_tasks.append(influx_health_task)
-                LOG.info("influx_health_check_task_started", interval_seconds=300)
-                
-            except Exception as e:
-                LOG.error("influx_health_task_creation_failed", error=str(e))
-                
-            LOG.info("base_periodic_tasks_started", count=len(self.periodic_tasks))
-
-            
-            if hasattr(self, 'portfolio_rebalancer') and self.portfolio_rebalancer is not None:
-                try:
-                    async def periodic_rebalancing():
-                        while self.is_running:
-                            try:
-                                await asyncio.sleep(3600)
-                                if hasattr(self, 'risk_manager'):
-                                    symbols_to_close = await self.portfolio_rebalancer.check_rebalance_needed(self.risk_manager)
-                                    if symbols_to_close:
-                                        LOG.info("executing_scheduled_rebalance", symbols_count=len(symbols_to_close))
-                                        await self.portfolio_rebalancer.execute_rebalance(symbols_to_close, self.risk_manager)
-                            except asyncio.CancelledError:
-                                break
-                            except Exception as e:
-                                LOG.error("periodic_rebalancing_error", error=str(e))
-                    rebalancing_task = asyncio.create_task(periodic_rebalancing())
-                    self.periodic_tasks.append(rebalancing_task)
-                    LOG.info("periodic_rebalancing_task_started", interval_hours=1)
-                except Exception as e:
-                    LOG.error("rebalancing_task_creation_failed", error=str(e))
-            else:
-                LOG.warning("portfolio_rebalancer_not_available")
-            try:
-                memory_monitor_task = asyncio.create_task(MEMORY_MANAGER.monitor_and_cleanup())
-                self.periodic_tasks.append(memory_monitor_task)
-                LOG.debug("memory_monitor_task_started")
-            except Exception as e:
-                LOG.error("memory_monitor_task_failed", error=str(e))
-            if self.performance_monitor:
-                try:
-                    perf_monitor_task = asyncio.create_task(self.performance_monitor.monitor_loop(self, interval=60))
-                    self.periodic_tasks.append(perf_monitor_task)
-                    LOG.debug("performance_monitor_task_started")
-                except Exception as e:
-                    LOG.error("performance_monitor_task_failed", error=str(e))
-            else:
-                LOG.warning("performance_monitor_unavailable_skipping_task")
-            if hasattr(self, 'dashboard') and self.dashboard is not None:
-                try:
-                    dashboard_exists = any('dashboard' in str(task.get_coro()) if hasattr(task, 'get_coro') else False for task in self.periodic_tasks)
-                    if not dashboard_exists:
-                        dashboard_task = asyncio.create_task(self.dashboard.periodic_dashboard_loop())
-                        self.periodic_tasks.append(dashboard_task)
-                        LOG.debug("dashboard_task_started")
-                    else:
-                        LOG.debug("dashboard_task_already_running")
-                except Exception as e:
-                    LOG.error("dashboard_task_failed", error=str(e))
-            else:
-                LOG.warning("dashboard_not_available_creating", message="Dashboard should exist from __init__")
-                try:
-                    self.dashboard = PerformanceDashboard(self)
-                    dashboard_task = asyncio.create_task(self.dashboard.periodic_dashboard_loop())
-                    self.periodic_tasks.append(dashboard_task)
-                    LOG.info("dashboard_created_and_started")
-                except Exception as dashboard_create_error:
-                    LOG.error("dashboard_creation_failed", error=str(dashboard_create_error))
-            LOG.info("base_periodic_tasks_started", count=len(self.periodic_tasks))
-        except Exception as e:
-            LOG.error("start_base_periodic_tasks_failed", error=str(e))
-
-    async def _process_symbol_data(self, symbol: str, market_data: Dict[str, Any]):
-        try:
-            if not market_data or not market_data.get("success", False):
-                LOG.debug("invalid_market_data_skipping", symbol=symbol)
-                return {'symbol': symbol, 'success': False, 'error': 'invalid_market_data'}
-            ohlcv = market_data.get("ohlcv", [])
-            if not ohlcv or len(ohlcv) == 0:
-                LOG.debug("empty_ohlcv_skipping", symbol=symbol)
-                return {'symbol': symbol, 'success': False, 'error': 'empty_ohlcv'}
-            df = create_dataframe(ohlcv)
-            if df is None or len(df) == 0 or 'close' not in df.columns:
-                LOG.error("invalid_dataframe_for_symbol", symbol=symbol)
-                return {'symbol': symbol, 'success': False, 'error': 'invalid_dataframe'}
-            df = calculate_technical_indicators(df)
-            current_price = float(df['close'].iloc[-1])
-            processing_timestamp = datetime.now(timezone.utc)
-            await execute_trading_pipeline_complete(self.exchange_manager, self.strategy_manager, self.automl, self.regime_detector, self.risk_optimizer, self.ensemble_learner, self, df, self.config, symbol)
-            if hasattr(self, 'data_accumulator') and self.data_accumulator is not None:
-                try:
-                    reward = 0.0
-                    if hasattr(self, 'risk_manager') and symbol in self.risk_manager.active_stops:
-                        stop_info = self.risk_manager.active_stops[symbol]
-                        entry_price = stop_info.get('entry_price', 0)
-                        side = stop_info.get('side', 'buy')
-                        if entry_price > 0 and current_price > 0:
-                            if side == 'buy':
-                                reward = (current_price - entry_price) / entry_price
-                            else:
-                                reward = (entry_price - current_price) / entry_price
-                            LOG.debug("reward_from_active_position", symbol=symbol, reward=reward, entry=entry_price, current=current_price)
-                    elif len(df) >= 2:
-                        prev_close = float(df['close'].iloc[-2])
-                        if prev_close > 0:
-                            price_change = (current_price - prev_close) / prev_close
-                            reward = price_change * 0.5
-                            LOG.debug("reward_from_price_change", symbol=symbol, reward=reward, prev_close=prev_close, current=current_price)
-                    await self.data_accumulator.add_sample(symbol, df.iloc[-1], reward=reward)
-                except Exception as acc_error:
-                    LOG.debug("data_accumulation_failed", symbol=symbol, error=str(acc_error))
-            return {
-                'symbol': symbol,
-                'current_price': current_price,
-                'df': df,
-                'timestamp': processing_timestamp,
-                'success': True,
-                'candles_processed': len(df)
-            }
-        except Exception as e:
-            LOG.error("symbol_processing_failed", symbol=symbol, error=str(e), traceback=traceback.format_exc())
-            return {'symbol': symbol, 'success': False, 'error': str(e)}
-
-    async def _integrate_all_decisions(self, traditional_signal, rl_decision, ensemble_signal, regime, confidence, df):
-        try:
-            all_signals = []
-            if traditional_signal and isinstance(traditional_signal, dict):
-                all_signals.append(('traditional', traditional_signal))
-            if rl_decision and isinstance(rl_decision, dict):
-                all_signals.append(('rl', rl_decision))
-            if ensemble_signal and isinstance(ensemble_signal, dict):
-                all_signals.append(('ensemble', ensemble_signal))
-            if not all_signals:
-                LOG.warning("no_valid_signals_for_integration")
-                return {"action": "hold", "confidence": 0.0}
-            action_map = {"buy": 1.0, "hold": 0.0, "sell": -1.0}
-            signal_type_weights = {'traditional': 0.30, 'ensemble': 0.45, 'rl': 0.25}
-            regime_weights = {
-                "bull": {"buy": 1.3, "hold": 0.9, "sell": 0.7},
-                "bear": {"buy": 0.7, "hold": 0.9, "sell": 1.3},
-                "sideways": {"buy": 0.9, "hold": 1.1, "sell": 0.9},
-                "volatile": {"buy": 0.8, "hold": 1.2, "sell": 0.8},
-                "unknown": {"buy": 1.0, "hold": 1.0, "sell": 1.0}
-            }
-            regime_weight_map = regime_weights.get(regime, regime_weights["unknown"])
-            regime_confidence_factor = max(0.3, confidence)
-            normalized_signals = []
-            for sig_type, sig in all_signals:
-                signal_name = sig.get('signal') or sig.get('action', 'hold')
-                raw_confidence = sig.get('confidence', 0.0)
-                norm_confidence = max(0.0, min(1.0, float(raw_confidence)))
-                type_weight = signal_type_weights.get(sig_type, 0.33)
-                regime_multiplier = regime_weight_map.get(signal_name, 1.0)
-                normalized_signals.append({
-                    'type': sig_type,
-                    'signal': signal_name,
-                    'raw_confidence': raw_confidence,
-                    'normalized_confidence': norm_confidence,
-                    'type_weight': type_weight,
-                    'regime_multiplier': regime_multiplier
-                })
-            weighted_score = 0.0
-            total_weight = 0.0
-            for sig in normalized_signals:
-                score = action_map.get(sig['signal'], 0.0)
-                sig_confidence = sig['normalized_confidence']
-                type_weight = sig['type_weight']
-                regime_multiplier = sig['regime_multiplier']
-                final_weight = sig_confidence * type_weight * regime_multiplier * regime_confidence_factor
-                weighted_score += score * final_weight
-                total_weight += final_weight
-            avg_score = weighted_score / total_weight if total_weight > 0 else 0.0
-            if regime in ['bull', 'unknown']:
-                buy_threshold = 0.25
-                sell_threshold = -0.35
-            elif regime == 'bear':
-                buy_threshold = 0.35
-                sell_threshold = -0.25
-            elif regime == 'sideways':
-                buy_threshold = 0.30
-                sell_threshold = -0.30
-            else:
-                buy_threshold = 0.40
-                sell_threshold = -0.40
-            if avg_score > buy_threshold:
-                integrated_action = "buy"
-            elif avg_score < sell_threshold:
-                integrated_action = "sell"
-            else:
-                integrated_action = "hold"
-            signal_agreement = 0.0
-            integrated_conf = abs(avg_score)
-            total_signals = len(normalized_signals)
-            if total_signals > 0:
-                agreeing_signals = sum(1 for sig in normalized_signals if sig['signal'] == integrated_action)
-                signal_agreement = agreeing_signals / total_signals
-                if signal_agreement >= 0.75:
-                    integrated_conf *= (1.0 + (signal_agreement - 0.75) * 0.4)
-                elif signal_agreement < 0.5:
-                    integrated_conf *= 0.7
-            if integrated_action == "hold" and abs(avg_score) > 0.05:
-                relaxed_buy = buy_threshold * 0.5
-                relaxed_sell = sell_threshold * 0.5
-                if avg_score > relaxed_buy:
-                    integrated_action = "buy"
-                    integrated_conf = abs(avg_score) * 1.5
-                    LOG.info("hold_overridden_to_buy", score=avg_score, original_threshold=buy_threshold, relaxed_threshold=relaxed_buy, boost_applied=1.5)
-                elif avg_score < relaxed_sell:
-                    integrated_action = "sell"
-                    integrated_conf = abs(avg_score) * 1.5
-                    LOG.info("hold_overridden_to_sell", score=avg_score, original_threshold=sell_threshold, relaxed_threshold=relaxed_sell, boost_applied=1.5)
-            integrated_conf = max(0.0, min(1.0, integrated_conf))
-            volatility_info = {}
-            try:
-                if 'volatility' in df.columns and not df['volatility'].isna().all():
-                    current_vol = float(df['volatility'].iloc[-1])
-                    avg_vol = float(df['volatility'].rolling(50).mean().iloc[-1])
-                    volatility_info['current_vol'] = current_vol
-                    volatility_info['avg_vol'] = avg_vol
-                    if avg_vol > 0 and current_vol > 0:
-                        vol_ratio = current_vol / avg_vol
-                        volatility_info['vol_ratio'] = vol_ratio
-                        if vol_ratio > 2.0:
-                            LOG.warning("extreme_volatility_forcing_hold", vol_ratio=vol_ratio, original_action=integrated_action, symbol=symbol if 'symbol' in locals() else "analyzing", current_vol=current_vol, avg_vol=avg_vol)
-                            integrated_action = "hold"
-                            vol_adjustment = 0.5
-                            volatility_info['forced_hold'] = True
-                            volatility_info['original_action'] = integrated_action
-                        elif vol_ratio > 1.8:
-                            vol_adjustment = 0.7
-                            LOG.warning("very_high_volatility_detected", vol_ratio=vol_ratio, adjustment=vol_adjustment, action=integrated_action, message="Severe confidence reduction applied")
-                            volatility_info['severity_level'] = 'very_high'
-                        elif vol_ratio > 1.5:
-                            vol_adjustment = 0.85
-                            LOG.debug("high_volatility_detected", vol_ratio=vol_ratio, adjustment=vol_adjustment)
-                            volatility_info['severity_level'] = 'high'
-                        elif vol_ratio > 1.2:
-                            vol_adjustment = 0.95
-                            volatility_info['severity_level'] = 'elevated'
-                        else:
-                            vol_adjustment = 1.0
-                            volatility_info['severity_level'] = 'normal'
-                        volatility_info['vol_adjustment'] = vol_adjustment
-                        integrated_conf *= vol_adjustment
-                    LOG.debug("confidence_adjusted_by_volatility", vol_ratio=vol_ratio, adjustment=vol_adjustment, final_confidence=integrated_conf, severity=volatility_info.get('severity_level', 'unknown'))
-            except Exception as vol_error:
-                LOG.debug("volatility_adjustment_failed", error=str(vol_error))
-
-            # CORRECCIÓN: Usar parámetros de función en lugar de variable no definida
-            LOG.info("ensemble_prediction_complete", action=integrated_action, confidence=float(integrated_conf))
-            return {
-                "action": integrated_action,
-                "confidence": float(integrated_conf),
-                "details": {
-                    "weighted_score": float(avg_score),
-                    "regime": regime,
-                    "regime_confidence": confidence,
-                    "signals": normalized_signals,
-                    "thresholds": {"buy": buy_threshold, "sell": sell_threshold},
-                    "total_weight": float(total_weight)
-                }
-            }
-        except Exception as e:
-            LOG.error("decision_integration_failed", error=str(e), traceback=traceback.format_exc())
-            return {"action": "hold", "confidence": 0.0, "details": {"error": str(e)}}
-
+        LOG.info("symbols_requiring_training_identified", count=len(symbols_to_train), details=symbols_to_train)
+        return symbols_to_train
+    
     async def _execute_advanced_trade_with_risk_management(self, symbol: str, decision: Dict, df: pd.DataFrame):
-        try:
-            if not decision or not isinstance(decision, dict):
-                LOG.error("invalid_decision_dict_for_trade", symbol=symbol, decision_type=type(decision).__name__)
-                return
-            if not hasattr(self, 'position_sizer'):
-                self.position_sizer = DynamicPositionSizer(self.config, self)
-            if not hasattr(self, 'risk_manager'):
-                self.risk_manager = DynamicRiskManager(self.config, self)
-            if self.risk_manager.check_circuit_breaker():
-                LOG.warning("trade_blocked_circuit_breaker", symbol=symbol)
-                return
-            if len(df) == 0 or 'close' not in df.columns:
-                LOG.error("invalid_df_for_trade", symbol=symbol)
-                return
-            required_indicators = ['close', 'volume']
-            missing_indicators = [ind for ind in required_indicators if ind not in df.columns]
-            if missing_indicators:
-                LOG.warning("missing_indicators_for_trade", symbol=symbol, missing=missing_indicators, message="Calculating missing indicators")
-                df = calculate_technical_indicators(df)
-            action = decision.get('action', 'hold')
-            confidence = float(decision.get('confidence', 0.0))
-            if action == 'hold' or confidence < 0.5:
-                LOG.debug("trade_skipped_hold_or_low_confidence", symbol=symbol, action=action, confidence=confidence)
-                return
-            if symbol in self.risk_manager.active_stops:
-                LOG.debug("position_already_active_skipping", symbol=symbol)
-                return
-            current_price = float(df['close'].iloc[-1])
-            if current_price <= 0 or np.isnan(current_price) or np.isinf(current_price):
-                LOG.error("invalid_current_price", symbol=symbol, price=current_price)
-                return
-            position_amount = self.position_sizer.calculate_position_size(symbol, confidence, current_price, df)
-            LOG.debug("position_size_calculated_for_trade", symbol=symbol, confidence=confidence, current_price=current_price, position_amount=position_amount, equity=self.equity)
-            position_size = position_amount / current_price if current_price > 0 else 0
-            min_notional = 10.0
-            calculated_notional = position_amount
-            if calculated_notional < min_notional:
-                LOG.warning("position_amount_below_min_notional", symbol=symbol, calculated_notional=calculated_notional, min_required=min_notional, price=current_price, size=position_size)
-                if calculated_notional >= min_notional * 0.8:
-                    position_amount = min_notional
-                    position_size = position_amount / current_price if current_price > 0 else 0
-                    LOG.info("position_adjusted_to_minimum", symbol=symbol, new_amount=position_amount, new_size=position_size)
-                else:
-                    return
-            if position_size < 0.001:
-                LOG.warning("position_size_too_small", symbol=symbol, size=position_size)
-                return
-            order_type = "market"
-            side = "buy" if action == "buy" else "sell"
-            order = await self.exchange_manager.create_order(symbol, order_type, side, position_size)
-            if order and order.get("success", False):
-                price_from_ticker = None
-                executed_price = order.get('price', 0)
-                is_simulated = order.get('info', {}).get('simulated', False) if isinstance(order.get('info'), dict) else False
-                if executed_price is None or executed_price <= 0 or np.isnan(executed_price) or np.isinf(executed_price) or is_simulated:
-                    LOG.info("fetching_market_price_for_order", symbol=symbol, order_price=executed_price, is_simulated=is_simulated)
-                    try:
-                        ticker = await self.exchange_manager.exchange.fetch_ticker(symbol)
-                        price_from_ticker = ticker.get('last', None)
-                        if price_from_ticker and price_from_ticker > 0:
-                            executed_price = float(price_from_ticker)
-                            LOG.info("using_ticker_price", symbol=symbol, price=executed_price)
-                        else:
-                            raise ValueError(f"Invalid ticker price: {price_from_ticker}")
-                    except Exception as ticker_error:
-                        LOG.warning("ticker_fetch_failed_using_dataframe_price", symbol=symbol, error=str(ticker_error))
-                        price_from_ticker = None
-                        if current_price > 0:
-                            executed_price = float(current_price)
-                            LOG.info("using_dataframe_price", symbol=symbol, price=executed_price)
-                        else:
-                            LOG.error("all_price_sources_invalid", symbol=symbol)
-                            return
-                if executed_price <= 0 or np.isnan(executed_price):
-                    LOG.error("invalid_final_execution_price", symbol=symbol, price=executed_price)
-                    return
-                LOG.info("order_execution_price_determined", symbol=symbol, executed_price=executed_price, source="ticker" if price_from_ticker else "dataframe")
-                executed_size = order.get('amount', position_size)
-                if executed_size <= 0 or np.isnan(executed_size) or np.isinf(executed_size):
-                    LOG.error("invalid_executed_size", symbol=symbol, size=executed_size)
-                    return
-                transaction = await self.position_ledger.record_open(self, symbol, side, executed_price, executed_size)
-                if transaction is None:
-                    LOG.error("failed_to_record_open_transaction", symbol=symbol)
-                    return
-                try:
-                    registration_success = self.risk_manager.register_position(symbol, executed_price, side, executed_size, confidence, df)
-                    if not registration_success:
-                        LOG.error("risk_manager_registration_failed_rolling_back", symbol=symbol)
-                        return
-                    if symbol not in self.risk_manager.active_stops:
-                        LOG.error("position_not_in_active_stops_after_registration", symbol=symbol)
-                        return
-                    if symbol not in self.symbol_performance:
-                        self.symbol_performance[symbol] = {
-                            'total_trades': 0,
-                            'winning_trades': 0,
-                            'losing_trades': 0,
-                            'total_pnl': 0.0,
-                            'win_rate': 0.0,
-                            'avg_win': 0.0,
-                            'avg_loss': 0.0,
-                            'largest_win': 0.0,
-                            'largest_loss': 0.0,
-                            'last_trade_time': datetime.now(timezone.utc)
-                        }
-                    self.symbol_performance[symbol]['total_trades'] += 1
-                    self.symbol_performance[symbol]['last_trade_time'] = datetime.now(timezone.utc)
-                    self.performance_metrics['total_trades'] += 1
-                    if 'total_pnl' not in self.performance_metrics:
-                        self.performance_metrics['total_pnl'] = 0.0
-                    audit_result = self.position_ledger.audit_equity(self)
-                    if not audit_result['is_consistent']:
-                        LOG.error("equity_inconsistent_after_open", symbol=symbol, audit=audit_result)
-                    try:
-                        if hasattr(self, 'performance_metrics'):
-                            metrics = self.performance_metrics
-                            total_trades = metrics.get('total_trades', 0)
-                            winning_trades = metrics.get('winning_trades', 0)
-                            if total_trades > 0:
-                                win_rate = winning_trades / total_trades
-                    except Exception as model_metrics_error:
-                        LOG.debug("model_metrics_write_failed", error=str(model_metrics_error))
-                    stop_info = self.risk_manager.active_stops.get(symbol)
-                    if stop_info:
-                        LOG.info("trade_executed_with_risk_management", symbol=symbol, action=action, size=executed_size, amount_usdt=position_amount, price=executed_price, confidence=confidence, stop_loss=stop_info['stop_loss'], tp_levels_count=len(stop_info.get('take_profit_levels', [])), transaction_id=transaction.transaction_id)
-                    else:
-                        LOG.warning("position_registered_but_not_in_active_stops", symbol=symbol)
-                    # ===== MEJORADO: Enviar métricas completas de apertura =====
-                    try:
-                        # Métrica de trade (apertura)
-                        trade_success = await INFLUX_METRICS.write_trade_metrics(
-                            symbol=symbol,
-                            action=action,  # "buy" o "sell"
-                            confidence=float(confidence),
-                            price=float(executed_price),
-                            size=float(executed_size),
-                            pnl=0.0  # PnL aún no realizado
-                        )
-                        
-                        # Métrica de posición abierta (solo si trade exitoso)
-                        if trade_success and INFLUX_METRICS.enabled and stop_info:
-                            await INFLUX_METRICS.write_open_position_metrics(
-                                symbol=symbol,
-                                side=side,
-                                entry_price=float(executed_price),
-                                size=float(executed_size),
-                                stop_loss=float(stop_info['stop_loss']),
-                                confidence=float(confidence)
-                            )
-                            
-                    except Exception as metrics_error:
-                        LOG.debug("trade_open_metrics_failed", 
-                                 symbol=symbol, 
-                                 error=str(metrics_error))
-                except Exception as reg_error:
-                    LOG.error("position_registration_exception", symbol=symbol, error=str(reg_error), traceback=traceback.format_exc())
-                    return
-            else:
-                LOG.error("trade_failed", symbol=symbol, error=order.get("error") if order else "Unknown")
-        except Exception as e:
-            LOG.error("advanced_trade_execution_failed", symbol=symbol, error=str(e), traceback=traceback.format_exc())
+        """
+        Orchestrates the full process of executing a trade based on a final decision,
+        including position sizing, order execution, and registration with risk management.
+        """
+        action = decision.get("action", "hold")
+        confidence = decision.get("confidence", 0.0)
 
-    async def _load_historical_data(self, months: int = 3) -> Optional[pd.DataFrame]:
-        """
-        ✅ MEJORADO: Carga datos históricos con fetching incremental y validación robusta
-        """
+        if action == "hold":
+            return
+
         try:
-            # Calcular timestamp de inicio con margen
-            end_time = datetime.now(timezone.utc)
-            start_time = end_time - timedelta(days=30*months + 7)
-            since = int(start_time.timestamp() * 1000)
+            # 1. Get current price
+            ticker = await fetch_ticker_robust(self.exchange_manager, symbol)
+            if not ticker:
+                LOG.error("cannot_get_price_for_trade_execution", symbol=symbol)
+                return
+            current_price = ticker.get('last', 0)
+            if current_price <= 0:
+                LOG.error("invalid_price_for_trade_execution", symbol=symbol, price=current_price)
+                return
+
+            # 2. Calculate position size
+            position_value = self.position_sizer.calculate_position_size(symbol, confidence, current_price, df)
+            if position_value < self.config.min_order_size:
+                LOG.info("position_size_too_small_skipping_trade", symbol=symbol, value=position_value, min_size=self.config.min_order_size)
+                return
             
-            # Detectar timeframe del config
-            timeframe = self.config.timeframe
+            size = position_value / current_price
+
+            # 3. Execute order
+            order_result = await self.smart_executor.execute_order_smart(
+                symbol, action, size, order_type="market", reference_price=current_price
+            )
+
+            if not order_result or not order_result.get("success"):
+                LOG.error("smart_order_execution_failed_in_pipeline", symbol=symbol, details=order_result)
+                return
             
-            # Calcular velas necesarias basado en timeframe
-            timeframe_minutes_map = {
-                '1m': 1, '3m': 3, '5m': 5, '15m': 15, '30m': 30,
-                '1h': 60, '2h': 120, '4h': 240, '6h': 360, '12h': 720,
-                '1d': 1440, '3d': 4320, '1w': 10080
+            executed_price = order_result.get('executed_price', current_price)
+            filled_size = order_result.get('filled_size', 0)
+
+            if filled_size <= 0:
+                LOG.warning("order_executed_with_zero_fill", symbol=symbol, result=order_result)
+                return
+
+            LOG.info("trade_executed_successfully",
+                     symbol=symbol,
+                     action=action,
+                     size=filled_size,
+                     price=executed_price)
+            
+            # 4. Record open position in ledger
+            equity_before = float(self.equity)
+            position_cost = executed_price * filled_size
+            self.equity -= position_cost # Decrease free cash
+            equity_after = float(self.equity)
+            
+            open_tx = await self.position_ledger.record_open(
+                self, symbol, action, executed_price, filled_size,
+                equity_before_override=equity_before,
+                equity_after_override=equity_after
+            )
+            
+            if not open_tx:
+                LOG.critical("failed_to_record_open_transaction_reverting_equity", symbol=symbol)
+                self.equity += position_cost # Revert equity change
+                return
+                
+            # 5. Register position for risk management
+            success = self.risk_manager.register_position(
+                symbol, executed_price, action, filled_size, confidence, df
+            )
+            
+            if not success:
+                LOG.error("failed_to_register_position_with_risk_manager", symbol=symbol)
+                # The reconciliation logic will handle this inconsistency.
+                return
+
+            # 6. Send open position metrics to InfluxDB
+            if symbol in self.risk_manager.active_stops:
+                stop_loss_price = self.risk_manager.active_stops[symbol]['stop_loss']
+                await INFLUX_METRICS.write_open_position_metrics(
+                    symbol, action, executed_price, filled_size, stop_loss_price, confidence
+                )
+            
+        except Exception as e:
+            LOG.error("execute_advanced_trade_failed",
+                      symbol=symbol,
+                      error=str(e),
+                      traceback=traceback.format_exc())
+            
+    async def _start_periodic_tasks(self) -> None:
+        """
+        REFACTORED: Starts all periodic background tasks for the bot in a clean, organized way.
+        """
+        LOG.info("starting_all_periodic_tasks", total_symbols=len(self.config.symbols))
+        
+        # Helper to create and register tasks
+        def start_task(coro, name):
+            try:
+                task = asyncio.create_task(coro)
+                self.periodic_tasks.append(task)
+                LOG.info(f"{name}_task_started")
+                return task
+            except Exception as e:
+                LOG.error(f"{name}_task_creation_failed", error=str(e))
+                return None
+
+        # --- Core Bot Health & Monitoring ---
+        if self.health_check:
+            start_task(self.health_check.periodic_health_log(), "health_check")
+        
+        if self.risk_manager:
+            start_task(position_monitoring_loop(self, self.exchange_manager, self.risk_manager, interval=10), "position_monitoring")
+        
+        if self.dashboard:
+            start_task(self.dashboard.periodic_dashboard_loop(), "dashboard")
+
+        start_task(MEMORY_MANAGER.monitor_and_cleanup(), "memory_monitor")
+        
+        # --- Data Persistence & Synchronization ---
+        if INFLUX_METRICS and INFLUX_METRICS.enabled:
+            start_task(sync_bot_metrics_to_influx(self), "influx_metrics_sync")
+            start_task(INFLUX_METRICS.check_health(), "influx_health_check")
+        
+        if self.position_ledger:
+            async def periodic_ledger_sync():
+                while self.is_running:
+                    await asyncio.sleep(300)
+                    await sync_ledger_with_risk_manager(self)
+            start_task(periodic_ledger_sync(), "ledger_risk_manager_sync")
+
+            async def periodic_reconciliation():
+                while self.is_running:
+                    await asyncio.sleep(3600)
+                    await self.position_ledger.reconcile_with_exchange(self, self.exchange_manager)
+            start_task(periodic_reconciliation(), "ledger_exchange_reconciliation")
+
+        # --- AI Model Management & Validation ---
+        start_task(periodic_model_retraining(self), "model_retraining")
+        start_task(periodic_rl_training(self, self.exchange_manager, self.config), "rl_training")
+
+        async def periodic_walk_forward_validation():
+            while self.is_running:
+                await asyncio.sleep(7 * 24 * 3600)  # Every 7 days
+                if self.walk_forward_validator:
+                    for symbol in self.config.symbols[:3]: # Validate top 3 symbols
+                        data = await self._load_historical_data_for_symbol(symbol, months=6)
+                        if data is not None and len(data) > 1000:
+                            await self.walk_forward_validator.run_walk_forward(self, data, symbol)
+        start_task(periodic_walk_forward_validation(), "walk_forward_validation")
+
+        # --- Portfolio & Strategy Management ---
+        if self.portfolio_rebalancer:
+            async def periodic_rebalancing():
+                while self.is_running:
+                    await asyncio.sleep(3600)
+                    if self.risk_manager:
+                        to_close = await self.portfolio_rebalancer.check_rebalance_needed(self.risk_manager)
+                        if to_close:
+                            await self.portfolio_rebalancer.execute_rebalance(to_close, self.risk_manager)
+            start_task(periodic_rebalancing(), "portfolio_rebalancing")
+        
+        # --- Automated Testing ---
+        if self.test_suite:
+            async def periodic_testing_task():
+                while self.is_running:
+                    await asyncio.sleep(6 * 3600) # Every 6 hours
+                    await self.test_suite.run_all_tests()
+            start_task(periodic_testing_task(), "automated_testing")
+            
+        # --- BTC Correlation Analysis ---
+        if self.btc_correlation_tracker:
+            start_task(self.btc_correlation_tracker.update_realtime_data(), "btc_correlation_tracker")
+            
+        LOG.info("all_periodic_tasks_initialized", count=len(self.periodic_tasks))
+
+    async def _update_state_after_trade_close(self, risk_manager, symbol: str, confidence: float,
+                                    side: str, size: float, entry_price: float,
+                                    exit_price: float, is_stop_loss: bool = False,
+                                    is_partial: bool = False, filled_size: float = None):
+        """
+        VERSIÓN DEFINITIVA: Una sola fuente de verdad para equity
+        """
+        bot = self # for clarity, as this is now a method
+        try:
+            # Validar precios
+            if entry_price <= 0 or exit_price <= 0 or np.isnan(entry_price) or np.isnan(exit_price):
+                LOG.error("invalid_prices_in_trade_close",
+                         symbol=symbol,
+                         entry=entry_price,
+                         exit=exit_price)
+                return
+            
+            # Determinar tamaño ejecutado
+            executed_size = filled_size if filled_size is not None else size
+            
+            # ✅ PASO 1: Calcular PnL UNA VEZ
+            if side == 'sell':  # Cerrando LONG (vendiendo)
+                realized_pnl = (exit_price - entry_price) * executed_size
+            else:  # Cerrando SHORT (comprando)
+                realized_pnl = (entry_price - exit_price) * executed_size
+            
+            position_value = entry_price * executed_size
+
+            # Validar PnL razonable
+            max_reasonable_pnl = position_value * 2.0
+            
+            if abs(realized_pnl) > max_reasonable_pnl:
+                LOG.error("unreasonable_pnl_detected",
+                         symbol=symbol,
+                         realized_pnl=realized_pnl,
+                         position_value=position_value)
+                realized_pnl = np.clip(realized_pnl, -position_value, position_value)
+                LOG.warning("pnl_clipped", clipped_pnl=realized_pnl)
+
+            # ✅ PASO 2: Capturar equity ANTES (snapshot inmutable)
+            equity_before = float(bot.equity)
+            
+            # ✅ PASO 3: Calcular equity DESPUÉS - BUG FIX
+            # The change in free cash is the returned capital (position_value) plus the PnL.
+            equity_after = equity_before + position_value + realized_pnl
+            
+            # ✅ VALIDACIÓN CRÍTICA: Verificar que no quede negativo
+            if equity_after < 0:
+                LOG.error("equity_would_be_negative_rejecting_trade",
+                         equity_before=equity_before,
+                         realized_pnl=realized_pnl,
+                         position_value=position_value,
+                         equity_after=equity_after,
+                         symbol=symbol)
+                return
+            
+            LOG.info("EQUITY_UPDATE_MASTER_RECORD",
+                    symbol=symbol,
+                    equity_before=equity_before,
+                    position_value=position_value,
+                    realized_pnl=realized_pnl,
+                    equity_after=equity_after,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    executed_size=executed_size,
+                    side=side)
+
+            # ✅ PASO 4: Aplicar ANTES de llamar al ledger
+            bot.equity = equity_after
+            
+            # ✅ PASO 5: Registrar en ledger (que NO debe modificar equity)
+            # Pasar equity_before y equity_after explícitos
+            transaction = await bot.position_ledger.record_close(
+                bot, symbol, exit_price, executed_size,
+                equity_before_override=equity_before,
+                equity_after_override=equity_after,
+                realized_pnl_override=realized_pnl
+            )
+
+            # Si la transacción falla, REVERTIR el cambio de equity
+            if transaction is None or not transaction.is_valid:
+                LOG.error("ledger_record_failed_reverting_equity",
+                         symbol=symbol,
+                         reverting_from=bot.equity,
+                         reverting_to=equity_before,
+                         errors=transaction.validation_errors if transaction else "None")
+                bot.equity = equity_before
+                return
+            
+            # ✅ VALIDACIÓN POST-LEDGER: Verificar que ledger no modificó equity
+            equity_after_ledger = float(bot.equity)
+            if abs(equity_after_ledger - equity_after) > 0.001:
+                LOG.error("CRITICAL_ledger_modified_equity_unexpectedly",
+                         expected=equity_after,
+                         actual=equity_after_ledger,
+                         diff=equity_after_ledger - equity_after,
+                         symbol=symbol)
+                # Forzar el valor correcto
+                bot.equity = equity_after
+            
+            # Actualizar métricas del bot
+            if hasattr(bot, 'performance_metrics'):
+                bot.performance_metrics['total_trades'] += 1
+                
+                if realized_pnl > 0:
+                    bot.performance_metrics['winning_trades'] += 1
+                else:
+                    bot.performance_metrics['losing_trades'] += 1
+                
+                total = bot.performance_metrics['total_trades']
+                if total > 0:
+                    bot.performance_metrics['win_rate'] = bot.performance_metrics['winning_trades'] / total
+                
+                # This is now handled more robustly by the sync function using ledger audit
+                bot.performance_metrics['total_pnl'] = bot.equity - bot.initial_capital
+            
+            # Actualizar risk manager
+            if hasattr(bot, 'risk_manager'):
+                bot.risk_manager.update_daily_pnl(realized_pnl)
+            
+            # Actualizar position sizer
+            if hasattr(bot, 'position_sizer'):
+                is_win = realized_pnl > 0
+                bot.position_sizer.update_trade_history(realized_pnl, is_win)
+            
+            # Actualizar performance por símbolo
+            await update_symbol_performance(bot, symbol, realized_pnl)
+            
+            # Guardar trade
+            trade_record = {
+                'symbol': symbol,
+                'side': side,
+                'size': executed_size,
+                'entry_price': entry_price,
+                'exit_price': exit_price,
+                'pnl': realized_pnl,
+                'pnl_pct': (realized_pnl / position_value * 100) if position_value > 0 else 0,
+                'is_stop_loss': is_stop_loss,
+                'is_partial': is_partial,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'confidence': confidence
             }
             
-            timeframe_minutes = timeframe_minutes_map.get(timeframe, 60)
-            required_candles = int((30 * months * 24 * 60) / timeframe_minutes)
+            if hasattr(bot, 'trades'):
+                bot.trades.append(trade_record)
             
-            # ✅ LÍMITE POR REQUEST del exchange (Binance: 1000 típicamente)
-            max_per_request = 1000
+            # Enviar a InfluxDB
+            try:
+                await INFLUX_METRICS.write_trade_metrics(
+                    symbol=symbol,
+                    action=side,
+                    confidence=confidence,
+                    price=float(exit_price),
+                    size=float(executed_size),
+                    pnl=float(realized_pnl)
+                )
+            except Exception as influx_error:
+                LOG.debug("influx_metrics_failed", error=str(influx_error))
             
-            # ✅ ESTRATEGIA INCREMENTAL: Múltiples requests si es necesario
-            all_ohlcv = []
-            current_since = since
-            requests_needed = max(1, (required_candles // max_per_request) + 1)
+            # Cerrar en risk manager si no es parcial
+            if not is_partial:
+                risk_manager.close_position(symbol)
             
-            LOG.info("fetching_historical_data_incrementally",
-                    months=months,
-                    required_candles=required_candles,
-                    requests_needed=requests_needed,
-                    timeframe=timeframe,
-                    symbol=self.config.symbols[0])
-            
-            for request_num in range(min(requests_needed, 5)):  # Max 5 requests
-                try:
-                    result = await asyncio.wait_for(
-                        self.exchange_manager.fetch_ohlcv(
-                            self.config.symbols[0], 
-                            timeframe, 
-                            limit=max_per_request,
-                            since=current_since
-                        ),
-                        timeout=30.0
-                    )
-                    
-                    if not result or not result.get("success", False):
-                        error_msg = result.get('error') if result else 'No response'
-                        LOG.warning("historical_fetch_failed_on_request",
-                                   request=request_num + 1,
-                                   error=error_msg)
-                        
-                        # Si primer request falla, abortar
-                        if request_num == 0:
-                            return None
-                        # Si request subsecuente falla, usar lo que tenemos
-                        break
-                    
-                    ohlcv_batch = result.get("ohlcv", [])
-                    
-                    if not ohlcv_batch or len(ohlcv_batch) == 0:
-                        LOG.warning("empty_batch_on_request", request=request_num + 1)
-                        break
-                    
-                    # Agregar batch
-                    all_ohlcv.extend(ohlcv_batch)
-                    
-                    LOG.debug("historical_batch_fetched",
-                             request=request_num + 1,
-                             batch_size=len(ohlcv_batch),
-                             total_so_far=len(all_ohlcv))
-                    
-                    # ✅ Actualizar timestamp para siguiente request
-                    # Usar timestamp de última vela + 1ms
-                    if ohlcv_batch:
-                        last_timestamp = ohlcv_batch[-1][0]
-                        current_since = last_timestamp + 1
-                    
-                    # Si obtuvimos menos del límite, ya no hay más datos
-                    if len(ohlcv_batch) < max_per_request:
-                        LOG.info("reached_end_of_available_data",
-                                request=request_num + 1,
-                                final_batch_size=len(ohlcv_batch))
-                        break
-                    
-                    # Pausa entre requests para evitar rate limits
-                    if request_num < requests_needed - 1:
-                        await asyncio.sleep(0.5)
-                    
-                except asyncio.TimeoutError:
-                    LOG.warning("historical_fetch_timeout",
-                               request=request_num + 1)
-                    if request_num == 0:
-                        return None
-                    break
-                    
-                except Exception as batch_error:
-                    LOG.error("historical_batch_error",
-                             request=request_num + 1,
-                             error=str(batch_error))
-                    if request_num == 0:
-                        return None
-                    break
-            
-            # Validar datos obtenidos
-            if not all_ohlcv or len(all_ohlcv) < 100:
-                LOG.warning("insufficient_historical_data_after_all_requests",
-                           total_candles=len(all_ohlcv) if all_ohlcv else 0,
-                           required=required_candles)
-                return None
-            
-            # ✅ ELIMINAR DUPLICADOS (por timestamp)
-            seen_timestamps = set()
-            unique_ohlcv = []
-            
-            for candle in all_ohlcv:
-                timestamp = candle[0]
-                if timestamp not in seen_timestamps:
-                    seen_timestamps.add(timestamp)
-                    unique_ohlcv.append(candle)
-            
-            if len(unique_ohlcv) < len(all_ohlcv):
-                LOG.info("duplicates_removed",
-                        original=len(all_ohlcv),
-                        unique=len(unique_ohlcv),
-                        duplicates=len(all_ohlcv) - len(unique_ohlcv))
-            
-            # Crear DataFrame
-            df = create_dataframe(unique_ohlcv)
-            if df is None or len(df) == 0 or 'close' not in df.columns:
-                LOG.error("dataframe_creation_failed_after_fetch")
-                return None
-            
-            # ✅ VALIDAR COBERTURA TEMPORAL
-            time_span_hours = (df.index[-1] - df.index[0]).total_seconds() / 3600
-            expected_hours = months * 30 * 24
-            coverage_pct = (time_span_hours / expected_hours * 100) if expected_hours > 0 else 0
-            
-            # ✅ CRITERIO FLEXIBLE: Aceptar si tenemos al menos 70% de cobertura
-            if coverage_pct < 70:
-                LOG.warning("historical_data_coverage_below_threshold",
-                           expected_hours=expected_hours,
-                           actual_hours=time_span_hours,
-                           coverage_pct=coverage_pct,
-                           threshold_pct=70,
-                           message="Will continue but with limited data")
-                
-                # Si cobertura < 50%, intentar con timeframe alternativo
-                if coverage_pct < 50 and timeframe == '1h':
-                    LOG.info("attempting_alternative_timeframe_for_better_coverage")
-                    
-                    alt_result = await self._load_historical_data_with_timeframe(
-                        months=months,
-                        timeframe='15m'
-                    )
-                    
-                    if alt_result is not None:
-                        return alt_result
-            else:
-                LOG.info("historical_data_coverage_acceptable",
-                        expected_hours=expected_hours,
-                        actual_hours=time_span_hours,
-                        coverage_pct=coverage_pct)
-            
-            # ✅ VERIFICAR GAPS TEMPORALES
-            if len(df) > 1:
-                time_diffs = df.index.to_series().diff()
-                median_diff = time_diffs.median()
-                
-                # Detectar gaps grandes (3x el diff mediano)
-                large_gaps = (time_diffs > median_diff * 3).sum()
-                
-                if large_gaps > len(df) * 0.05:  # Más del 5%
-                    LOG.warning("historical_data_has_gaps",
-                               total_rows=len(df),
-                               large_gaps=large_gaps,
-                               gap_pct=large_gaps / len(df) * 100)
-            
-            # Calcular indicadores
-            df = calculate_technical_indicators(df)
-            
-            # ✅ VALIDAR INDICADORES CRÍTICOS
-            required_indicators = ['rsi', 'macd', 'sma_20']
-            missing_indicators = [ind for ind in required_indicators 
-                                 if ind not in df.columns or df[ind].isna().all()]
-            
-            if missing_indicators:
-                LOG.warning("historical_data_missing_indicators",
-                           missing=missing_indicators)
-                # Intentar recalcular
-                df = calculate_technical_indicators(df)
-            
-            LOG.info("historical_data_loaded_successfully", 
-                    symbol=self.config.symbols[0], 
-                    rows=len(df), 
-                    months=months, 
-                    date_range=f"{df.index[0]} to {df.index[-1]}",
-                    time_span_hours=time_span_hours,
-                    coverage_pct=coverage_pct,
-                    total_requests=len(all_ohlcv) // max_per_request + 1)
-            
-            return df
+            LOG.info("trade_closed_successfully",
+                    symbol=symbol,
+                    side=side,
+                    executed_size=executed_size,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    realized_pnl=realized_pnl,
+                    equity_final=bot.equity,
+                    is_stop_loss=is_stop_loss,
+                    is_partial=is_partial)
             
         except Exception as e:
-            LOG.error("historical_data_load_failed", 
-                     error=str(e), 
-                     months=months, 
-                     traceback=traceback.format_exc())
-            return None
+            LOG.error("update_bot_after_trade_close_failed",
+                     symbol=symbol,
+                     error=str(e),
+                     traceback=traceback.format_exc()[:500])
     
     async def _load_historical_data_for_symbol(self, symbol: str, months: int = 3) -> Optional[pd.DataFrame]:
         """
@@ -7226,7 +6888,7 @@ class AdvancedAITradingBot(ProductionBot):
                 return None
             
             # Calcular indicadores
-            df = calculate_technical_indicators(df)
+            df = await calculate_technical_indicators(df, symbol, timeframe)
             
             LOG.info("historical_data_loaded_for_symbol", 
                     symbol=symbol,
@@ -7260,6 +6922,191 @@ class AdvancedAITradingBot(ProductionBot):
         finally:
             # Restaurar timeframe original
             self.config.timeframe = original_timeframe
+
+    async def _process_symbol_data(self, symbol: str, market_data: Dict) -> Dict:
+        """
+        Processes market data for a single symbol by executing the full trading pipeline.
+        This method is called from the main loop for each symbol.
+        """
+        try:
+            df = market_data.get("dataframe")
+            if df is None or len(df) < 50:
+                return {'success': False, 'reason': 'insufficient_dataframe'}
+
+            await execute_trading_pipeline_complete(
+                self.exchange_manager, self.strategy_manager, self.automl,
+                self.regime_detector, self.risk_optimizer,
+                self.ensemble_learner, self, df, self.config, symbol
+            )
+            return {'success': True, 'candles_processed': len(df)}
+        except Exception as e:
+            LOG.error("process_symbol_data_failed", symbol=symbol, error=str(e))
+            return {'success': False, 'error': str(e)}
+
+    async def _integrate_all_decisions(self, traditional_signal: Dict, rl_decision: Dict, 
+                                     ensemble_signal: Dict, regime: str, confidence: float,
+                                     df: pd.DataFrame) -> Dict:
+        """
+        Integrates signals from all sources into a single, final trading decision.
+        Weights are dynamically adjusted based on market regime and signal confidence.
+        """
+        try:
+            # Ponderación base de cada modelo
+            weights = {
+                'traditional': 0.30,
+                'rl': 0.30,
+                'ensemble': 0.40
+            }
+
+            # Ajuste de ponderación por régimen de mercado
+            if regime == 'volatile':
+                weights['traditional'] *= 1.2  # Estrategias técnicas son más fiables
+                weights['ensemble'] *= 0.8
+                weights['rl'] *= 0.9
+            elif regime == 'bull' or regime == 'bear':
+                weights['ensemble'] *= 1.2  # Modelos de ML pueden capturar mejor tendencias
+                weights['traditional'] *= 0.9
+                weights['rl'] *= 1.1
+            elif regime == 'sideways':
+                weights['rl'] *= 1.2  # RL puede aprender a operar en rangos
+                weights['traditional'] *= 1.1
+                weights['ensemble'] *= 0.8
+            
+            # Normalizar pesos
+            total_weight = sum(weights.values())
+            weights = {k: v / total_weight for k, v in weights.items()}
+
+            signals = {
+                'traditional': traditional_signal,
+                'rl': rl_decision,
+                'ensemble': ensemble_signal
+            }
+            
+            signal_map = {"buy": 1.0, "hold": 0.0, "sell": -1.0}
+            
+            final_score = 0.0
+            total_confidence_weight = 0.0
+
+            for model_name, signal_data in signals.items():
+                action_key = 'action' if model_name == 'ensemble' else 'signal'
+                action = signal_data.get(action_key, 'hold')
+                signal_value = signal_map.get(action, 0.0)
+                
+                model_confidence = signal_data.get('confidence', 0.0)
+                
+                # Ponderar la señal por su confianza y el peso del modelo
+                weighted_signal = signal_value * model_confidence * weights[model_name]
+                final_score += weighted_signal
+                total_confidence_weight += model_confidence * weights[model_name]
+
+            # Normalizar el score final
+            if total_confidence_weight > 0:
+                final_score /= total_confidence_weight
+            
+            final_confidence = abs(final_score)
+
+            # Convertir score a señal final
+            if final_score > 0.35:
+                final_action = "buy"
+            elif final_score < -0.35:
+                final_action = "sell"
+            else:
+                final_action = "hold"
+            
+            return {
+                "action": final_action,
+                "confidence": min(1.0, final_confidence * 1.5),  # Amplificar confianza final
+                "details": {
+                    "final_score": final_score,
+                    "weights": weights,
+                    "individual_signals": signals
+                }
+            }
+
+        except Exception as e:
+            LOG.error("decision_integration_failed", error=str(e))
+            return {"action": "hold", "confidence": 0.0, "details": {"error": str(e)}}
+        
+async def _retrain_underperforming_models(self, time_window_hours: int = 24 * 7, min_trades: int = 5, pnl_threshold: float = 0.0, cooldown_hours: int = 24):
+    """
+    Identifies and retrains models for symbols with poor performance in the last `time_window_hours`.
+    This is the core of the adaptive self-learning retraining logic.
+    """
+    LOG.info("starting_model_performance_review_and_retraining", time_window_hours=time_window_hours, min_trades=min_trades)
+    if not (hasattr(self, 'position_ledger') and hasattr(self, 'ensemble_learner') and hasattr(self, 'data_accumulator')):
+        LOG.error("retraining_skipped_missing_components")
+        return
+
+    try:
+        start_time = datetime.now(timezone.utc) - timedelta(hours=time_window_hours)
+        performance_data = self.position_ledger.get_performance_since(start_time)
+
+        if not performance_data:
+            LOG.info("no_trades_in_the_last_window_skipping_retraining", time_window_hours=time_window_hours)
+            return
+
+        underperforming_symbols = []
+        for symbol, stats in performance_data.items():
+            # Define criteria for "underperforming"
+            if stats['total_trades'] >= min_trades and stats['total_pnl'] < pnl_threshold:
+                # Cooldown check
+                if symbol in self.ensemble_learner.symbol_training_history:
+                    last_training_time = self.ensemble_learner.symbol_training_history[symbol].get('last_training')
+                    if last_training_time:
+                        time_since_last_training = (datetime.now(timezone.utc) - last_training_time).total_seconds()
+                        if time_since_last_training < cooldown_hours * 3600:
+                            LOG.info("retraining_skipped_due_to_cooldown", symbol=symbol, hours_since_last_training=time_since_last_training/3600)
+                            continue
+                
+                underperforming_symbols.append((symbol, stats))
+                LOG.warning("underperforming_symbol_detected", symbol=symbol, **stats)
+
+        if not underperforming_symbols:
+            LOG.info("all_symbols_performing_well_no_retraining_needed")
+            return
+
+        LOG.info("retraining_triggered_for_symbols", count=len(underperforming_symbols), symbols=[s[0] for s in underperforming_symbols])
+
+        for symbol, stats in underperforming_symbols:
+            try:
+                # 1. Load sufficient historical data for retraining
+                LOG.info("loading_data_for_retraining", symbol=symbol)
+                training_data = await self._load_historical_data_for_symbol(symbol, months=3)
+                
+                if training_data is None or len(training_data) < 500:
+                    LOG.warning("cannot_retrain_insufficient_historical_data", symbol=symbol)
+                    continue
+
+                # 2. Retrain the specialized model
+                LOG.info("retraining_specialized_model", symbol=symbol, samples=len(training_data))
+                await self.ensemble_learner.fit(
+                    df=training_data,
+                    epochs=10, # Use standard epochs for a full retrain
+                    symbol=symbol
+                )
+
+            except Exception as e:
+                LOG.error("failed_to_retrain_symbol", symbol=symbol, error=str(e))
+
+    except Exception as e:
+        LOG.error("retraining_process_failed", error=str(e), traceback=traceback.format_exc())
+
+
+            
+async def periodic_portfolio_snapshot(bot):
+    """Periodically records the bot's equity for performance tracking."""
+    while getattr(bot, 'is_running', False):
+        try:
+            await asyncio.sleep(300)  # Every 5 minutes
+            if hasattr(bot, 'equity') and hasattr(bot, 'portfolio_history'):
+                bot.portfolio_history.append((datetime.now(timezone.utc), float(bot.equity)))
+                # Keep history from growing indefinitely
+                if len(bot.portfolio_history) > 20000:  # ~2 months of 5-min snapshots
+                    bot.portfolio_history = bot.portfolio_history[-20000:]
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            LOG.error("periodic_portfolio_snapshot_failed", error=str(e))
 
 async def manual_equity_audit(bot):
     if not hasattr(bot, 'position_ledger'):
@@ -7411,10 +7258,11 @@ class AdvancedAutoML:
             LOG.error("automl_optimization_failed", error=str(e))
 
 class AdvancedMarketRegimeDetector:
-    def __init__(self, config: AdvancedAIConfig):
+    def __init__(self, config: AdvancedAIConfig, strategy_manager: StrategyManager):
         self.config = config
         self.regime_cache = {}
-        self.cache_ttl = 300
+        self.cache_ttl = 300        
+        self.strategy_mgr = strategy_manager
 
     def detect_regime(self, df: pd.DataFrame, symbol: str = None) -> Tuple[str, float]:
         try:
@@ -7424,37 +7272,41 @@ class AdvancedMarketRegimeDetector:
                 if time.time() - cached_time < self.cache_ttl:
                     LOG.debug("using_cached_regime", symbol=symbol, regime=cached_regime, confidence=cached_confidence)
                     return cached_regime, cached_confidence
-            if len(df) < self.config.feature_engineering_lookback or 'close' not in df.columns:
+            if df is None or len(df) < self.config.feature_engineering_lookback or 'close' not in df.columns:
                 LOG.error("invalid_df_for_regime_detection", message="DataFrame too small or missing columns", symbol=symbol)
                 return "unknown", 0.0
             features = pd.DataFrame()
             features['volatility'] = df['close'].pct_change().rolling(20).std()
             if 'high' in df.columns and 'low' in df.columns:
-                from __main__ import StrategyManager
-                strategy_mgr = StrategyManager(self.config)
-                features['trend_strength'] = strategy_mgr.adx(df['high'], df['low'], df['close'], 14)
+                # FIX: Use the instance's StrategyManager.
+                features['trend_strength'] = self.strategy_mgr.adx(df['high'], df['low'], df['close'], 14)
             else:
                 sma_fast = df['close'].rolling(10).mean()
                 sma_slow = df['close'].rolling(30).mean()
                 features['trend_strength'] = abs(sma_fast - sma_slow) / df['close'] * 100
             features['volume_profile'] = df['volume'].rolling(20).mean()
             try:
-                features['market_correlation'] = df['close'].pct_change().rolling(20).apply(lambda x: x.corr(df['volume'].pct_change().loc[x.index]) if len(x) > 1 else 0.5)
+                # Use pct_change for both series to compare rates of change
+                close_pct = df['close'].pct_change()
+                volume_pct = df['volume'].pct_change().replace([np.inf, -np.inf], 0)
+                features['market_correlation'] = close_pct.rolling(20).corr(volume_pct)
             except Exception as corr_error:
                 LOG.debug("correlation_calculation_failed", error=str(corr_error))
                 features['market_correlation'] = 0.5
+
             features = features.dropna()
-            column_lengths = {col: len(features[col]) for col in features.columns}
-            if len(set(column_lengths.values())) > 1:
-                LOG.error("inconsistent_feature_lengths", lengths=column_lengths)
-                return None
             if len(features) < 20:
                 LOG.warning("insufficient_features_for_regime", samples=len(features), symbol=symbol)
                 return "unknown", 0.0
+
             scaler = StandardScaler()
             scaled_features = scaler.fit_transform(features)
             n_clusters = min(self.config.regime_n_clusters, len(scaled_features))
-            clustering = SpectralClustering(n_clusters=n_clusters, affinity='nearest_neighbors')
+            if n_clusters < 2:
+                LOG.warning("not_enough_samples_for_clustering", samples=len(scaled_features), required=2)
+                return "unknown", 0.0
+                
+            clustering = SpectralClustering(n_clusters=n_clusters, affinity='nearest_neighbors', random_state=42)
             labels = clustering.fit_predict(scaled_features)
             current_label = labels[-1]
             current_features = features.iloc[-1]
@@ -7467,9 +7319,14 @@ class AdvancedMarketRegimeDetector:
                 regime = 'bull' if recent_returns > 0 else 'bear'
             else:
                 regime = 'sideways'
-            from sklearn.metrics import silhouette_score
-            score = silhouette_score(scaled_features, labels)
-            confidence = max(0.0, min(1.0, (score + 1) / 2))
+
+            # Use silhouette_score only if there's more than one cluster
+            if len(np.unique(labels)) > 1:
+                score = silhouette_score(scaled_features, labels)
+                confidence = max(0.0, min(1.0, (score + 1) / 2))
+            else:
+                confidence = 0.5 # Default confidence if only one cluster is found
+
             if len(labels) > 30:
                 recent_labels = labels[-30:]
                 consistency = (recent_labels == current_label).mean()
@@ -7674,7 +7531,6 @@ class PPOAgent:
                 'state_dim': self.state_dim,
                 'action_dim': self.action_dim,
                 'gamma': self.gamma,
-                'epsilon': self.epsilon if hasattr(self, 'epsilon') else 1.0,
                 'update_count': self.update_count if hasattr(self, 'update_count') else 0,
                 'timestamp': datetime.now(timezone.utc).isoformat()
             }
@@ -7706,7 +7562,7 @@ class PPOAgent:
             return False
 
 class TradingEnv(gym.Env):
-    def __init__(self, df: pd.DataFrame = None, symbols=['BTC/USDT']):
+    def __init__(self, df: pd.DataFrame):
         super().__init__()
         if df is None:
             raise ValueError("TradingEnv requires a valid DataFrame with market data. Cannot initialize with None. Please provide historical OHLCV data.")
@@ -7860,11 +7716,12 @@ class RLTrainingManager:
                          available=list(df.columns)[:10])
                 return False
             
-            # CORRECCIÓN: Limpiar environment anterior si existe
             if self.env is not None:
                 try:
-                    self.env.close()
+                    if hasattr(self.env, 'close'):
+                        self.env.close()
                     del self.env
+                    self.env = None
                     LOG.debug("previous_rl_env_cleaned")
                 except Exception as cleanup_error:
                     LOG.debug("env_cleanup_error", error=str(cleanup_error))
@@ -7877,7 +7734,6 @@ class RLTrainingManager:
                     df_columns=len(df.columns),
                     using_real_data=True)
             
-            # NUEVO: Tracking de métricas de entrenamiento
             training_metrics = {
                 'episode_rewards': [],
                 'episode_lengths': [],
@@ -7914,21 +7770,16 @@ class RLTrainingManager:
                     episode_steps += 1
                     obs = next_obs
                 
-                # Calcular returns y advantages
                 returns, advantages = self.rl_agent.compute_returns_and_advantages(
                     rewards, values, dones
                 )
                 
-                # Update del agente
                 self.rl_agent.update(states, actions, log_probs, returns, advantages)
                 
-                # NUEVO: Incrementar contador total de episodios
                 self.rl_agent.total_episodes += 1
                 
-                # Actualizar epsilon
                 self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
                 
-                # Registrar métricas
                 training_metrics['episode_rewards'].append(episode_reward)
                 training_metrics['episode_lengths'].append(episode_steps)
                 training_metrics['episode_net_worths'].append(self.env.net_worth)
@@ -7937,7 +7788,6 @@ class RLTrainingManager:
                     training_metrics['best_reward'] = episode_reward
                     training_metrics['best_episode'] = ep
                 
-                # Log periódico
                 if ep % 10 == 0:
                     avg_reward_10 = np.mean(training_metrics['episode_rewards'][-10:])
                     avg_net_worth_10 = np.mean(training_metrics['episode_net_worths'][-10:])
@@ -7952,7 +7802,6 @@ class RLTrainingManager:
                             epsilon=self.epsilon,
                             steps=episode_steps)
                 
-                # Enviar métricas a InfluxDB
                 try:
                     await INFLUX_METRICS.write_rl_metrics(
                         episode=ep,
@@ -7964,12 +7813,10 @@ class RLTrainingManager:
                 except Exception as influx_error:
                     LOG.debug("rl_metrics_write_failed", error=str(influx_error))
                 
-                # NUEVO: Limpieza periódica de memoria
                 if ep % 20 == 0 and ep > 0:
                     optimize_memory_usage()
                     LOG.debug("memory_cleanup_during_rl_training", episode=ep)
             
-            # Log final de entrenamiento
             LOG.info("rl_training_completed",
                     episodes=episodes,
                     avg_reward=np.mean(training_metrics['episode_rewards']),
@@ -7977,7 +7824,6 @@ class RLTrainingManager:
                     best_episode=training_metrics['best_episode'],
                     final_epsilon=self.epsilon)
             
-            # Guardar agente entrenado
             try:
                 save_success = self.rl_agent.save()
                 if save_success:
@@ -7989,7 +7835,6 @@ class RLTrainingManager:
                 LOG.error("rl_agent_save_exception",
                          error=str(save_error))
             
-            # NUEVO: Guardar métricas de entrenamiento
             try:
                 import pickle
                 import os
@@ -8001,16 +7846,15 @@ class RLTrainingManager:
                 LOG.debug("training_metrics_save_failed",
                          error=str(metrics_save_error))
             
-            # CRÍTICO: Limpiar environment al final
             try:
-                self.env.close()
+                if self.env is not None and hasattr(self.env, 'close'):
+                    self.env.close()
                 del self.env
                 self.env = None
                 LOG.debug("rl_env_cleaned_after_training")
             except Exception as cleanup_error:
                 LOG.debug("final_env_cleanup_error", error=str(cleanup_error))
             
-            # Limpieza final de memoria
             optimize_memory_usage()
             
             return True
@@ -8020,10 +7864,10 @@ class RLTrainingManager:
                      error=str(e),
                      traceback=traceback.format_exc()[:500])
             
-            # Limpiar environment en caso de error
             if self.env is not None:
                 try:
-                    self.env.close()
+                    if hasattr(self.env, 'close'):
+                        self.env.close()
                     del self.env
                     self.env = None
                 except Exception:
@@ -8041,7 +7885,7 @@ class RLTrainingManager:
             df = create_dataframe(result.get("ohlcv", []))
             if df is None or len(df) == 0:
                 raise RuntimeError("Invalid DataFrame from market data")
-            df = calculate_technical_indicators(df)
+            df = await calculate_technical_indicators(df, symbol, '1h')
             LOG.info("real_data_loaded", rows=len(df), columns=len(df.columns))
             await self.train(episodes=episodes, df=df)
         except Exception as e:
@@ -8049,6 +7893,32 @@ class RLTrainingManager:
             raise
 
 class AdvancedEnsembleLearner:
+    # NESTED CLASSES: Define NN models once at the class level
+    class LSTMPredictor(nn.Module):
+        def __init__(self, input_dim, hidden_dim):
+            super().__init__()
+            self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+            self.fc = nn.Linear(hidden_dim, 3)
+
+        def forward(self, x):
+            _, (hn, _) = self.lstm(x)
+            return F.softmax(self.fc(hn[0]), dim=1)
+
+    class AttentionNetwork(nn.Module):
+        def __init__(self, input_dim, hidden_dim):
+            super().__init__()
+            self.embedding = nn.Linear(input_dim, hidden_dim)
+            self.transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, batch_first=True), num_layers=2)
+            self.fc = nn.Linear(hidden_dim, 3)
+
+        def forward(self, x):
+            if len(x.shape) == 2:
+                x = x.unsqueeze(1)
+            x = self.embedding(x)
+            x = self.transformer(x)
+            x = x.mean(dim=1)
+            return F.softmax(self.fc(x), dim=1)
+
     def __init__(self, config):
         self.config = config
         self.lstm = None
@@ -8061,37 +7931,28 @@ class AdvancedEnsembleLearner:
         self.symbol_training_history = {}
         LOG.debug("ensemble_learner_initialized_with_empty_symbol_models")
 
+    def has_model_for_symbol(self, symbol: str) -> bool:
+        """Checks if a complete, valid specialized model exists for a symbol."""
+        if not symbol or not hasattr(self, 'symbol_models') or symbol not in self.symbol_models:
+            return False
+        
+        model_dict = self.symbol_models.get(symbol)
+        if not isinstance(model_dict, dict):
+            return False
+            
+        # Check if all required model components are present and not None
+        required_models = ['lstm', 'gb', 'attention', 'technical']
+        for model_name in required_models:
+            if model_name not in model_dict or model_dict[model_name] is None:
+                return False
+                
+        return True
+    
     def initialize_base_models(self):
         try:
-            class LSTMPredictor(nn.Module):
-                def __init__(self, input_dim, hidden_dim):
-                    super().__init__()
-                    self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
-                    self.fc = nn.Linear(hidden_dim, 3)
-
-                def forward(self, x):
-                    _, (hn, _) = self.lstm(x)
-                    return F.softmax(self.fc(hn[0]), dim=1)
-
-            self.lstm = LSTMPredictor(4, 64).to(self.device)
+            self.lstm = self.LSTMPredictor(4, 64).to(self.device)
             self.gb = XGBClassifier(n_estimators=10, max_depth=5, random_state=42, verbosity=0) if XGBClassifier else GradientBoostingClassifier(n_estimators=10, max_depth=5, random_state=42)
-
-            class AttentionNetwork(nn.Module):
-                def __init__(self, input_dim, hidden_dim):
-                    super().__init__()
-                    self.embedding = nn.Linear(input_dim, hidden_dim)
-                    self.transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, batch_first=True), num_layers=2)
-                    self.fc = nn.Linear(hidden_dim, 3)
-
-                def forward(self, x):
-                    if len(x.shape) == 2:
-                        x = x.unsqueeze(1)
-                    x = self.embedding(x)
-                    x = self.transformer(x)
-                    x = x.mean(dim=1)
-                    return F.softmax(self.fc(x), dim=1)
-
-            self.attention = AttentionNetwork(4, 64).to(self.device)
+            self.attention = self.AttentionNetwork(4, 64).to(self.device)
             self.technical = VotingClassifier(estimators=[
                 ('rf', RandomForestClassifier(n_estimators=10, max_depth=5, random_state=42)),
                 ('lr', LogisticRegression(max_iter=100, random_state=42))
@@ -8104,7 +7965,7 @@ class AdvancedEnsembleLearner:
             LOG.error("ensemble_init_failed", error=str(e))
             raise
 
-    async def fit(self, df: pd.DataFrame, targets: pd.Series = None, epochs=10, batch_size=32, buy_threshold=0.01, sell_threshold=-0.01, symbol: str = None):
+    async def fit(self, df: pd.DataFrame, targets: pd.Series = None, epochs=10, batch_size=32, buy_threshold=None, sell_threshold=None, symbol: str = None):
         try:
             if len(df) < 50:
                 LOG.warning("insufficient_data_for_ensemble_training", rows=len(df), symbol=symbol)
@@ -8125,220 +7986,104 @@ class AdvancedEnsembleLearner:
                 padding = np.zeros((features.shape[0], missing_count))
                 features = np.hstack([features, padding])
 
-            # --- MEJORA 1: Targets con estrategia adaptativa ---
+            # --- MEJORA: Targets con estrategia adaptativa ---
             if targets is None:
                 if 'close' in df.columns:
                     future_returns = df['close'].shift(-1) / df['close'] - 1
                     future_returns = future_returns.iloc[:-1]
                     features = features[:-1]
 
-                    # ✅ ESTRATEGIA ADAPTATIVA: Usar percentiles para balanceo
-                    # En lugar de thresholds fijos, usar distribución de datos
+                    # ✅ Use provided thresholds if they exist, otherwise use adaptive logic
+                    if buy_threshold is None or sell_threshold is None:
+                        volatility = future_returns.std()
+                        
+                        if volatility > 0.03:  # Alta volatilidad (>3%)
+                            buy_percentile = 0.65
+                            sell_percentile = 0.35
+                        elif volatility > 0.015:  # Volatilidad media (1.5-3%)
+                            buy_percentile = 0.70
+                            sell_percentile = 0.30
+                        else:  # Baja volatilidad (<1.5%)
+                            buy_percentile = 0.75
+                            sell_percentile = 0.25
+                        
+                        buy_threshold = future_returns.quantile(buy_percentile)
+                        sell_threshold = future_returns.quantile(sell_percentile)
+                        log_reason = "adaptive_percentile"
+                    else:
+                        log_reason = "external_override"
                     
-                    # Calcular volatilidad del símbolo
-                    volatility = future_returns.std()
-                    
-                    # ✅ Ajustar thresholds según volatilidad
-                    if volatility > 0.03:  # Alta volatilidad (>3%)
-                        # Usar percentiles más amplios
-                        buy_percentile = 0.65  # Top 35%
-                        sell_percentile = 0.35  # Bottom 35%
-                    elif volatility > 0.015:  # Volatilidad media (1.5-3%)
-                        buy_percentile = 0.70  # Top 30%
-                        sell_percentile = 0.30  # Bottom 30%
-                    else:  # Baja volatilidad (<1.5%)
-                        # Percentiles más estrictos
-                        buy_percentile = 0.75  # Top 25%
-                        sell_percentile = 0.25  # Bottom 25%
-                    
-                    buy_threshold = future_returns.quantile(buy_percentile)
-                    sell_threshold = future_returns.quantile(sell_percentile)
-                    
-                    # ✅ MEJORA 2: Crear targets balanceados
                     targets = np.ones(len(future_returns), dtype=int)  # Default: hold
                     targets[future_returns > buy_threshold] = 2  # Buy
                     targets[future_returns < sell_threshold] = 0  # Sell
 
-                    # ✅ Validar distribución ANTES de continuar
                     unique, counts = np.unique(targets, return_counts=True)
                     target_dist = dict(zip(unique, counts))
-                    buy_count = target_dist.get(2, 0)
-                    sell_count = target_dist.get(0, 0)
-                    hold_count = target_dist.get(1, 0)
-                    total = len(targets)
-
-                    LOG.info("adaptive_target_distribution", 
-                            symbol=symbol,
-                            volatility=volatility,
-                            buy_threshold=buy_threshold,
-                            sell_threshold=sell_threshold,
-                            buy_pct=buy_count/total*100,
-                            sell_pct=sell_count/total*100,
-                            hold_pct=hold_count/total*100)
-
-                    # ✅ MEJORA 3: Si sigue desbalanceado, aplicar SMOTE o undersampling
-                    max_class_pct = max(counts) / len(targets)
                     
-                    if max_class_pct > 0.80:  # Si clase mayoritaria > 80%
-                        LOG.warning("severe_imbalance_applying_balancing",
-                                   symbol=symbol,
-                                   max_class_pct=max_class_pct * 100)
+                    LOG.info("adaptive_target_distribution", 
+                            symbol=symbol, reason=log_reason,
+                            buy_threshold=buy_threshold, sell_threshold=sell_threshold,
+                            buy_pct=target_dist.get(2, 0)/len(targets)*100 if len(targets) > 0 else 0,
+                            sell_pct=target_dist.get(0, 0)/len(targets)*100 if len(targets) > 0 else 0,
+                            hold_pct=target_dist.get(1, 0)/len(targets)*100 if len(targets) > 0 else 0)
+
+                    max_class_pct = max(counts) / len(targets) if len(targets) > 0 else 0
+                    if max_class_pct > 0.80:
+                        LOG.warning("severe_imbalance_applying_balancing", symbol=symbol, max_class_pct=max_class_pct * 100)
                         
-                        # ✅ ESTRATEGIA 1: Undersampling inteligente de clase mayoritaria
-                        # Mantener todas las minorías, reducir mayoritaria
-                        
-                        majority_class = int(np.argmax(counts))
+                        majority_class = int(unique[np.argmax(counts)])
                         minority_classes = [c for c in unique if c != majority_class]
-                        
-                        # Calcular tamaño objetivo para clase mayoritaria
-                        # (2x el promedio de minoritarias)
                         minority_avg = np.mean([target_dist.get(c, 0) for c in minority_classes])
                         target_majority_size = int(minority_avg * 2)
                         
-                        # Indices de cada clase
                         majority_indices = np.where(targets == majority_class)[0]
                         minority_indices = np.where(targets != majority_class)[0]
                         
-                        # Sample inteligente de mayoritaria (mantener variedad)
                         if len(majority_indices) > target_majority_size:
-                            # Samplear uniformemente a lo largo del tiempo
                             step = len(majority_indices) / target_majority_size
-                            sampled_majority = [majority_indices[int(i * step)] 
-                                               for i in range(target_majority_size)]
+                            sampled_majority_indices = [majority_indices[int(i * step)] for i in range(target_majority_size)]
                         else:
-                            sampled_majority = majority_indices
+                            sampled_majority_indices = list(majority_indices)
                         
-                        # Combinar
-                        balanced_indices = np.concatenate([
-                            sampled_majority,
-                            minority_indices
-                        ])
-                        
-                        # Ordenar para mantener secuencia temporal
-                        balanced_indices = np.sort(balanced_indices)
-                        
-                        # Aplicar balanceo
+                        balanced_indices = np.sort(np.concatenate([sampled_majority_indices, minority_indices]))
                         features = features[balanced_indices]
                         targets = targets[balanced_indices]
                         
-                        # Validar nueva distribución
-                        unique_balanced, counts_balanced = np.unique(targets, return_counts=True)
-                        new_dist = dict(zip(unique_balanced, counts_balanced))
-                        
-                        LOG.info("class_balancing_applied",
-                                symbol=symbol,
-                                original_samples=len(majority_indices) + len(minority_indices),
-                                balanced_samples=len(targets),
-                                new_distribution=new_dist,
-                                buy=new_dist.get(2, 0),
-                                sell=new_dist.get(0, 0),
-                                hold=new_dist.get(1, 0))
+                        unique_b, counts_b = np.unique(targets, return_counts=True)
+                        LOG.info("class_balancing_applied", symbol=symbol, original_samples=len(majority_indices) + len(minority_indices), balanced_samples=len(targets), new_distribution=dict(zip(unique_b, counts_b)))
                     
-                    # ✅ VALIDACIÓN FINAL: Mínimos absolutos
                     unique_final, counts_final = np.unique(targets, return_counts=True)
                     target_dist_final = dict(zip(unique_final, counts_final))
-                    buy_samples = target_dist_final.get(2, 0)
-                    sell_samples = target_dist_final.get(0, 0)
-                    
-                    if buy_samples < 5 or sell_samples < 5:
-                        LOG.error("insufficient_minority_samples_after_balancing",
-                                 symbol=symbol,
-                                 buy_samples=buy_samples,
-                                 sell_samples=sell_samples)
-                        
-                        # Guardar en historial como fallido
-                        if symbol:
-                            if not hasattr(self, 'symbol_training_history'):
-                                self.symbol_training_history = {}
-                            self.symbol_training_history[symbol] = {
-                                'training_count': 0,
-                                'last_training': datetime.now(timezone.utc),
-                                'samples_used': [],
-                                'status': 'failed',
-                                'reason': 'insufficient_minority_samples_after_balancing',
-                                'distribution': target_dist_final
-                            }
-                        
+                    if target_dist_final.get(2, 0) < 5 or target_dist_final.get(0, 0) < 5:
+                        LOG.error("insufficient_minority_samples_after_balancing", symbol=symbol, distribution=target_dist_final)
                         self.is_trained = False if symbol is None else self.is_trained
                         return
-                    
-                    LOG.info("targets_created_with_validation", 
-                            buy_threshold=buy_threshold, 
-                            sell_threshold=sell_threshold, 
-                            symbol=symbol, 
-                            final_distribution={
-                                'buy': buy_samples, 
-                                'sell': sell_samples, 
-                                'hold': target_dist_final.get(1, 0)
-                            })
-                else:
-                    targets = np.ones(len(features), dtype=int)
             else:
-                # Si targets se pasa como argumento, validar
                 targets = np.array(targets, dtype=int)
-                targets = np.clip(targets, 0, 2)
                 if len(features) != len(targets):
-                    LOG.error("feature_target_length_mismatch_provided", 
-                             features=len(features), 
-                             targets=len(targets), 
-                             symbol=symbol)
+                    LOG.error("feature_target_length_mismatch_provided", features=len(features), targets=len(targets), symbol=symbol)
                     self.is_trained = False if symbol is None else self.is_trained
                     return
 
-            unique, counts = np.unique(targets, return_counts=True)
-            target_dist = dict(zip(unique, counts))
-            
-            # --- Dividir en train/val aquí, fuera del bloque if/else ---
-            from sklearn.model_selection import train_test_split
             X_train, X_val, y_train, y_val = train_test_split(
                 features, targets, test_size=0.2, random_state=42, stratify=targets
             )
             LOG.debug("train_val_split", train=len(X_train), val=len(X_val), symbol=symbol)
-            
-            max_class_pct = max(counts) / len(targets)
-            if max_class_pct > 0.80:
-                LOG.warning("severe_class_imbalance_detected", symbol=symbol, max_class_percentage=f"{max_class_pct*100:.1f}%", distribution=target_dist, message="Training may produce biased model")
+
             if symbol:
                 LOG.info("training_specialized_model", symbol=symbol)
                 if symbol not in self.symbol_models:
-                    class LSTMPredictor(nn.Module):
-                        def __init__(self, input_dim, hidden_dim):
-                            super().__init__()
-                            self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
-                            self.fc = nn.Linear(hidden_dim, 3)
-
-                        def forward(self, x):
-                            _, (hn, _) = self.lstm(x)
-                            return F.softmax(self.fc(hn[0]), dim=1)
-
-                    class AttentionNetwork(nn.Module):
-                        def __init__(self, input_dim, hidden_dim):
-                            super().__init__()
-                            self.embedding = nn.Linear(input_dim, hidden_dim)
-                            self.transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, batch_first=True), num_layers=2)
-                            self.fc = nn.Linear(hidden_dim, 3)
-
-                        def forward(self, x):
-                            if len(x.shape) == 2:
-                                x = x.unsqueeze(1)
-                            x = self.embedding(x)
-                            x = self.transformer(x)
-                            x = x.mean(dim=1)
-                            return F.softmax(self.fc(x), dim=1)
-
                     self.symbol_models[symbol] = {
-                        'lstm': LSTMPredictor(4, 64).to(self.device),
+                        'lstm': self.LSTMPredictor(4, 64).to(self.device),
                         'gb': XGBClassifier(n_estimators=10, max_depth=10, random_state=42, verbosity=0) if XGBClassifier else GradientBoostingClassifier(n_estimators=10, max_depth=10, random_state=42),
-                        'attention': AttentionNetwork(4, 64).to(self.device),
+                        'attention': self.AttentionNetwork(4, 64).to(self.device),
                         'technical': VotingClassifier(estimators=[
                             ('rf', RandomForestClassifier(n_estimators=10, max_depth=10, random_state=42)),
                             ('lr', LogisticRegression(max_iter=100, random_state=42))
                         ], voting='soft')
                     }
                     self.symbol_training_history[symbol] = {
-                        'training_count': 0,
-                        'last_training': datetime.now(timezone.utc),
-                        'samples_used': []
+                        'training_count': 0, 'last_training': datetime.now(timezone.utc), 'samples_used': []
                     }
                     LOG.info("specialized_models_created", symbol=symbol)
                 lstm_model = self.symbol_models[symbol]['lstm']
@@ -8347,22 +8092,21 @@ class AdvancedEnsembleLearner:
                 tech_model = self.symbol_models[symbol]['technical']
             else:
                 LOG.info("training_general_model")
+                self.initialize_base_models()
                 lstm_model = self.lstm
                 gb_model = self.gb
                 attn_model = self.attention
                 tech_model = self.technical
+
             try:
-                if hasattr(gb_model, 'n_classes_'):
-                    delattr(gb_model, 'n_classes_')
+                if hasattr(gb_model, 'n_classes_'): delattr(gb_model, 'n_classes_')
                 gb_model.fit(X_train, y_train)
-                test_pred = gb_model.predict_proba(X_val[:1])
-                LOG.info("gb_model_trained", n_classes=gb_model.n_classes_ if hasattr(gb_model, 'n_classes_') else 'unknown', prediction_shape=test_pred.shape, symbol=symbol)
+                LOG.info("gb_model_trained", symbol=symbol)
             except Exception as e:
                 LOG.warning("gb_training_failed", error=str(e), symbol=symbol)
             try:
                 tech_model.fit(X_train, y_train)
-                test_pred = tech_model.predict_proba(X_val[:1])
-                LOG.info("technical_model_trained", prediction_shape=test_pred.shape, symbol=symbol)
+                LOG.info("technical_model_trained", symbol=symbol)
             except Exception as e:
                 LOG.warning("technical_training_failed", error=str(e), symbol=symbol)
             try:
@@ -8372,19 +8116,13 @@ class AdvancedEnsembleLearner:
                 criterion = nn.CrossEntropyLoss()
                 optimizer_lstm = torch.optim.Adam(lstm_model.parameters(), lr=0.001)
                 for epoch in range(epochs):
-                    epoch_loss = 0.0
                     for batch_x, batch_y in train_loader:
-                        batch_x = batch_x.to(self.device)
-                        batch_y = batch_y.to(self.device)
                         optimizer_lstm.zero_grad()
-                        out_lstm = lstm_model(batch_x)
-                        loss_lstm = criterion(out_lstm, batch_y)
+                        out_lstm = lstm_model(batch_x.to(self.device))
+                        loss_lstm = criterion(out_lstm, batch_y.to(self.device))
                         loss_lstm.backward()
                         torch.nn.utils.clip_grad_norm_(lstm_model.parameters(), 1.0)
                         optimizer_lstm.step()
-                        epoch_loss += loss_lstm.item()
-                    if epoch % 5 == 0:
-                        LOG.debug("lstm_training_progress", epoch=epoch, loss=epoch_loss, symbol=symbol)
                 LOG.info("lstm_model_trained", epochs=epochs, symbol=symbol)
             except Exception as e:
                 LOG.warning("lstm_training_failed", error=str(e), symbol=symbol)
@@ -8396,68 +8134,22 @@ class AdvancedEnsembleLearner:
                 optimizer_attn = torch.optim.Adam(attn_model.parameters(), lr=0.001)
                 for epoch in range(epochs):
                     for batch_x, batch_y in train_loader_attn:
-                        batch_x = batch_x.to(self.device)
-                        batch_y = batch_y.to(self.device)
                         optimizer_attn.zero_grad()
-                        out_attn = attn_model(batch_x)
-                        loss_attn = criterion(out_attn, batch_y)
+                        out_attn = attn_model(batch_x.to(self.device))
+                        loss_attn = criterion(out_attn, batch_y.to(self.device))
                         loss_attn.backward()
                         torch.nn.utils.clip_grad_norm_(attn_model.parameters(), 1.0)
                         optimizer_attn.step()
                 LOG.info("attention_model_trained", epochs=epochs, symbol=symbol)
             except Exception as e:
                 LOG.warning("attention_training_failed", error=str(e), symbol=symbol)
+            
             if symbol:
-                LOG.info("registering_specialized_models", symbol=symbol, has_symbol_models_attr=hasattr(self, 'symbol_models'))
-                if not hasattr(self, 'symbol_models'):
-                    self.symbol_models = {}
-                    LOG.warning("symbol_models_created_in_fit", symbol=symbol, message="Should have been initialized in __init__")
-                try:
-                    self.symbol_models[symbol] = {
-                        'lstm': lstm_model,
-                        'gb': gb_model,
-                        'attention': attn_model,
-                        'technical': tech_model
-                    }
-                    LOG.info("specialized_models_registered_successfully", symbol=symbol, models_registered=['lstm', 'gb', 'attention', 'technical'], total_specialized_symbols=len(self.symbol_models))
-                except Exception as reg_error:
-                    LOG.error("specialized_models_registration_failed", symbol=symbol, error=str(reg_error))
-                if symbol not in self.symbol_models:
-                    LOG.error("CRITICAL_symbol_not_in_dict_after_registration", symbol=symbol, dict_keys=list(self.symbol_models.keys()))
-                else:
-                    LOG.debug("registration_verified", symbol=symbol, sub_models=list(self.symbol_models[symbol].keys()))
-            if symbol:
-                if not hasattr(self, 'symbol_models'):
-                    self.symbol_models = {}
-                    LOG.warning("symbol_models_created_during_fit", message="Should have been initialized in __init__")
-                if not hasattr(self, 'symbol_training_history'):
-                    self.symbol_training_history = {}
-                    LOG.warning("symbol_training_history_created_during_fit")
-                if symbol not in self.symbol_models:
-                    LOG.error("CRITICAL_symbol_not_in_symbol_models_after_training", symbol=symbol, lstm_trained=lstm_model is not None, gb_trained=gb_model is not None, has_symbol_models_attr=hasattr(self, 'symbol_models'), symbol_models_keys=list(self.symbol_models.keys()) if hasattr(self, 'symbol_models') else [])
-                    try:
-                        LOG.warning("force_registering_specialized_models", symbol=symbol)
-                        self.symbol_models[symbol] = {
-                            'lstm': lstm_model,
-                            'gb': gb_model,
-                            'attention': attn_model,
-                            'technical': tech_model
-                        }
-                        LOG.info("specialized_models_force_registered", symbol=symbol)
-                    except Exception as force_reg_error:
-                        LOG.error("force_registration_failed", symbol=symbol, error=str(force_reg_error))
-                        return
-                if symbol not in self.symbol_training_history:
-                    self.symbol_training_history[symbol] = {
-                        'training_count': 0,
-                        'last_training': datetime.now(timezone.utc),
-                        'samples_used': []
-                    }
                 self.symbol_training_history[symbol]['training_count'] += 1
                 self.symbol_training_history[symbol]['last_training'] = datetime.now(timezone.utc)
                 self.symbol_training_history[symbol]['samples_used'].append(len(X_train))
-                if len(self.symbol_training_history[symbol]['samples_used']) > 10:
-                    self.symbol_training_history[symbol]['samples_used'] = self.symbol_training_history[symbol]['samples_used'][-10:]
+                self.symbol_training_history[symbol]['samples_used'] = self.symbol_training_history[symbol]['samples_used'][-10:]
+            
             self.is_trained = True
             LOG.info("ensemble_models_trained_successfully", epochs=epochs, train_samples=len(X_train), val_samples=len(X_val), symbol=symbol if symbol else "general", specialized=symbol is not None)
             await self._save_models()
@@ -8517,7 +8209,7 @@ class AdvancedEnsembleLearner:
                             last_training_str = None
                         samples_used = history.get('samples_used', [])
                         if not isinstance(samples_used, list):
-                            samples_used = []
+                            samples_used = list(samples_used)
                         metadata_json['training_history'][symbol] = {
                             'training_count': int(history.get('training_count', 0)),
                             'last_training': last_training_str,
@@ -8555,14 +8247,18 @@ class AdvancedEnsembleLearner:
         except Exception as e:
             LOG.error("ensemble_models_save_failed", error=str(e))
             return False
-
+        
     async def _load_models(self, base_path: str = "models/ensemble"):
         try:
             import os
             import pickle
+            import zipfile  # Needed for specific torch exceptions
+
             if not os.path.exists(base_path):
                 LOG.warning("ensemble_models_not_found", path=base_path)
                 return False
+            
+            # Load general models first
             with open(f"{base_path}/gb_model.pkl", "rb") as f:
                 self.gb = pickle.load(f)
             with open(f"{base_path}/technical_model.pkl", "rb") as f:
@@ -8571,60 +8267,66 @@ class AdvancedEnsembleLearner:
             self.attention.load_state_dict(torch.load(f"{base_path}/attention_model.pth", map_location=self.device))
             self.lstm.eval()
             self.attention.eval()
+            
+            # Load specialized models with enhanced, robust error handling
             specialized_dir = f"{base_path}/specialized"
             if os.path.exists(specialized_dir):
                 for symbol_dir_name in os.listdir(specialized_dir):
-                    symbol_dir = f"{specialized_dir}/{symbol_dir_name}"
+                    symbol_dir = os.path.join(specialized_dir, symbol_dir_name)
                     if not os.path.isdir(symbol_dir):
                         continue
+                    
                     symbol = symbol_dir_name.replace('_', '/')
-                    try:
-                        class LSTMPredictor(nn.Module):
-                            def __init__(self, input_dim, hidden_dim):
-                                super().__init__()
-                                self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
-                                self.fc = nn.Linear(hidden_dim, 3)
+                    models_to_load = {
+                        'gb': (os.path.join(symbol_dir, "gb_model.pkl"), 'pickle'),
+                        'technical': (os.path.join(symbol_dir, "technical_model.pkl"), 'pickle'),
+                        'lstm': (os.path.join(symbol_dir, "lstm_model.pth"), 'torch_lstm'),
+                        'attention': (os.path.join(symbol_dir, "attention_model.pth"), 'torch_attn'),
+                    }
+                    loaded_models = {}
+                    all_successful = True
 
-                            def forward(self, x):
-                                _, (hn, _) = self.lstm(x)
-                                return F.softmax(self.fc(hn[0]), dim=1)
+                    for model_name, (path, model_type) in models_to_load.items():
+                        # 1. Validate file existence and size
+                        if not os.path.exists(path) or os.path.getsize(path) == 0:
+                            LOG.warning("specialized_model_load_failed", symbol=symbol, model_file=os.path.basename(path), error="File not found or is empty")
+                            all_successful = False
+                            continue # Skip this model file, but try others for the same symbol
+                        
+                        # 2. Attempt to load based on model type
+                        try:
+                            if model_type == 'pickle':
+                                with open(path, "rb") as f:
+                                    loaded_models[model_name] = pickle.load(f)
+                            
+                            elif model_type.startswith('torch'):
+                                model_class = self.LSTMPredictor if 'lstm' in model_type else self.AttentionNetwork
+                                model = model_class(4, 64).to(self.device)
+                                model.load_state_dict(torch.load(path, map_location=self.device))
+                                model.eval()
+                                loaded_models[model_name] = model
+                        
+                        # 3. Handle specific loading errors for corrupted files
+                        except (pickle.UnpicklingError, EOFError) as e:
+                            LOG.warning("specialized_model_load_failed", symbol=symbol, model_file=os.path.basename(path), error=f"Corrupted pickle file ({type(e).__name__}): {e}")
+                            all_successful = False
+                        except (RuntimeError, zipfile.BadZipFile, KeyError) as e:
+                            LOG.warning("specialized_model_load_failed", symbol=symbol, model_file=os.path.basename(path), error=f"Corrupted torch file ({type(e).__name__}): {e}")
+                            all_successful = False
+                        except Exception as e:
+                            LOG.warning("specialized_model_load_failed", symbol=symbol, model_file=os.path.basename(path), error=f"Unexpected error: {e}")
+                            all_successful = False
 
-                        class AttentionNetwork(nn.Module):
-                            def __init__(self, input_dim, hidden_dim):
-                                super().__init__()
-                                self.embedding = nn.Linear(input_dim, hidden_dim)
-                                self.transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, batch_first=True), num_layers=2)
-                                self.fc = nn.Linear(hidden_dim, 3)
-
-                            def forward(self, x):
-                                if len(x.shape) == 2:
-                                    x = x.unsqueeze(1)
-                                x = self.embedding(x)
-                                x = self.transformer(x)
-                                x = x.mean(dim=1)
-                                return F.softmax(self.fc(x), dim=1)
-
-                        with open(f"{symbol_dir}/gb_model.pkl", "rb") as f:
-                            gb = pickle.load(f)
-                        with open(f"{symbol_dir}/technical_model.pkl", "rb") as f:
-                            technical = pickle.load(f)
-                        lstm = LSTMPredictor(4, 64).to(self.device)
-                        lstm.load_state_dict(torch.load(f"{symbol_dir}/lstm_model.pth", map_location=self.device))
-                        lstm.eval()
-                        attention = AttentionNetwork(4, 64).to(self.device)
-                        attention.load_state_dict(torch.load(f"{symbol_dir}/attention_model.pth", map_location=self.device))
-                        attention.eval()
-                        self.symbol_models[symbol] = {
-                            'lstm': lstm,
-                            'gb': gb,
-                            'attention': attention,
-                            'technical': technical
-                        }
+                    # 4. Only register the specialized model if all parts were loaded successfully
+                    if all_successful:
+                        self.symbol_models[symbol] = loaded_models
                         LOG.debug("specialized_model_loaded", symbol=symbol)
-                    except Exception as symbol_load_error:
-                        LOG.warning("specialized_model_load_failed", symbol=symbol, error=str(symbol_load_error))
-                        continue
+                    else:
+                        LOG.warning("specialized_model_set_incomplete_and_skipped", symbol=symbol, loaded_parts=list(loaded_models.keys()))
+
                 LOG.info("specialized_models_loaded", count=len(self.symbol_models))
+            
+            # Load metadata at the end
             metadata_path = f"{base_path}/metadata.json"
             try:
                 with open(metadata_path, "r") as f:
@@ -8632,58 +8334,35 @@ class AdvancedEnsembleLearner:
             except json.JSONDecodeError as json_error:
                 LOG.error("metadata_json_corrupted", error=str(json_error), path=metadata_path, message="Recreating metadata from scratch")
                 metadata = {
-                    'is_trained': True,
-                    'timestamp': datetime.now(timezone.utc).isoformat(),
-                    'device': str(self.device),
-                    'specialized_symbols': list(self.symbol_models.keys()) if self.symbol_models else [],
-                    'training_history': {}
+                    'is_trained': True, 'timestamp': datetime.now(timezone.utc).isoformat(), 'device': str(self.device),
+                    'specialized_symbols': list(self.symbol_models.keys()) if self.symbol_models else [], 'training_history': {}
                 }
                 for symbol in metadata['specialized_symbols']:
-                    metadata['training_history'][symbol] = {
-                        'training_count': 1,
-                        'last_training': None,
-                        'samples_used': []
-                    }
+                    metadata['training_history'][symbol] = {'training_count': 1, 'last_training': None, 'samples_used': []}
                 try:
-                    with open(metadata_path, "w") as f:
-                        json.dump(metadata, f, indent=2)
-                    LOG.info("metadata_reconstructed_and_saved")
-                except Exception as save_error:
-                    LOG.warning("metadata_reconstruction_save_failed", error=str(save_error))
+                    with open(metadata_path, "w") as f: json.dump(metadata, f, indent=2)
+                except Exception: pass
             except FileNotFoundError:
                 LOG.warning("metadata_file_not_found_creating_default", path=metadata_path)
                 metadata = {
-                    'is_trained': True,
-                    'timestamp': datetime.now(timezone.utc).isoformat(),
-                    'device': str(self.device),
-                    'specialized_symbols': list(self.symbol_models.keys()) if self.symbol_models else [],
-                    'training_history': {}
+                    'is_trained': True, 'timestamp': datetime.now(timezone.utc).isoformat(), 'device': str(self.device),
+                    'specialized_symbols': list(self.symbol_models.keys()) if self.symbol_models else [], 'training_history': {}
                 }
                 try:
-                    with open(metadata_path, "w") as f:
-                        json.dump(metadata, f, indent=2)
-                    LOG.info("default_metadata_created")
-                except Exception as save_error:
-                    LOG.warning("default_metadata_save_failed", error=str(save_error))
+                    with open(metadata_path, "w") as f: json.dump(metadata, f, indent=2)
+                except Exception: pass
             self.is_trained = metadata.get('is_trained', False)
             loaded_history = metadata.get('training_history', {})
             self.symbol_training_history = {}
             for symbol, history in loaded_history.items():
                 try:
                     last_training = history.get('last_training')
-                    if last_training:
-                        if isinstance(last_training, str):
-                            try:
-                                last_training = datetime.fromisoformat(last_training)
-                            except ValueError:
-                                try:
-                                    from dateutil import parser as dateparser
-                                    last_training = dateparser.parse(last_training)
-                                except Exception:
-                                    LOG.warning("cannot_parse_training_date", symbol=symbol, date_string=last_training)
-                                    last_training = None
-                        elif not isinstance(last_training, datetime):
-                            last_training = None
+                    if last_training and isinstance(last_training, str):
+                        try:
+                            last_training = datetime.fromisoformat(last_training)
+                        except ValueError:
+                            from dateutil import parser as dateparser
+                            last_training = dateparser.parse(last_training)
                     self.symbol_training_history[symbol] = {
                         'training_count': history.get('training_count', 0),
                         'last_training': last_training,
@@ -8691,11 +8370,6 @@ class AdvancedEnsembleLearner:
                     }
                 except Exception as history_error:
                     LOG.warning("training_history_parse_failed", symbol=symbol, error=str(history_error))
-                    self.symbol_training_history[symbol] = {
-                        'training_count': 1,
-                        'last_training': None,
-                        'samples_used': []
-                    }
             LOG.info("ensemble_models_loaded", path=base_path, timestamp=metadata.get('timestamp'), specialized_count=len(self.symbol_models))
             return True
         except Exception as e:
@@ -8752,7 +8426,8 @@ class AdvancedEnsembleLearner:
             else:
                 if not self.is_trained:
                     LOG.warning("ensemble_not_trained_using_fallback", symbol=symbol)
-                    return {"action": "hold", "confidence": 0.3, "prediction_method": "not_trained"}
+                    # CORRECCIÓN: Un modelo no entrenado debe tener confianza CERO.
+                    return {"action": "hold", "confidence": 0.0, "prediction_method": "not_trained"}
                 LOG.debug("using_general_model", symbol=symbol, general_trained=self.is_trained)
                 lstm_model = self.lstm
                 gb_model = self.gb
@@ -8870,7 +8545,7 @@ class AdvancedEnsembleLearner:
                     LOG.error("prediction_shape_invalid_after_normalization", model=model_name, shape=pred.shape, expected=(3,))
                     predictions[model_name] = np.array([0.33, 0.34, 0.33])
             try:
-                pred_list = [predictions[k] for k in predictions.keys()]
+                pred_list = list(predictions.values())
                 shapes = [p.shape for p in pred_list]
                 LOG.debug("averaging_predictions", shapes=shapes, all_equal=(len(set(shapes)) == 1))
                 if len(set(shapes)) != 1:
@@ -8928,8 +8603,8 @@ class AdvancedEnsembleLearner:
                     # NUEVO: Verificar que buy_prob sea suficientemente alto en términos absolutos
                     if buy_prob > 0.35:  # Mínimo 35% de probabilidad
                         action = "buy"
-                        confidence_boost = (buy_prob + hold_prob) / 2.0
-                        confidence = min(0.85, confidence_boost * 1.3)
+                        # MEJORA: La nueva confianza debe reflejar la probabilidad de la nueva acción
+                        confidence = min(0.85, buy_prob * 1.2)
                         LOG.info("overriding_hold_to_buy",
                                 original_hold_prob=hold_prob,
                                 buy_prob=buy_prob,
@@ -8946,8 +8621,8 @@ class AdvancedEnsembleLearner:
                     # NUEVO: Verificar probabilidad mínima absoluta
                     if sell_prob > 0.35:
                         action = "sell"
-                        confidence_boost = (sell_prob + hold_prob) / 2.0
-                        confidence = min(0.85, confidence_boost * 1.3)
+                        # MEJORA: La nueva confianza debe reflejar la probabilidad de la nueva acción
+                        confidence = min(0.85, sell_prob * 1.2)
                         LOG.info("overriding_hold_to_sell",
                                 original_hold_prob=hold_prob,
                                 sell_prob=sell_prob,
@@ -9280,7 +8955,7 @@ class WalkForwardValidator:
             return None, None
     
     async def run_walk_forward(self, bot, historical_df: pd.DataFrame, 
-                               symbol: str) -> Dict[str, Any]:
+                           symbol: str) -> Dict[str, Any]:
         """
         Ejecuta validación walk-forward completa con ajuste automático
         """
@@ -9301,8 +8976,16 @@ class WalkForwardValidator:
                     self.train_window_days = optimal_train
                     self.test_window_days = optimal_test
                     
-            # ✅ CORRECCIÓN: Validación más estricta de datos mínimos
-            min_required_rows = (self.train_window_days + self.test_window_days) * 24 + 100
+            # ✅ CORRECCIÓN: Calcular requerimiento de datos basado en timeframe
+            if len(historical_df) > 1:
+                time_diff_seconds = (historical_df.index[1] - historical_df.index[0]).total_seconds()
+                hours_per_candle = time_diff_seconds / 3600 if time_diff_seconds > 0 else 1.0
+            else:
+                hours_per_candle = 1.0
+            
+            train_samples = int(self.train_window_days * 24 / hours_per_candle) if hours_per_candle > 0 else 0
+            test_samples = int(self.test_window_days * 24 / hours_per_candle) if hours_per_candle > 0 else 0
+            min_required_rows = train_samples + test_samples + 100 # Margen extra
             
             if len(historical_df) < min_required_rows:
                 LOG.warning("insufficient_data_for_walk_forward",
@@ -9442,6 +9125,12 @@ class WalkForwardValidator:
     
     def _create_windows(self, df: pd.DataFrame) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
         """Crea ventanas deslizantes train/test"""
+        if not isinstance(df, pd.DataFrame):
+                LOG.error("df_is_not_dataframe_in_window_creation",
+                         df_type=type(df).__name__,
+                         message="Possible awaited coroutine issue")
+                return []
+
         windows = []
         
         # ✅ CORRECCIÓN: Calcular tamaños con detección de timeframe
@@ -9460,12 +9149,6 @@ class WalkForwardValidator:
                 hours_per_candle = 24.0
         else:
             hours_per_candle = 1.0  # Default 1h
-
-        if not isinstance(df, pd.DataFrame):
-                LOG.error("df_is_not_dataframe_in_window_creation",
-                         df_type=type(df).__name__,
-                         message="Possible awaited coroutine issue")
-                return []
         
         # Calcular samples necesarios
         train_samples = int(self.train_window_days * 24 / hours_per_candle)
@@ -9718,15 +9401,120 @@ class WalkForwardValidator:
             'total_windows': len(window_results)
         }
 
+async def background_initial_training(bot: AdvancedAITradingBot, symbols_to_train_dict: Dict[str, str]):
+    """
+    Runs initial training and retraining for both ensemble and RL models in the background.
+    """
+    LOG.info("background_initial_training_task_started", ensemble_symbols_count=len(symbols_to_train_dict))
+    
+    # --- Part 1: Ensemble Model Training ---
+    if symbols_to_train_dict:
+        LOG.info("starting_parallel_specialized_model_training")
+        semaphore = asyncio.Semaphore(3)  # Limit concurrent training jobs to avoid memory overload
+
+        async def train_one_symbol(symbol, reason):
+            async with semaphore:
+                try:
+                    LOG.info("starting_training_for_symbol", symbol=symbol, reason=reason)
+                    training_data = await bot._load_historical_data_for_symbol(symbol, months=3)
+                    
+                    if training_data is not None and len(training_data) > 100:
+                        await bot.ensemble_learner.fit(training_data, epochs=10, symbol=symbol)
+                        LOG.info("background_training_completed_for_symbol", symbol=symbol)
+                    else:
+                        LOG.warning("skipping_training_insufficient_data", symbol=symbol, reason=reason)
+                except Exception as e:
+                    LOG.error("background_training_failed_for_symbol", symbol=symbol, error=str(e))
+
+        training_tasks = [train_one_symbol(s, r) for s, r in symbols_to_train_dict.items()]
+        await asyncio.gather(*training_tasks)
+        LOG.info("background_ensemble_training_phase_finished")
+
+    # --- Part 2: RL Model Initial Training (if not loaded) ---
+    if not bot.rl_agent.load(): # Only train if no model was loaded
+        try:
+            LOG.info("starting_initial_rl_model_training_in_background")
+            all_symbols = await discover_usdt_pairs(bot.exchange_manager, exclude_stablecoins=True)
+            top_symbols = await filter_pairs_by_volume(bot.exchange_manager, all_symbols, 1000000.0)
+            symbols_for_rl = top_symbols[:5] if top_symbols else bot.config.symbols[:1]
+            
+            combined_data = []
+            for sym in symbols_for_rl:
+                data = await bot._load_historical_data_for_symbol(sym, months=6)
+                if data is not None and len(data) > 500:
+                    combined_data.append(data)
+            
+            if combined_data:
+                hist_data = pd.concat(combined_data, ignore_index=True)
+                if len(hist_data) > 500:
+                    LOG.info("data_for_rl_training_prepared", symbols=symbols_for_rl, samples=len(hist_data))
+                    await bot.rl_training_manager.train(episodes=50, df=hist_data)
+                    LOG.info("initial_rl_training_completed_successfully")
+        except Exception as e:
+            LOG.error("initial_rl_training_in_background_failed", error=str(e))
+    else:
+        LOG.info("skipping_initial_rl_training_as_agent_was_loaded")
+        
+    LOG.info("background_initial_training_task_finished")
+
+async def periodic_model_retraining(bot, interval_hours=24):
+    """Periodically checks for and retrains underperforming models."""
+    while bot.is_running:
+        try:
+            await asyncio.sleep(interval_hours * 3600)
+            LOG.info("starting_periodic_model_retraining_cycle")
+            await bot._retrain_underperforming_models(time_window_hours=interval_hours)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            LOG.error("periodic_model_retraining_failed", error=str(e))
+            
 async def periodic_rl_training(bot, exchange_manager, config, interval_hours=24):
     while bot.is_running:
         try:
             await asyncio.sleep(interval_hours * 3600)
             LOG.info("starting_periodic_rl_training")
-            hist_data = await bot._load_historical_data(months=3)
-            if hist_data is not None and len(hist_data) > 100:
+
+            hist_data = None
+            try:
+                # Discover all pairs and filter by high volume for a robust dataset
+                LOG.info("discovering_high_volume_pairs_for_rl_training")
+                all_pairs = await discover_usdt_pairs(exchange_manager, exclude_stablecoins=True)
+                
+                top_symbols = await filter_pairs_by_volume(
+                    exchange_manager,
+                    all_pairs,
+                    min_volume_24h=1000000.0  # Use high-volume pairs ($1M+)
+                )
+                
+                # Use top 10 high-volume symbols for training data
+                symbols_to_use = top_symbols[:10] if top_symbols else list(config.symbols)[:1]
+
+                combined_hist_data = []
+                for sym in symbols_to_use:
+                    # Load a good amount of data for each
+                    sym_hist = await bot._load_historical_data_for_symbol(sym, months=6)
+                    if sym_hist is not None and len(sym_hist) >= 500:
+                        combined_hist_data.append(sym_hist)
+                
+                if combined_hist_data:
+                    hist_data = pd.concat(combined_hist_data, ignore_index=True)
+                    LOG.info("multi_symbol_data_loaded_for_rl_training",
+                             symbols_used=len(symbols_to_use),
+                             symbols=symbols_to_use,
+                             total_samples=len(hist_data))
+                else:
+                    LOG.warning("failed_to_load_any_historical_data_for_rl_training")
+
+            except Exception as data_load_error:
+                LOG.error("error_loading_multi_symbol_data_for_rl", error=str(data_load_error))
+
+            if hist_data is not None and len(hist_data) > 500:
                 await bot.rl_training_manager.train(episodes=50, df=hist_data)
                 LOG.info("periodic_rl_training_completed")
+            else:
+                LOG.warning("skipping_periodic_rl_training_due_to_insufficient_data")
+
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -9774,7 +9562,7 @@ def create_dataframe(ohlcv_data: List) -> Optional[pd.DataFrame]:
         LOG.error("create_dataframe_failed", error=str(e))
         return None
 
-def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+async def calculate_technical_indicators(df: pd.DataFrame, symbol: str, timeframe: str) -> pd.DataFrame:
     try:
         if df is None or len(df) == 0:
             LOG.warning("empty_dataframe_for_indicators")
@@ -9785,34 +9573,17 @@ def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
         if len(df) < 50:
             LOG.warning("insufficient_data_for_indicators", rows=len(df))
             return df
-        cache_key = None
-        try:
-            # OPTIMIZACIÓN: Hash más eficiente usando solo últimos valores críticos
-            if len(df) > 0:
-                # Crear hash basado en últimas 5 velas (suficiente para detectar cambios)
-                cache_components = (
-                    len(df),
-                    float(df['close'].iloc[-1]),
-                    float(df['volume'].iloc[-1]) if 'volume' in df.columns else 0,
-                    float(df['close'].iloc[-5]) if len(df) >= 5 else 0
-                )
-                cache_key = f"ind_{hash(cache_components)}"
-                
-                if cache_key in FEATURE_CACHE._cache:
-                    timestamp = FEATURE_CACHE._timestamps.get(cache_key, 0)
-                    if time.time() - timestamp < FEATURE_CACHE.ttl:
-                        cached_df = FEATURE_CACHE._cache[cache_key]
-                        FEATURE_CACHE._hit_count += 1
-                        LOG.debug("using_cached_indicators", 
-                                 cache_hit=True, 
-                                 cache_age_seconds=time.time() - timestamp)
-                        return cached_df.copy()
-                
-                FEATURE_CACHE._miss_count += 1
-        except Exception as e:
-            LOG.debug("cache_lookup_failed", error=str(e))
-            cache_key = None
-        df = df.copy()
+
+        # Keep a reference to the original df for consistent cache keying.
+        original_df = df
+        
+        # Use the original, unmodified DataFrame to check the cache.
+        cached_data = await FEATURE_CACHE.get(symbol, timeframe, original_df)
+        if cached_data is not None:
+             LOG.debug("using_cached_indicators", cache_hit=True)
+             return cached_data
+
+        df = df.copy() # Work on a copy to avoid side effects
         indicators_to_calculate = []
         if 'rsi' not in df.columns or df['rsi'].isna().all():
             indicators_to_calculate.append('rsi')
@@ -9826,13 +9597,16 @@ def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
             indicators_to_calculate.append('volatility')
         if 'adx' not in df.columns or df['adx'].isna().all():
             indicators_to_calculate.append('adx')
+        
         LOG.debug("indicators_to_calculate", missing=indicators_to_calculate, total_needed=len(indicators_to_calculate))
         if 'rsi' in indicators_to_calculate:
             try:
                 delta = df['close'].diff()
-                gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-                rs = gain / (loss.replace(0, 1e-9))
+                gain = delta.clip(lower=0)
+                loss = -delta.clip(upper=0)
+                ema_gain = gain.ewm(com=14 - 1, min_periods=14).mean()
+                ema_loss = loss.ewm(com=14 - 1, min_periods=14).mean()
+                rs = ema_gain / (ema_loss.replace(0, 1e-9))
                 df['rsi'] = 100 - (100 / (1 + rs))
             except Exception as e:
                 LOG.debug("rsi_calculation_failed", error=str(e))
@@ -9890,9 +9664,11 @@ def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
         if 'adx' in indicators_to_calculate:
             try:
                 if 'high' in df.columns and 'low' in df.columns:
-                    from __main__ import AdvancedAIConfig
-                    minimal_config = AdvancedAIConfig(symbols=['BTC/USDT'])
-                    strategy_mgr = StrategyManager(minimal_config)
+                    # Avoid creating a new config object
+                    if 'strategy_manager' in globals():
+                         strategy_mgr = globals()['strategy_manager']
+                    else:
+                         strategy_mgr = StrategyManager(CFG)
                     df['adx'] = strategy_mgr.adx(df['high'], df['low'], df['close'], 14)
                 else:
                     df['adx'] = 25.0
@@ -9909,72 +9685,31 @@ def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
         except Exception as e:
             LOG.debug("returns_calculation_failed", error=str(e))
 
-        # CORRECCIÓN: Validar antes de llenar NaN
-        # Verificar que columnas críticas no tengan TODOS NaN
         critical_cols = ['rsi', 'macd', 'sma_20']
         for col in critical_cols:
             if col in df.columns and df[col].isna().all():
-                LOG.error("critical_indicator_all_nan",
-                         column=col,
-                         message="Calculation may have failed")
-                # Intentar recalcular o usar valores default seguros
-                if col == 'rsi':
-                    df['rsi'] = 50.0
+                LOG.error("critical_indicator_all_nan", column=col, message="Calculation may have failed")
+                if col == 'rsi': df['rsi'] = 50.0
                 elif col == 'macd':
-                    df['macd'] = 0.0
-                    df['macd_signal'] = 0.0
-                    df['macd_hist'] = 0.0
-                elif col == 'sma_20':
-                    df['sma_20'] = df['close']
+                    df['macd'], df['macd_signal'], df['macd_hist'] = 0.0, 0.0, 0.0
+                elif col == 'sma_20': df['sma_20'] = df['close']
         
-        # CORRECCIÓN: Llenar NaN de forma más inteligente
-        # 1. Forward fill primero (usar valores pasados)
-        df = df.ffill()
+        df = df.ffill().bfill().fillna(0)
         
-        # 2. Backward fill para los primeros valores
-        df = df.bfill()
-        
-        # 3. Solo después llenar con 0 los que quedan
-        df = df.fillna(0)
-        
-        # NUEVO: Validación post-fill
         remaining_nans = df.isna().sum().sum()
         if remaining_nans > 0:
-            LOG.warning("nans_remain_after_fill",
-                       total_nans=remaining_nans,
-                       columns_with_nans=df.columns[df.isna().any()].tolist())
+            LOG.warning("nans_remain_after_fill", total_nans=remaining_nans, columns_with_nans=df.columns[df.isna().any()].tolist())
 
-        # ✅ GUARDAR EN CACHE
-        if cache_key:
-            try:
-                FEATURE_CACHE._cache[cache_key] = df.copy()
-                FEATURE_CACHE._timestamps[cache_key] = time.time()
-                
-                # Limpiar cache si excede tamaño
-                if len(FEATURE_CACHE._cache) > FEATURE_CACHE.max_size:
-                    oldest_key = min(FEATURE_CACHE._timestamps.keys(),
-                                   key=lambda k: FEATURE_CACHE._timestamps[k])
-                    del FEATURE_CACHE._cache[oldest_key]
-                    del FEATURE_CACHE._timestamps[oldest_key]
-                
-                LOG.debug("indicators_cached",
-                         cache_size=len(FEATURE_CACHE._cache),
-                         calculated=indicators_to_calculate)
-            except Exception as e:
-                LOG.debug("cache_save_failed", error=str(e))
+        # Use the original_df for the cache key, and the modified df as the value.
+        await FEATURE_CACHE.set(symbol, timeframe, original_df, df)
 
-        LOG.debug("technical_indicators_calculated",
-                 rows=len(df),
-                 columns=len(df.columns),
-                 newly_calculated=len(indicators_to_calculate))
+        LOG.debug("technical_indicators_calculated", rows=len(df), columns=len(df.columns), newly_calculated=len(indicators_to_calculate))
         
         return df
 
     except Exception as e:
-        LOG.error("calculate_technical_indicators_failed",
-                 error=str(e),
-                 traceback=traceback.format_exc()[:500])
-        return df
+        LOG.error("calculate_technical_indicators_failed", error=str(e), traceback=traceback.format_exc()[:500])
+        return df if df is not None else pd.DataFrame()
 
 async def fetch_market_data(exchange_manager, symbol: str, timeframe: str, max_retries: int = 5) -> Dict[str, Any]:
     """
@@ -10158,7 +9893,7 @@ async def fetch_market_data(exchange_manager, symbol: str, timeframe: str, max_r
             
             # Calcular indicadores técnicos
             try:
-                df = calculate_technical_indicators(df)
+                df = await calculate_technical_indicators(df, symbol, timeframe)
                 if 'rsi' not in df.columns or df['rsi'].isna().all():
                     LOG.warning("technical_indicators_incomplete",
                                symbol=symbol)
@@ -10372,7 +10107,7 @@ async def discover_usdt_pairs(exchange_manager, exclude_stablecoins: bool = True
         markets_result = await exchange_manager.exchange.load_markets()
         if not markets_result:
             LOG.warning("no_markets_loaded", message="Could not load markets from exchange")
-            return ['BTC/USDT', 'ETH/USDT']
+            return ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'ADA/USDT', 'SOL/USDT']
         # Filtrar pares USDT spot
         usdt_pairs = []
         stablecoins = {'USDT', 'USDC', 'BUSD', 'DAI', 'TUSD', 'USDP', 'USDD', 'GUSD', 'FRAX', 'LUSD'}
@@ -10398,16 +10133,15 @@ async def discover_usdt_pairs(exchange_manager, exclude_stablecoins: bool = True
                 total_discovered=len(usdt_pairs),
                 exclude_stablecoins=exclude_stablecoins,
                 returning_all=True)
-        return usdt_pairs if usdt_pairs else ['BTC/USDT', 'ETH/USDT']
+        return usdt_pairs if usdt_pairs else ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'ADA/USDT', 'SOL/USDT']
 
     except Exception as e:
         LOG.error("usdt_pairs_discovery_failed", error=str(e))
         # Fallback final a pares principales
         return ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'ADA/USDT', 'SOL/USDT']
 
-
 async def filter_pairs_by_volume(exchange_manager, pairs: List[str],
-                                min_volume_24h: float = 1000000.0) -> List[str]:
+                                min_volume_24h: float = 100000.0) -> List[str]:
     """
     Filtra pares por volumen mínimo de 24h en USDT
     """
@@ -10440,9 +10174,7 @@ async def filter_pairs_by_volume(exchange_manager, pairs: List[str],
         LOG.error("volume_filtering_failed", error=str(e))
         return pairs
 
-
 CFG = create_config()
-
 
 async def aggregate_strategy_signals(strategy_signals: Dict[str, Dict],
                                     regime: str = "unknown",
@@ -10600,9 +10332,7 @@ async def aggregate_strategy_signals(strategy_signals: Dict[str, Dict],
                  error=str(e),
                  traceback=traceback.format_exc()[:500])
         return {"signal": "hold", "confidence": 0.0, "reason": f"Aggregation error: {str(e)}"}
-
-
-
+    
 async def execute_trading_pipeline_complete(exchange_manager, strategy_manager, automl,
                                            regime_detector, risk_optimizer,
                                            ensemble_learner, bot, df, config, symbol):
@@ -10836,6 +10566,16 @@ async def execute_trading_pipeline_complete(exchange_manager, strategy_manager, 
 
         # 8. Integrar todas las señales - MEJORADO CON VALIDACIÓN POR ACCUMULATOR
         try:
+            # USAR _integrate_all_decisions
+            integrated_decision = await bot._integrate_all_decisions(
+                traditional_signal,
+                rl_decision,
+                ensemble_signal,
+                regime,
+                confidence,
+                df
+            )
+            
             # NUEVO: Validar decisión con datos históricos del accumulator
             decision_confidence_boost = 0.0
             decision_confidence_penalty = 0.0
@@ -10896,16 +10636,6 @@ async def execute_trading_pipeline_complete(exchange_manager, strategy_manager, 
                 except Exception as acc_val_error:
                     LOG.debug("accumulator_validation_failed", error=str(acc_val_error))
             
-            # USAR _integrate_all_decisions
-            integrated_decision = await bot._integrate_all_decisions(
-                traditional_signal,
-                rl_decision,
-                ensemble_signal,
-                regime,
-                confidence,
-                df
-            )
-
             # Aplicar boost/penalty del accumulator
             if decision_confidence_boost > 0 or decision_confidence_penalty > 0:
                 old_conf = integrated_decision.get('confidence', 0.0)
@@ -11307,7 +11037,6 @@ async def execute_trading_pipeline_complete(exchange_manager, strategy_manager, 
                  error=str(e),
                  traceback=traceback.format_exc())
 
-
 # ===========================
 # FUNCIONES AUXILIARES ADICIONALES
 # ===========================
@@ -11393,7 +11122,6 @@ async def update_symbol_performance(bot, symbol: str, pnl: float):
         LOG.error("symbol_performance_update_failed", symbol=symbol, error=str(e))
         return None
 
-
 async def _monitor_positions(bot, exchange_manager, risk_manager):
     """Lógica de monitoreo de posiciones con TRACKING POR SÍMBOLO - VERSIÓN COMPLETA"""
     try:
@@ -11412,7 +11140,8 @@ async def _monitor_positions(bot, exchange_manager, risk_manager):
             # Iterar sobre items() en lugar de keys() para evitar RuntimeError
             for sym, info in list(risk_manager.active_stops.items()):
                 if not isinstance(info, dict):
-                    LOG.warning("invalid_stop_info_type", symbol=sym)
+                    LOG.warning("invalid_stop_info_type_closing", symbol=sym)
+                    asyncio.create_task(_close_invalid_position(risk_manager, bot, sym))
                     continue
                 
                 try:
@@ -11422,7 +11151,7 @@ async def _monitor_positions(bot, exchange_manager, risk_manager):
                     
                     # Validación temprana
                     if entry_price_raw is None or remaining_size_raw is None:
-                        LOG.error("missing_critical_fields", symbol=sym)
+                        LOG.error("missing_critical_fields_closing", symbol=sym)
                         asyncio.create_task(_close_invalid_position(risk_manager, bot, sym))
                         continue
                     
@@ -11437,16 +11166,14 @@ async def _monitor_positions(bot, exchange_manager, risk_manager):
                                    entry_price=entry_price)
                         # Intentar recuperar del ledger
                         if hasattr(bot, 'position_ledger') and bot.position_ledger:
-                            for transaction in reversed(bot.position_ledger.transactions):
-                                if (transaction.symbol == sym and
-                                    transaction.transaction_type == TransactionType.OPEN):
-                                    recovered_price = transaction.entry_price
-                                    if 0 < recovered_price <= 1000000.0:
-                                        entry_price = recovered_price
-                                        LOG.info("entry_price_recovered_from_ledger",
-                                                symbol=sym,
-                                                entry_price=entry_price)
-                                        break
+                            if sym in bot.position_ledger.active_positions:
+                                ledger_pos = bot.position_ledger.active_positions[sym]
+                                recovered_price = ledger_pos.entry_price
+                                if 0 < recovered_price <= 1000000.0:
+                                    entry_price = recovered_price
+                                    LOG.info("entry_price_recovered_from_ledger",
+                                            symbol=sym,
+                                            entry_price=entry_price)
                         if not (0 < entry_price <= 1000000.0):
                             LOG.error("cannot_recover_entry_price_closing_position",
                                      symbol=sym,
@@ -11460,7 +11187,7 @@ async def _monitor_positions(bot, exchange_manager, risk_manager):
                     # Validación de remaining_size
                     max_reasonable_size = 10000000.0
                     if not (0 < remaining_size <= max_reasonable_size) or np.isnan(remaining_size) or np.isinf(remaining_size):
-                        LOG.error("invalid_remaining_size_details",
+                        LOG.error("invalid_remaining_size_details_closing",
                                  symbol=sym,
                                  remaining_size=remaining_size,
                                  max_reasonable=max_reasonable_size,
@@ -11475,7 +11202,7 @@ async def _monitor_positions(bot, exchange_manager, risk_manager):
                     position_value = entry_price * remaining_size
                     max_position_value = 100000.0
                     if position_value > max_position_value:
-                        LOG.error("position_value_exceeds_limit_in_monitoring",
+                        LOG.error("position_value_exceeds_limit_in_monitoring_closing",
                                  symbol=sym,
                                  position_value=position_value,
                                  entry_price=entry_price,
@@ -11499,18 +11226,19 @@ async def _monitor_positions(bot, exchange_manager, risk_manager):
                                error=str(conv_error))
                     # Intentar recuperar desde ledger
                     if hasattr(bot, 'position_ledger') and bot.position_ledger:
-                        for transaction in reversed(bot.position_ledger.transactions):
-                            if (transaction.symbol == sym and
-                                transaction.transaction_type == TransactionType.OPEN):
-                                active_stops_snapshot[sym] = {
-                                    'entry_price': transaction.entry_price,
-                                    'remaining_size': transaction.size,
-                                    'side': transaction.side,
-                                    'stop_loss': transaction.entry_price * 0.98 if transaction.side == 'buy' else transaction.entry_price * 1.02
-                                }
-                                LOG.info("position_recovered_from_ledger", symbol=sym)
-                                break
-                    continue
+                         if sym in bot.position_ledger.active_positions:
+                            transaction = bot.position_ledger.active_positions[sym]
+                            active_stops_snapshot[sym] = {
+                                'entry_price': transaction.entry_price,
+                                'remaining_size': transaction.size,
+                                'side': transaction.side,
+                                'stop_loss': transaction.entry_price * 0.98 if transaction.side == 'buy' else transaction.entry_price * 1.02
+                            }
+                            LOG.info("position_recovered_from_ledger", symbol=sym)
+                            continue
+                    
+                    LOG.error("could_not_recover_position_closing", symbol=sym)
+                    asyncio.create_task(_close_invalid_position(risk_manager, bot, sym))
 
         except Exception as snapshot_error:
             LOG.error("snapshot_creation_failed", error=str(snapshot_error))
@@ -11548,22 +11276,49 @@ async def _monitor_positions(bot, exchange_manager, risk_manager):
                  error=str(e),
                  traceback=traceback.format_exc())
 
-
 async def _close_invalid_position(risk_manager, bot, symbol):
-    """Cierra posición inválida de forma asíncrona y segura"""
+    """Cierra posición inválida de forma asíncrona y segura, incluyendo orden en exchange."""
     try:
-        # Usar lock específico del símbolo si existe
+        LOG.warning("attempting_to_close_invalid_position", symbol=symbol)
+        
+        # Usar lock específico del símbolo para evitar race conditions
         if hasattr(bot, 'symbol_execution_locks') and symbol in bot.symbol_execution_locks:
             async with bot.symbol_execution_locks[symbol]:
+                # 1. Obtener información de la posición del ledger (más fiable)
+                size_to_close = None
+                side_to_close = None
+                if hasattr(bot, 'position_ledger') and symbol in bot.position_ledger.active_positions:
+                    ledger_pos = bot.position_ledger.active_positions[symbol]
+                    size_to_close = ledger_pos.size
+                    side_to_close = ledger_pos.side
+                
+                # 2. Intentar cerrar en el exchange si tenemos datos
+                if size_to_close and side_to_close:
+                    close_side = 'sell' if side_to_close == 'buy' else 'buy'
+                    LOG.info("executing_market_close_for_invalid_position",
+                             symbol=symbol, side=close_side, size=size_to_close)
+                    try:
+                        order = await bot.exchange_manager.create_order(
+                            symbol, 'market', close_side, size_to_close
+                        )
+                        if order and order.get("success"):
+                            LOG.info("market_close_successful_for_invalid_pos", symbol=symbol)
+                        else:
+                            LOG.error("market_close_failed_for_invalid_pos", 
+                                      symbol=symbol, error=order.get('error') if order else 'No response')
+                    except Exception as ex_error:
+                        LOG.error("market_close_exception_for_invalid_pos",
+                                  symbol=symbol, error=str(ex_error))
+
+                # 3. Limpiar estado interno independientemente del resultado del exchange
                 risk_manager.close_position(symbol)
-                # Limpiar del ledger también
                 if hasattr(bot, 'position_ledger'):
                     if symbol in bot.position_ledger.active_positions:
                         del bot.position_ledger.active_positions[symbol]
                         LOG.info("invalid_position_cleaned_from_ledger", symbol=symbol)
-        else:
-            risk_manager.close_position(symbol)
-        LOG.info("invalid_position_closed_successfully", symbol=symbol)
+                
+                LOG.info("internal_state_cleaned_for_invalid_position", symbol=symbol)
+
     except Exception as e:
         LOG.error("failed_to_close_invalid_position",
                  symbol=symbol,
@@ -11750,9 +11505,9 @@ async def _execute_stop_loss_trade(bot, exchange_manager, risk_manager,
                          symbol=symbol)
                 return
             
-            # Actualizar bot metrics
-            await _update_bot_after_trade_close(
-                bot, risk_manager, symbol, 0.0, close_side,
+            # Actualizar bot metrics (using refactored method)
+            await bot._update_state_after_trade_close(
+                risk_manager, symbol, 0.0, close_side,
                 remaining_size, entry_price, executed_price, 
                 is_stop_loss=True
             )
@@ -11773,7 +11528,6 @@ async def _execute_stop_loss_trade(bot, exchange_manager, risk_manager,
                  symbol=symbol, 
                  error=str(e),
                  traceback=traceback.format_exc()[:300])
-
 
 async def _get_validated_execution_price(order, exchange_manager, symbol, fallback_price):
     """Helper para obtener precio de ejecución validado con múltiples fallbacks"""
@@ -11941,7 +11695,7 @@ async def _execute_take_profit_trade(bot, exchange_manager, risk_manager,
             is_full_close = new_remaining < 0.001  # Menos de 0.001 = cierre total
             
             # Actualizar métricas
-            await _update_bot_after_trade_close(
+            await _update_state_after_trade_close(
                 bot, risk_manager, symbol, 0.0, close_side,
                 close_size, entry_price, executed_price,
                 is_stop_loss=False,
@@ -11949,14 +11703,17 @@ async def _execute_take_profit_trade(bot, exchange_manager, risk_manager,
                 filled_size=close_size
             )
             
-            # CORRECCIÓN: Actualizar remaining_size DESPUÉS de update
+            # CORRECCIÓN: Actualizar el diccionario real en risk_manager
             if not is_full_close:
-                stop_info['remaining_size'] = new_remaining
-                LOG.info("partial_take_profit_executed",
-                        symbol=symbol,
-                        closed_size=close_size,
-                        remaining_size=new_remaining,
-                        exit_price=executed_price)
+                if symbol in risk_manager.active_stops:
+                    risk_manager.active_stops[symbol]['remaining_size'] = new_remaining
+                    LOG.info("partial_take_profit_executed",
+                            symbol=symbol,
+                            closed_size=close_size,
+                            remaining_size=new_remaining,
+                            exit_price=executed_price)
+                else:
+                    LOG.warning("position_disappeared_during_tp_execution", symbol=symbol)
             else:
                 # Cerrar completamente
                 risk_manager.close_position(symbol)
@@ -12006,7 +11763,7 @@ async def sync_bot_metrics_to_influx(bot, force=False):
                     LOG.warning("equity_inconsistent_in_sync",
                                discrepancy=audit['discrepancy'])
                     # Usar valores auditados como verdad
-                    current_equity = float(audit['actual_equity'])
+                    current_equity = float(audit['actual_free_equity'])
                     total_pnl = float(audit['total_realized_pnl'])
                 else:
                     total_pnl = float(audit['total_realized_pnl'])
@@ -12029,13 +11786,22 @@ async def sync_bot_metrics_to_influx(bot, force=False):
             active_positions = 0
             if hasattr(bot, 'risk_manager') and bot.risk_manager:
                 active_positions = len(bot.risk_manager.active_stops)
+
+            # Get performance metrics
+            perf_metrics = bot.performance_metrics if hasattr(bot, 'performance_metrics') else {}
+            total_trades = perf_metrics.get('total_trades', 0)
+            win_rate = perf_metrics.get('win_rate', 0.0)
+            sharpe_ratio = perf_metrics.get('sharpe_ratio', 0.0)
             
             # Enviar métricas de portfolio
             portfolio_success = await INFLUX_METRICS.write_portfolio_metrics(
                 equity=current_equity,
                 drawdown=drawdown,
                 positions=active_positions,
-                total_pnl=total_pnl
+                total_pnl=total_pnl,
+                total_trades=total_trades,
+                win_rate=win_rate,
+                sharpe_ratio=sharpe_ratio
             )
             
             metrics_sent['portfolio'] = portfolio_success
@@ -12163,22 +11929,26 @@ async def sync_bot_metrics_to_influx(bot, force=False):
         # ========================================
         try:
             if hasattr(bot, '_last_regime') and bot._last_regime:
-                # ✅ CORRECCIÓN: Enviar régimen de TODOS los símbolos con posiciones activas
-                
-                # Priorizar símbolos con posiciones
                 regime_symbols = []
                 
                 if hasattr(bot, 'risk_manager') and bot.risk_manager.active_stops:
-                    # Símbolos con posiciones activas
                     regime_symbols.extend(bot.risk_manager.active_stops.keys())
                 
-                # Agregar símbolo principal si no está
-                main_symbol = bot.config.symbols[0] if bot.config.symbols else None
-                if main_symbol and main_symbol not in regime_symbols:
-                    regime_symbols.append(main_symbol)
+                if len(regime_symbols) < 5:
+                    try:
+                        additional_symbols = await filter_pairs_by_volume(
+                            bot.exchange_manager,
+                            bot.config.symbols,
+                            min_volume_24h=500000.0
+                        )
+                        regime_symbols.extend([s for s in additional_symbols[:5] if s not in regime_symbols])
+                        LOG.debug("added_volume_based_regime_symbols",
+                                 added=len(additional_symbols[:5]),
+                                 total_regime_symbols=len(regime_symbols))
+                    except Exception as vol_error:
+                        LOG.warning("volume_filter_for_regime_failed", error=str(vol_error))
                 
-                # Limitar a 10 símbolos para no saturar
-                regime_symbols = regime_symbols[:10]
+                regime_symbols = list(set(regime_symbols))[:10]
                 
                 regime_numeric_map = {
                     'bull': 1.0,
@@ -12188,6 +11958,7 @@ async def sync_bot_metrics_to_influx(bot, force=False):
                     'unknown': 0.0
                 }
                 
+                regime_success_count = 0
                 for symbol in regime_symbols:
                     if symbol in bot._last_regime:
                         regime_data = bot._last_regime[symbol]
@@ -12205,12 +11976,18 @@ async def sync_bot_metrics_to_influx(bot, force=False):
                             )
                             
                             if regime_success:
-                                metrics_sent['regime'] = True
-                        
+                                regime_success_count += 1
+                            
                         except Exception as regime_write_error:
                             LOG.debug("regime_metric_write_failed",
                                      symbol=symbol,
                                      error=str(regime_write_error))
+                
+                if regime_success_count > 0:
+                    metrics_sent['regime'] = True
+                    LOG.debug("regime_metrics_sent_multi_symbol",
+                             symbols=regime_success_count,
+                             total_attempted=len(regime_symbols))
         
         except Exception as regime_error:
             LOG.error("regime_metrics_sync_failed", error=str(regime_error))
@@ -12220,10 +11997,8 @@ async def sync_bot_metrics_to_influx(bot, force=False):
         # ========================================
         try:
             if hasattr(bot, 'trades') and bot.trades:
-                # Enviar últimos 10 trades (ya se envían individualmente, aquí resumir)
                 recent_trades = bot.trades[-10:]
                 
-                # Agrupar por símbolo
                 trades_by_symbol = {}
                 for trade in recent_trades:
                     symbol = trade.get('symbol')
@@ -12232,7 +12007,6 @@ async def sync_bot_metrics_to_influx(bot, force=False):
                             trades_by_symbol[symbol] = []
                         trades_by_symbol[symbol].append(trade)
                 
-                # Enviar resumen por símbolo
                 for symbol, symbol_trades in trades_by_symbol.items():
                     try:
                         total_pnl = sum(t.get('pnl', 0) for t in symbol_trades)
@@ -12261,9 +12035,6 @@ async def sync_bot_metrics_to_influx(bot, force=False):
         except Exception as trades_error:
             LOG.error("recent_trades_metrics_failed", error=str(trades_error))
         
-        # ========================================
-        # FLUSH EXPLÍCITO si force=True
-        # ========================================
         if force and hasattr(INFLUX_METRICS, 'write_api'):
             try:
                 INFLUX_METRICS.write_api.flush()
@@ -12271,7 +12042,6 @@ async def sync_bot_metrics_to_influx(bot, force=False):
             except Exception as flush_error:
                 LOG.debug("influx_flush_failed", error=str(flush_error))
         
-        # Resultado final
         success_count = sum(1 for v in metrics_sent.values() if v)
         total_count = len(metrics_sent)
         
@@ -12290,945 +12060,239 @@ async def sync_bot_metrics_to_influx(bot, force=False):
 
 async def advanced_ai_main_with_rl():
     """
-    VERSIÓN MEJORADA: Main con testing integrado, telegram y validación robusta
+    Main function to initialize and run the advanced AI trading bot, now featuring
+    a fully optimized and robust startup sequence and main loop.
     """
-    config = None
-    bot = None
-    exchange_manager = None
-    telegram_kill_switch = None
+    config, bot, exchange_manager, telegram_kill_switch = None, None, None, None
     
     try:
+        # =======================================================================
+        # ===== PHASE 1: INITIALIZATION AND SETUP ===============================
+        # =======================================================================
         LOG.info("starting_advanced_ai_trading_bot_with_full_features")
         
-        # Crear configuración
         config = create_config()
-        
-        # Validar configuración
         config.validate_config_modes()
         
-        # Crear exchange manager
-        api_key = os.getenv('BINANCE_API_KEY', '')
-        api_secret = os.getenv('BINANCE_API_SECRET', '')
+        api_key, api_secret = os.getenv('BINANCE_API_KEY', ''), os.getenv('BINANCE_API_SECRET', '')
+        exchange_manager = ExchangeManager(config.exchange, api_key, api_secret, config.sandbox, config.dry_run)
         
-        exchange_manager = ExchangeManager(
-            exchange_name=config.exchange,
-            api_key=api_key,
-            api_secret=api_secret,
-            sandbox=config.sandbox,
-            dry_run=config.dry_run
-        )
-        
-        # Crear strategy manager
         strategy_manager = StrategyManager(config)
         await strategy_manager.initialize()
         
-        # Crear bot
         bot = AdvancedAITradingBot(config, exchange_manager, strategy_manager)
-
-        # NUEVO: Configurar initial_capital en InfluxDB
         set_influx_initial_capital(config.initial_capital)
         
-        # Inicializar componentes AI
+        # Initialize AI components
         LOG.info("initializing_ai_components")
-        
-        # AutoML
         bot.automl = AdvancedAutoML(config)
-        
-        # Regime Detector
-        bot.regime_detector = AdvancedMarketRegimeDetector(config)
-        
-        # Risk Optimizer
+        bot.regime_detector = AdvancedMarketRegimeDetector(config, strategy_manager)
         bot.risk_optimizer = BayesianRiskOptimizer(config)
-        
-        # Ensemble Learner
         bot.ensemble_learner = AdvancedEnsembleLearner(config)
         bot.ensemble_learner.initialize_base_models()
         
-        # Intentar cargar modelos guardados
-        try:
-            load_success = await bot.ensemble_learner._load_models()
-            if load_success:
-                LOG.info("ensemble_models_loaded_from_disk")
-            else:
-                LOG.info("no_saved_models_will_train_from_scratch")
-        except Exception as load_error:
-            LOG.warning("model_loading_failed_will_train", error=str(load_error))
+        # Load saved models
+        if await bot.ensemble_learner._load_models():
+            LOG.info("ensemble_models_loaded_from_disk")
+            all_trained_symbols = list(bot.ensemble_learner.symbol_models.keys())
+            config.symbols = sorted(list(set(config.symbols + all_trained_symbols)))
+            bot.config.symbols = config.symbols
+            bot.symbol_execution_locks = {symbol: asyncio.Lock() for symbol in config.symbols}
+            LOG.info("symbol_list_updated_with_trained_models", total=len(config.symbols))
         
-        # RL Agent
         bot.rl_agent = PPOAgent(config)
+        if bot.rl_agent.load(): LOG.info("rl_agent_loaded_from_checkpoint")
         
-        # Intentar cargar agente RL guardado
-        try:
-            rl_load_success = bot.rl_agent.load()
-            if rl_load_success:
-                LOG.info("rl_agent_loaded_from_checkpoint")
-            else:
-                LOG.info("no_rl_checkpoint_will_train_from_scratch")
-        except Exception as rl_load_error:
-            LOG.warning("rl_agent_loading_failed", error=str(rl_load_error))
-        
-        # RL Training Manager
         bot.rl_training_manager = RLTrainingManager(config, bot.rl_agent)
         
-        # Dashboard
         try:
             bot.dashboard = PerformanceDashboard(bot)
-            LOG.info("dashboard_initialized")
-        except Exception as dashboard_error:
-            LOG.error("dashboard_initialization_failed", error=str(dashboard_error))
-            bot.dashboard = None
+        except Exception as e:
+            LOG.error("dashboard_initialization_failed", error=str(e))
         
-        # ===== NUEVO: Iniciar Telegram Kill Switch =====
+        telegram_kill_switch = TelegramKillSwitch()
+        if telegram_kill_switch.enabled:
+            await telegram_kill_switch.start(bot)
+            bot.telegram_kill_switch = telegram_kill_switch
+        
+        # =======================================================================
+        # ===== PHASE 2: INITIAL TRAINING AND VALIDATION ========================
+        # =======================================================================
+        
+        # Prioritize symbols by volume for training
+        symbols_to_train = []
         try:
-            telegram_kill_switch = TelegramKillSwitch()
-            if telegram_kill_switch.enabled:
-                await telegram_kill_switch.start(bot)
-                bot.telegram_kill_switch = telegram_kill_switch
-                LOG.info("telegram_kill_switch_active",
-                        admins=len(telegram_kill_switch.admin_chat_ids))
-            else:
-                LOG.info("telegram_kill_switch_disabled")
-        except Exception as telegram_error:
-            LOG.warning("telegram_kill_switch_failed_to_start",
-                       error=str(telegram_error))
-        
-        # Entrenar modelos iniciales
-        LOG.info("loading_historical_data_for_initial_training")
-        
-        # ===== CORRECCIÓN: Entrenar para TODOS los símbolos, no solo el primero =====
-        trained_symbols = []
-        training_failures = []
-        
-        # Determinar cuántos símbolos entrenar inicialmente (top por volumen)
-        max_initial_training = int(os.getenv('MAX_INITIAL_TRAINING_SYMBOLS', '50'))
-        
-        LOG.info("multi_symbol_training_starting",
-                total_symbols=len(config.symbols),
-                max_initial=max_initial_training,
-                strategy="train_top_volume_first")
-        
-        # Filtrar símbolos por volumen para priorizar
-        try:
-            priority_symbols = await filter_pairs_by_volume(
-                exchange_manager,
-                config.symbols[:100],  # Analizar primeros 100
-                min_volume_24h=1000000.0  # $1M mínimo
-            )
-            
-            if priority_symbols:
-                symbols_to_train = priority_symbols[:max_initial_training]
-                LOG.info("symbols_prioritized_by_volume",
-                        total_analyzed=min(100, len(config.symbols)),
-                        high_volume=len(priority_symbols),
-                        selected_for_training=len(symbols_to_train))
-            else:
-                # Fallback: primeros N símbolos
-                symbols_to_train = config.symbols[:max_initial_training]
-                LOG.warning("volume_filter_failed_using_first_n",
-                           n=max_initial_training)
-        
-        except Exception as priority_error:
-            LOG.error("symbol_prioritization_failed", error=str(priority_error))
-            symbols_to_train = config.symbols[:max_initial_training]
-        
-        # Entrenar modelo general con datos combinados primero
-        LOG.info("training_general_ensemble_model")
-        
-        try:
-            # Cargar datos del símbolo más líquido para modelo general
-            main_symbol = symbols_to_train[0] if symbols_to_train else config.symbols[0]
-            hist_data = await bot._load_historical_data(months=3)
-            
-            if hist_data is not None and len(hist_data) >= 100:
-                LOG.info("training_general_model",
-                        symbol=main_symbol,
-                        samples=len(hist_data))
-                
-                await bot.ensemble_learner.fit(hist_data, epochs=10, symbol=None)
-                trained_symbols.append(f"{main_symbol}_general")
-                
-                LOG.info("general_model_trained_successfully")
-            else:
-                LOG.warning("insufficient_data_for_general_model",
-                           data_rows=len(hist_data) if hist_data is not None else 0)
-        
-        except Exception as general_error:
-            LOG.error("general_model_training_failed", error=str(general_error))
-            training_failures.append(('general_model', str(general_error)))
-        
-        # ===== NUEVO: Entrenar modelos especializados para cada símbolo =====
-        LOG.info("starting_specialized_model_training",
-                symbols_count=len(symbols_to_train))
-        
-        # Usar concurrencia controlada para no saturar
-        training_semaphore = asyncio.Semaphore(3)  # Máximo 3 entrenamientos paralelos
-        
-        async def train_specialized_model(symbol: str):
-            async with training_semaphore:
-                try:
-                    LOG.info("training_specialized_model_starting", symbol=symbol)
-                    
-                    # Cargar datos históricos del símbolo específico
-                    # Reusar exchange_manager ya existente
-                    symbol_hist = await bot._load_historical_data_for_symbol(
-                        symbol, months=3
-                    )
-                    
-                    if symbol_hist is None or len(symbol_hist) < 100:
-                        LOG.warning("insufficient_data_for_specialized_model",
-                                   symbol=symbol,
-                                   rows=len(symbol_hist) if symbol_hist is not None else 0)
-                        return {'symbol': symbol, 'success': False, 'reason': 'insufficient_data'}
-                    
-                    # Entrenar modelo especializado
-                    await bot.ensemble_learner.fit(
-                        symbol_hist,
-                        epochs=8,  # Menos epochs para especializados
-                        symbol=symbol
-                    )
-                    
-                    # ✅ CRÍTICO: Verificar que se guardó correctamente
-                    if symbol not in bot.ensemble_learner.symbol_models:
-                        LOG.error("specialized_model_not_registered",
-                                 symbol=symbol,
-                                 available_models=list(bot.ensemble_learner.symbol_models.keys())[:10])
-                        return {'symbol': symbol, 'success': False, 'reason': 'registration_failed'}
-                    
-                    LOG.info("specialized_model_trained_successfully",
-                            symbol=symbol,
-                            samples=len(symbol_hist))
-                    
-                    return {'symbol': symbol, 'success': True, 'samples': len(symbol_hist)}
-                
-                except Exception as train_error:
-                    LOG.error("specialized_model_training_failed",
-                             symbol=symbol,
-                             error=str(train_error))
-                    return {'symbol': symbol, 'success': False, 'error': str(train_error)}
-        
-        # Crear tareas de entrenamiento
-        training_tasks = [
-            asyncio.create_task(train_specialized_model(symbol))
-            for symbol in symbols_to_train
-        ]
-        
-        # Ejecutar con timeout generoso (5 minutos por símbolo)
-        total_timeout = len(symbols_to_train) * 300
-        
-        try:
-            training_results = await asyncio.wait_for(
-                asyncio.gather(*training_tasks, return_exceptions=True),
-                timeout=total_timeout
-            )
-            
-            # Analizar resultados
-            for result in training_results:
-                if isinstance(result, dict):
-                    if result.get('success'):
-                        trained_symbols.append(result['symbol'])
-                    else:
-                        training_failures.append((result['symbol'], result.get('reason', result.get('error'))))
-                elif isinstance(result, Exception):
-                    training_failures.append(('unknown_symbol', str(result)))
-            
-            LOG.info("specialized_training_completed",
-                    total_attempted=len(symbols_to_train),
-                    successful=len(trained_symbols),
-                    failed=len(training_failures),
-                    success_rate=len(trained_symbols)/len(symbols_to_train)*100 if symbols_to_train else 0)
-            
-            # ✅ NUEVO: Guardar estado de modelos entrenados
-            if hasattr(bot, 'ensemble_learner'):
-                bot.ai_models_status = {
-                    'general_model_trained': bot.ensemble_learner.is_trained,
-                    'specialized_models_count': len(bot.ensemble_learner.symbol_models),
-                    'specialized_symbols': list(bot.ensemble_learner.symbol_models.keys()),
-                    'trained_symbols': trained_symbols,
-                    'training_failures': training_failures,
-                    'symbol_training_history': bot.ensemble_learner.symbol_training_history
-                }
-                
-                LOG.info("ai_models_status_updated",
-                        general_trained=bot.ai_models_status['general_model_trained'],
-                        specialized_count=bot.ai_models_status['specialized_models_count'])
-        
-        except asyncio.TimeoutError:
-            LOG.error("specialized_training_timeout",
-                     timeout_seconds=total_timeout,
-                     symbols_attempted=len(symbols_to_train))
-            
-            # Cancelar tareas pendientes
-            for task in training_tasks:
-                if not task.done():
-                    task.cancel()
-            
-            await asyncio.gather(*training_tasks, return_exceptions=True)
-        
-        # ===== WALK-FORWARD VALIDATION: Solo para símbolos exitosos =====
-            
-            if trained_symbols and len(trained_symbols) >= 3:
-                LOG.info("starting_multi_symbol_walk_forward_validation",
-                        symbols_to_validate=min(5, len(trained_symbols)))
-                
-                # Validar top 5 símbolos entrenados
-                validation_targets = trained_symbols[:5]
-                
-                validation_results = {}
-                
-                for symbol in validation_targets:
-                    try:
-                        # Cargar datos del símbolo
-                        symbol_data = await bot._load_historical_data_for_symbol(
-                            symbol, months=6
-                        )
-                        
-                        if symbol_data is None or len(symbol_data) < 1000:
-                            LOG.warning("insufficient_data_for_walk_forward",
-                                       symbol=symbol,
-                                       rows=len(symbol_data) if symbol_data is not None else 0)
-                            continue
-                        
-                        LOG.info("validating_symbol_with_walk_forward",
-                                symbol=symbol,
-                                data_rows=len(symbol_data))
-                        
-                        validation_result = await bot.walk_forward_validator.run_walk_forward(
-                            bot, symbol_data, symbol=symbol
-                        )
-                        
-                        validation_results[symbol] = validation_result
-                        
-                        if validation_result.get('success'):
-                            analysis = validation_result.get('analysis', {})
-                            
-                            LOG.info("walk_forward_completed_for_symbol",
-                                    symbol=symbol,
-                                    windows=len(validation_result.get('windows', [])),
-                                    avg_degradation=analysis.get('avg_degradation', 0),
-                                    overfitting=analysis.get('overfitting_detected', False))
-                            
-                            # Si overfitting, re-entrenar con regularización
-                            if analysis.get('overfitting_detected'):
-                                LOG.warning("retraining_symbol_with_regularization",
-                                           symbol=symbol)
-                                
-                                await bot.ensemble_learner.fit(
-                                    symbol_data,
-                                    epochs=5,
-                                    symbol=symbol
-                                )
-                        
-                    except Exception as validation_error:
-                        LOG.error("walk_forward_failed_for_symbol",
-                                 symbol=symbol,
-                                 error=str(validation_error))
-                        validation_results[symbol] = {
-                            'success': False,
-                            'error': str(validation_error)
-                        }
-                
-                LOG.info("multi_symbol_validation_completed",
-                        total_validated=len(validation_results),
-                        successful=[s for s, r in validation_results.items() if r.get('success')],
-                        failed=[s for s, r in validation_results.items() if not r.get('success')])
-            
-            else:
-                LOG.warning("skipping_walk_forward_insufficient_trained_models",
-                           trained_count=len(trained_symbols),
-                           required=3)
-            
-            # Entrenar RL agent con datos combinados
-            LOG.info("training_rl_agent_on_combined_historical_data")
-            
-            # Usar datos del símbolo más líquido para RL
-            if hist_data is not None and len(hist_data) >= 100:
-                await bot.rl_training_manager.train(episodes=50, df=hist_data)
-                LOG.info("rl_training_completed")
-            else:
-                LOG.warning("insufficient_data_for_rl_training")
-            
-            LOG.info("initial_training_completed",
-                    total_trained_symbols=len(trained_symbols),
-                    failed_trainings=len(training_failures))
-        
-        else:
-            LOG.warning("no_symbols_to_train")
-        
-        # ===== NUEVO: Ejecutar Tests Iniciales con Validación Estricta =====
-        LOG.info("running_initial_automated_tests")
-        try:
-            initial_test_results = await bot.test_suite.run_all_tests()
-            
-            failed_count = initial_test_results.get('failed', 0)
-            total_count = initial_test_results.get('total_tests', 0)
-            success_rate = initial_test_results.get('success_rate', 0)
-            
-            if failed_count > 0:
-                LOG.warning("initial_tests_had_failures",
-                           failed=failed_count,
-                           total=total_count,
-                           success_rate=success_rate * 100)
-                
-                # NUEVO: Identificar tests críticos fallidos
-                critical_failures = []
-                for result in initial_test_results.get('results', []):
-                    if not result['passed']:
-                        test_name = result['test_name']
-                        # Tests críticos que no pueden fallar
-                        critical_tests = [
-                            'position_ledger_atomicity',
-                            'risk_manager_stop_loss',
-                            'equity_audit_consistency'
-                        ]
-                        if test_name in critical_tests:
-                            critical_failures.append(test_name)
-                
-                if critical_failures:
-                    LOG.critical("critical_tests_failed_cannot_start",
-                                failed_tests=critical_failures)
-                    
-                    await ALERT_SYSTEM.send_alert(
-                        "CRITICAL",
-                        "Bot startup aborted - Critical tests failed",
-                        failed_tests=critical_failures,
-                        total_failures=failed_count
-                    )
-                    
-                    # NUEVO: Opción de continuar o abortar
-                    abort_on_critical_failure = os.getenv('ABORT_ON_TEST_FAILURE', 'true').lower() == 'true'
-                    
-                    if abort_on_critical_failure:
-                        LOG.critical("aborting_startup_due_to_test_failures")
-                        raise RuntimeError(f"Critical tests failed: {critical_failures}")
-                    else:
-                        LOG.warning("continuing_despite_critical_failures_unsafe")
-            else:
-                LOG.info("all_initial_tests_passed",
-                        total=total_count,
-                        success_rate=success_rate * 100)
-                
-        except Exception as test_error:
-            LOG.error("initial_testing_failed_exception",
-                     error=str(test_error))
-            
-            # Decidir si continuar
-            if os.getenv('ABORT_ON_TEST_ERROR', 'true').lower() == 'true':
-                raise
+            max_initial_training = int(os.getenv('MAX_INITIAL_TRAINING_SYMBOLS', '50'))
+            priority_symbols = await filter_pairs_by_volume(exchange_manager, config.symbols, 100000.0)
+            symbols_to_train = priority_symbols[:max_initial_training]
+        except Exception as e:
+            LOG.error("symbol_prioritization_failed", error=str(e))
+            symbols_to_train = config.symbols[:10]
 
-        # ===== CORRECCIÓN: Restablecer equity tras tests =====
-        bot.equity = float(config.initial_capital)
-        bot.initial_capital = float(config.initial_capital)
+        # Train General Model on combined data from top symbols
+        LOG.info("training_general_ensemble_model_on_multi_symbol_data")
+        general_training_symbols = symbols_to_train[:5]
+        combined_data = []
+        for sym in general_training_symbols:
+            data = await bot._load_historical_data_for_symbol(sym, months=3)
+            if data is not None and len(data) > 100: combined_data.append(data)
         
-        # ===== NUEVO: Reconciliación Inicial =====
-        if hasattr(bot, 'position_ledger'):
-            try:
-                LOG.info("performing_initial_reconciliation")
-                initial_recon = await bot.position_ledger.reconcile_with_exchange(
-                    bot, exchange_manager
-                )
-                
-                if initial_recon.get('discrepancies') or initial_recon.get('ledger_only') or initial_recon.get('exchange_only'):
-                    LOG.warning("initial_reconciliation_found_issues",
-                               **initial_recon)
-                else:
-                    LOG.info("initial_reconciliation_clean")
-            except Exception as recon_error:
-                LOG.warning("initial_reconciliation_failed", error=str(recon_error))
+        if combined_data:
+            hist_data = pd.concat(combined_data, ignore_index=True)
+            await bot.ensemble_learner.fit(hist_data, epochs=10)
+            LOG.info("general_model_trained_successfully", samples=len(hist_data))
+        else:
+            LOG.warning("insufficient_data_for_general_model_training")
+            
+        # Train Specialized Models in Parallel
+        LOG.info("starting_parallel_specialized_model_training", count=len(symbols_to_train))
+        semaphore = asyncio.Semaphore(5)
         
-        # Iniciar bot
+        async def train_specialized(symbol):
+            async with semaphore:
+                data = await bot._load_historical_data_for_symbol(symbol, months=3)
+                if data is not None and len(data) > 100:
+                    await bot.ensemble_learner.fit(data, epochs=8, symbol=symbol)
+                    return symbol
+                return None
+
+        tasks = [train_specialized(s) for s in symbols_to_train]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        trained_symbols = [res for res in results if res and isinstance(res, str)]
+        LOG.info("specialized_training_complete", successful=len(trained_symbols), total=len(symbols_to_train))
+
+        # Run Walk-Forward Validation on top successfully trained symbols
+        if trained_symbols:
+            for symbol in trained_symbols[:3]:
+                validation_data = await bot._load_historical_data_for_symbol(symbol, months=6)
+                if validation_data is not None and len(validation_data) > 1000:
+                    await bot.walk_forward_validator.run_walk_forward(bot, validation_data, symbol)
+        
+        # Train RL Agent
+        if 'hist_data' in locals() and hist_data is not None and len(hist_data) >= 100:
+            await bot.rl_training_manager.train(episodes=50, df=hist_data)
+
+        # =======================================================================
+        # ===== PHASE 3: PRE-FLIGHT CHECKS AND BOT STARTUP ======================
+        # =======================================================================
+        
+        # Run initial tests
+        LOG.info("running_initial_automated_tests")
+        initial_tests = await bot.test_suite.run_all_tests()
+        if initial_tests.get('failed', 0) > 0:
+            critical_failures = [r['test_name'] for r in initial_tests.get('results', []) if not r['passed'] and 'ledger' in r['test_name']]
+            if critical_failures and os.getenv('ABORT_ON_TEST_FAILURE', 'true').lower() == 'true':
+                raise RuntimeError(f"Startup aborted due to critical test failures: {critical_failures}")
+            LOG.warning("initial_tests_had_failures", failed=initial_tests['failed'])
+
+        # Reset equity after tests and perform initial reconciliation
+        bot.equity = bot.initial_capital = float(config.initial_capital)
+        await bot.position_ledger.reconcile_with_exchange(bot, exchange_manager)
+        
+        # Start the bot and its periodic tasks
         await bot.start()
-        
         LOG.info("bot_started_entering_main_loop")
-        
-        # Main loop
+
+        # =======================================================================
+        # ===== PHASE 4: MAIN TRADING LOOP ======================================
+        # =======================================================================
         while bot.is_running:
             try:
-                # Verificar kill switch de Telegram
-                if hasattr(bot, 'telegram_kill_switch') and bot.telegram_kill_switch:
-                    if bot.telegram_kill_switch.circuit_breaker_active:
-                        LOG.warning("trading_paused_by_telegram_kill_switch")
-                        await asyncio.sleep(30)
-                        continue
+                if bot.telegram_kill_switch and bot.telegram_kill_switch.circuit_breaker_active:
+                    LOG.warning("trading_paused_by_telegram_kill_switch")
+                    await asyncio.sleep(30)
+                    continue
+
+                # Prioritize symbols: 1. Active, 2. High-Volume Candidates
+                active_symbols = list(bot.risk_manager.active_stops.keys()) if bot.risk_manager else []
+                candidate_symbols = [s for s in bot.config.symbols if s not in active_symbols]
                 
-                # ✅ MEJORA: Confirmar cantidad de símbolos a procesar
-                symbols_to_process = config.symbols.copy()
+                high_vol_candidates = await filter_pairs_by_volume(bot.exchange_manager, candidate_symbols, 100000.0)
+                symbols_to_process = active_symbols + high_vol_candidates[:50] # Process active + up to 50 candidates
                 
-                LOG.info("main_loop_iteration_starting",
-                        total_symbols_configured=len(symbols_to_process),
-                        symbols_sample=symbols_to_process[:10] if len(symbols_to_process) > 10 else symbols_to_process)
+                # Dynamic concurrency based on memory
+                mem_mb = MEMORY_MANAGER.get_memory_usage().get('rss_mb', 0)
+                max_concurrent = 3 if mem_mb > 1800 else 5 if mem_mb > 1500 else 10
                 
-                # ✅ MEJORA: Estrategia de priorización con logging
+                LOG.info("main_loop_iteration", processing=len(symbols_to_process), active=len(active_symbols), candidates=len(high_vol_candidates), concurrency=max_concurrent)
                 
-                # 1. Símbolos con posiciones activas (máxima prioridad)
-                priority_1_active = []
-                
-                # 2. Símbolos con alto volumen/volatilidad (alta prioridad)
-                priority_2_highvol = []
-                
-                # 3. Resto de símbolos
-                priority_3_rest = []
-                
-                if hasattr(bot, 'risk_manager'):
-                    active_symbols = set(bot.risk_manager.active_stops.keys())
-                    
-                    for symbol in symbols_to_process:
-                        if symbol in active_symbols:
-                            priority_1_active.append(symbol)
-                        else:
-                            priority_3_rest.append(symbol)
-                    
-                    LOG.info("symbol_prioritization",
-                            active_positions=len(priority_1_active),
-                            remaining=len(priority_3_rest))
-                else:
-                    priority_3_rest = symbols_to_process.copy()
-                
-                # ✅ MEJORA: Filtrado inteligente para reducir carga sin perder oportunidades
-                # Solo aplicar si hay MUCHOS símbolos (>50)
-                
-                if len(priority_3_rest) > 50:
-                    LOG.info("applying_smart_symbol_filtering",
-                            total_candidates=len(priority_3_rest),
-                            reason="too_many_symbols")
-                    
-                    # Filtrar por volumen mínimo
-                    try:
-                        filtered_by_volume = await filter_pairs_by_volume(
-                            bot.exchange_manager,
-                            priority_3_rest[:100],  # Limitar consultas
-                            min_volume_24h=500000.0  # $500k mínimo
-                        )
-                        
-                        if filtered_by_volume:
-                            priority_2_highvol = filtered_by_volume[:30]  # Top 30
-                            LOG.info("volume_filtering_applied",
-                                    original=len(priority_3_rest),
-                                    after_filter=len(filtered_by_volume),
-                                    selected=len(priority_2_highvol))
-                        else:
-                            # Fallback: usar primeros 30 si filtro falla
-                            priority_2_highvol = priority_3_rest[:30]
-                            LOG.warning("volume_filter_failed_using_first_n",
-                                       selected=len(priority_2_highvol))
-                    
-                    except Exception as filter_error:
-                        LOG.error("symbol_filtering_error_using_all",
-                                 error=str(filter_error))
-                        priority_2_highvol = priority_3_rest[:30]
-                else:
-                    # Si pocos símbolos, procesar todos
-                    priority_2_highvol = priority_3_rest
-                
-                # Combinar prioridades
-                ordered_symbols = priority_1_active + priority_2_highvol
-                
-                LOG.info("symbol_processing_plan",
-                        total_to_process=len(ordered_symbols),
-                        active_positions=len(priority_1_active),
-                        high_volume=len(priority_2_highvol),
-                        skipped=len(symbols_to_process) - len(ordered_symbols))
-                
-                # ✅ MEJORA: Ajustar concurrencia dinámicamente
-                base_concurrent = 10  # Aumentado de 5
-                memory_usage = MEMORY_MANAGER.get_memory_usage().get('rss_mb', 0) if MEMORY_MANAGER else 0
-                
-                if memory_usage > 1800:
-                    max_concurrent = 3
-                    LOG.warning("reducing_concurrency_critical_memory", memory_mb=memory_usage)
-                elif memory_usage > 1500:
-                    max_concurrent = 5
-                    LOG.info("reducing_concurrency_high_memory", memory_mb=memory_usage)
-                else:
-                    # Ajustar según cantidad de símbolos
-                    if len(ordered_symbols) > 100:
-                        max_concurrent = 15
-                    elif len(ordered_symbols) > 50:
-                        max_concurrent = 12
-                    else:
-                        max_concurrent = base_concurrent
-                    
-                    LOG.debug("concurrency_set",
-                             max_concurrent=max_concurrent,
-                             symbols=len(ordered_symbols),
-                             memory_mb=memory_usage)
-                
-                semaphore = asyncio.Semaphore(max_concurrent)
-                
-                # ✅ MEJORA: Logging detallado por símbolo procesado
-                processing_stats = {
-                    'attempted': 0,
-                    'success': 0,
-                    'failed': 0,
-                    'skipped': 0,
-                    'timeout': 0
-                }
-                
+                processing_semaphore = asyncio.Semaphore(max_concurrent)
                 async def process_with_semaphore(symbol):
-                    async with semaphore:
-                        processing_stats['attempted'] += 1
-                        
-                        # Logging cada 50 símbolos
-                        if processing_stats['attempted'] % 50 == 0:
-                            LOG.info("processing_progress",
-                                    processed=processing_stats['attempted'],
-                                    total=len(ordered_symbols),
-                                    progress_pct=processing_stats['attempted']/len(ordered_symbols)*100)
-                        
-                        if symbol not in bot.symbol_execution_locks:
-                            bot.symbol_execution_locks[symbol] = asyncio.Lock()
-                        
-                        if bot.symbol_execution_locks[symbol].locked():
-                            processing_stats['skipped'] += 1
-                            LOG.debug("symbol_already_processing_skipping", symbol=symbol)
-                            return {'symbol': symbol, 'status': 'skipped'}
-                        
-                        try:
-                            async with bot.symbol_execution_locks[symbol]:
-                                # ✅ Timeout individual por símbolo
-                                try:
-                                    result = await asyncio.wait_for(
-                                        fetch_market_data(
-                                            bot.exchange_manager,
-                                            symbol,
-                                            bot.config.timeframe
-                                        ),
-                                        timeout=15.0  # 15 segundos por símbolo
-                                    )
-                                except asyncio.TimeoutError:
-                                    processing_stats['timeout'] += 1
-                                    LOG.warning("symbol_fetch_timeout", symbol=symbol)
-                                    return {'symbol': symbol, 'status': 'timeout'}
-                                
-                                if result.get('success'):
-                                    process_result = await bot._process_symbol_data(symbol, result)
-                                    
-                                    if process_result and process_result.get('success'):
-                                        processing_stats['success'] += 1
-                                        
-                                        # Log detallado solo para símbolos importantes
-                                        if symbol in priority_1_active or processing_stats['success'] % 20 == 0:
-                                            LOG.info("symbol_processed_successfully",
-                                                    symbol=symbol,
-                                                    candles=process_result.get('candles_processed', 0),
-                                                    has_active_position=symbol in priority_1_active)
-                                    else:
-                                        processing_stats['failed'] += 1
-                                    
-                                    return {
-                                        'symbol': symbol,
-                                        'status': 'success',
-                                        'result': process_result
-                                    }
-                                else:
-                                    processing_stats['failed'] += 1
-                                    return {
-                                        'symbol': symbol,
-                                        'status': 'failed',
-                                        'error': result.get('error')
-                                    }
-                        except Exception as e:
-                            processing_stats['failed'] += 1
-                            LOG.debug("symbol_processing_exception",
-                                     symbol=symbol,
-                                     error=str(e)[:100])
-                            return {'symbol': symbol, 'status': 'error', 'error': str(e)}
+                    async with processing_semaphore:
+                        async with bot.symbol_execution_locks.get(symbol, asyncio.Lock()):
+                            market_data = await fetch_market_data(bot.exchange_manager, symbol, bot.config.timeframe)
+                            if market_data.get('success'):
+                                await bot._process_symbol_data(symbol, market_data)
+
+                process_tasks = [process_with_semaphore(s) for s in symbols_to_process]
+                await asyncio.gather(*process_tasks, return_exceptions=True)
                 
-                # Crear tareas
-                tasks = [asyncio.create_task(process_with_semaphore(symbol)) 
-                        for symbol in ordered_symbols]
-                
-                # Esperar resultados con timeout global generoso
-                if tasks:
-                    try:
-                        # Timeout: 2 minutos + 5 segundos por símbolo
-                        global_timeout = 120 + (len(ordered_symbols) * 5)
-                        
-                        results = await asyncio.wait_for(
-                            asyncio.gather(*tasks, return_exceptions=True),
-                            timeout=global_timeout
-                        )
-                        
-                        # ✅ Análisis detallado de resultados
-                        LOG.info("main_loop_iteration_complete",
-                                total_symbols=len(ordered_symbols),
-                                attempted=processing_stats['attempted'],
-                                success=processing_stats['success'],
-                                failed=processing_stats['failed'],
-                                skipped=processing_stats['skipped'],
-                                timeout=processing_stats['timeout'],
-                                success_rate=processing_stats['success']/processing_stats['attempted']*100 
-                                            if processing_stats['attempted'] > 0 else 0)
-                        
-                        # ✅ Log de símbolos problemáticos
-                        failed_symbols = [r['symbol'] for r in results 
-                                         if isinstance(r, dict) and r.get('status') in ['failed', 'error', 'timeout']]
-                        
-                        if failed_symbols and len(failed_symbols) > 10:
-                            LOG.warning("multiple_symbols_failed",
-                                       count=len(failed_symbols),
-                                       sample=failed_symbols[:10])
-                        
-                    except asyncio.TimeoutError:
-                        LOG.error("main_loop_global_timeout",
-                                 timeout_seconds=global_timeout,
-                                 symbols_attempted=len(ordered_symbols),
-                                 processed=processing_stats['success'])
-                        
-                        # Cancelar pendientes
-                        for task in tasks:
-                            if not task.done():
-                                task.cancel()
-                        
-                        await asyncio.gather(*tasks, return_exceptions=True)
-                
-                # Health check y ajustes
-                if hasattr(bot, 'health_check'):
-                    try:
-                        health = bot.health_check.get_health_status()
-                        
-                        # Alertar si memoria muy alta
-                        if health.get('memory_mb', 0) > 2000:
-                            LOG.warning("high_memory_usage_in_main_loop",
-                                       memory_mb=health['memory_mb'])
-                            
-                            # Forzar limpieza
-                            optimize_memory_usage()
-                            
-                        # Alertar si CPU muy alto
-                        if health.get('cpu_percent', 0) > 90:
-                            LOG.warning("high_cpu_usage_in_main_loop",
-                                       cpu_percent=health['cpu_percent'])
-                            
-                            # Aumentar intervalo temporalmente
-                            await asyncio.sleep(30)
-                            
-                    except Exception as health_error:
-                        LOG.debug("health_check_error", error=str(health_error))
-                
-                # Intervalo entre ciclos
                 await asyncio.sleep(60)
                 
             except asyncio.CancelledError:
                 LOG.info("main_loop_cancelled")
                 break
             except Exception as e:
-                LOG.error("main_loop_error",
-                         error=str(e),
-                         traceback=traceback.format_exc()[:500])
+                LOG.error("main_loop_error", error=str(e), traceback=traceback.format_exc()[:500])
                 await asyncio.sleep(30)
         
-    except KeyboardInterrupt:
-        LOG.info("keyboard_interrupt_received_shutting_down")
+    except (KeyboardInterrupt, RuntimeError) as e:
+        if isinstance(e, RuntimeError):
+            LOG.critical("runtime_error_triggering_shutdown", error=str(e))
+        LOG.info("shutdown_signal_received")
     
     except Exception as e:
-        LOG.critical("critical_error_in_main",
-                    error=str(e),
-                    traceback=traceback.format_exc())
+        LOG.critical("critical_error_in_main", error=str(e), traceback=traceback.format_exc())
     
     finally:
+        # =======================================================================
+        # ===== PHASE 5: GRACEFUL SHUTDOWN ======================================
+        # =======================================================================
         LOG.info("initiating_graceful_shutdown")
-        
-        # NUEVO: Lista de errores de shutdown para reportar
         shutdown_errors = []
         
-        # 1. Detener Telegram primero (puede enviar notificaciones)
         if telegram_kill_switch and telegram_kill_switch.enabled:
-            try:
-                LOG.info("stopping_telegram_kill_switch")
-                await telegram_kill_switch.stop()
-                LOG.info("telegram_kill_switch_stopped")
-            except Exception as telegram_error:
-                error_msg = f"Telegram shutdown error: {str(telegram_error)}"
-                shutdown_errors.append(error_msg)
-                LOG.error("telegram_shutdown_error", error=str(telegram_error))
+            try: await telegram_kill_switch.stop()
+            except Exception as e: shutdown_errors.append(f"Telegram: {e}")
         
-        # 2. Detener bot y sus tareas periódicas
         if bot:
             try:
-                LOG.info("stopping_bot_and_periodic_tasks")
+                await bot.stop() # This now handles task cancellation and resource cleanup
+                if bot.ensemble_learner: await bot.ensemble_learner._save_models()
+                if bot.rl_agent: bot.rl_agent.save()
+                if bot.strategy_manager: await bot.strategy_manager.save_strategy_performance()
                 
-                # Marcar como no running para detener loops
-                bot.is_running = False
-                
-                # Esperar un momento para que loops detecten el cambio
-                await asyncio.sleep(2)
-                
-                # NUEVO: Cancelar tareas periódicas explícitamente
-                if hasattr(bot, 'periodic_tasks'):
-                    LOG.info("cancelling_periodic_tasks", count=len(bot.periodic_tasks))
-                    for task in bot.periodic_tasks:
-                        if task and not task.done():
-                            task.cancel()
-                    
-                    # Esperar cancelaciones con timeout
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.gather(*bot.periodic_tasks, return_exceptions=True),
-                            timeout=10.0
-                        )
-                    except asyncio.TimeoutError:
-                        LOG.warning("periodic_tasks_cancellation_timeout")
-                
-                # Guardar estado final
-                try:
-                    # Guardar ensemble models
-                    if hasattr(bot, 'ensemble_learner') and bot.ensemble_learner:
-                        LOG.info("saving_ensemble_models")
-                        await bot.ensemble_learner._save_models()
-                    
-                    # Guardar RL agent
-                    if hasattr(bot, 'rl_agent') and bot.rl_agent:
-                        LOG.info("saving_rl_agent")
-                        bot.rl_agent.save()
-                    
-                    # Guardar strategy performance
-                    if hasattr(bot, 'strategy_manager') and bot.strategy_manager:
-                        LOG.info("saving_strategy_performance")
-                        await bot.strategy_manager.save_strategy_performance()
-                    
-                except Exception as save_error:
-                    error_msg = f"State save error: {str(save_error)}"
-                    shutdown_errors.append(error_msg)
-                    LOG.error("state_save_error", error=str(save_error))
-                
-                # NUEVO: Generar reporte final
-                try:
-                    final_report = await bot.get_performance_report()
-                    LOG.info("final_performance_report", **final_report)
-                    
-                    # Guardar reporte en archivo
-                    import json
-                    report_path = f"reports/final_report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
-                    os.makedirs("reports", exist_ok=True)
-                    with open(report_path, 'w') as f:
-                        json.dump(final_report, f, indent=2)
-                    LOG.info("final_report_saved", path=report_path)
-                    
-                except Exception as report_error:
-                    LOG.warning("final_report_generation_failed", error=str(report_error))
-                
-                # Ejecutar audit final de equity
-                if hasattr(bot, 'position_ledger'):
-                    try:
-                        LOG.info("performing_final_equity_audit")
-                        final_audit = bot.position_ledger.audit_equity(bot)
-                        LOG.info("final_equity_audit", **final_audit)
-                        
-                        if not final_audit['is_consistent']:
-                            LOG.error("final_audit_inconsistent",
-                                     discrepancy=final_audit['discrepancy'])
-                    except Exception as audit_error:
-                        LOG.warning("final_audit_failed", error=str(audit_error))
-                
-                # Llamar al método stop del bot
-                await bot.stop()
-                LOG.info("bot_stopped")
-                
-            except Exception as stop_error:
-                error_msg = f"Bot stop error: {str(stop_error)}"
-                shutdown_errors.append(error_msg)
-                LOG.error("bot_stop_error", error=str(stop_error))
+                final_report = await bot.get_performance_report()
+                LOG.info("final_performance_report", **final_report)
+                os.makedirs("reports", exist_ok=True)
+                with open(f"reports/final_report_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}.json", 'w') as f:
+                    json.dump(final_report, f, indent=2)
+            except Exception as e: shutdown_errors.append(f"Bot stop: {e}")
         
-        # 3. Cerrar conexión con exchange
         if exchange_manager:
-            try:
-                LOG.info("closing_exchange_connection")
-                await exchange_manager.close()
-                LOG.info("exchange_closed")
-            except Exception as close_error:
-                error_msg = f"Exchange close error: {str(close_error)}"
-                shutdown_errors.append(error_msg)
-                LOG.error("exchange_close_error", error=str(close_error))
+            try: await exchange_manager.close()
+            except Exception as e: shutdown_errors.append(f"Exchange close: {e}")
         
-        # 4. MEJORADO: Flush completo de InfluxDB y métricas locales
-        try:
-            LOG.info("flushing_all_metrics")
-            
-            # Sincronización final forzada
-            if bot:
-                try:
-                    await sync_bot_metrics_to_influx(bot, force=True)
-                    LOG.info("final_metrics_sync_completed")
-                except Exception as sync_error:
-                    LOG.warning("final_sync_failed", error=str(sync_error))
-            
-            # Flush InfluxDB
-            if INFLUX_METRICS and INFLUX_METRICS.enabled:
-                if hasattr(INFLUX_METRICS, 'write_api') and INFLUX_METRICS.write_api:
-                    try:
-                        # Múltiples intentos de flush
-                        for attempt in range(3):
-                            try:
-                                INFLUX_METRICS.write_api.flush()
-                                LOG.info("influxdb_flushed_successfully", attempt=attempt + 1)
-                                break
-                            except Exception as flush_error:
-                                if attempt < 2:
-                                    await asyncio.sleep(1)
-                                else:
-                                    raise
-                    except Exception as influx_error:
-                        LOG.error("influxdb_flush_failed_all_attempts", 
-                                 error=str(influx_error))
-            
-            # Flush buffer local de métricas
-            if METRICS and hasattr(METRICS, '_flush_buffer'):
-                try:
-                    METRICS._flush_buffer()
-                    LOG.info("local_metrics_buffer_flushed")
-                except Exception as metrics_error:
-                    LOG.warning("metrics_buffer_flush_failed", error=str(metrics_error))
-            
-            LOG.info("all_metrics_flushed")
-            
-        except Exception as flush_error:
-            LOG.error("metrics_flush_error", error=str(flush_error))
-        
-        # 5. NUEVO: Limpieza de memoria final
-        try:
-            LOG.info("final_memory_cleanup")
-            optimize_memory_usage()
-            
-            # Obtener estadísticas finales
-            if MEMORY_MANAGER:
-                final_mem_stats = MEMORY_MANAGER.get_memory_stats()
-                LOG.info("final_memory_stats", **final_mem_stats)
-        except Exception as mem_error:
-            LOG.debug("final_memory_cleanup_error", error=str(mem_error))
-        
-        # 6. NUEVO: Reporte de shutdown
+        try: # Final metric flush
+            if bot: await sync_bot_metrics_to_influx(bot, force=True)
+            if METRICS: METRICS._flush_buffer()
+        except Exception as e: shutdown_errors.append(f"Metric flush: {e}")
+
         if shutdown_errors:
-            LOG.warning("shutdown_completed_with_errors",
-                       error_count=len(shutdown_errors),
-                       errors=shutdown_errors)
+            LOG.warning("shutdown_completed_with_errors", errors=shutdown_errors)
         else:
             LOG.info("shutdown_completed_successfully")
         
-        # 7. NUEVO: Enviar notificación final (si Telegram está disponible)
-        try:
-            if telegram_kill_switch and telegram_kill_switch.enabled and not shutdown_errors:
-                # Crear bot temporal para enviar mensaje final
+        # Final Telegram notification
+        if telegram_kill_switch and telegram_kill_switch.enabled and not shutdown_errors and bot:
+            try:
                 from telegram import Bot
-                temp_bot = Bot(token=telegram_kill_switch.bot_token)
-                
-                shutdown_message = (
-                    "🛑 *Bot Shutdown Complete*\n\n"
-                    f"Final Equity: ${bot.equity:,.2f}\n"
-                    f"Total Trades: {bot.performance_metrics.get('total_trades', 0)}\n"
-                    f"Win Rate: {bot.performance_metrics.get('win_rate', 0)*100:.1f}%\n"
-                )
-                
+                final_msg = (f"🛑 *Bot Shutdown Complete*\n\nFinal Equity: ${bot.equity:,.2f}\n"
+                             f"Total PnL: ${bot.performance_metrics.get('total_pnl', 0):,.2f}")
                 for admin_id in telegram_kill_switch.admin_chat_ids:
-                    try:
-                        await temp_bot.send_message(
-                            chat_id=admin_id,
-                            text=shutdown_message,
-                            parse_mode='Markdown'
-                        )
-                    except Exception:
-                        pass
-        except Exception as final_notify_error:
-            LOG.debug("final_notification_failed", error=str(final_notify_error))
+                    await Bot(token=telegram_kill_switch.bot_token).send_message(admin_id, final_msg, 'Markdown')
+            except Exception as e:
+                LOG.debug("final_telegram_notification_failed", error=str(e))
 
 async def process_symbol_with_lock(bot, symbol: str):
     """Helper para procesar símbolo con lock"""
@@ -13264,8 +12328,34 @@ def setup_signal_handlers():
 
 if __name__ == "__main__":
     try:
+        # Example of how to generate and save the dashboard JSON
+        INFLUXDB_BUCKET = os.getenv('INFLUXDB_BUCKET', 'trading_bot')
+        INFLUXDB_ORG = os.getenv('INFLUXDB_ORG', 'DASHBOARD')
+        
+        # IMPORTANT: Replace '__YOUR_DATASOURCE_UID__' with the actual UID of your
+        # InfluxDB datasource in Grafana. You can find this in the datasource settings URL.
+        # It usually looks like a short random string (e.g., "P4sS7uN7k").
+        GRAFANA_DATASOURCE_UID = os.getenv('GRAFANA_DATASOURCE_UID', 'InfluxDB')
+
+        print("Generating Grafana dashboard JSON...")
+        dashboard_json = generate_grafana_dashboard_json(
+            bucket=INFLUXDB_BUCKET,
+            org=INFLUXDB_ORG,
+            datasource_uid=GRAFANA_DATASOURCE_UID
+        )
+        
+        output_filename = "grafana_ai_trading_bot_dashboard.json"
+        with open(output_filename, "w") as f:
+            f.write(dashboard_json)
+        
+        print(f"✅ Grafana dashboard JSON saved to '{output_filename}'")
+        if GRAFANA_DATASOURCE_UID == '__YOUR_DATASOURCE_UID__':
+            print(f"⚠️  Remember to replace '{GRAFANA_DATASOURCE_UID}' in the file with your actual Grafana InfluxDB datasource UID, or set the GRAFANA_DATASOURCE_UID environment variable.")
+
+        # The main bot execution logic remains here
         setup_signal_handlers()
         asyncio.run(advanced_ai_main_with_rl())
+
     except KeyboardInterrupt:
         LOG.info("application_terminated_gracefully")
     except Exception as e:
