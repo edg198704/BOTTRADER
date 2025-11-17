@@ -40,3 +40,7 @@ risk_management:
 
 database:
   path: "position_ledger.db" # Path to the SQLite database for position tracking
+
+telegram:
+  bot_token: YOUR_TELEGRAM_BOT_TOKEN # Optional: Your Telegram bot token
+  admin_chat_ids: [123456789] # Optional: List of admin chat IDs for control
