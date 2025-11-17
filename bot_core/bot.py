@@ -3,6 +3,7 @@ import logging
 import time
 import pandas as pd
 from typing import Dict, Any, Optional
+import ccxt
 
 from bot_core.exchange_api import ExchangeAPI
 from bot_core.position_manager import PositionManager
@@ -29,14 +30,11 @@ class TradingBot:
         """Fetches and returns a dictionary with OHLCV DataFrame and latest price."""
         try:
             # Fetch both OHLCV and ticker data for a complete view
-            ohlcv_task = self.exchange_api.get_market_data(self.symbol, '1h', 200)
-            ticker_task = self.exchange_api.get_market_data(self.symbol)
-            results = await asyncio.gather(ohlcv_task, ticker_task)
+            # Assuming get_market_data can fetch OHLCV with parameters
+            ohlcv_data = await self.exchange_api.get_market_data(self.symbol, '1h', 200)
+            ticker_data = await self.exchange_api.get_market_data(self.symbol)
             
-            ohlcv_data = results[0]
-            ticker_data = results[1]
-
-            if not ohlcv_data or not ohlcv_data.get('ohlcv') or not ticker_data or not ticker_data.get('lastPrice'):
+            if not ohlcv_data or not isinstance(ohlcv_data.get('ohlcv'), list) or not ticker_data or not ticker_data.get('lastPrice'):
                 logger.warning(f"Received invalid or empty market data for {self.symbol}")
                 return None
             
@@ -73,25 +71,24 @@ class TradingBot:
             order_response = await self.exchange_api.place_order(self.symbol, action_type, 'MARKET', quantity)
             logger.info(f"Order placed: {order_response}")
             
-            # Use filled price if available, otherwise use current price as estimate
             if order_response and order_response.get('status') == 'FILLED':
                 entry_price = float(order_response['cummulativeQuoteQty']) / float(order_response['executedQty'])
                 filled_quantity = float(order_response['executedQty'])
+
+                stop_loss = self.risk_manager.calculate_stop_loss(self.symbol, entry_price, action_type, ohlcv_df)
+                take_profit_levels = self.risk_manager.calculate_take_profit_levels(entry_price, action_type, confidence)
+
+                self.position_manager.add_position(
+                    symbol=self.symbol,
+                    side=action_type,
+                    quantity=filled_quantity,
+                    entry_price=entry_price,
+                    stop_loss=stop_loss,
+                    take_profit_levels=take_profit_levels
+                )
             else:
-                entry_price = current_price
-                filled_quantity = quantity
+                logger.error(f"Order for {self.symbol} was not filled. Status: {order_response.get('status')}. Not opening position.")
 
-            stop_loss = self.risk_manager.calculate_stop_loss(self.symbol, entry_price, action_type, ohlcv_df)
-            take_profit_levels = self.risk_manager.calculate_take_profit_levels(entry_price, action_type, confidence)
-
-            self.position_manager.add_position(
-                symbol=self.symbol,
-                side=action_type,
-                quantity=filled_quantity,
-                entry_price=entry_price,
-                stop_loss=stop_loss,
-                take_profit_levels=take_profit_levels
-            )
         except Exception as e:
             logger.error(f"Error placing {action_type} order for {self.symbol}: {e}", exc_info=True)
 
@@ -108,6 +105,8 @@ class TradingBot:
             if order_response and order_response.get('status') == 'FILLED':
                 close_price = float(order_response['cummulativeQuoteQty']) / float(order_response['executedQty'])
                 self.position_manager.close_position(position_id, close_price)
+            else:
+                logger.error(f"Failed to close position {position_id}. Order status: {order_response.get('status')}")
         except Exception as e:
             logger.error(f"Error closing position {position_id} for {position.symbol}: {e}", exc_info=True)
 
@@ -166,8 +165,15 @@ class TradingBot:
                         logger.info(f"Strategy generated position management action: {action}")
                         await self._close_position_by_id(action.get('position_id'))
 
+            except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, asyncio.TimeoutError) as e:
+                logger.warning(f"Network/Exchange issue in main loop: {e}. Retrying in 30s...")
+                await asyncio.sleep(30)
+            except ccxt.ExchangeError as e:
+                logger.error(f"Exchange error in main loop: {e}. Retrying in 60s...")
+                await asyncio.sleep(60)
             except Exception as e:
                 logger.critical(f"Unhandled exception in main bot loop: {e}", exc_info=True)
+                await asyncio.sleep(self.trade_interval_seconds) # Avoid rapid-fire loops on critical error
 
             finally:
                 elapsed_time = time.monotonic() - start_time
