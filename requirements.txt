@@ -68,3 +68,6 @@ jupyter>=1.0.0   # For analysis notebooks
 
 aiohttp
 pyyaml
+PyYAML>=6.0
+SQLAlchemy>=2.0.0
+python-binance>=1.0.17 # Required if using BinanceExchangeAPI
