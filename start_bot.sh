@@ -1,21 +1,24 @@
 #!/bin/bash
+# start_bot.sh
+# Script to start the trading bot.
 
-# Enterprise AI Trading Bot - Startup Script
-
-echo "🚀 Starting Enterprise AI Trading Bot..."
-
-# Activate virtual environment
-source venv/bin/activate
-
-# Validate environment
-python3 utils_enterprise.py --validate-env
-
-# Load environment variables
-if [ -f .env ]; then
-    export $(grep -v '^#' .env | xargs)
+# Ensure the virtual environment is activated
+if [ -f "venv/bin/activate" ]; then
+    source venv/bin/activate
+elif [ -f ".venv/bin/activate" ]; then
+    source .venv/bin/activate
+else
+    echo "Virtual environment not found. Please run setup.sh first."
+    exit 1
 fi
 
-# Start the bot
-python3 bot_ai_enterprise_refactored.py
+# Set Python path to include the current directory for module imports
+export PYTHONPATH=$(pwd):$PYTHONPATH
 
-echo "✅ Bot stopped"
+# Set logging level (optional, can also be set in config_enterprise.yaml)
+# export LOG_LEVEL=INFO
+
+echo "Starting BOTTRADER..."
+python start_bot.py
+
+echo "BOTTRADER stopped."
