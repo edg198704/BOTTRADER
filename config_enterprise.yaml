@@ -1,0 +1,207 @@
+# Enterprise AI Trading Bot - Configuration Template
+# Copy this file and customize for your environment
+
+# ==============================================
+# EXCHANGE CONFIGURATION
+# ==============================================
+exchange:
+  name: "binance"                    # binance, coinbase, kucoin, kraken
+  sandbox: false                     # Use sandbox/testnet
+  dry_run: true                      # Enable dry run mode
+  api_key: ""                        # Exchange API key (use env var: ${EXCHANGE_API_KEY})
+  api_secret: ""                     # Exchange API secret (use env var: ${EXCHANGE_API_SECRET})
+
+# ==============================================
+# TRADING PARAMETERS
+# ==============================================
+trading:
+  symbols:                           # Trading pairs
+    - "BTC/USDT"
+    - "ETH/USDT"
+    - "ADA/USDT"
+  
+  timeframe: "1h"                    # 1m, 5m, 15m, 30m, 1h, 4h, 1d
+  initial_capital: 10000.0          # Starting capital in USD
+  max_position_size: 0.1             # Maximum position size as % of capital
+  max_concurrent_positions: 10       # Maximum number of open positions
+  
+  # Risk Management
+  stop_loss_pct: 0.02                # Stop loss percentage (2%)
+  take_profit_pct: 0.04              # Take profit percentage (4%)
+  max_drawdown: 0.15                 # Maximum drawdown threshold (15%)
+  max_risk_per_trade: 0.02           # Maximum risk per trade (2% of capital)
+
+# ==============================================
+# AI/ML CONFIGURATION
+# ==============================================
+ai_ml:
+  use_ensemble: true                 # Enable ensemble learning
+  use_rl_agent: false                # Enable reinforcement learning agent
+  
+  # Model Training
+  training_symbols_limit: 50         # Maximum symbols to train on
+  retrain_interval_hours: 24         # Retrain models every N hours
+  
+  # Feature Engineering
+  technical_indicators:              # Technical indicators to calculate
+    - "sma_20"
+    - "sma_50"
+    - "ema_12"
+    - "ema_26"
+    - "rsi"
+    - "macd"
+    - "bollinger_bands"
+    - "volume_ratio"
+  
+  # Model Parameters
+  random_forest:
+    n_estimators: 100
+    max_depth: 10
+  
+  gradient_boosting:
+    n_estimators: 100
+    learning_rate: 0.1
+    max_depth: 6
+
+# ==============================================
+# MONITORING & ALERTING
+# ==============================================
+monitoring:
+  enable_monitoring: true            # Enable monitoring system
+  
+  # Metrics
+  metrics_interval_seconds: 60       # Send metrics every N seconds
+  health_check_interval_seconds: 30  # Health check every N seconds
+  
+  # InfluxDB Configuration
+  influxdb:
+    enabled: true
+    url: "http://localhost:8086"     # InfluxDB URL
+    token: ""                        # InfluxDB token (use env var: ${INFLUXDB_TOKEN})
+    org: "trading_bot"               # Organization name
+    bucket: "trading_metrics"        # Bucket name
+  
+  # Telegram Alerts
+  telegram:
+    enabled: true
+    bot_token: ""                    # Telegram bot token (use env var: ${TELEGRAM_BOT_TOKEN})
+    admin_chat_ids:                  # Admin chat IDs
+      - 123456789                    # Replace with actual chat ID
+    alert_levels:                    # Alert levels to send
+      - "WARNING"
+      - "CRITICAL"
+
+# ==============================================
+# SYSTEM CONFIGURATION
+# ==============================================
+system:
+  # Resource Management
+  max_memory_mb: 2000                # Maximum memory usage in MB
+  cpu_limit_percent: 80              # CPU usage warning threshold
+  
+  # Logging
+  log_level: "INFO"                  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  enable_debug_logging: false        # Enable debug logging
+  log_rotation:
+    max_size_mb: 10                  # Log file max size
+    backup_count: 5                  # Number of backup files
+  
+  # Performance
+  enable_profiling: false            # Enable performance profiling
+  cache_size: 1000                   # Feature cache size
+  buffer_size: 10000                 # Data buffer size
+
+# ==============================================
+# SECURITY CONFIGURATION
+# ==============================================
+security:
+  encrypt_api_keys: true             # Encrypt API keys in storage
+  api_key_rotation_days: 90          # Rotate API keys every N days
+  max_failed_attempts: 3             # Max failed authentication attempts
+  
+  # Network Security
+  rate_limit_requests: 100           # Rate limit per minute
+  request_timeout_seconds: 30        # Request timeout
+  
+  # Data Protection
+  encrypt_sensitive_data: true       # Encrypt sensitive configuration
+  secure_logging: true               # Sanitize sensitive data in logs
+
+# ==============================================
+# DATA MANAGEMENT
+# ==============================================
+data:
+  # Storage
+  data_retention_days: 90            # Keep data for N days
+  enable_data_compression: true      # Compress old data
+  
+  # Cache Configuration
+  cache:
+    enabled: true
+    ttl_seconds: 300                 # Cache time-to-live
+    max_size: 1000                   # Maximum cache entries
+    
+  # Database
+  database:
+    type: "sqlite"                   # sqlite, postgresql, mysql
+    path: "trading_bot.db"           # Database file path
+    backup_enabled: true
+    backup_interval_hours: 24
+
+# ==============================================
+# DEVELOPMENT & TESTING
+# ==============================================
+development:
+  enable_testing: false              # Enable test mode
+  abort_on_critical_errors: true     # Abort on critical errors
+  
+  # Sandbox Configuration
+  sandbox_mode: true                 # Run in sandbox mode
+  simulate_fills: true               # Simulate order fills
+  
+  # Debug Settings
+  save_raw_data: false               # Save raw market data
+  save_predictions: false            # Save model predictions
+  debug_log_api_calls: false         # Log all API calls
+
+# ==============================================
+# ADVANCED SETTINGS
+# ==============================================
+advanced:
+  # Parallel Processing
+  max_concurrent_requests: 10        # Max concurrent API requests
+  worker_threads: 4                  # Number of worker threads
+  
+  # Memory Optimization
+  garbage_collection_interval: 300   # GC interval in seconds
+  memory_cleanup_threshold: 0.8      # Trigger cleanup at 80% memory usage
+  
+  # Error Recovery
+  retry_attempts: 3                  # Max retry attempts
+  retry_delay_seconds: 1             # Initial retry delay
+  circuit_breaker_failure_threshold: 5  # Circuit breaker failure threshold
+  
+  # Market Regime Detection
+  regime_detection:
+    enabled: true
+    lookback_periods: 50             # Periods to analyze for regime
+    volatility_threshold: 0.02       # Volatility threshold for regime detection
+
+# ==============================================
+# ENVIRONMENT VARIABLES
+# ==============================================
+# Set these environment variables in production:
+#
+# export EXCHANGE_API_KEY="your_exchange_api_key"
+# export EXCHANGE_API_SECRET="your_exchange_api_secret"
+# export INFLUXDB_TOKEN="your_influxdb_token"
+# export TELEGRAM_BOT_TOKEN="your_telegram_bot_token"
+# export TELEGRAM_ADMIN_IDS="123456789,987654321"
+#
+# Optional environment overrides:
+# export EXCHANGE="binance"
+# export DRY_RUN="true"
+# export SYMBOLS="BTC/USDT,ETH/USDT,ADA/USDT"
+# export INITIAL_CAPITAL="10000"
+# export LOG_LEVEL="INFO"
+# export MAX_MEMORY_MB="2000"
