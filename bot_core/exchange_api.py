@@ -1,11 +1,12 @@
 import abc
 import time
 import random
-import logging
 from typing import Dict, Any, List, Optional
 import ccxt.async_support as ccxt
 
-logger = logging.getLogger(__name__)
+from bot_core.logger import get_logger
+
+logger = get_logger(__name__)
 
 class ExchangeAPI(abc.ABC):
     """Abstract Base Class for interacting with a cryptocurrency exchange."""
@@ -48,10 +49,10 @@ class MockExchangeAPI(ExchangeAPI):
         self.order_id_counter = 0
         self.last_price = 30000.0
         self.open_orders = {}
-        logger.info(f"MockExchangeAPI initialized with balances: {self.balances}")
+        logger.info("MockExchangeAPI initialized", initial_balances=self.balances)
 
     async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[Any]]:
-        logger.debug(f"Mock: Fetching {limit} candles for {symbol}")
+        logger.debug("Mock: Fetching market data", symbol=symbol, limit=limit)
         now = int(time.time() * 1000)
         interval_ms = 3600 * 1000 # 1h
         ohlcv = []
@@ -69,7 +70,7 @@ class MockExchangeAPI(ExchangeAPI):
         return ohlcv
 
     async def get_ticker_data(self, symbol: str) -> Dict[str, Any]:
-        logger.debug(f"Mock: Fetching ticker data for {symbol}")
+        logger.debug("Mock: Fetching ticker data", symbol=symbol)
         self.last_price += random.uniform(-100, 100)
         return {"symbol": symbol, "lastPrice": str(self.last_price)}
 
@@ -92,11 +93,11 @@ class MockExchangeAPI(ExchangeAPI):
                 self.balances[quote_asset] = self.balances.get(quote_asset, 0) + cost
             
             status = "FILLED"
-            logger.info(f"Mock: Market {side} {quantity} {base_asset} at {fill_price}. New balances: {self.balances}")
+            logger.info("Mock: Order filled", side=side, quantity=quantity, symbol=symbol, fill_price=fill_price, new_balances=self.balances)
             self.open_orders[order_id] = {'id': order_id, 'status': 'closed', 'filled': quantity, 'average': fill_price, 'symbol': symbol}
         else:
             status = "REJECTED"
-            logger.warning(f"Mock: Insufficient balance for market {side}.")
+            logger.warning("Mock: Insufficient balance for order", side=side, symbol=symbol)
             self.open_orders[order_id] = {'id': order_id, 'status': 'rejected', 'symbol': symbol}
 
         return {
@@ -110,7 +111,6 @@ class MockExchangeAPI(ExchangeAPI):
         order = self.open_orders.get(order_id)
         if not order:
             return None
-        # Mock market orders fill instantly, so they'd be 'closed'
         return {
             'id': order['id'],
             'status': order['status'],
@@ -141,18 +141,18 @@ class CCXTExchangeAPI(ExchangeAPI):
 
         if testnet and self.exchange.has['test']:
             self.exchange.set_sandbox_mode(True)
-            logger.info(f"CCXTExchangeAPI for {name} initialized in TESTNET mode.")
+            logger.info("CCXTExchangeAPI initialized in TESTNET mode", exchange=name)
         else:
-            logger.info(f"CCXTExchangeAPI for {name} initialized in LIVE mode.")
+            logger.info("CCXTExchangeAPI initialized in LIVE mode", exchange=name)
 
     async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[Any]]:
         try:
             return await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         except ccxt.NetworkError as e:
-            logger.error(f"Network error fetching OHLCV for {symbol}: {e}")
+            logger.error("Network error fetching OHLCV", symbol=symbol, error=str(e))
             raise
         except ccxt.ExchangeError as e:
-            logger.error(f"Exchange error fetching OHLCV for {symbol}: {e}")
+            logger.error("Exchange error fetching OHLCV", symbol=symbol, error=str(e))
             raise
 
     async def get_ticker_data(self, symbol: str) -> Dict[str, Any]:
@@ -160,10 +160,10 @@ class CCXTExchangeAPI(ExchangeAPI):
             ticker = await self.exchange.fetch_ticker(symbol)
             return {"symbol": symbol, "lastPrice": str(ticker['last'])}
         except ccxt.NetworkError as e:
-            logger.error(f"Network error fetching ticker for {symbol}: {e}")
+            logger.error("Network error fetching ticker", symbol=symbol, error=str(e))
             raise
         except ccxt.ExchangeError as e:
-            logger.error(f"Exchange error fetching ticker for {symbol}: {e}")
+            logger.error("Exchange error fetching ticker", symbol=symbol, error=str(e))
             raise
 
     async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None) -> Dict[str, Any]:
@@ -184,10 +184,10 @@ class CCXTExchangeAPI(ExchangeAPI):
                 "cummulativeQuoteQty": order.get('cost', 0.0)
             }
         except ccxt.InsufficientFunds as e:
-            logger.error(f"Insufficient funds to place order for {symbol}: {e}")
+            logger.error("Insufficient funds to place order", symbol=symbol, error=str(e))
             raise
         except ccxt.ExchangeError as e:
-            logger.error(f"Exchange error placing order for {symbol}: {e}")
+            logger.error("Exchange error placing order", symbol=symbol, error=str(e))
             raise
 
     async def fetch_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
@@ -201,10 +201,10 @@ class CCXTExchangeAPI(ExchangeAPI):
                 'symbol': order.get('symbol')
             }
         except ccxt.OrderNotFound:
-            logger.warning(f"Order {order_id} for {symbol} not found on exchange.")
+            logger.warning("Order not found on exchange", order_id=order_id, symbol=symbol)
             return None
         except ccxt.ExchangeError as e:
-            logger.error(f"Error fetching order {order_id}: {e}")
+            logger.error("Error fetching order", order_id=order_id, error=str(e))
             raise
 
     async def get_balance(self) -> Dict[str, Any]:
@@ -212,9 +212,9 @@ class CCXTExchangeAPI(ExchangeAPI):
             balance = await self.exchange.fetch_balance()
             return balance.get('total', {})
         except ccxt.ExchangeError as e:
-            logger.error(f"Error fetching balance: {e}")
+            logger.error("Error fetching balance", error=str(e))
             raise
 
     async def close(self):
-        logger.info(f"Closing connection to {self.exchange.name}...")
+        logger.info("Closing connection to exchange", exchange=self.exchange.name)
         await self.exchange.close()
