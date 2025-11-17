@@ -1,6 +1,7 @@
 import logging
 from typing import Dict, Any, List
 import pandas as pd
+import numpy as np
 from bot_core.position_manager import PositionManager
 from bot_core.config import RiskManagementConfig, BotConfig
 
@@ -19,13 +20,12 @@ class RiskManager:
         try:
             if current_price <= 0:
                 return 0.0
-            # Base position size based on max value in USD, scaled by confidence
             # Confidence acts as a conviction score, from 0.5 to 1.0, scaling the position size.
-            confidence_scaler = (confidence - 0.5) * 2 if confidence > 0.5 else 0.1
+            confidence_scaler = max(0.1, (confidence - 0.5) * 2 if confidence > 0.5 else 0.1)
             position_value_usd = self.config.max_position_size_usd * confidence_scaler
             
-            # Ensure position value does not exceed a fraction of total equity
-            max_value_from_equity = available_equity * 0.1 # Max 10% of equity per trade
+            # Ensure position value does not exceed a fraction of total equity (e.g., 10%)
+            max_value_from_equity = available_equity * 0.1
             final_position_value = min(position_value_usd, max_value_from_equity)
 
             size = final_position_value / current_price
@@ -58,7 +58,6 @@ class RiskManager:
                     logger.info(f"ATR-based stop loss for {symbol}: {stop_loss:.4f} (ATR: {atr:.4f})")
                     return float(stop_loss)
 
-            # Fallback to percentage-based stop loss
             logger.warning(f"Could not calculate ATR for {symbol}. Falling back to percentage-based stop loss.")
             if side.upper() == 'BUY':
                 return entry_price * (1 - self.config.stop_loss_fallback_pct)
@@ -67,7 +66,6 @@ class RiskManager:
 
         except Exception as e:
             logger.error(f"Error calculating stop loss for {symbol}: {e}", exc_info=True)
-            # Safe fallback
             if side.upper() == 'BUY':
                 return entry_price * (1 - self.config.stop_loss_fallback_pct)
             else:
@@ -79,12 +77,11 @@ class RiskManager:
         stop_pct = self.config.stop_loss_fallback_pct
         base_rr = 2.0 # Base risk-reward ratio
 
-        # Define TP levels based on confidence
         if confidence > 0.8:
             tp_ratios = [base_rr * 1.0, base_rr * 2.0]
             size_fractions = [0.6, 0.4]
         elif confidence > 0.6:
-            tp_ratios = [base_rr * 1.25]
+            tp_ratios = [base_rr * 1.5]
             size_fractions = [1.0]
         else:
             tp_ratios = [base_rr * 1.0]
@@ -114,11 +111,9 @@ class RiskManager:
             logger.warning(f"Trade denied for {symbol}: Proposed value ${trade_value_usd:.2f} exceeds max size ${self.config.max_position_size_usd:.2f}.")
             return False
 
-        # Check daily loss limit
-        daily_pnl = self.position_manager.get_daily_realized_pnl()
-        if daily_pnl < -abs(self.config.max_daily_loss_usd):
-            logger.critical(f"Daily loss limit of ${self.config.max_daily_loss_usd:.2f} exceeded. Halting trading.")
-            self.is_trading_halted = True
+        self.update_risk_metrics() # Ensure metrics are fresh before this check
+        if self.is_trading_halted:
+            logger.warning("Trade denied: Daily loss limit or circuit breaker triggered.")
             return False
 
         logger.debug(f"Trade for {symbol} {side} {quantity}@{price} passed initial risk checks.")
@@ -130,17 +125,17 @@ class RiskManager:
         unrealized_pnl = self.position_manager.get_total_unrealized_pnl()
         
         portfolio_value = self.initial_capital + realized_pnl + unrealized_pnl
-        daily_drawdown = (portfolio_value - self.initial_capital) / self.initial_capital if self.initial_capital > 0 else 0
+        portfolio_drawdown = (portfolio_value - self.initial_capital) / self.initial_capital if self.initial_capital > 0 else 0
 
-        if daily_pnl < -abs(self.config.max_daily_loss_usd) and not self.is_trading_halted:
+        if realized_pnl < -abs(self.config.max_daily_loss_usd) and not self.is_trading_halted:
             logger.critical(f"Daily loss limit of ${self.config.max_daily_loss_usd:.2f} exceeded. Halting trading.")
             self.is_trading_halted = True
 
-        if daily_drawdown < self.config.circuit_breaker_threshold and not self.is_trading_halted:
-            logger.critical(f"Portfolio drawdown {daily_drawdown:.2%} exceeded circuit breaker threshold of {self.config.circuit_breaker_threshold:.2%}. Halting trading.")
+        if portfolio_drawdown < self.config.circuit_breaker_threshold and not self.is_trading_halted:
+            logger.critical(f"Portfolio drawdown {portfolio_drawdown:.2%} exceeded circuit breaker threshold of {self.config.circuit_breaker_threshold:.2%}. Halting trading.")
             self.is_trading_halted = True
         
-        logger.debug(f"Risk metrics updated. Daily PnL: ${realized_pnl:.2f}, Portfolio Value: ${portfolio_value:.2f}, Drawdown: {daily_drawdown:.2%}")
+        logger.debug(f"Risk metrics updated. Daily PnL: ${realized_pnl:.2f}, Portfolio Value: ${portfolio_value:.2f}, Drawdown: {portfolio_drawdown:.2%}")
 
     def update_trailing_stops(self):
         """Iterates through open positions and updates their trailing stops."""
