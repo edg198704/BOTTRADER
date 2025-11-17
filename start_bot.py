@@ -1,73 +1,101 @@
 import asyncio
-import logging
 import signal
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
-from config_loader import load_config
-from bot_core.config import BotConfig, StrategyConfig
-from bot_core.exchange_api import ExchangeAPI, MockExchangeAPI, CCXTExchangeAPI
+from bot_core.config import BotConfig
+from bot_core.logger import setup_logging, get_logger, set_correlation_id
+from bot_core.exchange_api import MockExchangeAPI, CCXTExchangeAPI, ExchangeAPI
 from bot_core.position_manager import PositionManager
 from bot_core.risk_manager import RiskManager
-from bot_core.strategy import TradingStrategy, AIEnsembleStrategy, SimpleMACrossoverStrategy
-from bot_core.order_manager import OrderManager
-from bot_core.execution_handler import ExecutionHandler
+from bot_core.strategy import TradingStrategy, SimpleMACrossoverStrategy, AIEnsembleStrategy
 from bot_core.bot import TradingBot
 from bot_core.telegram_bot import TelegramBot
+from bot_core.data_handler import LiveAPIDataHandler
+from bot_core.execution_handler import ExecutionHandler
+from bot_core.order_manager import OrderManager
+from bot_core.ai.ensemble_learner import EnsembleLearner
+from bot_core.ai.regime_detector import MarketRegimeDetector
+from config_loader import load_config
 
-# Setup basic logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
-# Global bot instance to be accessible by signal handler
-bot_instance: TradingBot = None
-telegram_bot_instance: TelegramBot = None
+# --- Factory Functions ---
 
-def get_exchange_api(config: BotConfig) -> ExchangeAPI:
-    """Factory function to create an exchange API instance based on config."""
-    exchange_config = config.exchange
-    if exchange_config.name == "MockExchange":
-        logger.info("Using MockExchangeAPI for simulation.")
+def get_exchange_api(config: Dict[str, Any]) -> ExchangeAPI:
+    """Factory function to create an exchange API instance."""
+    exchange_config = config['exchange']
+    if exchange_config['name'] == "MockExchange":
         return MockExchangeAPI()
     else:
-        logger.info(f"Using CCXTExchangeAPI for {exchange_config.name}.")
         return CCXTExchangeAPI(
-            name=exchange_config.name,
-            api_key=exchange_config.api_key,
-            api_secret=exchange_config.api_secret,
-            testnet=exchange_config.testnet
+            name=exchange_config['name'],
+            api_key=exchange_config.get('api_key'),
+            api_secret=exchange_config.get('api_secret'),
+            testnet=exchange_config.get('testnet', True)
         )
 
-def get_strategy(config: StrategyConfig) -> TradingStrategy:
-    """Factory function to create a trading strategy instance based on config."""
-    strategy_map = {
-        "AIEnsembleStrategy": AIEnsembleStrategy,
-        "SimpleMACrossoverStrategy": SimpleMACrossoverStrategy
-    }
-    strategy_class = strategy_map.get(config.name)
-    if not strategy_class:
-        raise ValueError(f"Unknown strategy '{config.name}' specified in configuration.")
+def get_strategy(event_queue: asyncio.Queue, config: Dict[str, Any]) -> TradingStrategy:
+    """Factory function to create a trading strategy instance."""
+    strategy_config = config['strategy']
+    strategy_name = strategy_config['name']
     
-    logger.info(f"Using strategy: {config.name}")
-    return strategy_class(config.dict())
+    strategy_map = {
+        "SimpleMACrossoverStrategy": SimpleMACrossoverStrategy,
+        "AIEnsembleStrategy": AIEnsembleStrategy
+    }
+
+    if strategy_name not in strategy_map:
+        raise ValueError(f"Unknown strategy: {strategy_name}")
+
+    if strategy_name == "AIEnsembleStrategy":
+        # Create and inject AI components
+        from bot_core.config import AIStrategyConfig
+        ai_config = AIStrategyConfig(**strategy_config['ai_ensemble'])
+        ensemble_learner = EnsembleLearner(ai_config)
+        regime_detector = MarketRegimeDetector(ai_config)
+        return AIEnsembleStrategy(event_queue, strategy_config, ensemble_learner, regime_detector)
+    else:
+        return strategy_map[strategy_name](event_queue, strategy_config)
+
+# --- Main Application ---
 
 async def main():
     """Main function to initialize and run the trading bot."""
-    global bot_instance, telegram_bot_instance
+    set_correlation_id()
+    
+    # Load and validate configuration
     try:
-        # 1. Load Configuration
-        config = load_config('config_enterprise.yaml')
+        raw_config = load_config('config_enterprise.yaml')
+        config = BotConfig(**raw_config)
+    except Exception as e:
+        # Use basic logger since full one might not be configured
+        import logging
+        logging.basicConfig(level="ERROR")
+        logging.error(f"Failed to load or validate configuration: {e}")
+        return
 
-        # 2. Initialize Components
-        exchange_api = get_exchange_api(config)
-        position_manager = PositionManager(config.database.path)
+    # Setup application-wide logging
+    setup_logging(config.logging.level, config.logging.file_path, config.logging.use_json)
+    logger.info("Configuration loaded and validated successfully.")
+
+    bot = None
+    telegram_bot = None
+    try:
+        # Initialize components with dependency injection
+        event_queue = asyncio.Queue()
+        exchange_api = get_exchange_api(config.dict())
+        position_manager = PositionManager(db_path=config.database.path)
         risk_manager = RiskManager(config.risk_management, position_manager, config.initial_capital)
-        strategy = get_strategy(config.strategy)
-        order_manager = OrderManager(exchange_api)
-        execution_handler = ExecutionHandler(order_manager, risk_manager)
+        strategy = get_strategy(event_queue, config.dict())
+        
+        order_manager = OrderManager(event_queue, exchange_api)
+        execution_handler = ExecutionHandler(event_queue, order_manager, risk_manager)
+        data_handler = LiveAPIDataHandler(event_queue, exchange_api, [config.strategy.symbol], config.strategy.interval_seconds)
 
-        # 3. Initialize the Main Bot Orchestrator
-        bot_instance = TradingBot(
+        # Assemble the bot
+        bot = TradingBot(
             config=config,
+            data_handler=data_handler,
             exchange_api=exchange_api,
             strategy=strategy,
             position_manager=position_manager,
@@ -76,53 +104,47 @@ async def main():
             order_manager=order_manager
         )
 
-        # 4. Initialize optional Telegram Bot
-        try:
-            telegram_bot_instance = TelegramBot(config.telegram, bot_instance)
-            if telegram_bot_instance.enabled:
-                await telegram_bot_instance.start()
-        except Exception as e:
-            logger.error(f"Failed to initialize Telegram bot: {e}")
+        # Initialize and start Telegram bot if configured
+        if config.telegram.bot_token and config.telegram.admin_chat_ids:
+            telegram_bot = TelegramBot(config.telegram, bot)
+            asyncio.create_task(telegram_bot.start())
+        else:
+            logger.warning("Telegram bot not configured. Skipping.")
 
-        # 5. Start the bot's main loop
-        await bot_instance.run()
+        # Handle graceful shutdown
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s, bot, telegram_bot)))
+
+        # Start the main bot loop
+        await bot.run()
 
     except Exception as e:
-        logger.critical(f"Bot failed to start: {e}", exc_info=True)
+        logger.critical("Fatal error during bot initialization or runtime", error=str(e), exc_info=True)
     finally:
-        logger.info("Bot shutting down.")
-        if bot_instance:
-            await bot_instance.stop()
-        if telegram_bot_instance:
-            await telegram_bot_instance.stop()
-        if 'position_manager' in locals() and position_manager:
-            position_manager.close()
-        if 'exchange_api' in locals() and exchange_api:
-            await exchange_api.close()
+        logger.info("Main function finished.")
 
-async def shutdown(signal, loop):
+async def shutdown(sig: signal.Signals, bot: TradingBot, telegram_bot: Optional[TelegramBot]):
     """Graceful shutdown handler."""
-    logger.info(f"Received exit signal {signal.name}...")
-    if bot_instance:
-        await bot_instance.stop()
+    logger.warning(f"Received shutdown signal: {sig.name}. Initiating graceful shutdown...")
     
     tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    [task.cancel() for task in tasks]
+    
+    if telegram_bot:
+        await telegram_bot.stop()
+    
+    if bot:
+        await bot.stop()
 
-    logger.info("Cancelling outstanding tasks")
+    for task in tasks:
+        task.cancel()
+
     await asyncio.gather(*tasks, return_exceptions=True)
-    loop.stop()
+    logger.info("All tasks cancelled. Shutdown complete.")
+    asyncio.get_running_loop().stop()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    signals = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
-    for s in signals:
-        loop.add_signal_handler(
-            s, lambda s=s: asyncio.create_task(shutdown(s, loop))
-        )
-
     try:
-        loop.run_until_complete(main())
-    finally:
-        logger.info("Shutdown complete.")
-        loop.close()
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Application exiting.")
