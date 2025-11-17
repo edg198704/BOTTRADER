@@ -54,7 +54,7 @@ Key supporting files in the root directory include:
     *   **`risk_management`**: Define your risk tolerance with `max_position_size_usd`, `max_daily_loss_usd`, etc.
     *   **`telegram`**: To enable the remote control feature, create a bot with BotFather on Telegram, get the token, and find your chat ID. Add them to the `bot_token` and `admin_chat_ids` fields.
 
-    **IMPORTANT**: For production, load API keys and tokens from environment variables or a secure vault, not directly from the YAML file.
+    **IMPORTANT**: For production, load API keys and tokens from environment variables or a secure vault, not directly from the YAML file. The bot will automatically look for `BOT_EXCHANGE_API_KEY`, `BOT_EXCHANGE_API_SECRET`, and `BOT_TELEGRAM_BOT_TOKEN` environment variables.
 
 ## Running the Bot
 
@@ -71,7 +71,7 @@ The bot will initialize all components based on your configuration and begin its
 ### Adding a New Strategy
 
 1.  Create a new class in `bot_core/strategy.py` that inherits from `TradingStrategy`.
-2.  Implement the `analyze_market` and `manage_positions` abstract methods with your custom logic.
+2.  Implement the `analyze_market` abstract method with your custom logic.
 3.  Import your new strategy class in `start_bot.py`.
 4.  Update the factory function `get_strategy` in `start_bot.py` to recognize and instantiate your new strategy by adding its class name to the `strategy_map` dictionary.
 5.  Update `config_enterprise.yaml` to set `strategy.name` to your new strategy's class name.
