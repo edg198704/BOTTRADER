@@ -1,105 +1,116 @@
-# start_bot.py
 import asyncio
 import logging
-import os
-import sys
 import signal
-
-# Add the current directory to the Python path to allow importing bot_core
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+import sys
+from typing import Dict, Any
 
 from config_loader import ConfigLoader
-from bot_core.exchange_api import MockExchangeAPI, ExchangeAPI # Import base and mock
-# from bot_core.exchange_api import BinanceExchangeAPI # Uncomment if using Binance
-from bot_core.position_manager import PositionManager
-from bot_core.strategy import SimpleMACrossoverStrategy, TradingStrategy # Import specific strategy and base
 from bot_core.bot import TradingBot
+from bot_core.exchange_api import ExchangeAPI, MockExchangeAPI, CCXTExchangeAPI
+from bot_core.position_manager import PositionManager
+from bot_core.risk_manager import RiskManager
+from bot_core.strategy import TradingStrategy, SimpleMACrossoverStrategy, AIEnsembleStrategy
 
 # Configure logging
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                    handlers=[logging.StreamHandler(sys.stdout)])
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
 logger = logging.getLogger(__name__)
 
+# --- Factory Functions for Dynamic Component Creation ---
+
+def get_exchange_api(config: Dict[str, Any]) -> ExchangeAPI:
+    exchange_name = config.get('name', 'MockExchange')
+    if exchange_name == 'MockExchange':
+        logger.info("Using MockExchangeAPI for testing.")
+        return MockExchangeAPI()
+    else:
+        logger.info(f"Using CCXTExchangeAPI for {exchange_name}.")
+        return CCXTExchangeAPI(
+            name=exchange_name,
+            api_key=config.get('api_key'),
+            api_secret=config.get('api_secret'),
+            testnet=config.get('testnet', True)
+        )
+
+def get_strategy(config: Dict[str, Any]) -> TradingStrategy:
+    strategy_name = config.get('name', 'SimpleMACrossoverStrategy')
+    if strategy_name == 'AIEnsembleStrategy':
+        logger.info("Using AIEnsembleStrategy.")
+        return AIEnsembleStrategy(config)
+    elif strategy_name == 'SimpleMACrossoverStrategy':
+        logger.info("Using SimpleMACrossoverStrategy.")
+        return SimpleMACrossoverStrategy(config)
+    else:
+        raise ValueError(f"Unknown strategy: {strategy_name}")
+
 async def main():
-    config_path = os.path.join(os.path.dirname(__file__), 'config_enterprise.yaml')
+    """Main function to initialize and run the trading bot."""
+    bot_instance = None
     try:
-        config_loader = ConfigLoader(config_path)
-        app_config = config_loader.config
+        # 1. Load Configuration
+        config_loader = ConfigLoader('config_enterprise.yaml')
+        config = config_loader.load_and_validate()
 
-        # Set global log level from config if available
-        global_log_level = app_config.get("global", {}).get("log_level", LOG_LEVEL).upper()
-        logging.getLogger().setLevel(global_log_level)
-        logger.info(f"Starting bot with log level: {global_log_level}")
+        # 2. Initialize Components (Dependency Injection)
+        exchange_api = get_exchange_api(config.exchange.dict())
+        position_manager = PositionManager(config.database.path)
+        risk_manager = RiskManager(config.risk_management.dict(), position_manager, config.strategy.dict().get('initial_capital', 10000.0))
+        strategy = get_strategy(config.strategy.dict())
 
-        # Initialize Exchange API
-        exchange_config = config_loader.get_section("exchange")
-        exchange_name = exchange_config.get("name", "MockExchange")
-        exchange_api: ExchangeAPI
+        # 3. Create Bot Instance
+        bot_instance = TradingBot(
+            config=config,
+            exchange_api=exchange_api,
+            strategy=strategy,
+            position_manager=position_manager,
+            risk_manager=risk_manager
+        )
 
-        if exchange_name == "MockExchange":
-            exchange_api = MockExchangeAPI()
-            logger.info("Using MockExchangeAPI for trading.")
-        # elif exchange_name == "Binance":
-        #     api_key = exchange_config.get("api_key")
-        #     api_secret = exchange_config.get("api_secret")
-        #     testnet = exchange_config.get("testnet", False)
-        #     if not api_key or not api_secret:
-        #         raise ValueError("Binance API key and secret must be provided in config.")
-        #     exchange_api = BinanceExchangeAPI(api_key, api_secret, testnet)
-        #     logger.info(f"Using BinanceExchangeAPI (Testnet: {testnet}) for trading.")
-        else:
-            raise ValueError(f"Unsupported exchange: {exchange_name}")
+        # 4. Setup Graceful Shutdown
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(
+                sig,
+                lambda s=sig: asyncio.create_task(shutdown(s, loop, bot_instance))
+            )
 
-        # Initialize Position Manager
-        db_path = config_loader.get("database.path", "position_ledger.db")
-        position_manager = PositionManager(db_path)
-
-        # Initialize Strategy
-        strategy_name = config_loader.get("strategy.name", "SimpleMACrossoverStrategy")
-        strategy_class: Type[TradingStrategy]
-        if strategy_name == "SimpleMACrossoverStrategy":
-            strategy_class = SimpleMACrossoverStrategy
-        else:
-            raise ValueError(f"Unsupported strategy: {strategy_name}")
-
-        # Initialize and run the Trading Bot
-        bot = TradingBot(app_config, exchange_api, strategy_class, position_manager)
-
-        # Handle graceful shutdown
-        loop = asyncio.get_event_loop()
-        for sig in ('SIGINT', 'SIGTERM'):
-            loop.add_signal_handler(getattr(signal, sig), lambda: asyncio.create_task(shutdown(bot, loop)))
-
-        await bot.run()
+        # 5. Run the Bot
+        await bot_instance.run()
 
     except FileNotFoundError as e:
-        logger.critical(f"Configuration error: {e}")
-        sys.exit(1)
+        logger.critical(f"Configuration file error: {e}")
     except ValueError as e:
         logger.critical(f"Configuration or initialization error: {e}")
-        sys.exit(1)
-    except KeyError as e:
-        logger.critical(f"Missing required configuration key: {e}")
-        sys.exit(1)
     except Exception as e:
-        logger.critical(f"An unexpected error occurred: {e}", exc_info=True)
-        sys.exit(1)
+        logger.critical(f"An unexpected error occurred during startup: {e}", exc_info=True)
+    finally:
+        if bot_instance and bot_instance.running:
+            bot_instance.stop()
+        logger.info("Bot application has shut down.")
 
-async def shutdown(bot: TradingBot, loop: asyncio.AbstractEventLoop):
+async def shutdown(sig: signal.Signals, loop: asyncio.AbstractEventLoop, bot: TradingBot):
     """Graceful shutdown handler."""
-    logger.info("Shutdown signal received. Initiating graceful shutdown...")
-    bot.stop()
-    # Give some time for the bot loop to exit
-    await asyncio.sleep(2)
+    logger.warning(f"Received exit signal {sig.name}...")
+    
+    if bot:
+        bot.stop()
+
     tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    for task in tasks:
-        task.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True) # Wait for tasks to cancel
+    [task.cancel() for task in tasks]
+
+    logger.info(f"Cancelling {len(tasks)} outstanding tasks")
+    await asyncio.gather(*tasks, return_exceptions=True)
+    
+    if bot and bot.exchange_api:
+        await bot.exchange_api.close()
+
     loop.stop()
-    logger.info("Bot shutdown complete.")
 
 if __name__ == "__main__":
-    import signal
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot shutdown initiated by user.")
