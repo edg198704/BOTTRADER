@@ -44,6 +44,11 @@ class TelegramConfig(BaseModel):
     bot_token: Optional[str] = None
     admin_chat_ids: List[int] = Field(default_factory=list)
 
+class LoggingConfig(BaseModel):
+    level: str = "INFO"
+    file_path: Optional[str] = "logs/trading_bot.log"
+    use_json: bool = True
+
 class BotConfig(BaseModel):
     initial_capital: float = 10000.0
     exchange: ExchangeConfig
@@ -51,6 +56,7 @@ class BotConfig(BaseModel):
     risk_management: RiskManagementConfig
     database: DatabaseConfig
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
     @validator('strategy')
     def validate_strategy_symbol(cls, v):
