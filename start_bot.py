@@ -1,68 +1,83 @@
 import asyncio
 import logging
 import signal
+import sys
 from typing import Dict, Any
 
-from config_loader import ConfigLoader
-from bot_core.config import BotConfig, StrategyConfig
-from bot_core.bot import TradingBot
-from bot_core.exchange_api import ExchangeAPI, MockExchangeAPI, CCXTExchangeAPI
+import yaml
+from pydantic import ValidationError
+
+from bot_core.config import BotConfig
+from bot_core.exchange_api import CCXTExchangeAPI, MockExchangeAPI, ExchangeAPI
 from bot_core.position_manager import PositionManager
 from bot_core.risk_manager import RiskManager
 from bot_core.strategy import TradingStrategy, SimpleMACrossoverStrategy, AIEnsembleStrategy
-from bot_core.execution_handler import ExecutionHandler
 from bot_core.order_manager import OrderManager
+from bot_core.execution_handler import ExecutionHandler
+from bot_core.bot import TradingBot
+from bot_core.telegram_bot import TelegramBot
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout,
+)
 logger = logging.getLogger(__name__)
 
-bots = []
+
+def load_config(config_path: str = "config_enterprise.yaml") -> BotConfig:
+    """Loads and validates the bot configuration from a YAML file."""
+    try:
+        with open(config_path, 'r') as f:
+            config_dict = yaml.safe_load(f)
+        return BotConfig(**config_dict)
+    except FileNotFoundError:
+        logger.critical(f"Configuration file not found at {config_path}")
+        sys.exit(1)
+    except ValidationError as e:
+        logger.critical(f"Configuration validation error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.critical(f"Error loading configuration: {e}")
+        sys.exit(1)
 
 def get_exchange_api(config: BotConfig) -> ExchangeAPI:
-    """Factory function to create an exchange API instance."""
-    exchange_config = config.exchange
-    if exchange_config.name == "MockExchange":
+    """Factory function for creating an exchange API instance."""
+    if config.exchange.name == "MockExchange":
         return MockExchangeAPI()
-    else:
-        return CCXTExchangeAPI(
-            name=exchange_config.name,
-            api_key=exchange_config.api_key,
-            api_secret=exchange_config.api_secret,
-            testnet=exchange_config.testnet
-        )
+    return CCXTExchangeAPI(
+        name=config.exchange.name,
+        api_key=config.exchange.api_key,
+        api_secret=config.exchange.api_secret,
+        testnet=config.exchange.testnet
+    )
 
-def get_strategy(config: StrategyConfig) -> TradingStrategy:
-    """Factory function to create a strategy instance."""
+def get_strategy(config: BotConfig) -> TradingStrategy:
+    """Factory function for creating a trading strategy instance."""
     strategy_map = {
         "SimpleMACrossoverStrategy": SimpleMACrossoverStrategy,
         "AIEnsembleStrategy": AIEnsembleStrategy
     }
-    strategy_class = strategy_map.get(config.name)
+    strategy_class = strategy_map.get(config.strategy.name)
     if not strategy_class:
-        raise ValueError(f"Unknown strategy: {config.name}")
-    return strategy_class(config.dict())
+        raise ValueError(f"Unknown strategy: {config.strategy.name}")
+    return strategy_class(config.strategy.dict())
 
 async def main():
-    """Main function to initialize and run the trading bot."""
-    config_loader = ConfigLoader('config_enterprise.yaml')
-    try:
-        config = config_loader.load_and_validate()
-    except (FileNotFoundError, ValueError) as e:
-        logger.critical(f"Failed to load configuration: {e}")
-        return
-
-    # Initialize shared components
+    """Main function to initialize and run the bot and its components."""
+    config = load_config()
+    
+    # Initialize components
     exchange_api = get_exchange_api(config)
-    position_manager = PositionManager(config.database.path)
+    position_manager = PositionManager(db_path=config.database.path)
     risk_manager = RiskManager(config.risk_management, position_manager, config.initial_capital)
+    strategy = get_strategy(config)
     order_manager = OrderManager(exchange_api)
-
-    # Initialize strategy-specific components
-    strategy = get_strategy(config.strategy)
     execution_handler = ExecutionHandler(order_manager, risk_manager)
 
-    # Create and store the bot instance
-    bot = TradingBot(
+    # Initialize the main bot
+    trading_bot = TradingBot(
         config=config,
         exchange_api=exchange_api,
         strategy=strategy,
@@ -71,34 +86,43 @@ async def main():
         execution_handler=execution_handler,
         order_manager=order_manager
     )
-    bots.append(bot)
 
-    # Setup signal handlers for graceful shutdown
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s, loop)))
+    # Initialize the Telegram bot
+    telegram_bot = TelegramBot(config.telegram, trading_bot)
 
-    try:
-        await bot.run()
-    finally:
-        logger.info("Bot has finished its run.")
-        position_manager.close()
-        await exchange_api.close()
+    # Graceful shutdown handler
+    shutdown_event = asyncio.Event()
+    def _signal_handler(*_):
+        logger.info("Shutdown signal received. Initiating graceful shutdown...")
+        shutdown_event.set()
 
-async def shutdown(sig, loop):
-    logger.info(f"Received exit signal {sig.name}...")
-    for bot in bots:
-        await bot.stop()
-    
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    [task.cancel() for task in tasks]
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
 
-    logger.info(f"Cancelling {len(tasks)} outstanding tasks")
-    await asyncio.gather(*tasks, return_exceptions=True)
-    loop.stop()
+    # Start tasks
+    bot_task = asyncio.create_task(trading_bot.run())
+    telegram_task = asyncio.create_task(telegram_bot.start())
+
+    logger.info("Bot and all components are running. Press Ctrl+C to stop.")
+
+    # Wait for shutdown signal
+    await shutdown_event.wait()
+
+    # Perform cleanup
+    logger.info("Stopping all services...")
+    await trading_bot.stop()
+    await telegram_bot.stop()
+    position_manager.close()
+    await exchange_api.close()
+
+    bot_task.cancel()
+    telegram_task.cancel()
+    await asyncio.gather(bot_task, telegram_task, return_exceptions=True)
+
+    logger.info("Shutdown complete.")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info("Application shutdown gracefully.")
+    except KeyboardInterrupt:
+        logger.info("Application stopped by user.")
