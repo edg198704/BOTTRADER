@@ -7,6 +7,7 @@ import time
 
 from bot_core.logger import get_logger
 from bot_core.exchange_api import ExchangeAPI
+from bot_core.data_handler import OrderEvent, FillEvent as SystemFillEvent
 
 logger = get_logger(__name__)
 
@@ -38,6 +39,7 @@ class Order:
 
 @dataclass
 class FillEvent:
+    # This is the internal FillEvent for the OrderManager, not the system-wide one.
     symbol: str
     side: str
     quantity: float
@@ -46,10 +48,10 @@ class FillEvent:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 class OrderManager:
-    def __init__(self, exchange_api: ExchangeAPI):
+    def __init__(self, event_queue: asyncio.Queue, exchange_api: ExchangeAPI):
+        self.event_queue = event_queue
         self.exchange_api = exchange_api
         self._orders: Dict[str, Order] = {}
-        self._fill_queue = asyncio.Queue()
         self._tracking_task: Optional[asyncio.Task] = None
         self.running = False
         logger.info("OrderManager initialized.")
@@ -74,7 +76,17 @@ class OrderManager:
                 pass
         logger.info("OrderManager stopped.")
 
-    async def submit_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None, metadata: Optional[Dict[str, Any]] = None) -> Order:
+    async def on_order_event(self, event: OrderEvent):
+        """Handles an OrderEvent from the event queue."""
+        await self._submit_order(
+            symbol=event.symbol,
+            side=event.side,
+            order_type=event.order_type,
+            quantity=event.quantity,
+            metadata=event.metadata
+        )
+
+    async def _submit_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None, metadata: Optional[Dict[str, Any]] = None) -> Order:
         """Submits an order to the exchange and starts tracking it."""
         client_order_id = f"bot_{int(time.time() * 1000)}_{random.randint(100,999)}"
         order = Order(
@@ -107,13 +119,6 @@ class OrderManager:
         
         order.updated_at = time.time()
         return order
-
-    async def get_fill_events(self) -> List[FillEvent]:
-        """Retrieves all available fill events from the queue."""
-        fills = []
-        while not self._fill_queue.empty():
-            fills.append(await self._fill_queue.get())
-        return fills
 
     async def _track_orders_loop(self):
         """Periodically checks the status of open orders."""
@@ -170,8 +175,8 @@ class OrderManager:
             order.error_message = str(e)
 
     async def _handle_fill(self, order: Order, fill_quantity: float, fill_price: float):
-        """Processes a fill and adds it to the queue."""
-        fill = FillEvent(
+        """Processes a fill and adds a system-wide FillEvent to the main queue."""
+        fill = SystemFillEvent(
             symbol=order.symbol,
             side=order.side,
             quantity=fill_quantity,
@@ -179,5 +184,5 @@ class OrderManager:
             order_id=order.client_order_id,
             metadata=order.metadata
         )
-        await self._fill_queue.put(fill)
-        logger.info("Fill event generated", fill=fill)
+        await self.event_queue.put(fill)
+        logger.info("FillEvent queued for system processing", fill=fill)
