@@ -4,106 +4,125 @@ import signal
 import sys
 
 from config_loader import ConfigLoader
-from bot_core.bot import TradingBot
-from bot_core.exchange_api import MockExchangeAPI, CCXTExchangeAPI, ExchangeAPI
+from bot_core.config import BotConfig, StrategyConfig
+from bot_core.exchange_api import ExchangeAPI, MockExchangeAPI, CCXTExchangeAPI
 from bot_core.position_manager import PositionManager
 from bot_core.risk_manager import RiskManager
-from bot_core.strategy import SimpleMACrossoverStrategy, AIEnsembleStrategy, TradingStrategy
-from bot_core.config import BotConfig
+from bot_core.strategy import TradingStrategy, SimpleMACrossoverStrategy, AIEnsembleStrategy
+from bot_core.bot import TradingBot
+from bot_core.execution_handler import ExecutionHandler
 
-# Setup logging
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Global bot instance to be accessible by signal handler
-bot_instance: TradingBot = None
+# --- Factory Functions ---
 
 def get_exchange_api(config: BotConfig) -> ExchangeAPI:
-    """Factory function to create an exchange API instance."""
-    if config.exchange.name == "MockExchange":
+    """Factory function to create an exchange API instance based on config."""
+    exchange_config = config.exchange
+    if exchange_config.name == "MockExchange":
         return MockExchangeAPI()
     else:
         return CCXTExchangeAPI(
-            name=config.exchange.name,
-            api_key=config.exchange.api_key,
-            api_secret=config.exchange.api_secret,
-            testnet=config.exchange.testnet
+            name=exchange_config.name,
+            api_key=exchange_config.api_key,
+            api_secret=exchange_config.api_secret,
+            testnet=exchange_config.testnet
         )
 
-def get_strategy(config: BotConfig) -> TradingStrategy:
-    """Factory function to create a trading strategy instance."""
+def get_strategy(config: StrategyConfig) -> TradingStrategy:
+    """Factory function to create a trading strategy instance based on config."""
     strategy_map = {
         "SimpleMACrossoverStrategy": SimpleMACrossoverStrategy,
-        "AIEnsembleStrategy": AIEnsembleStrategy,
+        "AIEnsembleStrategy": AIEnsembleStrategy
     }
-    strategy_class = strategy_map.get(config.strategy.name)
+    strategy_class = strategy_map.get(config.name)
     if not strategy_class:
-        raise ValueError(f"Unknown strategy: {config.strategy.name}")
-    return strategy_class(config.strategy.dict())
+        raise ValueError(f"Unknown strategy: {config.name}")
+    return strategy_class(config.dict())
+
+# --- Main Application Logic ---
+
+class BotApplication:
+    def __init__(self, config: BotConfig):
+        self.config = config
+        self.bot: Optional[TradingBot] = None
+        self.tasks: List[asyncio.Task] = []
+
+    async def start(self):
+        """Initializes and starts the trading bot and its components."""
+        try:
+            # 1. Initialize Components
+            exchange_api = get_exchange_api(self.config)
+            strategy = get_strategy(self.config.strategy)
+            position_manager = PositionManager(self.config.database.path)
+            risk_manager = RiskManager(self.config.risk_management, position_manager, self.config.initial_capital)
+            execution_handler = ExecutionHandler(exchange_api, position_manager, risk_manager)
+
+            # 2. Initialize the main TradingBot
+            self.bot = TradingBot(
+                config=self.config,
+                exchange_api=exchange_api,
+                strategy=strategy,
+                position_manager=position_manager,
+                risk_manager=risk_manager,
+                execution_handler=execution_handler
+            )
+
+            # 3. Start the bot's main loop as a task
+            self.tasks.append(asyncio.create_task(self.bot.run()))
+            logger.info("Bot application started. Press Ctrl+C to stop.")
+            await asyncio.gather(*self.tasks)
+
+        except Exception as e:
+            logger.critical(f"Failed to start bot application: {e}", exc_info=True)
+        finally:
+            await self.shutdown()
+
+    async def shutdown(self, signame: str = 'SIGTERM'):
+        """Gracefully shuts down the application."""
+        logger.info(f"Shutdown triggered by {signame}. Cleaning up...")
+        if self.bot:
+            self.bot.stop()
+        
+        for task in self.tasks:
+            if not task.done():
+                task.cancel()
+        
+        # Allow tasks to finish cancellation
+        await asyncio.sleep(1)
+
+        # Clean up resources
+        if self.bot and self.bot.exchange_api:
+            await self.bot.exchange_api.close()
+        if self.bot and self.bot.position_manager:
+            self.bot.position_manager.close()
+
+        logger.info("Shutdown complete.")
 
 async def main():
-    """Main function to initialize and run the trading bot."""
-    global bot_instance
-    position_manager = None
-    exchange_api = None
-
     try:
-        # Load configuration
         config_loader = ConfigLoader('config_enterprise.yaml')
         config = config_loader.load_and_validate()
-
-        # Initialize components
-        position_manager = PositionManager(db_path=config.database.path)
-        exchange_api = get_exchange_api(config)
-        risk_manager = RiskManager(
-            config=config.risk_management, 
-            position_manager=position_manager, 
-            initial_capital=config.initial_capital
-        )
-        strategy = get_strategy(config)
-
-        # Create and run the bot
-        bot_instance = TradingBot(config, exchange_api, strategy, position_manager, risk_manager)
-        
-        # Setup signal handlers for graceful shutdown
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s)))
-
-        await bot_instance.run()
-
-    except Exception as e:
-        logger.critical(f"Bot failed to start or crashed: {e}", exc_info=True)
+    except (FileNotFoundError, ValueError) as e:
+        logger.critical(f"Configuration error: {e}")
         sys.exit(1)
-    finally:
-        if bot_instance and bot_instance.running:
-            bot_instance.stop()
-        if position_manager:
-            position_manager.close()
-        if exchange_api:
-            await exchange_api.close()
-        logger.info("Bot shutdown complete.")
 
-async def shutdown(sig: signal.Signals):
-    """Graceful shutdown handler."""
-    logger.info(f"Received exit signal {sig.name}... initiating graceful shutdown.")
-    if bot_instance:
-        bot_instance.stop()
-    
-    # Allow time for tasks to clean up
-    await asyncio.sleep(2)
+    app = BotApplication(config)
 
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    if tasks:
-        logger.info(f"Cancelling {len(tasks)} outstanding tasks")
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+    # Set up signal handlers for graceful shutdown
+    loop = asyncio.get_running_loop()
+    for signame in {'SIGINT', 'SIGTERM'}:
+        loop.add_signal_handler(
+            getattr(signal, signame),
+            lambda signame=signame: asyncio.create_task(app.shutdown(signame))
+        )
 
-    asyncio.get_running_loop().stop()
+    await app.start()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, asyncio.exceptions.CancelledError):
-        logger.info("Event loop stopped.")
+    except KeyboardInterrupt:
+        logger.info("Application stopped by user.")
