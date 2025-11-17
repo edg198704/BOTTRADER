@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 from typing import Dict, Any, List, Optional
 from enum import Enum
 from dataclasses import dataclass, field
@@ -33,6 +34,7 @@ class Order:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     error_message: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class FillEvent:
@@ -41,6 +43,7 @@ class FillEvent:
     quantity: float
     price: float
     order_id: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 class OrderManager:
     def __init__(self, exchange_api: ExchangeAPI):
@@ -71,16 +74,17 @@ class OrderManager:
                 pass
         logger.info("OrderManager stopped.")
 
-    async def submit_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None) -> Order:
+    async def submit_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None, metadata: Optional[Dict[str, Any]] = None) -> Order:
         """Submits an order to the exchange and starts tracking it."""
-        client_order_id = f"bot_{int(time.time() * 1000)}"
+        client_order_id = f"bot_{int(time.time() * 1000)}_{random.randint(100,999)}"
         order = Order(
             client_order_id=client_order_id,
             symbol=symbol,
             side=side,
             order_type=order_type,
             quantity=quantity,
-            price=price
+            price=price,
+            metadata=metadata or {}
         )
         self._orders[client_order_id] = order
 
@@ -134,30 +138,25 @@ class OrderManager:
     async def _check_order_status(self, order: Order):
         """Fetches the latest status of a single order from the exchange."""
         try:
-            # This method assumes exchange_api has a 'fetch_order' method.
-            # We will need to add this to the ExchangeAPI interface.
-            if not hasattr(self.exchange_api, 'fetch_order'):
-                 logger.warning("ExchangeAPI does not support fetch_order. Cannot track order status.")
-                 # As a fallback, we'll assume market orders fill instantly.
-                 if order.order_type == 'MARKET' and order.status == OrderStatus.OPEN:
-                     await self._handle_fill(order, order.quantity, order.price or self.exchange_api.last_price)
-                     order.status = OrderStatus.FILLED
-                 return
+            if not order.exchange_order_id:
+                logger.warning(f"Cannot track order {order.client_order_id} without exchange_order_id.")
+                return
 
             status_response = await self.exchange_api.fetch_order(order.exchange_order_id, order.symbol)
             
             if not status_response:
                 return
 
-            new_status = OrderStatus(status_response.get('status', 'ERROR').upper())
+            new_status_str = status_response.get('status', 'ERROR').upper()
+            new_status = OrderStatus[new_status_str] if new_status_str in OrderStatus.__members__ else OrderStatus.ERROR
             filled_qty = float(status_response.get('filled', 0.0))
             
             if new_status != order.status or filled_qty > order.filled_quantity:
-                logger.info(f"Order {order.client_order_id} status changed: {order.status} -> {new_status}, Filled: {filled_qty}/{order.quantity}")
+                logger.info(f"Order {order.client_order_id} status changed: {order.status.value} -> {new_status.value}, Filled: {filled_qty}/{order.quantity}")
                 
                 fill_amount = filled_qty - order.filled_quantity
                 if fill_amount > 0:
-                    fill_price = float(status_response.get('average', order.price))
+                    fill_price = float(status_response.get('average', order.price or 0.0))
                     await self._handle_fill(order, fill_amount, fill_price)
 
                 order.status = new_status
@@ -177,7 +176,8 @@ class OrderManager:
             side=order.side,
             quantity=fill_quantity,
             price=fill_price,
-            order_id=order.client_order_id
+            order_id=order.client_order_id,
+            metadata=order.metadata
         )
         await self._fill_queue.put(fill)
         logger.info(f"Fill event generated: {fill}")
