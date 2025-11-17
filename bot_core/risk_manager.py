@@ -1,22 +1,36 @@
 import logging
 from typing import Dict, Any, List
 import pandas as pd
+from datetime import datetime, time
+from enum import Enum, auto
+
 from bot_core.position_manager import PositionManager
 from bot_core.config import RiskManagementConfig
 
 logger = logging.getLogger(__name__)
+
+class HaltReason(Enum):
+    NONE = auto()
+    DAILY_LOSS_LIMIT = auto()
+    CIRCUIT_BREAKER = auto()
 
 class RiskManager:
     def __init__(self, config: RiskManagementConfig, position_manager: PositionManager, initial_capital: float):
         self.config = config
         self.position_manager = position_manager
         self.initial_capital = initial_capital
-        self.is_trading_halted = False
+        self._halt_reason: HaltReason = HaltReason.NONE
+        self._current_trading_day: datetime.date = datetime.utcnow().date()
         logger.info(f"RiskManager initialized with config: {self.config.dict()}")
+
+    @property
+    def is_halted(self) -> bool:
+        """Public property to check if trading is currently halted."""
+        return self._halt_reason != HaltReason.NONE
 
     def get_portfolio_value(self) -> float:
         """Calculates the current total value of the portfolio."""
-        realized_pnl = self.position_manager.get_daily_realized_pnl()
+        realized_pnl = self.position_manager.get_daily_realized_pnl(datetime.combine(self._current_trading_day, time.min))
         unrealized_pnl = self.position_manager.get_total_unrealized_pnl()
         return self.initial_capital + realized_pnl + unrealized_pnl
 
@@ -95,8 +109,8 @@ class RiskManager:
 
     def check_trade_allowed(self, symbol: str, side: str, quantity: float, price: float) -> bool:
         """Performs pre-trade risk checks."""
-        if self.is_trading_halted:
-            logger.warning("Trading is halted by risk manager.")
+        if self.is_halted:
+            logger.warning(f"Trading is halted due to {self._halt_reason.name}. Trade denied.")
             return False
 
         open_positions = self.position_manager.get_open_positions()
@@ -109,29 +123,44 @@ class RiskManager:
             logger.warning(f"Trade denied for {symbol}: Proposed value ${trade_value_usd:.2f} exceeds max size ${self.config.max_position_size_usd:.2f}.")
             return False
 
-        self.update_risk_metrics() # Ensure metrics are fresh before this check
-        if self.is_trading_halted:
-            logger.warning("Trade denied: Daily loss limit or circuit breaker triggered.")
+        # Re-check metrics just before trade to ensure no limits were just breached
+        self.update_risk_metrics()
+        if self.is_halted:
+            logger.warning(f"Trade denied: Risk limit breached just before execution ({self._halt_reason.name}).")
             return False
 
         logger.debug(f"Trade for {symbol} {side} {quantity}@{price} passed initial risk checks.")
         return True
 
     def update_risk_metrics(self):
-        """Updates portfolio-level risk metrics and checks for circuit breaker conditions."""
+        """Updates portfolio-level risk metrics and manages trading halt state machine."""
+        today = datetime.utcnow().date()
+        if today > self._current_trading_day:
+            logger.info(f"New trading day. Resetting daily limits from {self._current_trading_day} to {today}.")
+            self._current_trading_day = today
+            if self._halt_reason == HaltReason.DAILY_LOSS_LIMIT:
+                logger.info("Resetting trading halt due to new day.")
+                self._halt_reason = HaltReason.NONE
+
+        # If trading is halted by circuit breaker, no further checks are needed.
+        if self._halt_reason == HaltReason.CIRCUIT_BREAKER:
+            return
+
         portfolio_value = self.get_portfolio_value()
-        realized_pnl = self.position_manager.get_daily_realized_pnl()
+        realized_pnl = self.position_manager.get_daily_realized_pnl(datetime.combine(self._current_trading_day, time.min))
         portfolio_drawdown = (portfolio_value - self.initial_capital) / self.initial_capital if self.initial_capital > 0 else 0
 
-        if realized_pnl < -abs(self.config.max_daily_loss_usd) and not self.is_trading_halted:
-            logger.critical(f"Daily loss limit of ${self.config.max_daily_loss_usd:.2f} exceeded. Halting trading.")
-            self.is_trading_halted = True
+        if realized_pnl < -abs(self.config.max_daily_loss_usd):
+            if self._halt_reason != HaltReason.DAILY_LOSS_LIMIT:
+                logger.critical(f"Daily loss limit of ${self.config.max_daily_loss_usd:.2f} exceeded. Halting trading.")
+                self._halt_reason = HaltReason.DAILY_LOSS_LIMIT
 
-        if portfolio_drawdown < self.config.circuit_breaker_threshold and not self.is_trading_halted:
-            logger.critical(f"Portfolio drawdown {portfolio_drawdown:.2%} exceeded circuit breaker threshold of {self.config.circuit_breaker_threshold:.2%}. Halting trading.")
-            self.is_trading_halted = True
+        if portfolio_drawdown < self.config.circuit_breaker_threshold:
+            if self._halt_reason != HaltReason.CIRCUIT_BREAKER:
+                logger.critical(f"Portfolio drawdown {portfolio_drawdown:.2%} exceeded circuit breaker threshold of {self.config.circuit_breaker_threshold:.2%}. Halting trading permanently.")
+                self._halt_reason = HaltReason.CIRCUIT_BREAKER
         
-        logger.debug(f"Risk metrics updated. Daily PnL: ${realized_pnl:.2f}, Portfolio Value: ${portfolio_value:.2f}, Drawdown: {portfolio_drawdown:.2%}")
+        logger.debug(f"Risk metrics updated. Daily PnL: ${realized_pnl:.2f}, Portfolio Value: ${portfolio_value:.2f}, Drawdown: {portfolio_drawdown:.2%}, Halt Status: {self._halt_reason.name}")
 
     def update_trailing_stops(self):
         """Iterates through open positions and updates their trailing stops."""
