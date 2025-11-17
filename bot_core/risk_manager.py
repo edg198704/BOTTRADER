@@ -1,7 +1,6 @@
 import logging
 from typing import Dict, Any, List
 import pandas as pd
-import numpy as np
 from bot_core.position_manager import PositionManager
 from bot_core.config import RiskManagementConfig
 
@@ -37,7 +36,6 @@ class RiskManager:
             risk_amount_usd = portfolio_value * self.config.risk_per_trade_pct
             size = risk_amount_usd / risk_per_unit
 
-            # Cap the position size by the absolute max value
             max_size_from_cap = self.config.max_position_size_usd / current_price
             final_size = min(size, max_size_from_cap)
 
@@ -51,24 +49,14 @@ class RiskManager:
     def calculate_stop_loss(self, symbol: str, entry_price: float, side: str, df: pd.DataFrame) -> float:
         """Calculate stop loss using ATR for volatility, with a fallback to percentage."""
         try:
-            # ATR-based stop loss
-            if df is not None and not df.empty and all(c in df.columns for c in ['high', 'low', 'close']) and len(df) >= 14:
-                high = df['high']
-                low = df['low']
-                close = df['close']
-                tr1 = high - low
-                tr2 = abs(high - close.shift())
-                tr3 = abs(low - close.shift())
-                tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-                atr = tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1]
-
-                if pd.notna(atr) and atr > 0:
-                    if side.upper() == 'BUY':
-                        stop_loss = entry_price - (atr * self.config.atr_stop_multiplier)
-                    else:
-                        stop_loss = entry_price + (atr * self.config.atr_stop_multiplier)
-                    logger.info(f"ATR-based stop loss for {symbol}: {stop_loss:.4f} (ATR: {atr:.4f})")
-                    return float(stop_loss)
+            if 'atr' in df.columns and pd.notna(df['atr'].iloc[-1]) and df['atr'].iloc[-1] > 0:
+                atr = df['atr'].iloc[-1]
+                if side.upper() == 'BUY':
+                    stop_loss = entry_price - (atr * self.config.atr_stop_multiplier)
+                else:
+                    stop_loss = entry_price + (atr * self.config.atr_stop_multiplier)
+                logger.info(f"ATR-based stop loss for {symbol}: {stop_loss:.4f} (ATR: {atr:.4f})")
+                return float(stop_loss)
 
             logger.warning(f"Could not calculate ATR for {symbol}. Falling back to percentage-based stop loss.")
             if side.upper() == 'BUY':
@@ -85,25 +73,23 @@ class RiskManager:
 
     def calculate_take_profit_levels(self, entry_price: float, side: str, confidence: float) -> List[Dict[str, Any]]:
         """Calculate multiple take profit levels based on confidence and risk/reward."""
-        levels = []
-        stop_pct = self.config.stop_loss_fallback_pct
-        base_rr = 2.0 # Base risk-reward ratio
-
         if confidence > 0.8:
-            tp_ratios = [base_rr * 1.0, base_rr * 2.0]
-            size_fractions = [0.6, 0.4]
+            tp_multipliers = [1.5, 3.0, 5.0]  # Risk:Reward
+            size_distribution = [0.5, 0.3, 0.2] # 50%, 30%, 20%
         elif confidence > 0.6:
-            tp_ratios = [base_rr * 1.5]
-            size_fractions = [1.0]
+            tp_multipliers = [1.5, 3.0]
+            size_distribution = [0.6, 0.4]
         else:
-            tp_ratios = [base_rr * 1.0]
-            size_fractions = [1.0]
+            tp_multipliers = [1.5]
+            size_distribution = [1.0]
 
-        for ratio, frac in zip(tp_ratios, size_fractions):
+        levels = []
+        risk_pct = self.config.stop_loss_fallback_pct # Use fallback as a baseline risk measure
+        for mult, frac in zip(tp_multipliers, size_distribution):
             if side.upper() == 'BUY':
-                tp_price = entry_price * (1 + stop_pct * ratio)
+                tp_price = entry_price * (1 + risk_pct * mult)
             else:
-                tp_price = entry_price * (1 - stop_pct * ratio)
+                tp_price = entry_price * (1 - risk_pct * mult)
             levels.append({"price": tp_price, "fraction": frac})
         return levels
 
@@ -157,7 +143,6 @@ class RiskManager:
             if pos.stop_loss is None:
                 continue
             
-            # Example: 1.5% trailing distance from current price, only if in profit
             trailing_distance = pos.current_price * 0.015 
             new_stop = None
             if pos.side == 'BUY' and pos.current_price > pos.entry_price:
