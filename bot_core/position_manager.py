@@ -1,14 +1,14 @@
-import logging
 import json
 from datetime import datetime
-from typing import Optional, List, Dict, Any
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, inspect, Text, func
+from typing import Optional, List
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, func
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import SQLAlchemyError
 
+from bot_core.logger import get_logger
 from bot_core.order_manager import FillEvent
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 Base = declarative_base()
 
@@ -40,7 +40,7 @@ class PositionManager:
         self.engine = create_engine(f'sqlite:///{db_path}')
         self._init_db()
         self.Session = sessionmaker(bind=self.engine)
-        logger.info(f"PositionManager initialized with DB: {db_path}")
+        logger.info("PositionManager initialized", db_path=db_path)
 
     def _init_db(self):
         Base.metadata.create_all(self.engine)
@@ -56,13 +56,11 @@ class PositionManager:
                 position = session.query(Position).filter_by(symbol=fill.symbol, status='OPEN').first()
 
                 if not position:
-                    # This must be an opening fill
                     if fill.metadata.get("intent") == "OPEN":
                         self._create_new_position(session, fill)
                     else:
-                        logger.warning(f"Received a fill for {fill.symbol} with no open position and no 'OPEN' intent.")
+                        logger.warning("Received fill with no open position and no 'OPEN' intent.", fill=fill)
                 else:
-                    # Handle fill for an existing position
                     if position.side == fill.side.upper():
                         self._increase_position(session, position, fill)
                     else:
@@ -71,10 +69,10 @@ class PositionManager:
                 session.commit()
             except SQLAlchemyError as e:
                 session.rollback()
-                logger.error(f"Database error processing fill for {fill.symbol}: {e}", exc_info=True)
+                logger.error("Database error processing fill", symbol=fill.symbol, error=str(e), exc_info=True)
             except Exception as e:
                 session.rollback()
-                logger.error(f"Unexpected error processing fill for {fill.symbol}: {e}", exc_info=True)
+                logger.error("Unexpected error processing fill", symbol=fill.symbol, error=str(e), exc_info=True)
 
     def _create_new_position(self, session, fill: FillEvent):
         """Creates and persists a new position from an opening fill."""
@@ -89,28 +87,26 @@ class PositionManager:
             take_profit_levels=json.dumps(fill.metadata.get('take_profit_levels', []))
         )
         session.add(position)
-        logger.info(f"Opened new position from fill: {position}")
+        logger.info("Opened new position from fill", position=repr(position))
 
     def _increase_position(self, session, position: Position, fill: FillEvent):
         """Increases an existing position and recalculates the average entry price."""
-        logger.info(f"Increasing position for {position.symbol} by {fill.quantity} at {fill.price}")
+        logger.info("Increasing position", symbol=position.symbol, quantity=fill.quantity, price=fill.price)
         total_cost_before = position.quantity * position.entry_price
         additional_cost = fill.quantity * fill.price
         new_total_quantity = position.quantity + fill.quantity
 
         position.entry_price = (total_cost_before + additional_cost) / new_total_quantity
         position.quantity = new_total_quantity
-        # Update risk levels if provided in new fill metadata
         if 'stop_loss' in fill.metadata:
             position.stop_loss = fill.metadata['stop_loss']
-        logger.info(f"Position increased. New avg price: {position.entry_price}, new quantity: {position.quantity}")
+        logger.info("Position increased", new_avg_price=position.entry_price, new_quantity=position.quantity)
 
     def _decrease_or_close_position(self, session, position: Position, fill: FillEvent):
         """Decreases or fully closes an existing position."""
         close_quantity = fill.quantity
         if close_quantity >= position.quantity:
-            # Full close
-            logger.info(f"Closing full position for {position.symbol} ({position.quantity}) with fill of {close_quantity}")
+            logger.info("Closing full position", symbol=position.symbol, current_qty=position.quantity, fill_qty=close_quantity)
             if position.side == 'BUY':
                 position.realized_pnl = (fill.price - position.entry_price) * position.quantity
             else: # SELL
@@ -119,19 +115,18 @@ class PositionManager:
             position.status = 'CLOSED'
             position.current_price = fill.price
             position.unrealized_pnl = 0.0
-            logger.info(f"Closed position {position.id}. Realized PnL: {position.realized_pnl:.2f}")
+            logger.info("Closed position", position_id=position.id, realized_pnl=f"{position.realized_pnl:.2f}")
         else:
-            # Partial close
-            logger.info(f"Partially closing position for {position.symbol} by {close_quantity}")
+            logger.info("Partially closing position", symbol=position.symbol, close_qty=close_quantity)
             realized_pnl_on_portion = 0
             if position.side == 'BUY':
                 realized_pnl_on_portion = (fill.price - position.entry_price) * close_quantity
             else: # SELL
-                real_pnl_on_portion = (position.entry_price - fill.price) * close_quantity
+                realized_pnl_on_portion = (position.entry_price - fill.price) * close_quantity
             
             position.quantity -= close_quantity
             position.realized_pnl += realized_pnl_on_portion
-            logger.info(f"Partial close on {position.id}. Realized PnL: {realized_pnl_on_portion:.2f}. Remaining qty: {position.quantity}")
+            logger.info("Partial close processed", position_id=position.id, realized_pnl=f"{realized_pnl_on_portion:.2f}", remaining_qty=position.quantity)
 
     def get_open_positions(self, symbol: Optional[str] = None) -> List[Position]:
         with self._get_session() as session:
@@ -141,7 +136,7 @@ class PositionManager:
                     query = query.filter_by(symbol=symbol)
                 return query.all()
             except SQLAlchemyError as e:
-                logger.error(f"Error getting open positions: {e}")
+                logger.error("Error getting open positions", error=str(e))
                 return []
 
     def get_position_by_id(self, position_id: int) -> Optional[Position]:
@@ -150,7 +145,7 @@ class PositionManager:
             try:
                 return session.query(Position).filter_by(id=position_id, status='OPEN').first()
             except SQLAlchemyError as e:
-                logger.error(f"Error getting position by id {position_id}: {e}")
+                logger.error("Error getting position by id", position_id=position_id, error=str(e))
                 return None
 
     def update_position_pnl(self, position_id: int, current_price: float) -> Optional[Position]:
@@ -168,7 +163,7 @@ class PositionManager:
                 return None
             except SQLAlchemyError as e:
                 session.rollback()
-                logger.error(f"Error updating PnL for position {position_id}: {e}")
+                logger.error("Error updating PnL for position", position_id=position_id, error=str(e))
                 return None
 
     def update_position_risk(self, position_id: int, new_stop_loss: float) -> Optional[Position]:
@@ -178,12 +173,12 @@ class PositionManager:
                 if position:
                     position.stop_loss = new_stop_loss
                     session.commit()
-                    logger.info(f"Updated stop loss for position {position_id} to {new_stop_loss}")
+                    logger.info("Updated stop loss for position", position_id=position_id, new_stop_loss=new_stop_loss)
                     return position
                 return None
             except SQLAlchemyError as e:
                 session.rollback()
-                logger.error(f"Error updating risk for position {position_id}: {e}")
+                logger.error("Error updating risk for position", position_id=position_id, error=str(e))
                 return None
 
     def get_total_unrealized_pnl(self) -> float:
@@ -192,7 +187,7 @@ class PositionManager:
                 total_pnl = session.query(func.sum(Position.unrealized_pnl)).filter_by(status='OPEN').scalar()
                 return total_pnl or 0.0
             except SQLAlchemyError as e:
-                logger.error(f"Error calculating total unrealized PnL: {e}")
+                logger.error("Error calculating total unrealized PnL", error=str(e))
                 return 0.0
 
     def get_daily_realized_pnl(self, date: Optional[datetime] = None) -> float:
@@ -208,7 +203,7 @@ class PositionManager:
                 ).scalar()
                 return daily_pnl or 0.0
             except SQLAlchemyError as e:
-                logger.error(f"Error calculating daily realized PnL: {e}")
+                logger.error("Error calculating daily realized PnL", error=str(e))
                 return 0.0
 
     def close(self):
