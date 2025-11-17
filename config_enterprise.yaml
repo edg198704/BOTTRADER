@@ -1,49 +1,29 @@
-# config_enterprise.yaml
-# This configuration file defines settings for the trading bot.
+# Enterprise configuration for the modular trading bot.
 
-# --- Global Settings ---
-global:
-  log_level: INFO # DEBUG, INFO, WARNING, ERROR, CRITICAL
-  environment: production # production, development, test
-
-# --- Exchange API Settings ---
 exchange:
-  name: MockExchange # Use 'MockExchange' for testing, 'Binance' for real trading
-  api_key: YOUR_BINANCE_API_KEY # Replace with your actual API key
-  api_secret: YOUR_BINANCE_API_SECRET # Replace with your actual API secret
-  testnet: true # Set to true for Binance testnet, false for live trading
+  name: MockExchange # 'MockExchange' for testing, or a ccxt-supported exchange like 'binance'
+  api_key: YOUR_API_KEY
+  api_secret: YOUR_API_SECRET
+  testnet: true # For exchanges that support a testnet/sandbox environment
 
-# --- Strategy Settings ---
 strategy:
-  name: SimpleMACrossoverStrategy # Name of the strategy to use
-  symbol: BTCUSDT # Trading pair
-  interval: 10 # Strategy execution interval in seconds
-  trade_quantity: 0.0005 # Quantity to trade per order (e.g., 0.0005 BTC)
+  name: AIEnsembleStrategy # 'AIEnsembleStrategy' or 'SimpleMACrossoverStrategy'
+  symbol: "BTC/USDT" # Trading pair
+  interval_seconds: 60 # Strategy execution interval in seconds
+  trade_quantity: 0.001 # Base quantity for trading
+  # AIEnsembleStrategy specific parameters
+  feature_columns: ['close', 'rsi', 'macd', 'volume']
+  buy_threshold: 0.002
+  sell_threshold: -0.0015
   # SimpleMACrossoverStrategy specific parameters
   fast_ma_period: 10
   slow_ma_period: 20
 
-# --- Risk Management Settings ---
 risk_management:
-  max_position_size_usd: 500 # Maximum value of a single position in USD
-  max_daily_loss_usd: 100 # Maximum cumulative realized loss allowed per day in USD
-  max_open_positions: 2 # Maximum number of open positions allowed simultaneously
+  max_position_size_usd: 1000.0 # Maximum value of a single position in USD
+  max_daily_loss_usd: 500.0 # Maximum cumulative realized loss allowed per day in USD
+  max_open_positions: 5 # Maximum number of open positions allowed simultaneously
+  circuit_breaker_threshold: -0.10 # Halt trading if portfolio drops by 10% in a day
 
-# --- Database Settings ---
 database:
-  path: position_ledger.db # Path to the SQLite database for position tracking
-
-# --- Other Settings (e.g., notifications, monitoring) ---
-notifications:
-  telegram:
-    enabled: false
-    bot_token: YOUR_TELEGRAM_BOT_TOKEN
-    chat_id: YOUR_TELEGRAM_CHAT_ID
-  email:
-    enabled: false
-    sender_email: bot@example.com
-    recipient_email: admin@example.com
-    smtp_server: smtp.example.com
-    smtp_port: 587
-    smtp_username: YOUR_SMTP_USERNAME
-    smtp_password: YOUR_SMTP_PASSWORD
+  path: "position_ledger.db" # Path to the SQLite database for position tracking
