@@ -127,7 +127,7 @@ class PositionManager:
             if position.side == 'BUY':
                 realized_pnl_on_portion = (fill.price - position.entry_price) * close_quantity
             else: # SELL
-                realized_pnl_on_portion = (position.entry_price - fill.price) * close_quantity
+                real_pnl_on_portion = (position.entry_price - fill.price) * close_quantity
             
             position.quantity -= close_quantity
             position.realized_pnl += realized_pnl_on_portion
