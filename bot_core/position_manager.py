@@ -1,7 +1,8 @@
 import logging
+import json
 from datetime import datetime
-from typing import Optional, List
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, inspect
+from typing import Optional, List, Dict, Any
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, inspect, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -23,6 +24,8 @@ class Position(Base):
     status = Column(String, nullable=False, default='OPEN', index=True) # 'OPEN', 'CLOSED'
     open_time = Column(DateTime, default=datetime.utcnow)
     close_time = Column(DateTime)
+    stop_loss = Column(Float)
+    take_profit_levels = Column(Text) # Storing as JSON string
 
     def __repr__(self):
         return (
@@ -38,15 +41,13 @@ class PositionManager:
         logger.info(f"PositionManager initialized with DB: {db_path}")
 
     def _init_db(self):
-        inspector = inspect(self.engine)
-        if not inspector.has_table('positions'):
-            Base.metadata.create_all(self.engine)
-            logger.info("Database table 'positions' created.")
+        Base.metadata.create_all(self.engine)
+        logger.info("Database tables checked and/or created.")
 
     def _get_session(self):
         return self.Session()
 
-    def add_position(self, symbol: str, side: str, quantity: float, entry_price: float) -> Optional[Position]:
+    def add_position(self, symbol: str, side: str, quantity: float, entry_price: float, stop_loss: float, take_profit_levels: List[Dict[str, Any]]) -> Optional[Position]:
         with self._get_session() as session:
             try:
                 existing_position = session.query(Position).filter_by(symbol=symbol, status='OPEN').first()
@@ -60,8 +61,9 @@ class PositionManager:
                     quantity=quantity,
                     entry_price=entry_price,
                     current_price=entry_price,
-                    unrealized_pnl=0.0,
-                    status='OPEN'
+                    status='OPEN',
+                    stop_loss=stop_loss,
+                    take_profit_levels=json.dumps(take_profit_levels)
                 )
                 session.add(position)
                 session.commit()
@@ -102,6 +104,21 @@ class PositionManager:
                 logger.error(f"Error updating PnL for position {position_id}: {e}")
                 return None
 
+    def update_position_risk(self, position_id: int, new_stop_loss: float) -> Optional[Position]:
+        with self._get_session() as session:
+            try:
+                position = session.query(Position).filter_by(id=position_id, status='OPEN').first()
+                if position:
+                    position.stop_loss = new_stop_loss
+                    session.commit()
+                    logger.info(f"Updated stop loss for position {position_id} to {new_stop_loss}")
+                    return position
+                return None
+            except SQLAlchemyError as e:
+                session.rollback()
+                logger.error(f"Error updating risk for position {position_id}: {e}")
+                return None
+
     def close_position(self, position_id: int, close_price: float) -> Optional[Position]:
         with self._get_session() as session:
             try:
@@ -127,8 +144,8 @@ class PositionManager:
     def get_total_unrealized_pnl(self) -> float:
         with self._get_session() as session:
             try:
-                total_pnl = session.query(Float).filter(Position.status == 'OPEN').with_entities(Position.unrealized_pnl).sum()
-                return total_pnl or 0.0
+                open_positions = self.get_open_positions()
+                return sum(p.unrealized_pnl for p in open_positions)
             except SQLAlchemyError as e:
                 logger.error(f"Error calculating total unrealized PnL: {e}")
                 return 0.0
@@ -140,10 +157,10 @@ class PositionManager:
                     date = datetime.utcnow()
                 start_of_day = datetime(date.year, date.month, date.day)
                 
-                daily_pnl = session.query(Float).filter(
+                daily_pnl = session.query(func.sum(Position.realized_pnl)).filter(
                     Position.status == 'CLOSED',
                     Position.close_time >= start_of_day
-                ).with_entities(Position.realized_pnl).sum()
+                ).scalar()
                 return daily_pnl or 0.0
             except SQLAlchemyError as e:
                 logger.error(f"Error calculating daily realized PnL: {e}")
