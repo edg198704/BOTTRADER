@@ -31,14 +31,14 @@ class TradingBot:
         try:
             # Fetch both OHLCV and ticker data for a complete view
             # Assuming get_market_data can fetch OHLCV with parameters
-            ohlcv_data = await self.exchange_api.get_market_data(self.symbol, '1h', 200)
+            ohlcv_data_list = await self.exchange_api.get_market_data(self.symbol, '1h', 200)
             ticker_data = await self.exchange_api.get_market_data(self.symbol)
             
-            if not ohlcv_data or not isinstance(ohlcv_data.get('ohlcv'), list) or not ticker_data or not ticker_data.get('lastPrice'):
+            if not isinstance(ohlcv_data_list, list) or not ticker_data or not ticker_data.get('lastPrice'):
                 logger.warning(f"Received invalid or empty market data for {self.symbol}")
                 return None
             
-            df = pd.DataFrame(ohlcv_data['ohlcv'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df = pd.DataFrame(ohlcv_data_list, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
             logger.debug(f"Fetched {len(df)} candles for {self.symbol}")
@@ -47,8 +47,8 @@ class TradingBot:
             logger.error(f"Error fetching market data for {self.symbol}: {e}", exc_info=True)
             return None
 
-    async def _execute_trade_action(self, action: Dict[str, Any], ohlcv_df):
-        """Executes a trade action (BUY/SELL)."""
+    async def _execute_trade_action(self, action: Dict[str, Any], ohlcv_df: pd.DataFrame):
+        """Orchestrates the pre-trade risk assessment and order execution."""
         action_type = action.get('action')
         if action_type not in ['BUY', 'SELL']:
             return
@@ -59,23 +59,32 @@ class TradingBot:
             logger.error(f"Could not get current price for {self.symbol} to execute trade.")
             return
 
-        confidence = action.get('confidence', 0.5)
-        portfolio_value = self.risk_manager.initial_capital + self.position_manager.get_total_unrealized_pnl() + self.position_manager.get_daily_realized_pnl()
-        quantity = self.risk_manager.calculate_position_size(self.symbol, current_price, confidence, portfolio_value)
+        # 1. Calculate Stop Loss first, as it's needed for position sizing
+        stop_loss_price = self.risk_manager.calculate_stop_loss(self.symbol, current_price, action_type, ohlcv_df)
 
+        # 2. Calculate Position Size based on risk
+        portfolio_value = self.risk_manager.initial_capital + self.position_manager.get_total_unrealized_pnl() + self.position_manager.get_daily_realized_pnl()
+        quantity = self.risk_manager.calculate_position_size(portfolio_value, current_price, stop_loss_price)
+        if quantity <= 0:
+            logger.warning(f"Calculated position size is zero or negative for {self.symbol}. Aborting trade.")
+            return
+
+        # 3. Perform final pre-trade checks
         if not self.risk_manager.check_trade_allowed(self.symbol, action_type, quantity, current_price):
             logger.warning(f"Trade {action_type} {quantity} {self.symbol} denied by risk manager.")
             return
 
+        # 4. Place the order
         try:
             order_response = await self.exchange_api.place_order(self.symbol, action_type, 'MARKET', quantity)
             logger.info(f"Order placed: {order_response}")
             
+            # 5. Open the position in the ledger if filled
             if order_response and order_response.get('status') == 'FILLED':
                 entry_price = float(order_response['cummulativeQuoteQty']) / float(order_response['executedQty'])
                 filled_quantity = float(order_response['executedQty'])
 
-                stop_loss = self.risk_manager.calculate_stop_loss(self.symbol, entry_price, action_type, ohlcv_df)
+                confidence = action.get('confidence', 0.5)
                 take_profit_levels = self.risk_manager.calculate_take_profit_levels(entry_price, action_type, confidence)
 
                 self.position_manager.add_position(
@@ -83,7 +92,7 @@ class TradingBot:
                     side=action_type,
                     quantity=filled_quantity,
                     entry_price=entry_price,
-                    stop_loss=stop_loss,
+                    stop_loss=stop_loss_price,
                     take_profit_levels=take_profit_levels
                 )
             else:
