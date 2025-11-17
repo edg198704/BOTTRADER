@@ -118,8 +118,23 @@ class AIEnsembleStrategy(TradingStrategy):
         self.model = VotingClassifier(estimators=[('rf', clf1), ('xgb', clf2), ('lr', clf3)], voting='soft')
         logger.info("AI ensemble model initialized.")
 
+    def _calculate_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        # RSI
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).ewm(com=13, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(com=13, adjust=False).mean()
+        rs = gain / (loss + 1e-9)
+        df['rsi'] = 100 - (100 / (1 + rs))
+        # MACD
+        exp1 = df['close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['close'].ewm(span=26, adjust=False).mean()
+        df['macd'] = exp1 - exp2
+        df.dropna(inplace=True)
+        return df
+
     async def analyze_market(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> Optional[Dict[str, Any]]:
-        df = self._calculate_technical_indicators(ohlcv_df)
+        df = self._calculate_features(ohlcv_df)
         if df is None or df.empty:
             return None
 
@@ -147,7 +162,7 @@ class AIEnsembleStrategy(TradingStrategy):
         if ohlcv_df.empty or not position_to_manage or not self.is_trained:
             return actions
 
-        df = self._calculate_technical_indicators(ohlcv_df)
+        df = self._calculate_features(ohlcv_df)
         if df is None or df.empty:
             return actions
 
@@ -163,21 +178,6 @@ class AIEnsembleStrategy(TradingStrategy):
             actions.append({'action': 'CLOSE', 'position_id': position_to_manage.id})
         
         return actions
-
-    def _calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        # RSI
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).ewm(com=13, adjust=False).mean()
-        loss = (-delta.where(delta < 0, 0)).ewm(com=13, adjust=False).mean()
-        rs = gain / (loss + 1e-9)
-        df['rsi'] = 100 - (100 / (1 + rs))
-        # MACD
-        exp1 = df['close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['close'].ewm(span=26, adjust=False).mean()
-        df['macd'] = exp1 - exp2
-        df.dropna(inplace=True)
-        return df
 
     def _predict(self, df: pd.DataFrame) -> Dict[str, Any]:
         latest_features = df[self.feature_columns].iloc[-1:]
