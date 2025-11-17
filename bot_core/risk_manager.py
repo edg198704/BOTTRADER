@@ -8,32 +8,37 @@ from bot_core.config import RiskManagementConfig, BotConfig
 logger = logging.getLogger(__name__)
 
 class RiskManager:
-    def __init__(self, config: BotConfig, position_manager: PositionManager, initial_capital: float):
-        self.config = config.risk_management
+    def __init__(self, config: RiskManagementConfig, position_manager: PositionManager, initial_capital: float):
+        self.config = config
         self.position_manager = position_manager
         self.initial_capital = initial_capital
         self.is_trading_halted = False
         logger.info(f"RiskManager initialized with config: {self.config.dict()}")
 
-    def calculate_position_size(self, symbol: str, current_price: float, confidence: float, available_equity: float) -> float:
-        """Calculate position size based on risk management rules."""
+    def calculate_position_size(self, available_equity: float, current_price: float, stop_loss_price: float) -> float:
+        """Calculates position size based on a fixed percentage of equity to risk."""
         try:
-            if current_price <= 0:
+            if current_price <= 0 or stop_loss_price <= 0:
+                logger.warning("Invalid prices for position size calculation.")
                 return 0.0
-            # Confidence acts as a conviction score, from 0.5 to 1.0, scaling the position size.
-            confidence_scaler = max(0.1, (confidence - 0.5) * 2 if confidence > 0.5 else 0.1)
-            position_value_usd = self.config.max_position_size_usd * confidence_scaler
-            
-            # Ensure position value does not exceed a fraction of total equity (e.g., 10%)
-            max_value_from_equity = available_equity * 0.1
-            final_position_value = min(position_value_usd, max_value_from_equity)
 
-            size = final_position_value / current_price
-            logger.info(f"Calculated position size for {symbol}: {size:.8f} based on confidence {confidence:.2f} and equity {available_equity:.2f}")
-            return float(size)
+            risk_per_unit = abs(current_price - stop_loss_price)
+            if risk_per_unit == 0:
+                logger.warning("Risk per unit is zero, cannot calculate position size.")
+                return 0.0
+
+            risk_amount_usd = available_equity * self.config.risk_per_trade_pct
+            size = risk_amount_usd / risk_per_unit
+
+            # Cap the position size by the absolute max value
+            max_size_from_cap = self.config.max_position_size_usd / current_price
+            final_size = min(size, max_size_from_cap)
+
+            logger.info(f"Calculated position size: {final_size:.8f} (Risk Amount: ${risk_amount_usd:.2f}, SL Distance: ${risk_per_unit:.4f})")
+            return float(final_size)
 
         except Exception as e:
-            logger.error(f"Error calculating position size for {symbol}: {e}", exc_info=True)
+            logger.error(f"Error calculating position size: {e}", exc_info=True)
             return 0.0
 
     def calculate_stop_loss(self, symbol: str, entry_price: float, side: str, df: pd.DataFrame) -> float:
