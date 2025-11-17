@@ -106,12 +106,11 @@ class LiveAPIDataHandler(DataHandler):
                     df = create_dataframe(ohlcv_data)
                     if df is None: continue
 
-                    df_with_indicators = calculate_technical_indicators(df)
                     last_price = float(ticker_data['lastPrice'])
 
                     market_event = MarketEvent(
                         symbol=symbol,
-                        ohlcv_df=df_with_indicators,
+                        ohlcv_df=df,
                         last_price=last_price
                     )
                     await self.event_queue.put(market_event)
@@ -149,41 +148,3 @@ def create_dataframe(ohlcv_data: list) -> pd.DataFrame | None:
     except Exception as e:
         logger.error("Error creating DataFrame", error=str(e), exc_info=True)
         return None
-
-def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate all necessary technical indicators."""
-    if df is None or len(df) < 50:
-        logger.warning("DataFrame has insufficient data for all indicators.", data_length=len(df) if df is not None else 0)
-        return df
-
-    df_out = df.copy()
-
-    # RSI
-    delta = df_out['close'].diff()
-    gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
-    loss = -delta.clip(upper=0).ewm(com=13, adjust=False).mean()
-    rs = gain / (loss + 1e-9)
-    df_out['rsi'] = 100 - (100 / (1 + rs))
-
-    # MACD
-    ema12 = df_out['close'].ewm(span=12, adjust=False).mean()
-    ema26 = df_out['close'].ewm(span=26, adjust=False).mean()
-    df_out['macd'] = ema12 - ema26
-    df_out['macd_signal'] = df_out['macd'].ewm(span=9, adjust=False).mean()
-
-    # Bollinger Bands
-    sma_20 = df_out['close'].rolling(20).mean()
-    std_20 = df_out['close'].rolling(20).std()
-    df_out['bb_upper'] = sma_20 + (std_20 * 2)
-    df_out['bb_lower'] = sma_20 - (std_20 * 2)
-
-    # ATR (for Risk Manager)
-    high_low = df_out['high'] - df_out['low']
-    high_close = abs(df_out['high'] - df_out['close'].shift())
-    low_close = abs(df_out['low'] - df_out['close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df_out['atr'] = tr.ewm(alpha=1/14, adjust=False).mean()
-
-    df_out.dropna(inplace=True)
-    logger.debug("Technical indicators calculated", row_count=len(df_out))
-    return df_out
