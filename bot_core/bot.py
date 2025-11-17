@@ -59,36 +59,29 @@ class TradingBot:
         fills = await self.order_manager.get_fill_events()
         for fill in fills:
             logger.info(f"Processing fill event: {fill}")
-            position = self.position_manager.get_position_by_symbol(fill.symbol)
-            
-            if position and position.side != fill.side: # Closing a position
-                # This is a simplified close logic. A real system would handle partial closes.
-                self.position_manager.close_position(position.id, fill.price)
-            elif not position: # Opening a new position
-                # We need stop loss and take profit info here. This is a limitation.
-                # For now, we'll add the position without them, assuming RiskManager handles it.
-                # A better approach would be to store the intended SL/TP with the order.
-                self.position_manager.add_position(
-                    symbol=fill.symbol,
-                    side=fill.side,
-                    quantity=fill.quantity,
-                    entry_price=fill.price,
-                    stop_loss=0, # Placeholder
-                    take_profit_levels=[] # Placeholder
-                )
-            else: # Increasing a position
-                logger.warning(f"Received fill for an existing position side. This logic is not yet implemented. {fill}")
+            try:
+                # The PositionManager now handles the logic of opening/closing
+                self.position_manager.update_from_fill(fill)
+            except Exception as e:
+                logger.error(f"Error processing fill event in PositionManager: {e}", exc_info=True)
 
     async def _close_position_by_id(self, position_id: int, reason: str = "strategy signal"):
-        position = next((p for p in self.position_manager.get_open_positions() if p.id == position_id), None)
+        position = self.position_manager.get_position_by_id(position_id)
         if not position:
             logger.warning(f"Attempted to close position {position_id}, but it was not found.")
             return
 
         close_side = 'SELL' if position.side == 'BUY' else 'BUY'
         try:
-            # Instead of placing order directly, we submit to order manager
-            await self.order_manager.submit_order(position.symbol, close_side, 'MARKET', position.quantity)
+            # Submit a closing order with metadata indicating which position to close
+            metadata = {"intent": "CLOSE", "position_id_to_close": position.id}
+            await self.order_manager.submit_order(
+                symbol=position.symbol, 
+                side=close_side, 
+                order_type='MARKET', 
+                quantity=position.quantity,
+                metadata=metadata
+            )
             logger.info(f"Submitted closing order for position {position_id} ({reason})")
         except Exception as e:
             logger.error(f"Error submitting closing order for position {position_id}: {e}", exc_info=True)
@@ -102,9 +95,10 @@ class TradingBot:
         while self.running:
             start_time = time.monotonic()
             try:
-                # Process any fills that have occurred
+                # 1. Process fills to update position state first
                 await self._process_fill_events()
 
+                # 2. Fetch and process new market data
                 market_data = await self._fetch_and_process_market_data()
                 if not market_data:
                     await asyncio.sleep(self.trade_interval_seconds)
@@ -113,37 +107,46 @@ class TradingBot:
                 ohlcv_df = market_data['ohlcv_df']
                 current_price = market_data['last_price']
 
+                # 3. Update PnL for open positions
                 open_positions = self.position_manager.get_open_positions(self.symbol)
                 for pos in open_positions:
                     self.position_manager.update_position_pnl(pos.id, current_price)
                 
+                # 4. Update risk metrics and check for halts
                 self.risk_manager.update_risk_metrics()
                 self.risk_manager.update_trailing_stops()
 
                 if self.risk_manager.is_trading_halted:
                     logger.warning("Trading halted by risk manager. Monitoring only.")
-                    await asyncio.sleep(self.trade_interval_seconds)
-                    continue
-
+                    # Still check for stop loss hits to close risky positions
+                
+                # 5. Check for stop loss triggers
                 positions_to_check = self.position_manager.get_open_positions(self.symbol)
                 for pos in positions_to_check:
-                    if (pos.side == 'BUY' and current_price <= pos.stop_loss) or (pos.side == 'SELL' and current_price >= pos.stop_loss):
+                    if pos.stop_loss and ((pos.side == 'BUY' and current_price <= pos.stop_loss) or \
+                       (pos.side == 'SELL' and current_price >= pos.stop_loss)):
                         logger.info(f"Stop loss hit for position {pos.id} at price {current_price}")
                         await self._close_position_by_id(pos.id, reason="stop loss")
+                        # Continue to next loop iteration after closing to get fresh state
                         continue
 
-                open_positions = self.position_manager.get_open_positions(self.symbol)
-                
-                trade_signal = await self.strategy.analyze_market(ohlcv_df, open_positions)
-                if trade_signal:
-                    logger.info(f"Strategy generated new trade signal: {trade_signal}")
-                    await self.execution_handler.execute_trade_proposal(trade_signal, ohlcv_df)
+                # 6. If not halted, ask strategy for signals
+                if not self.risk_manager.is_trading_halted:
+                    # Get fresh positions state after potential closes
+                    current_open_positions = self.position_manager.get_open_positions(self.symbol)
+                    
+                    # Ask for new trade signals
+                    trade_signal = await self.strategy.analyze_market(ohlcv_df, current_open_positions)
+                    if trade_signal:
+                        logger.info(f"Strategy generated new trade signal: {trade_signal}")
+                        await self.execution_handler.execute_trade_proposal(trade_signal, ohlcv_df)
 
-                position_management_actions = await self.strategy.manage_positions(ohlcv_df, open_positions)
-                for action in position_management_actions:
-                    if action.get('action') == 'CLOSE':
-                        logger.info(f"Strategy generated position management action: {action}")
-                        await self._close_position_by_id(action.get('position_id'))
+                    # Ask for position management actions
+                    position_management_actions = await self.strategy.manage_positions(ohlcv_df, current_open_positions)
+                    for action in position_management_actions:
+                        if action.get('action') == 'CLOSE':
+                            logger.info(f"Strategy generated position management action: {action}")
+                            await self._close_position_by_id(action.get('position_id'))
 
             except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, asyncio.TimeoutError) as e:
                 logger.warning(f"Network/Exchange issue in main loop: {e}. Retrying in 30s...")
