@@ -19,6 +19,14 @@ try:
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
+    # Define dummy classes if ML libraries are not available
+    class nn:
+        class Module: pass
+    class RandomForestClassifier: pass
+    class GradientBoostingClassifier: pass
+    class VotingClassifier: pass
+    class LogisticRegression: pass
+    class XGBClassifier: pass
 
 logger = logging.getLogger(__name__)
 
@@ -29,15 +37,14 @@ class TradingStrategy(abc.ABC):
     def __init__(self, config: Dict[str, Any]):
         self.symbol = config.get("symbol", "BTC/USDT")
         self.interval_seconds = config.get("interval_seconds", 60)
-        self.trade_quantity = config.get("trade_quantity", 0.001)
         logger.info(f"{self.__class__.__name__} initialized for {self.symbol}.")
 
     @abc.abstractmethod
-    async def analyze_market(self, ohlcv: List[List[float]], open_positions: List[Any]) -> Optional[Dict[str, Any]]:
+    async def analyze_market(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> Optional[Dict[str, Any]]:
         pass
 
     @abc.abstractmethod
-    async def manage_positions(self, ohlcv: List[List[float]], open_positions: List[Any]) -> List[Dict[str, Any]]:
+    async def manage_positions(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> List[Dict[str, Any]]:
         pass
 
 # --- AI Ensemble Strategy ---
@@ -91,14 +98,14 @@ class AIEnsembleStrategy(TradingStrategy):
             finally:
                 self.is_training = False
 
-    async def analyze_market(self, ohlcv: List[List[float]], open_positions: List[Any]) -> Optional[Dict[str, Any]]:
-        df = self._prepare_dataframe(ohlcv)
-        if df is None:
+    async def analyze_market(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> Optional[Dict[str, Any]]:
+        df = self._calculate_technical_indicators(ohlcv_df)
+        if df is None or df.empty:
             return None
 
         await self._ensure_model_trained(df)
 
-        if not self.is_trained or len(open_positions) > 0:
+        if not self.is_trained or any(p.symbol == self.symbol for p in open_positions):
             return None
 
         prediction = self._predict(df)
@@ -108,26 +115,16 @@ class AIEnsembleStrategy(TradingStrategy):
         logger.debug(f"AI prediction for {self.symbol}: signal={signal}, confidence={confidence:.2f}")
 
         if signal == 1 and confidence > self.confidence_threshold: # BUY
-            return {'action': 'BUY', 'confidence': confidence, 'order_type': 'MARKET'}
+            return {'action': 'BUY', 'confidence': confidence}
         elif signal == -1 and confidence > self.confidence_threshold: # SELL
-            return {'action': 'SELL', 'confidence': confidence, 'order_type': 'MARKET'}
+            return {'action': 'SELL', 'confidence': confidence}
         
         return None
 
-    async def manage_positions(self, ohlcv: List[List[float]], open_positions: List[Any]) -> List[Dict[str, Any]]:
+    async def manage_positions(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> List[Dict[str, Any]]:
         # Position management logic (e.g., closing on opposite signal) can be added here.
-        # For now, we rely on the RiskManager for stop-loss and take-profit.
+        # For now, we rely on the RiskManager and main bot loop for stop-loss and take-profit.
         return []
-
-    def _prepare_dataframe(self, ohlcv: List[List[float]]) -> Optional[pd.DataFrame]:
-        if not ohlcv or len(ohlcv) < 50:
-            return None
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        df = self._calculate_technical_indicators(df)
-        df.dropna(inplace=True)
-        return df
 
     def _calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
@@ -141,15 +138,16 @@ class AIEnsembleStrategy(TradingStrategy):
         exp1 = df['close'].ewm(span=12, adjust=False).mean()
         exp2 = df['close'].ewm(span=26, adjust=False).mean()
         df['macd'] = exp1 - exp2
+        df.dropna(inplace=True)
         return df
 
     def train(self, df: pd.DataFrame):
         logger.info("Starting AI model training...")
         df = df.copy()
-        future_returns = df['close'].pct_change(periods=-5).shift(5)
+        future_returns = df['close'].pct_change(periods=5).shift(-5)
         df['target'] = 0 # HOLD
-        df.loc[future_returns > 0.01, 'target'] = 1 # BUY
-        df.loc[future_returns < -0.01, 'target'] = -1 # SELL
+        df.loc[future_returns > 0.005, 'target'] = 1 # BUY threshold
+        df.loc[future_returns < -0.005, 'target'] = -1 # SELL threshold
         df.dropna(inplace=True)
 
         if len(df) < 100 or len(df['target'].unique()) < 3:
@@ -200,8 +198,7 @@ class AIEnsembleStrategy(TradingStrategy):
         final_signal_idx = np.argmax(ensemble_proba)
         confidence = np.max(ensemble_proba)
 
-        signal_map = {-1: 0, 0: 1, 1: 2} # Our target to array index
-        reverse_map = {0: -1, 1: 0, 2: 1} # Array index to our target
+        reverse_map = {0: -1, 1: 0, 2: 1} # Array index to our target (-1 sell, 0 hold, 1 buy)
         final_signal = reverse_map[final_signal_idx]
 
         return {'signal': final_signal, 'confidence': confidence}
@@ -224,17 +221,15 @@ class AIEnsembleStrategy(TradingStrategy):
             return
         for name, model in self.models.items():
             try:
+                path = f"{self.model_path}/{name}.{'pth' if isinstance(model, nn.Module) else 'pkl'}"
+                if not os.path.exists(path):
+                    continue
                 if isinstance(model, nn.Module):
-                    path = f"{self.model_path}/{name}.pth"
-                    if os.path.exists(path):
-                        model.load_state_dict(torch.load(path, map_location=self.device))
-                        self.is_trained = True
+                    model.load_state_dict(torch.load(path, map_location=self.device))
                 else:
-                    path = f"{self.model_path}/{name}.pkl"
-                    if os.path.exists(path):
-                        with open(path, 'rb') as f:
-                            self.models[name] = pickle.load(f)
-                        self.is_trained = True
+                    with open(path, 'rb') as f:
+                        self.models[name] = pickle.load(f)
+                self.is_trained = True
             except Exception as e:
                 logger.error(f"Error loading model {name}: {e}")
         if self.is_trained:
@@ -250,11 +245,11 @@ class SimpleMACrossoverStrategy(TradingStrategy):
         self.fast_ma_period = config.get("fast_ma_period", 10)
         self.slow_ma_period = config.get("slow_ma_period", 20)
 
-    async def analyze_market(self, ohlcv: List[List[float]], open_positions: List[Any]) -> Optional[Dict[str, Any]]:
-        if not ohlcv or len(ohlcv) < self.slow_ma_period:
+    async def analyze_market(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> Optional[Dict[str, Any]]:
+        if ohlcv_df.empty or len(ohlcv_df) < self.slow_ma_period:
             return None
 
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df = ohlcv_df.copy()
         df['fast_ma'] = df['close'].rolling(window=self.fast_ma_period).mean()
         df['slow_ma'] = df['close'].rolling(window=self.slow_ma_period).mean()
         
@@ -264,19 +259,19 @@ class SimpleMACrossoverStrategy(TradingStrategy):
         has_open_position = any(p.symbol == self.symbol for p in open_positions)
 
         # Buy signal: Fast MA crosses above Slow MA
-        if last_row['fast_ma'] > last_row['slow_ma'] and prev_row['fast_ma'] <= prev_row['slow_ma'] and not has_open_position:
+        if not has_open_position and last_row['fast_ma'] > last_row['slow_ma'] and prev_row['fast_ma'] <= prev_row['slow_ma']:
             logger.info(f"Strategy: BUY signal for {self.symbol} at {last_row['close']:.2f}")
-            return {'action': 'BUY', 'quantity': self.trade_quantity, 'order_type': 'MARKET'}
+            return {'action': 'BUY'}
 
         return None
 
-    async def manage_positions(self, ohlcv: List[List[float]], open_positions: List[Any]) -> List[Dict[str, Any]]:
+    async def manage_positions(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> List[Dict[str, Any]]:
         actions = []
         position_to_manage = next((p for p in open_positions if p.symbol == self.symbol), None)
-        if not ohlcv or not position_to_manage:
+        if ohlcv_df.empty or not position_to_manage:
             return actions
 
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df = ohlcv_df.copy()
         df['fast_ma'] = df['close'].rolling(window=self.fast_ma_period).mean()
         df['slow_ma'] = df['close'].rolling(window=self.slow_ma_period).mean()
         
@@ -286,6 +281,6 @@ class SimpleMACrossoverStrategy(TradingStrategy):
         # Close signal: Fast MA crosses below Slow MA
         if position_to_manage.side == 'BUY' and last_row['fast_ma'] < last_row['slow_ma'] and prev_row['fast_ma'] >= prev_row['slow_ma']:
             logger.info(f"Strategy: Closing BUY position {position_to_manage.id} for {position_to_manage.symbol}.")
-            actions.append({'action': 'CLOSE', 'position_id': position_to_manage.id, 'order_type': 'MARKET'})
+            actions.append({'action': 'CLOSE', 'position_id': position_to_manage.id})
         
         return actions
