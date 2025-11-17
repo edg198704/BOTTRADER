@@ -4,28 +4,29 @@ This repository contains a production-ready, modular algorithmic trading bot bui
 
 ## Architecture Overview
 
-The bot's architecture is centered around a core set of decoupled components:
+The bot's architecture is centered around a core set of decoupled components located in the `bot_core/` directory:
 
-*   **`bot_core/`**: Contains the primary logic of the trading bot.
-    *   `config.py`: Defines Pydantic models for strict, type-safe configuration validation.
-    *   `exchange_api.py`: Provides an abstract interface for exchange interactions, with concrete implementations for a `MockExchangeAPI` (for testing) and `CCXTExchangeAPI` (for live/paper trading).
-    *   `position_manager.py`: Manages the state of all open and closed trading positions, persisting them to an SQLite database for durability.
-    *   `risk_manager.py`: Implements pre-trade and portfolio-level risk controls, including position size limits, daily loss thresholds, and a portfolio-wide circuit breaker.
-    *   `strategy.py`: Defines the `TradingStrategy` interface and provides concrete implementations like `SimpleMACrossoverStrategy` and the more advanced `AIEnsembleStrategy`.
-    *   `bot.py`: The main `TradingBot` class that orchestrates all components, running the primary trading loop.
-*   **`config_loader.py`**: A utility to load and validate the `config_enterprise.yaml` file against the Pydantic models.
-*   **`config_enterprise.yaml`**: The central configuration file for all bot parameters, including exchange credentials, strategy selection, and risk limits.
+*   **`bot.py`**: The main `TradingBot` class that orchestrates all components and runs the primary trading loop.
+*   **`config.py`**: Defines Pydantic models for strict, type-safe configuration validation.
+*   **`exchange_api.py`**: Provides an abstract interface for exchange interactions, with concrete implementations for a `MockExchangeAPI` (for testing) and `CCXTExchangeAPI` (for live/paper trading).
+*   **`position_manager.py`**: Manages the state of all trading positions, persisting them to an SQLite database for durability using SQLAlchemy.
+*   **`risk_manager.py`**: Implements pre-trade and portfolio-level risk controls, including dynamic position sizing, ATR-based stop loss, and a portfolio-wide circuit breaker.
+*   **`strategy.py`**: Defines the `TradingStrategy` interface and provides concrete implementations like `SimpleMACrossoverStrategy` and the advanced `AIEnsembleStrategy`.
+
+Key supporting files in the root directory include:
+
 *   **`start_bot.py`**: The single entry point for running the bot. It handles initialization, dependency injection, and graceful shutdown.
+*   **`config_loader.py`**: A utility to load and validate the `config_enterprise.yaml` file.
+*   **`config_enterprise.yaml`**: The central configuration file for all bot parameters.
 *   **`requirements.txt`**: A consolidated list of all Python dependencies.
-*   **`position_ledger.db`**: The SQLite database file where all trade and position history is stored.
 
 ## Key Features
 
 *   **Modular & Extensible**: Easily swap out exchange APIs or trading strategies by modifying the configuration.
-*   **Robust Risk Management**: Configurable limits for position size, daily loss, open positions, and a portfolio-level circuit breaker to protect capital.
-*   **Persistent State**: All trades are logged to an SQLite database, ensuring state is not lost on restart.
+*   **Advanced AI Strategy**: Includes a powerful ensemble strategy using LSTM, XGBoost, and other models for sophisticated signal generation.
+*   **Robust Risk Management**: Features dynamic position sizing, ATR-based stop loss, multiple take-profit levels, and a portfolio-level circuit breaker to protect capital.
+*   **Persistent State**: All trades are logged to an SQLite database using SQLAlchemy, ensuring state is not lost on restart.
 *   **Asynchronous Core**: Built with `asyncio` for efficient, non-blocking I/O, critical for handling real-time market data and API requests.
-*   **Strategy Support**: Comes with a simple MA Crossover strategy and a powerful AI Ensemble strategy out of the box.
 *   **Type-Safe Configuration**: Uses Pydantic for configuration loading and validation, preventing runtime errors from incorrect settings.
 *   **Graceful Shutdown**: Handles `SIGINT` and `SIGTERM` signals to ensure clean termination and resource cleanup.
 
@@ -46,11 +47,11 @@ The bot's architecture is centered around a core set of decoupled components:
 
 3.  **Configure the bot:**
     Open `config_enterprise.yaml` and customize the settings:
-    *   **`exchange`**: Set `name` to `MockExchange` for testing or a `ccxt`-supported exchange like `binance`. If using a real exchange, provide your `api_key` and `api_secret`. Set `testnet` to `true` for paper trading if supported.
-    *   **`strategy`**: Choose the `name` of the strategy to run (e.g., `AIEnsembleStrategy`) and configure its parameters like `symbol` and `interval_seconds`.
+    *   **`exchange`**: Set `name` to `MockExchange` for testing or a `ccxt`-supported exchange like `binance`. For a real exchange, provide your `api_key` and `api_secret` (it's highly recommended to use environment variables for these in production).
+    *   **`strategy`**: Choose the `name` of the strategy to run (e.g., `AIEnsembleStrategy` or `SimpleMACrossoverStrategy`) and configure its parameters.
     *   **`risk_management`**: Define your risk tolerance with `max_position_size_usd`, `max_daily_loss_usd`, etc.
 
-    **IMPORTANT**: For production, it is strongly recommended to load API keys from environment variables or a secure vault, not directly from the YAML file.
+    **IMPORTANT**: For production, load API keys from environment variables or a secure vault, not directly from the YAML file.
 
 ## Running the Bot
 
