@@ -31,8 +31,9 @@ class ExecutionHandler:
             return
         current_price = ohlcv_df['close'].iloc[-1]
 
-        # 2. Calculate Stop Loss first, as it's needed for position sizing
+        # 2. Calculate Stop Loss and Take Profit levels
         stop_loss_price = self.risk_manager.calculate_stop_loss(symbol, current_price, action_type, ohlcv_df)
+        take_profit_levels = self.risk_manager.calculate_take_profit_levels(current_price, action_type, confidence)
 
         # 3. Calculate Position Size based on risk
         quantity = self.risk_manager.calculate_position_size(current_price, stop_loss_price)
@@ -45,14 +46,22 @@ class ExecutionHandler:
             logger.warning(f"Trade {action_type} {quantity} {symbol} denied by risk manager.")
             return
 
-        # 5. Submit the order to the OrderManager
+        # 5. Prepare metadata for the order
+        metadata = {
+            "intent": "OPEN",
+            "stop_loss": stop_loss_price,
+            "take_profit_levels": take_profit_levels
+        }
+
+        # 6. Submit the order to the OrderManager
         try:
             logger.info(f"Submitting {action_type} order for {quantity} of {symbol} to OrderManager.")
             order = await self.order_manager.submit_order(
                 symbol=symbol,
                 side=action_type,
                 order_type='MARKET',
-                quantity=quantity
+                quantity=quantity,
+                metadata=metadata
             )
             
             if order.status in ['REJECTED', 'ERROR']:
