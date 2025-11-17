@@ -1,6 +1,6 @@
-import logging
 from typing import List, Optional
 
+from bot_core.logger import get_logger
 from bot_core.config import TelegramConfig
 from bot_core.bot import TradingBot
 
@@ -12,7 +12,7 @@ try:
 except ImportError:
     TELEGRAM_AVAILABLE = False
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class TelegramBot:
     def __init__(self, config: TelegramConfig, trading_bot: TradingBot):
@@ -25,7 +25,7 @@ class TelegramBot:
 
         if not self.config.bot_token or not self.config.admin_chat_ids:
             self.enabled = False
-            logger.warning("Telegram bot token or admin chat IDs not configured. Telegram bot is disabled.")
+            logger.warning("Telegram bot token or admin chat IDs not configured. Bot is disabled.")
         else:
             self.enabled = True
             self.application = Application.builder().token(self.config.bot_token).build()
@@ -82,14 +82,14 @@ class TelegramBot:
         if not self._is_admin(update):
             return
         self.trading_bot.halt_trading()
-        logger.warning(f"Trading halted by admin {update.effective_chat.id}")
+        logger.warning("Trading halted by admin", admin_id=update.effective_chat.id)
         await update.message.reply_text("🔴 Trading has been HALTED. No new positions will be opened.")
 
     async def _resume_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_admin(update):
             return
         self.trading_bot.resume_trading()
-        logger.info(f"Trading resumed by admin {update.effective_chat.id}")
+        logger.info("Trading resumed by admin", admin_id=update.effective_chat.id)
         await update.message.reply_text("🟢 Trading has been RESUMED.")
 
     async def _positions_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
