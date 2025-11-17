@@ -108,19 +108,9 @@ class RiskManager:
         return levels
 
     def check_trade_allowed(self, symbol: str, side: str, quantity: float, price: float) -> bool:
-        """Performs pre-trade risk checks."""
+        """Performs pre-trade risk checks, accounting for existing positions."""
         if self.is_halted:
             logger.warning(f"Trading is halted due to {self._halt_reason.name}. Trade denied.")
-            return False
-
-        open_positions = self.position_manager.get_open_positions()
-        if len(open_positions) >= self.config.max_open_positions:
-            logger.warning(f"Trade denied: Max open positions ({self.config.max_open_positions}) reached.")
-            return False
-
-        trade_value_usd = quantity * price
-        if trade_value_usd > self.config.max_position_size_usd:
-            logger.warning(f"Trade denied for {symbol}: Proposed value ${trade_value_usd:.2f} exceeds max size ${self.config.max_position_size_usd:.2f}.")
             return False
 
         # Re-check metrics just before trade to ensure no limits were just breached
@@ -129,7 +119,31 @@ class RiskManager:
             logger.warning(f"Trade denied: Risk limit breached just before execution ({self._halt_reason.name}).")
             return False
 
-        logger.debug(f"Trade for {symbol} {side} {quantity}@{price} passed initial risk checks.")
+        open_positions = self.position_manager.get_open_positions()
+        existing_position = next((p for p in open_positions if p.symbol == symbol), None)
+        
+        trade_value_usd = quantity * price
+
+        if existing_position:
+            if existing_position.side == side.upper(): # Increasing position size
+                new_total_quantity = existing_position.quantity + quantity
+                new_total_value = new_total_quantity * price # Approximate new value
+                if new_total_value > self.config.max_position_size_usd:
+                    logger.warning(f"Trade denied for {symbol}: Increasing position would exceed max size. Proposed new value ${new_total_value:.2f} > ${self.config.max_position_size_usd:.2f}.")
+                    return False
+            else: # Reducing or reversing position
+                # Reducing risk is generally allowed
+                pass
+        else: # Opening a new position
+            if len(open_positions) >= self.config.max_open_positions:
+                logger.warning(f"Trade denied: Max open positions ({self.config.max_open_positions}) reached.")
+                return False
+            
+            if trade_value_usd > self.config.max_position_size_usd:
+                logger.warning(f"Trade denied for {symbol}: Proposed value ${trade_value_usd:.2f} exceeds max size ${self.config.max_position_size_usd:.2f}.")
+                return False
+
+        logger.debug(f"Trade for {symbol} {side} {quantity}@{price} passed risk checks.")
         return True
 
     def update_risk_metrics(self):
