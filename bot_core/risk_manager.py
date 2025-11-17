@@ -3,7 +3,7 @@ from typing import Dict, Any, List
 import pandas as pd
 import numpy as np
 from bot_core.position_manager import PositionManager
-from bot_core.config import RiskManagementConfig, BotConfig
+from bot_core.config import RiskManagementConfig
 
 logger = logging.getLogger(__name__)
 
@@ -15,8 +15,14 @@ class RiskManager:
         self.is_trading_halted = False
         logger.info(f"RiskManager initialized with config: {self.config.dict()}")
 
-    def calculate_position_size(self, available_equity: float, current_price: float, stop_loss_price: float) -> float:
-        """Calculates position size based on a fixed percentage of equity to risk."""
+    def get_portfolio_value(self) -> float:
+        """Calculates the current total value of the portfolio."""
+        realized_pnl = self.position_manager.get_daily_realized_pnl()
+        unrealized_pnl = self.position_manager.get_total_unrealized_pnl()
+        return self.initial_capital + realized_pnl + unrealized_pnl
+
+    def calculate_position_size(self, current_price: float, stop_loss_price: float) -> float:
+        """Calculates position size based on a fixed percentage of portfolio equity to risk."""
         try:
             if current_price <= 0 or stop_loss_price <= 0:
                 logger.warning("Invalid prices for position size calculation.")
@@ -27,14 +33,15 @@ class RiskManager:
                 logger.warning("Risk per unit is zero, cannot calculate position size.")
                 return 0.0
 
-            risk_amount_usd = available_equity * self.config.risk_per_trade_pct
+            portfolio_value = self.get_portfolio_value()
+            risk_amount_usd = portfolio_value * self.config.risk_per_trade_pct
             size = risk_amount_usd / risk_per_unit
 
             # Cap the position size by the absolute max value
             max_size_from_cap = self.config.max_position_size_usd / current_price
             final_size = min(size, max_size_from_cap)
 
-            logger.info(f"Calculated position size: {final_size:.8f} (Risk Amount: ${risk_amount_usd:.2f}, SL Distance: ${risk_per_unit:.4f})")
+            logger.info(f"Calculated position size: {final_size:.8f} (Portfolio Value: ${portfolio_value:.2f}, Risk Amount: ${risk_amount_usd:.2f})")
             return float(final_size)
 
         except Exception as e:
@@ -126,10 +133,8 @@ class RiskManager:
 
     def update_risk_metrics(self):
         """Updates portfolio-level risk metrics and checks for circuit breaker conditions."""
+        portfolio_value = self.get_portfolio_value()
         realized_pnl = self.position_manager.get_daily_realized_pnl()
-        unrealized_pnl = self.position_manager.get_total_unrealized_pnl()
-        
-        portfolio_value = self.initial_capital + realized_pnl + unrealized_pnl
         portfolio_drawdown = (portfolio_value - self.initial_capital) / self.initial_capital if self.initial_capital > 0 else 0
 
         if realized_pnl < -abs(self.config.max_daily_loss_usd) and not self.is_trading_halted:
