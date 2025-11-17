@@ -8,14 +8,14 @@ class ExchangeConfig(BaseModel):
     testnet: bool = True
 
 class StrategyConfig(BaseModel):
-    name: str = "SimpleMACrossoverStrategy"
+    name: str = "AIEnsembleStrategy"
     symbol: str = "BTC/USDT"
     interval_seconds: int = 60
     trade_quantity: float = 0.001
     # AIEnsembleStrategy specific parameters
     feature_columns: List[str] = Field(default_factory=lambda: ['close', 'rsi', 'macd', 'volume'])
-    buy_threshold: float = 0.002
-    sell_threshold: float = -0.0015
+    confidence_threshold: float = 0.60
+    model_path: str = "models/ensemble"
     # SimpleMACrossoverStrategy specific parameters
     fast_ma_period: int = 10
     slow_ma_period: int = 20
@@ -25,6 +25,9 @@ class RiskManagementConfig(BaseModel):
     max_daily_loss_usd: float = 500.0
     max_open_positions: int = 5
     circuit_breaker_threshold: float = -0.10 # -10% portfolio drawdown
+    use_trailing_stop: bool = True
+    atr_stop_multiplier: float = 2.0
+    stop_loss_fallback_pct: float = 0.05
 
 class DatabaseConfig(BaseModel):
     path: str = "position_ledger.db"
@@ -37,7 +40,6 @@ class BotConfig(BaseModel):
 
     @validator('strategy')
     def validate_strategy_symbol(cls, v):
-        if '/' not in v.symbol and 'USDT' not in v.symbol:
-            # A simple check, can be made more robust
+        if '/' not in v.symbol:
             raise ValueError('Strategy symbol should be a valid trading pair, e.g., BTC/USDT')
         return v
