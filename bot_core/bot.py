@@ -1,11 +1,11 @@
 import asyncio
-import logging
 import time
 import pandas as pd
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
 import ccxt
 
+from bot_core.logger import get_logger
 from bot_core.exchange_api import ExchangeAPI
 from bot_core.position_manager import PositionManager
 from bot_core.risk_manager import RiskManager
@@ -15,7 +15,7 @@ from bot_core.execution_handler import ExecutionHandler
 from bot_core.order_manager import OrderManager, FillEvent
 from bot_core.data_handler import create_dataframe, calculate_technical_indicators
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class TradingBot:
     def __init__(self, config: BotConfig, exchange_api: ExchangeAPI,
@@ -35,7 +35,7 @@ class TradingBot:
         self.is_halted = False
         self.start_time = datetime.now(timezone.utc)
         self.tasks = []
-        logger.info(f"TradingBot initialized for symbol: {self.symbol}, interval: {self.trade_interval_seconds}s")
+        logger.info("TradingBot initialized", symbol=self.symbol, interval_seconds=self.trade_interval_seconds)
 
     def halt_trading(self):
         """Halts the bot from opening new positions."""
@@ -92,33 +92,33 @@ class TradingBot:
             ticker_data = await self.exchange_api.get_ticker_data(self.symbol)
             
             if not isinstance(ohlcv_data_list, list) or not ticker_data or not ticker_data.get('lastPrice'):
-                logger.warning(f"Received invalid or empty market data for {self.symbol}")
+                logger.warning("Received invalid or empty market data", symbol=self.symbol)
                 return None
             
             df = create_dataframe(ohlcv_data_list)
             if df is None: return None
 
             df_with_indicators = calculate_technical_indicators(df)
-            logger.debug(f"Fetched and processed {len(df_with_indicators)} candles for {self.symbol}")
+            logger.debug("Fetched and processed market data", symbol=self.symbol, candle_count=len(df_with_indicators))
             return {"ohlcv_df": df_with_indicators, "last_price": float(ticker_data['lastPrice'])}
         except Exception as e:
-            logger.error(f"Error fetching or processing market data for {self.symbol}: {e}", exc_info=True)
+            logger.error("Error fetching or processing market data", symbol=self.symbol, error=str(e), exc_info=True)
             return None
 
     async def _process_fill_events(self):
         """Processes fill events from the OrderManager to update positions."""
         fills = await self.order_manager.get_fill_events()
         for fill in fills:
-            logger.info(f"Processing fill event: {fill}")
+            logger.info("Processing fill event", fill=fill)
             try:
                 self.position_manager.update_from_fill(fill)
             except Exception as e:
-                logger.error(f"Error processing fill event in PositionManager: {e}", exc_info=True)
+                logger.error("Error processing fill event in PositionManager", error=str(e), exc_info=True)
 
     async def _close_position_by_id(self, position_id: int, reason: str = "strategy signal"):
         position = self.position_manager.get_position_by_id(position_id)
         if not position:
-            logger.warning(f"Attempted to close position {position_id}, but it was not found.")
+            logger.warning("Attempted to close non-existent position", position_id=position_id)
             return
 
         close_side = 'SELL' if position.side == 'BUY' else 'BUY'
@@ -131,15 +131,15 @@ class TradingBot:
                 quantity=position.quantity,
                 metadata=metadata
             )
-            logger.info(f"Submitted closing order for position {position_id} ({reason})")
+            logger.info("Submitted closing order", position_id=position_id, reason=reason)
         except Exception as e:
-            logger.error(f"Error submitting closing order for position {position_id}: {e}", exc_info=True)
+            logger.error("Error submitting closing order", position_id=position_id, error=str(e), exc_info=True)
 
     async def run(self):
         """Main execution loop of the trading bot."""
         self.running = True
         await self.order_manager.start()
-        logger.info(f"Starting TradingBot for {self.symbol}...")
+        logger.info("Starting TradingBot", symbol=self.symbol)
 
         while self.running:
             start_time = time.monotonic()
@@ -168,7 +168,7 @@ class TradingBot:
                 for pos in positions_to_check:
                     if pos.stop_loss and ((pos.side == 'BUY' and current_price <= pos.stop_loss) or \
                        (pos.side == 'SELL' and current_price >= pos.stop_loss)):
-                        logger.info(f"Stop loss hit for position {pos.id} at price {current_price}")
+                        logger.info("Stop loss hit", position_id=pos.id, current_price=current_price)
                         await self._close_position_by_id(pos.id, reason="stop loss")
                         continue
 
@@ -177,23 +177,23 @@ class TradingBot:
                     
                     trade_signal = await self.strategy.analyze_market(ohlcv_df, current_open_positions)
                     if trade_signal:
-                        logger.info(f"Strategy generated new trade signal: {trade_signal}")
+                        logger.info("Strategy generated new trade signal", signal=trade_signal)
                         await self.execution_handler.execute_trade_proposal(trade_signal, ohlcv_df)
 
                     position_management_actions = await self.strategy.manage_positions(ohlcv_df, current_open_positions)
                     for action in position_management_actions:
                         if action.get('action') == 'CLOSE':
-                            logger.info(f"Strategy generated position management action: {action}")
+                            logger.info("Strategy generated position management action", action=action)
                             await self._close_position_by_id(action.get('position_id'))
 
             except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, asyncio.TimeoutError) as e:
-                logger.warning(f"Network/Exchange issue in main loop: {e}. Retrying in 30s...")
+                logger.warning("Network/Exchange issue in main loop. Retrying...", error=str(e))
                 await asyncio.sleep(30)
             except ccxt.ExchangeError as e:
-                logger.error(f"Exchange error in main loop: {e}. Retrying in 60s...")
+                logger.error("Exchange error in main loop. Retrying...", error=str(e))
                 await asyncio.sleep(60)
             except Exception as e:
-                logger.critical(f"Unhandled exception in main bot loop: {e}", exc_info=True)
+                logger.critical("Unhandled exception in main bot loop", error=str(e), exc_info=True)
                 await asyncio.sleep(self.trade_interval_seconds)
 
             finally:
