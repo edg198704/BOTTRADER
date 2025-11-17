@@ -1,39 +1,49 @@
-# Configuration for the Enterprise Trading Bot
+# config_enterprise.yaml
+# This configuration file defines settings for the trading bot.
 
-api:
-  # Exchange API credentials
-  # It is highly recommended to use environment variables for production API keys.
-  # Example: API_KEY: ${ENV_API_KEY}
-  api_key: "YOUR_API_KEY"
-  api_secret: "YOUR_API_SECRET"
-  base_url: "https://api.exchange.com" # Example: Binance, Bybit, etc.
-  websocket_url: "wss://stream.exchange.com" # Example: Binance, Bybit, etc.
+# --- Global Settings ---
+global:
+  log_level: INFO # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  environment: production # production, development, test
 
-market_data:
-  # Market data subscription details
-  symbol: "BTCUSDT"
-  interval: "1m" # Candlestick interval (e.g., 1m, 5m, 1h)
-  limit: 100 # Number of historical data points to fetch
+# --- Exchange API Settings ---
+exchange:
+  name: MockExchange # Use 'MockExchange' for testing, 'Binance' for real trading
+  api_key: YOUR_BINANCE_API_KEY # Replace with your actual API key
+  api_secret: YOUR_BINANCE_API_SECRET # Replace with your actual API secret
+  testnet: true # Set to true for Binance testnet, false for live trading
 
+# --- Strategy Settings ---
 strategy:
-  # Strategy specific parameters
-  symbol: "BTCUSDT" # Trading pair
-  quantity: 0.001 # Base quantity for orders
-  # Example strategy parameters (e.g., for a simple moving average crossover)
+  name: SimpleMACrossoverStrategy # Name of the strategy to use
+  symbol: BTCUSDT # Trading pair
+  interval: 10 # Strategy execution interval in seconds
+  trade_quantity: 0.0005 # Quantity to trade per order (e.g., 0.0005 BTC)
+  # SimpleMACrossoverStrategy specific parameters
   fast_ma_period: 10
-  slow_ma_period: 30
-  # Add more strategy-specific parameters here
+  slow_ma_period: 20
 
+# --- Risk Management Settings ---
 risk_management:
-  # Risk management parameters
-  max_position_size: 0.01 # Maximum total position size in base asset (e.g., BTC)
-  stop_loss_percent: 0.01 # Percentage below entry price to set stop loss (e.g., 0.01 for 1%)
-  take_profit_percent: 0.02 # Percentage above entry price to set take profit (e.g., 0.02 for 2%)
-  max_daily_drawdown_percent: 0.05 # Max percentage loss from daily high equity
-  max_open_orders: 5 # Maximum number of open orders at any time
+  max_position_size_usd: 500 # Maximum value of a single position in USD
+  max_daily_loss_usd: 100 # Maximum cumulative realized loss allowed per day in USD
+  max_open_positions: 2 # Maximum number of open positions allowed simultaneously
 
-logging:
-  level: INFO # DEBUG, INFO, WARNING, ERROR, CRITICAL
-  file: bot_enterprise.log
-  max_bytes: 10485760 # 10 MB
-  backup_count: 5
+# --- Database Settings ---
+database:
+  path: position_ledger.db # Path to the SQLite database for position tracking
+
+# --- Other Settings (e.g., notifications, monitoring) ---
+notifications:
+  telegram:
+    enabled: false
+    bot_token: YOUR_TELEGRAM_BOT_TOKEN
+    chat_id: YOUR_TELEGRAM_CHAT_ID
+  email:
+    enabled: false
+    sender_email: bot@example.com
+    recipient_email: admin@example.com
+    smtp_server: smtp.example.com
+    smtp_port: 587
+    smtp_username: YOUR_SMTP_USERNAME
+    smtp_password: YOUR_SMTP_PASSWORD
