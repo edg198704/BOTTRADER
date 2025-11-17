@@ -2,7 +2,7 @@ import logging
 import json
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, inspect, Text
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, inspect, Text, func
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -165,3 +165,9 @@ class PositionManager:
             except SQLAlchemyError as e:
                 logger.error(f"Error calculating daily realized PnL: {e}")
                 return 0.0
+
+    def close(self):
+        """Gracefully disposes of the database engine connection pool."""
+        if self.engine:
+            self.engine.dispose()
+            logger.info("Database connection pool disposed.")
