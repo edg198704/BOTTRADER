@@ -1,93 +1,26 @@
 import abc
 import logging
+import os
+import pickle
 from typing import Dict, Any, List, Optional
+
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.model_selection import train_test_split
+
+# ML Imports with safe fallbacks
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import train_test_split
+    from xgboost import XGBClassifier
+    ML_AVAILABLE = True
+except ImportError:
+    ML_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
-
-# --- Helper Functions for AI Strategy ---
-def _calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or len(df) < 26: # Need enough data for MACD
-        return df
-    df = df.copy()
-    # RSI
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).ewm(com=13, adjust=False).mean()
-    loss = (-delta.where(delta < 0, 0)).ewm(com=13, adjust=False).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
-    # MACD
-    exp1 = df['close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['close'].ewm(span=26, adjust=False).mean()
-    df['macd'] = exp1 - exp2
-    df.fillna(method='bfill', inplace=True)
-    return df
-
-class AdvancedEnsembleLearner:
-    """A self-contained ML model for the AI strategy."""
-    def __init__(self, feature_columns: List[str]):
-        self.feature_columns = feature_columns
-        self.models = {
-            'rf': RandomForestClassifier(n_estimators=50, max_depth=10, random_state=42),
-            'gb': GradientBoostingClassifier(n_estimators=50, max_depth=5, random_state=42)
-        }
-        self.is_trained = False
-
-    def train(self, df: pd.DataFrame, buy_threshold: float, sell_threshold: float):
-        logger.info("Starting AI model training...")
-        df_with_indicators = _calculate_technical_indicators(df)
-        
-        # Create target variable
-        future_returns = df_with_indicators['close'].pct_change(periods=-1).shift(1)
-        df_with_indicators['target'] = 0 # HOLD
-        df_with_indicators.loc[future_returns > buy_threshold, 'target'] = 1 # BUY
-        df_with_indicators.loc[future_returns < sell_threshold, 'target'] = -1 # SELL
-        df_with_indicators.dropna(inplace=True)
-
-        if len(df_with_indicators) < 100:
-            logger.warning("Not enough data to train AI model.")
-            return
-
-        X = df_with_indicators[self.feature_columns]
-        y = df_with_indicators['target']
-
-        if len(y.unique()) < 2:
-            logger.warning("Not enough class diversity to train AI model.")
-            return
-
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-
-        for name, model in self.models.items():
-            model.fit(X_train, y_train)
-            score = model.score(X_test, y_test)
-            logger.info(f"Model '{name}' trained with accuracy: {score:.2f}")
-        
-        self.is_trained = True
-        logger.info("AI model training complete.")
-
-    def predict(self, df: pd.DataFrame) -> Dict[str, Any]:
-        if not self.is_trained:
-            return {'signal': 0, 'confidence': 0.0}
-        
-        df_with_indicators = _calculate_technical_indicators(df)
-        latest_features = df_with_indicators[self.feature_columns].iloc[-1:]
-
-        predictions = []
-        confidences = []
-        for model in self.models.values():
-            pred = model.predict(latest_features)[0]
-            proba = model.predict_proba(latest_features)[0]
-            predictions.append(pred)
-            confidences.append(np.max(proba))
-
-        # Simple majority vote
-        final_prediction = int(np.sign(sum(predictions)))
-        avg_confidence = np.mean(confidences)
-
-        return {'signal': final_prediction, 'confidence': avg_confidence}
 
 # --- Strategy Interfaces ---
 
@@ -107,47 +40,208 @@ class TradingStrategy(abc.ABC):
     async def manage_positions(self, ohlcv: List[List[float]], open_positions: List[Any]) -> List[Dict[str, Any]]:
         pass
 
+# --- AI Ensemble Strategy ---
+
 class AIEnsembleStrategy(TradingStrategy):
     """Trading strategy based on an ensemble of AI models."""
+
+    class LSTMPredictor(nn.Module):
+        def __init__(self, input_dim, hidden_dim):
+            super().__init__()
+            self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+            self.fc = nn.Linear(hidden_dim, 3) # sell, hold, buy
+
+        def forward(self, x):
+            _, (hn, _) = self.lstm(x)
+            return self.fc(hn[0])
+
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        self.model = AdvancedEnsembleLearner(config.get('feature_columns', []))
-        self.buy_threshold = config.get('buy_threshold', 0.002)
-        self.sell_threshold = config.get('sell_threshold', -0.0015)
+        if not ML_AVAILABLE:
+            raise ImportError("Required machine learning libraries are not installed.")
+        
+        self.feature_columns = config.get('feature_columns', ['close', 'rsi', 'macd', 'volume'])
+        self.confidence_threshold = config.get('confidence_threshold', 0.6)
+        self.model_path = config.get('model_path', 'models/ensemble')
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        self.models = {}
+        self.is_trained = False
         self.is_training = False
+        self._initialize_models()
+        self._load_models()
+
+    def _initialize_models(self):
+        self.models['lstm'] = self.LSTMPredictor(len(self.feature_columns), 64).to(self.device)
+        self.models['gb'] = XGBClassifier(n_estimators=50, max_depth=5, random_state=42, verbosity=0, use_label_encoder=False, eval_metric='mlogloss')
+        self.models['technical'] = VotingClassifier(estimators=[
+            ('rf', RandomForestClassifier(n_estimators=50, max_depth=10, random_state=42)),
+            ('lr', LogisticRegression(max_iter=200, random_state=42))
+        ], voting='soft')
+        logger.info(f"AI models initialized on device: {self.device}")
 
     async def _ensure_model_trained(self, df: pd.DataFrame):
-        if not self.model.is_trained and not self.is_training:
+        if not self.is_trained and not self.is_training:
             self.is_training = True
             try:
-                # Run training in a separate thread to not block the event loop
+                logger.info("Initial model training required. Starting training...")
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self.model.train, df, self.buy_threshold, self.sell_threshold)
+                await loop.run_in_executor(None, self.train, df)
+                self._save_models()
             finally:
                 self.is_training = False
 
     async def analyze_market(self, ohlcv: List[List[float]], open_positions: List[Any]) -> Optional[Dict[str, Any]]:
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        await self._ensure_model_trained(df)
-
-        if not self.model.is_trained or len(open_positions) > 0:
+        df = self._prepare_dataframe(ohlcv)
+        if df is None:
             return None
 
-        prediction = self.model.predict(df)
+        await self._ensure_model_trained(df)
+
+        if not self.is_trained or len(open_positions) > 0:
+            return None
+
+        prediction = self._predict(df)
         signal = prediction['signal']
         confidence = prediction['confidence']
 
-        if signal == 1 and confidence > 0.6: # BUY signal
-            return {'action': 'BUY', 'quantity': self.trade_quantity, 'order_type': 'MARKET'}
-        elif signal == -1 and confidence > 0.6: # SELL signal
-            return {'action': 'SELL', 'quantity': self.trade_quantity, 'order_type': 'MARKET'}
+        logger.debug(f"AI prediction for {self.symbol}: signal={signal}, confidence={confidence:.2f}")
+
+        if signal == 1 and confidence > self.confidence_threshold: # BUY
+            return {'action': 'BUY', 'confidence': confidence, 'order_type': 'MARKET'}
+        elif signal == -1 and confidence > self.confidence_threshold: # SELL
+            return {'action': 'SELL', 'confidence': confidence, 'order_type': 'MARKET'}
         
         return None
 
     async def manage_positions(self, ohlcv: List[List[float]], open_positions: List[Any]) -> List[Dict[str, Any]]:
-        # For this strategy, we close positions based on an opposite signal or risk management (handled elsewhere)
-        # A more advanced version could use the model to decide when to hold or close.
+        # Position management logic (e.g., closing on opposite signal) can be added here.
+        # For now, we rely on the RiskManager for stop-loss and take-profit.
         return []
+
+    def _prepare_dataframe(self, ohlcv: List[List[float]]) -> Optional[pd.DataFrame]:
+        if not ohlcv or len(ohlcv) < 50:
+            return None
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        df = self._calculate_technical_indicators(df)
+        df.dropna(inplace=True)
+        return df
+
+    def _calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        # RSI
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).ewm(com=13, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(com=13, adjust=False).mean()
+        rs = gain / (loss + 1e-9)
+        df['rsi'] = 100 - (100 / (1 + rs))
+        # MACD
+        exp1 = df['close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['close'].ewm(span=26, adjust=False).mean()
+        df['macd'] = exp1 - exp2
+        return df
+
+    def train(self, df: pd.DataFrame):
+        logger.info("Starting AI model training...")
+        df = df.copy()
+        future_returns = df['close'].pct_change(periods=-5).shift(5)
+        df['target'] = 0 # HOLD
+        df.loc[future_returns > 0.01, 'target'] = 1 # BUY
+        df.loc[future_returns < -0.01, 'target'] = -1 # SELL
+        df.dropna(inplace=True)
+
+        if len(df) < 100 or len(df['target'].unique()) < 3:
+            logger.warning("Not enough data or class diversity to train AI model.")
+            return
+
+        X = df[self.feature_columns]
+        y = df['target']
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+        # Train non-neural models
+        for name in ['gb', 'technical']:
+            self.models[name].fit(X_train, y_train)
+            score = self.models[name].score(X_test, y_test)
+            logger.info(f"Model '{name}' trained with accuracy: {score:.2f}")
+
+        # Train LSTM
+        X_train_torch = torch.tensor(X_train.values, dtype=torch.float32).unsqueeze(1).to(self.device)
+        y_train_torch = torch.tensor(y_train.values + 1, dtype=torch.long).to(self.device) # map -1,0,1 to 0,1,2
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.Adam(self.models['lstm'].parameters(), lr=0.001)
+        for epoch in range(10):
+            optimizer.zero_grad()
+            outputs = self.models['lstm'](X_train_torch)
+            loss = criterion(outputs, y_train_torch)
+            loss.backward()
+            optimizer.step()
+        logger.info("Model 'lstm' trained.")
+
+        self.is_trained = True
+        logger.info("AI model training complete.")
+
+    def _predict(self, df: pd.DataFrame) -> Dict[str, Any]:
+        latest_features = df[self.feature_columns].iloc[-1:]
+        
+        # Non-neural predictions
+        gb_pred_proba = self.models['gb'].predict_proba(latest_features)[0]
+        tech_pred_proba = self.models['technical'].predict_proba(latest_features)[0]
+
+        # LSTM prediction
+        lstm_features = torch.tensor(latest_features.values, dtype=torch.float32).unsqueeze(1).to(self.device)
+        with torch.no_grad():
+            lstm_output = self.models['lstm'](lstm_features)
+            lstm_pred_proba = F.softmax(lstm_output, dim=1).cpu().numpy()[0]
+
+        # Ensemble probabilities (sell, hold, buy)
+        ensemble_proba = (gb_pred_proba + tech_pred_proba + lstm_pred_proba) / 3
+        final_signal_idx = np.argmax(ensemble_proba)
+        confidence = np.max(ensemble_proba)
+
+        signal_map = {-1: 0, 0: 1, 1: 2} # Our target to array index
+        reverse_map = {0: -1, 1: 0, 2: 1} # Array index to our target
+        final_signal = reverse_map[final_signal_idx]
+
+        return {'signal': final_signal, 'confidence': confidence}
+
+    def _save_models(self):
+        os.makedirs(self.model_path, exist_ok=True)
+        for name, model in self.models.items():
+            try:
+                if isinstance(model, nn.Module):
+                    torch.save(model.state_dict(), f"{self.model_path}/{name}.pth")
+                else:
+                    with open(f"{self.model_path}/{name}.pkl", 'wb') as f:
+                        pickle.dump(model, f)
+            except Exception as e:
+                logger.error(f"Error saving model {name}: {e}")
+        logger.info("AI models saved.")
+
+    def _load_models(self):
+        if not os.path.exists(self.model_path):
+            return
+        for name, model in self.models.items():
+            try:
+                if isinstance(model, nn.Module):
+                    path = f"{self.model_path}/{name}.pth"
+                    if os.path.exists(path):
+                        model.load_state_dict(torch.load(path, map_location=self.device))
+                        self.is_trained = True
+                else:
+                    path = f"{self.model_path}/{name}.pkl"
+                    if os.path.exists(path):
+                        with open(path, 'rb') as f:
+                            self.models[name] = pickle.load(f)
+                        self.is_trained = True
+            except Exception as e:
+                logger.error(f"Error loading model {name}: {e}")
+        if self.is_trained:
+            logger.info("AI models loaded from disk.")
+
+
+# --- Simple MA Crossover Strategy ---
 
 class SimpleMACrossoverStrategy(TradingStrategy):
     """A simple Moving Average Crossover strategy."""
@@ -167,7 +261,7 @@ class SimpleMACrossoverStrategy(TradingStrategy):
         last_row = df.iloc[-1]
         prev_row = df.iloc[-2]
 
-        has_open_position = len(open_positions) > 0
+        has_open_position = any(p.symbol == self.symbol for p in open_positions)
 
         # Buy signal: Fast MA crosses above Slow MA
         if last_row['fast_ma'] > last_row['slow_ma'] and prev_row['fast_ma'] <= prev_row['slow_ma'] and not has_open_position:
@@ -178,7 +272,8 @@ class SimpleMACrossoverStrategy(TradingStrategy):
 
     async def manage_positions(self, ohlcv: List[List[float]], open_positions: List[Any]) -> List[Dict[str, Any]]:
         actions = []
-        if not ohlcv or len(open_positions) == 0:
+        position_to_manage = next((p for p in open_positions if p.symbol == self.symbol), None)
+        if not ohlcv or not position_to_manage:
             return actions
 
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -188,10 +283,9 @@ class SimpleMACrossoverStrategy(TradingStrategy):
         last_row = df.iloc[-1]
         prev_row = df.iloc[-2]
 
-        for position in open_positions:
-            # Close signal: Fast MA crosses below Slow MA
-            if position.side == 'BUY' and last_row['fast_ma'] < last_row['slow_ma'] and prev_row['fast_ma'] >= prev_row['slow_ma']:
-                logger.info(f"Strategy: Closing BUY position {position.id} for {position.symbol}.")
-                actions.append({'action': 'CLOSE', 'position_id': position.id, 'order_type': 'MARKET'})
+        # Close signal: Fast MA crosses below Slow MA
+        if position_to_manage.side == 'BUY' and last_row['fast_ma'] < last_row['slow_ma'] and prev_row['fast_ma'] >= prev_row['slow_ma']:
+            logger.info(f"Strategy: Closing BUY position {position_to_manage.id} for {position_to_manage.symbol}.")
+            actions.append({'action': 'CLOSE', 'position_id': position_to_manage.id, 'order_type': 'MARKET'})
         
         return actions
