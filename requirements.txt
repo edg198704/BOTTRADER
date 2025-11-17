@@ -3,8 +3,15 @@ pandas
 numpy
 scikit-learn
 torch
+gymnasium
+stable-baselines3
 xgboost
+optuna
+python-telegram-bot
+influxdb-client
+memory-profiler
+psutil
 pydantic
-PyYAML
+python-dotenv
 SQLAlchemy
-joblib
+PyYAML
