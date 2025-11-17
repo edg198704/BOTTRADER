@@ -12,6 +12,7 @@ import numpy as np
 
 from bot_core.logger import get_logger
 from bot_core.config import AIStrategyConfig
+from bot_core.data_handler import MarketEvent, SignalEvent, FillEvent
 
 # ML Imports with safe fallbacks
 try:
@@ -40,34 +41,39 @@ logger = get_logger(__name__)
 
 class TradingStrategy(abc.ABC):
     """Abstract Base Class for a trading strategy."""
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, event_queue: asyncio.Queue, config: Dict[str, Any]):
+        self.event_queue = event_queue
         self.symbol = config.get("symbol", "BTC/USDT")
         self.interval_seconds = config.get("interval_seconds", 60)
         logger.info("Strategy initialized", strategy_name=self.__class__.__name__, symbol=self.symbol)
 
     @abc.abstractmethod
-    async def analyze_market(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> Optional[Dict[str, Any]]:
-        """Analyzes market data to generate a new trade signal (BUY/SELL)."""
+    async def on_market_event(self, event: MarketEvent, open_positions: List[Any]):
+        """Reacts to new market data to generate trade signals."""
         pass
 
     @abc.abstractmethod
-    async def manage_positions(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> List[Dict[str, Any]]:
-        """Manages existing open positions (e.g., signals to close)."""
+    async def on_fill_event(self, event: FillEvent):
+        """Reacts to fill events to manage position state within the strategy."""
         pass
 
 # --- Simple MA Crossover Strategy ---
 
 class SimpleMACrossoverStrategy(TradingStrategy):
     """A simple Moving Average Crossover strategy."""
-    def __init__(self, config: Dict[str, Any]):
-        super().__init__(config)
+    def __init__(self, event_queue: asyncio.Queue, config: Dict[str, Any]):
+        super().__init__(event_queue, config)
         ma_config = config.get('simple_ma', {})
         self.fast_ma_period = ma_config.get("fast_ma_period", 10)
         self.slow_ma_period = ma_config.get("slow_ma_period", 20)
 
-    async def analyze_market(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> Optional[Dict[str, Any]]:
+    async def on_market_event(self, event: MarketEvent, open_positions: List[Any]):
+        if event.symbol != self.symbol:
+            return
+
+        ohlcv_df = event.ohlcv_df
         if ohlcv_df.empty or len(ohlcv_df) < self.slow_ma_period:
-            return None
+            return
 
         df = ohlcv_df.copy()
         df['fast_ma'] = df['close'].rolling(window=self.fast_ma_period).mean()
@@ -78,34 +84,24 @@ class SimpleMACrossoverStrategy(TradingStrategy):
 
         has_open_position = any(p.symbol == self.symbol for p in open_positions)
 
-        # Golden Cross
+        # Golden Cross (Buy Signal)
         if not has_open_position and last_row['fast_ma'] > last_row['slow_ma'] and prev_row['fast_ma'] <= prev_row['slow_ma']:
             logger.info("BUY signal generated", strategy="SimpleMACrossover", symbol=self.symbol, price=last_row['close'])
-            return {'action': 'BUY', 'symbol': self.symbol, 'confidence': 0.75}
+            signal = SignalEvent(symbol=self.symbol, action='BUY', confidence=0.75)
+            await self.event_queue.put(signal)
 
-        return None
-
-    async def manage_positions(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> List[Dict[str, Any]]:
-        actions = []
+        # Death Cross (Sell Signal to close position)
         position_to_manage = next((p for p in open_positions if p.symbol == self.symbol), None)
-        if ohlcv_df.empty or not position_to_manage:
-            return actions
+        if position_to_manage and position_to_manage.side == 'BUY' and last_row['fast_ma'] < last_row['slow_ma'] and prev_row['fast_ma'] >= prev_row['slow_ma']:
+            logger.info("CLOSE signal generated for BUY position", strategy="SimpleMACrossover", position_id=position_to_manage.id)
+            signal = SignalEvent(symbol=self.symbol, action='SELL', confidence=0.75) # Signal to sell/close
+            await self.event_queue.put(signal)
 
-        df = ohlcv_df.copy()
-        df['fast_ma'] = df['close'].rolling(window=self.fast_ma_period).mean()
-        df['slow_ma'] = df['close'].rolling(window=self.slow_ma_period).mean()
-        
-        last_row = df.iloc[-1]
-        prev_row = df.iloc[-2]
+    async def on_fill_event(self, event: FillEvent):
+        # Simple strategy does not need to react to fills
+        pass
 
-        # Death Cross
-        if position_to_manage.side == 'BUY' and last_row['fast_ma'] < last_row['slow_ma'] and prev_row['fast_ma'] >= prev_row['slow_ma']:
-            logger.info("Closing BUY position due to signal", strategy="SimpleMACrossover", position_id=position_to_manage.id)
-            actions.append({'action': 'CLOSE', 'position_id': position_to_manage.id})
-        
-        return actions
-
-# --- AI Components (Consolidated from monolithic files for integration) ---
+# --- AI Components (Consolidated for integration) ---
 
 class MarketRegime(Enum):
     BULL = "bull"
@@ -265,8 +261,8 @@ class _PPOAgent:
 # --- AI Ensemble Strategy ---
 
 class AIEnsembleStrategy(TradingStrategy):
-    def __init__(self, config: Dict[str, Any]):
-        super().__init__(config)
+    def __init__(self, event_queue: asyncio.Queue, config: Dict[str, Any]):
+        super().__init__(event_queue, config)
         if not ML_AVAILABLE:
             raise ImportError("Required ML libraries not installed for AIEnsembleStrategy.")
         
@@ -280,13 +276,14 @@ class AIEnsembleStrategy(TradingStrategy):
         self.ensemble_learner = _EnsembleLearner(self.ai_config)
         self.ppo_agent = _PPOAgent(self.ai_config) if self.use_ppo_agent else None
 
-    async def analyze_market(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> Optional[Dict[str, Any]]:
-        if ohlcv_df is None or ohlcv_df.empty or not self.ensemble_learner.is_trained:
-            return None
+    async def on_market_event(self, event: MarketEvent, open_positions: List[Any]):
+        if event.symbol != self.symbol or not self.ensemble_learner.is_trained:
+            return
 
         if any(p.symbol == self.symbol for p in open_positions):
-            return None
+            return
 
+        ohlcv_df = event.ohlcv_df
         regime = await self.regime_detector.detect_regime(self.symbol, ohlcv_df)
         logger.debug("Market regime detected", symbol=self.symbol, regime=regime)
 
@@ -297,7 +294,7 @@ class AIEnsembleStrategy(TradingStrategy):
         ensemble_confidence = ensemble_prediction['confidence']
 
         if ensemble_confidence < self.confidence_threshold:
-            return None
+            return
 
         final_action = ensemble_action
         final_confidence = ensemble_confidence
@@ -306,14 +303,14 @@ class AIEnsembleStrategy(TradingStrategy):
             if (current_regime == MarketRegime.BULL.value and ensemble_action == 'sell') or \
                (current_regime == MarketRegime.BEAR.value and ensemble_action == 'buy'):
                 logger.info("Regime filter overrides action", regime=current_regime, action=ensemble_action)
-                return None
+                return
             final_confidence *= regime.get('confidence', 0.5)
 
         if final_action != 'hold':
             logger.info("Final AI signal generated", symbol=self.symbol, action=final_action.upper(), confidence=final_confidence)
-            return {'action': final_action.upper(), 'symbol': self.symbol, 'confidence': final_confidence}
+            signal = SignalEvent(symbol=self.symbol, action=final_action.upper(), confidence=final_confidence)
+            await self.event_queue.put(signal)
 
-        return None
-
-    async def manage_positions(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> List[Dict[str, Any]]:
-        return []
+    async def on_fill_event(self, event: FillEvent):
+        # AI strategy could use fill events to update internal state or trigger retraining
+        logger.debug("AI Strategy received fill event", symbol=event.symbol)
