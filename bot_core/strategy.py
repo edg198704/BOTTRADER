@@ -11,7 +11,7 @@ import pandas as pd
 import numpy as np
 
 from bot_core.logger import get_logger
-from bot_core.config import AIStrategyConfig
+from bot_core.config import AIStrategyConfig, SimpleMAStrategyConfig
 from bot_core.data_handler import MarketEvent, SignalEvent, FillEvent
 
 # ML Imports with safe fallbacks
@@ -63,9 +63,9 @@ class SimpleMACrossoverStrategy(TradingStrategy):
     """A simple Moving Average Crossover strategy."""
     def __init__(self, event_queue: asyncio.Queue, config: Dict[str, Any]):
         super().__init__(event_queue, config)
-        ma_config = config.get('simple_ma', {})
-        self.fast_ma_period = ma_config.get("fast_ma_period", 10)
-        self.slow_ma_period = ma_config.get("slow_ma_period", 20)
+        ma_config = SimpleMAStrategyConfig(**config.get('simple_ma', {}))
+        self.fast_ma_period = ma_config.fast_ma_period
+        self.slow_ma_period = ma_config.slow_ma_period
 
     async def on_market_event(self, event: MarketEvent, open_positions: List[Any]):
         if event.symbol != self.symbol:
@@ -102,44 +102,6 @@ class SimpleMACrossoverStrategy(TradingStrategy):
         pass
 
 # --- AI Components (Consolidated for integration) ---
-
-def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate all necessary technical indicators."""
-    if df is None or len(df) < 50:
-        logger.warning("DataFrame has insufficient data for all indicators.", data_length=len(df) if df is not None else 0)
-        return df
-
-    df_out = df.copy()
-
-    # RSI
-    delta = df_out['close'].diff()
-    gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
-    loss = -delta.clip(upper=0).ewm(com=13, adjust=False).mean()
-    rs = gain / (loss + 1e-9)
-    df_out['rsi'] = 100 - (100 / (1 + rs))
-
-    # MACD
-    ema12 = df_out['close'].ewm(span=12, adjust=False).mean()
-    ema26 = df_out['close'].ewm(span=26, adjust=False).mean()
-    df_out['macd'] = ema12 - ema26
-    df_out['macd_signal'] = df_out['macd'].ewm(span=9, adjust=False).mean()
-
-    # Bollinger Bands
-    sma_20 = df_out['close'].rolling(20).mean()
-    std_20 = df_out['close'].rolling(20).std()
-    df_out['bb_upper'] = sma_20 + (std_20 * 2)
-    df_out['bb_lower'] = sma_20 - (std_20 * 2)
-
-    # ATR (for Risk Manager)
-    high_low = df_out['high'] - df_out['low']
-    high_close = abs(df_out['high'] - df_out['close'].shift())
-    low_close = abs(df_out['low'] - df_out['close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df_out['atr'] = tr.ewm(alpha=1/14, adjust=False).mean()
-
-    df_out.dropna(inplace=True)
-    logger.debug("Technical indicators calculated", row_count=len(df_out))
-    return df_out
 
 class MarketRegime(Enum):
     BULL = "bull"
@@ -210,9 +172,6 @@ class _EnsembleLearner:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.symbol_models: Dict[str, Dict[str, Any]] = {}
         self.is_trained = False
-        self._initialize_models()
-
-    def _initialize_models(self):
         logger.info("AI ensemble model templates initialized.")
         asyncio.create_task(self._load_models())
 
@@ -220,9 +179,9 @@ class _EnsembleLearner:
         if symbol not in self.symbol_models:
             logger.info("Creating new model set for symbol", symbol=symbol)
             self.symbol_models[symbol] = {
-                'lstm': self.LSTMPredictor(4, 64).to(self.device),
+                'lstm': self.LSTMPredictor(len(self.config.feature_columns), 64).to(self.device),
                 'gb': XGBClassifier(n_estimators=10, max_depth=5, random_state=42, use_label_encoder=False, eval_metric='logloss'),
-                'attention': self.AttentionNetwork(4, 64).to(self.device),
+                'attention': self.AttentionNetwork(len(self.config.feature_columns), 64).to(self.device),
                 'technical': VotingClassifier(estimators=[
                     ('rf', RandomForestClassifier(n_estimators=10, max_depth=5, random_state=42)),
                     ('lr', LogisticRegression(max_iter=100, random_state=42))
@@ -233,6 +192,7 @@ class _EnsembleLearner:
     async def _load_models(self):
         base_path = self.config.model_path
         if not os.path.isdir(base_path):
+            logger.warning("Model path does not exist, cannot load models.", path=base_path)
             return
 
         for symbol_dir in os.listdir(base_path):
@@ -251,16 +211,16 @@ class _EnsembleLearner:
                     logger.warning("Could not load models for symbol", symbol=symbol, error=str(e))
 
     async def predict(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
-        if not self.is_trained: return {'action': 'hold', 'confidence': 0.0}
+        if not self.is_trained:
+            logger.debug("Predict called but models are not trained or loaded.")
+            return {'action': 'hold', 'confidence': 0.0}
         try:
             models = self._get_or_create_symbol_models(symbol)
             feature_cols = self.config.feature_columns
-            for col in feature_cols:
-                if col not in df.columns:
-                    df[col] = 0
             
-            features = df[feature_cols].iloc[-1:].values
-            features = np.nan_to_num(features, nan=0.0)
+            current_features = {col: df[col].iloc[-1] if col in df.columns else 0 for col in feature_cols}
+            features_df = pd.DataFrame([current_features], columns=feature_cols)
+            features = np.nan_to_num(features_df.values, nan=0.0)
 
             predictions = []
             weights = []
@@ -286,15 +246,11 @@ class _EnsembleLearner:
             ensemble_pred = np.average(predictions, weights=weights, axis=0)
             action_idx = np.argmax(ensemble_pred)
             confidence = float(ensemble_pred[action_idx])
-            action_map = {0: 'sell', 1: 'hold', 2: 'buy'}
+            action_map = {0: 'sell', 1: 'hold', 2: 'buy'} # Assuming 0:sell, 1:hold, 2:buy
             return {'action': action_map.get(action_idx, 'hold'), 'confidence': confidence}
         except Exception as e:
-            logger.error("Error during prediction", symbol=symbol, error=str(e))
+            logger.error("Error during prediction", symbol=symbol, error=str(e), exc_info=True)
             return {'action': 'hold', 'confidence': 0.0}
-
-class _PPOAgent:
-    def __init__(self, config: AIStrategyConfig): pass
-    async def act(self, df: pd.DataFrame, current_price: float) -> Tuple[int, float]: return (1, 0.5) # Return hold
 
 # --- AI Ensemble Strategy ---
 
@@ -308,26 +264,19 @@ class AIEnsembleStrategy(TradingStrategy):
         
         self.confidence_threshold = self.ai_config.confidence_threshold
         self.use_regime_filter = self.ai_config.use_regime_filter
-        self.use_ppo_agent = self.ai_config.use_ppo_agent
         
         self.regime_detector = _MarketRegimeDetector(self.ai_config)
         self.ensemble_learner = _EnsembleLearner(self.ai_config)
-        self.ppo_agent = _PPOAgent(self.ai_config) if self.use_ppo_agent else None
 
     async def on_market_event(self, event: MarketEvent, open_positions: List[Any]):
         if event.symbol != self.symbol or not self.ensemble_learner.is_trained:
             return
 
         if any(p.symbol == self.symbol for p in open_positions):
+            logger.debug("Skipping signal generation, position already open.", symbol=self.symbol)
             return
 
-        # The strategy is now responsible for calculating its own indicators
-        raw_ohlcv_df = event.ohlcv_df
-        ohlcv_df = calculate_technical_indicators(raw_ohlcv_df)
-        if ohlcv_df.empty:
-            logger.warning("Could not generate indicators from market data.", symbol=self.symbol)
-            return
-
+        ohlcv_df = event.ohlcv_df
         regime = await self.regime_detector.detect_regime(self.symbol, ohlcv_df)
         logger.debug("Market regime detected", symbol=self.symbol, regime=regime)
 
@@ -338,6 +287,7 @@ class AIEnsembleStrategy(TradingStrategy):
         ensemble_confidence = ensemble_prediction['confidence']
 
         if ensemble_confidence < self.confidence_threshold:
+            logger.debug("Signal ignored due to low confidence.", confidence=ensemble_confidence, threshold=self.confidence_threshold)
             return
 
         final_action = ensemble_action
