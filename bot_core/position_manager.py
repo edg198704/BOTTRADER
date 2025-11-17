@@ -86,6 +86,15 @@ class PositionManager:
                 logger.error(f"Error getting open positions: {e}")
                 return []
 
+    def get_position_by_symbol(self, symbol: str) -> Optional[Position]:
+        """Retrieves a single open position by its symbol."""
+        with self._get_session() as session:
+            try:
+                return session.query(Position).filter_by(symbol=symbol, status='OPEN').first()
+            except SQLAlchemyError as e:
+                logger.error(f"Error getting position by symbol {symbol}: {e}")
+                return None
+
     def update_position_pnl(self, position_id: int, current_price: float) -> Optional[Position]:
         with self._get_session() as session:
             try:
