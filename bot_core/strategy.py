@@ -1,5 +1,4 @@
 import abc
-import logging
 import os
 import joblib
 import asyncio
@@ -11,6 +10,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 
+from bot_core.logger import get_logger
 from bot_core.config import AIStrategyConfig
 
 # ML Imports with safe fallbacks
@@ -34,7 +34,7 @@ except ImportError:
     class nn:
         class Module: pass
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # --- Strategy Interface ---
 
@@ -43,7 +43,7 @@ class TradingStrategy(abc.ABC):
     def __init__(self, config: Dict[str, Any]):
         self.symbol = config.get("symbol", "BTC/USDT")
         self.interval_seconds = config.get("interval_seconds", 60)
-        logger.info(f"{self.__class__.__name__} initialized for {self.symbol}.")
+        logger.info("Strategy initialized", strategy_name=self.__class__.__name__, symbol=self.symbol)
 
     @abc.abstractmethod
     async def analyze_market(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> Optional[Dict[str, Any]]:
@@ -80,7 +80,7 @@ class SimpleMACrossoverStrategy(TradingStrategy):
 
         # Golden Cross
         if not has_open_position and last_row['fast_ma'] > last_row['slow_ma'] and prev_row['fast_ma'] <= prev_row['slow_ma']:
-            logger.info(f"Strategy: BUY signal for {self.symbol} at {last_row['close']:.2f}")
+            logger.info("BUY signal generated", strategy="SimpleMACrossover", symbol=self.symbol, price=last_row['close'])
             return {'action': 'BUY', 'symbol': self.symbol, 'confidence': 0.75}
 
         return None
@@ -100,7 +100,7 @@ class SimpleMACrossoverStrategy(TradingStrategy):
 
         # Death Cross
         if position_to_manage.side == 'BUY' and last_row['fast_ma'] < last_row['slow_ma'] and prev_row['fast_ma'] >= prev_row['slow_ma']:
-            logger.info(f"Strategy: Closing BUY position {position_to_manage.id} for {position_to_manage.symbol}.")
+            logger.info("Closing BUY position due to signal", strategy="SimpleMACrossover", position_id=position_to_manage.id)
             actions.append({'action': 'CLOSE', 'position_id': position_to_manage.id})
         
         return actions
@@ -138,7 +138,7 @@ class _MarketRegimeDetector:
             confidence = min(1.0, abs(trend_strength) * 20 + (abs(rsi - 50) / 50))
             return {'regime': regime.value, 'confidence': confidence}
         except Exception as e:
-            logger.error(f"Error in regime detection for {symbol}: {e}")
+            logger.error("Error in regime detection", symbol=symbol, error=str(e))
             return {'regime': MarketRegime.UNKNOWN.value, 'confidence': 0.0}
 
 class _EnsembleLearner:
@@ -179,13 +179,12 @@ class _EnsembleLearner:
         self._initialize_models()
 
     def _initialize_models(self):
-        # This initializes a template. Actual models are created per-symbol.
         logger.info("AI ensemble model templates initialized.")
         asyncio.create_task(self._load_models())
 
     def _get_or_create_symbol_models(self, symbol: str) -> Dict[str, Any]:
         if symbol not in self.symbol_models:
-            logger.info(f"Creating new model set for symbol: {symbol}")
+            logger.info("Creating new model set for symbol", symbol=symbol)
             self.symbol_models[symbol] = {
                 'lstm': self.LSTMPredictor(4, 64).to(self.device),
                 'gb': XGBClassifier(n_estimators=10, max_depth=5, random_state=42, use_label_encoder=False, eval_metric='logloss'),
@@ -213,9 +212,9 @@ class _EnsembleLearner:
                     models['lstm'].load_state_dict(torch.load(os.path.join(symbol_path, "lstm_model.pth")))
                     models['attention'].load_state_dict(torch.load(os.path.join(symbol_path, "attention_model.pth")))
                     self.is_trained = True
-                    logger.info(f"Loaded models for {symbol}")
+                    logger.info("Loaded models for symbol", symbol=symbol)
                 except Exception as e:
-                    logger.warning(f"Could not load models for {symbol}: {e}")
+                    logger.warning("Could not load models for symbol", symbol=symbol, error=str(e))
 
     async def predict(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
         if not self.is_trained: return {'action': 'hold', 'confidence': 0.0}
@@ -232,17 +231,14 @@ class _EnsembleLearner:
             predictions = []
             weights = []
 
-            # GB Prediction
             gb_pred = models['gb'].predict_proba(features)[0]
             predictions.append(gb_pred)
             weights.append(0.25)
 
-            # Technical Prediction
             tech_pred = models['technical'].predict_proba(features)[0]
             predictions.append(tech_pred)
             weights.append(0.15)
 
-            # NN Predictions
             features_tensor = torch.FloatTensor(features).unsqueeze(1).to(self.device)
             with torch.no_grad():
                 lstm_pred = models['lstm'](features_tensor).cpu().numpy()[0]
@@ -259,7 +255,7 @@ class _EnsembleLearner:
             action_map = {0: 'sell', 1: 'hold', 2: 'buy'}
             return {'action': action_map.get(action_idx, 'hold'), 'confidence': confidence}
         except Exception as e:
-            logger.error(f"Error during prediction for {symbol}: {e}")
+            logger.error("Error during prediction", symbol=symbol, error=str(e))
             return {'action': 'hold', 'confidence': 0.0}
 
 class _PPOAgent:
@@ -274,7 +270,6 @@ class AIEnsembleStrategy(TradingStrategy):
         if not ML_AVAILABLE:
             raise ImportError("Required ML libraries not installed for AIEnsembleStrategy.")
         
-        # Adapt the dictionary config to the Pydantic model for the components
         self.ai_config = AIStrategyConfig(**config.get('ai_ensemble', {}))
         
         self.confidence_threshold = self.ai_config.confidence_threshold
@@ -292,39 +287,33 @@ class AIEnsembleStrategy(TradingStrategy):
         if any(p.symbol == self.symbol for p in open_positions):
             return None
 
-        # 1. Detect Market Regime
         regime = await self.regime_detector.detect_regime(self.symbol, ohlcv_df)
-        logger.debug(f"Market regime for {self.symbol}: {regime}")
+        logger.debug("Market regime detected", symbol=self.symbol, regime=regime)
 
-        # 2. Get Ensemble Prediction
         ensemble_prediction = await self.ensemble_learner.predict(ohlcv_df, self.symbol)
-        logger.debug(f"Ensemble prediction for {self.symbol}: {ensemble_prediction}")
+        logger.debug("Ensemble prediction received", symbol=self.symbol, prediction=ensemble_prediction)
 
-        # 3. Combine signals into a final decision
         ensemble_action = ensemble_prediction['action']
         ensemble_confidence = ensemble_prediction['confidence']
 
         if ensemble_confidence < self.confidence_threshold:
             return None
 
-        # 4. Apply Regime Filter
         final_action = ensemble_action
         final_confidence = ensemble_confidence
         if self.use_regime_filter:
             current_regime = regime.get('regime')
             if (current_regime == MarketRegime.BULL.value and ensemble_action == 'sell') or \
                (current_regime == MarketRegime.BEAR.value and ensemble_action == 'buy'):
-                logger.info(f"Regime filter overrides action. Regime: {current_regime}, Action: {ensemble_action}")
-                return None # Contradictory signal, do not trade
+                logger.info("Regime filter overrides action", regime=current_regime, action=ensemble_action)
+                return None
             final_confidence *= regime.get('confidence', 0.5)
 
         if final_action != 'hold':
-            logger.info(f"Final AI signal for {self.symbol}: {final_action.upper()} with confidence {final_confidence:.2f}")
+            logger.info("Final AI signal generated", symbol=self.symbol, action=final_action.upper(), confidence=final_confidence)
             return {'action': final_action.upper(), 'symbol': self.symbol, 'confidence': final_confidence}
 
         return None
 
     async def manage_positions(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> List[Dict[str, Any]]:
-        # This strategy relies on stop-loss and take-profit set at trade execution.
-        # Future enhancements could use AI signals for early exit.
         return []
