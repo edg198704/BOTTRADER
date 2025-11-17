@@ -1,7 +1,7 @@
 import abc
 import logging
 import os
-import pickle
+import joblib
 from typing import Dict, Any, List, Optional
 
 import pandas as pd
@@ -125,28 +125,44 @@ class AIEnsembleStrategy(TradingStrategy):
 
         if not self.is_trained:
             logger.warning("AI model is not trained. Cannot generate signals. Please train the model first.")
-            # In a real system, you might trigger training here.
             return None
 
         if any(p.symbol == self.symbol for p in open_positions):
             return None # Don't open a new position if one already exists for this symbol
 
         prediction = self._predict(df)
-        signal = prediction['signal']
+        action = prediction['action']
         confidence = prediction['confidence']
 
-        logger.debug(f"AI prediction for {self.symbol}: signal={signal}, confidence={confidence:.2f}")
+        logger.debug(f"AI prediction for {self.symbol}: action={action}, confidence={confidence:.2f}")
 
-        if signal == 1 and confidence > self.confidence_threshold: # BUY
-            return {'action': 'BUY', 'confidence': confidence}
-        elif signal == -1 and confidence > self.confidence_threshold: # SELL
-            return {'action': 'SELL', 'confidence': confidence}
+        if action != 'HOLD' and confidence > self.confidence_threshold:
+            return {'action': action, 'confidence': confidence}
         
         return None
 
     async def manage_positions(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> List[Dict[str, Any]]:
-        # This strategy relies on the RiskManager for SL/TP, so no specific management logic is needed here.
-        return []
+        actions = []
+        position_to_manage = next((p for p in open_positions if p.symbol == self.symbol), None)
+        if ohlcv_df.empty or not position_to_manage or not self.is_trained:
+            return actions
+
+        df = self._calculate_technical_indicators(ohlcv_df)
+        if df is None or df.empty:
+            return actions
+
+        prediction = self._predict(df)
+        current_signal = prediction['action']
+
+        # Close if signal is opposite to current position
+        is_opposing_signal = (position_to_manage.side == 'BUY' and current_signal == 'SELL') or \
+                               (position_to_manage.side == 'SELL' and current_signal == 'BUY')
+
+        if is_opposing_signal and prediction['confidence'] > self.confidence_threshold:
+            logger.info(f"Strategy: Closing {position_to_manage.side} position {position_to_manage.id} for {self.symbol} due to opposing signal '{current_signal}'.")
+            actions.append({'action': 'CLOSE', 'position_id': position_to_manage.id})
+        
+        return actions
 
     def _calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
@@ -168,38 +184,35 @@ class AIEnsembleStrategy(TradingStrategy):
         
         pred_proba = self.model.predict_proba(latest_features)[0]
         
-        # Assuming classes are ordered: 0=SELL (-1), 1=HOLD (0), 2=BUY (1)
+        # Classes are assumed to be trained as: 0=SELL, 1=HOLD, 2=BUY
         if len(pred_proba) != 3:
             logger.error("Model prediction shape is incorrect. Expected 3 classes.")
-            return {'signal': 0, 'confidence': 0.0}
+            return {'action': 'HOLD', 'confidence': 0.0}
 
         confidence = np.max(pred_proba)
         signal_idx = np.argmax(pred_proba)
 
-        signal_map = {-1: 0, 0: 1, 1: 2} # Our signal to class index
-        reverse_map = {0: -1, 1: 0, 2: 1} # Class index to our signal
-        final_signal = reverse_map.get(signal_idx, 0)
+        action_map = {0: 'SELL', 1: 'HOLD', 2: 'BUY'}
+        final_action = action_map.get(signal_idx, 'HOLD')
 
-        return {'signal': final_signal, 'confidence': confidence}
+        return {'action': final_action, 'confidence': confidence}
 
     def _save_model(self):
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
-        model_file = os.path.join(self.model_path, f"{self.symbol.replace('/', '_')}_ensemble.pkl")
+        model_file = os.path.join(self.model_path, f"{self.symbol.replace('/', '_')}_ensemble.joblib")
         try:
-            with open(model_file, 'wb') as f:
-                pickle.dump(self.model, f)
+            joblib.dump(self.model, model_file)
             logger.info(f"AI model saved to {model_file}")
         except Exception as e:
             logger.error(f"Error saving AI model: {e}")
 
     def _load_model(self):
-        model_file = os.path.join(self.model_path, f"{self.symbol.replace('/', '_')}_ensemble.pkl")
+        model_file = os.path.join(self.model_path, f"{self.symbol.replace('/', '_')}_ensemble.joblib")
         if not os.path.exists(model_file):
             logger.warning(f"No pre-trained AI model found at {model_file}. Model needs training.")
             return
         try:
-            with open(model_file, 'rb') as f:
-                self.model = pickle.load(f)
+            self.model = joblib.load(model_file)
             self.is_trained = True
             logger.info(f"AI model loaded from {model_file}")
         except Exception as e:
