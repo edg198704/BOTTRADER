@@ -1,68 +1,93 @@
-from abc import ABC, abstractmethod
+import abc
+from typing import Dict, Any, Optional
 import pandas as pd
-from typing import Dict, Optional, List
 
 from bot_core.logger import get_logger
 from bot_core.config import StrategyConfig
-from bot_core.position_manager import Position
+from bot_core.ai.ensemble_learner import EnsembleLearner
+from bot_core.ai.regime_detector import MarketRegimeDetector, MarketRegime
 
 logger = get_logger(__name__)
 
-class TradingStrategy(ABC):
-    """Abstract base class for all trading strategies."""
-    def __init__(self, config: StrategyConfig):
-        self.config = config
+class TradingStrategy(abc.ABC):
+    """Abstract Base Class for all trading strategies."""
 
-    @abstractmethod
-    async def analyze_market(self, df: pd.DataFrame, open_positions: List[Position]) -> Optional[Dict]:
-        """
-        Analyzes market data and returns a trading signal if conditions are met.
-        Returns a dictionary with 'action' ('BUY' or 'SELL') or None.
-        """
+    @abc.abstractmethod
+    async def analyze_market(self, df: pd.DataFrame, open_positions: Dict) -> Optional[Dict[str, Any]]:
+        """Analyzes market data and returns a trading signal or None."""
         pass
 
-class SimpleMACrossoverStrategy(TradingStrategy):
-    """A simple moving average crossover strategy."""
+class AIEnsembleStrategy(TradingStrategy):
+    """An advanced strategy using an ensemble of ML models and market regime detection."""
     def __init__(self, config: StrategyConfig):
-        super().__init__(config)
-        self.fast_ma_period = config.simple_ma.fast_ma_period
-        self.slow_ma_period = config.simple_ma.slow_ma_period
-        logger.info("SimpleMACrossoverStrategy initialized", fast_period=self.fast_ma_period, slow_period=self.slow_ma_period)
+        self.config = config.ai_ensemble
+        self.symbol = config.symbol
+        self.ensemble_learner = EnsembleLearner(self.config)
+        self.regime_detector = MarketRegimeDetector(self.config)
+        logger.info("AIEnsembleStrategy initialized.")
 
-    async def analyze_market(self, df: pd.DataFrame, open_positions: List[Position]) -> Optional[Dict]:
-        symbol = self.config.symbol
-        position_open = any(p.symbol == symbol for p in open_positions)
+    async def analyze_market(self, df: pd.DataFrame, open_positions: Dict) -> Optional[Dict[str, Any]]:
+        # 1. Detect Market Regime
+        regime_result = await self.regime_detector.detect_regime(self.symbol, df)
+        regime = regime_result.get('regime')
 
-        if 'sma_fast' not in df.columns or 'sma_slow' not in df.columns:
-            logger.warning("Required SMA columns not in DataFrame. Skipping analysis.")
+        # 2. Regime Filtering
+        if self.config.use_regime_filter and regime in [MarketRegime.SIDEWAYS.value, MarketRegime.UNKNOWN.value]:
+            logger.debug("Holding due to market regime", regime=regime)
             return None
 
-        # Get the last two candles for crossover detection
-        last_candle = df.iloc[-1]
-        prev_candle = df.iloc[-2]
+        # 3. Get AI Prediction
+        prediction = await self.ensemble_learner.predict(df, self.symbol)
+        action = prediction.get('action')
+        confidence = prediction.get('confidence', 0.0)
 
-        # Golden Cross (Buy Signal)
-        is_golden_cross = prev_candle['sma_fast'] <= prev_candle['sma_slow'] and last_candle['sma_fast'] > last_candle['sma_slow']
-        if is_golden_cross and not position_open:
-            logger.info("Golden Cross detected. Generating BUY signal.", symbol=symbol)
-            return {'action': 'BUY', 'symbol': symbol}
+        if not action or action == 'hold' or confidence < self.config.confidence_threshold:
+            return None
 
-        # Death Cross (Sell Signal)
-        is_death_cross = prev_candle['sma_fast'] >= prev_candle['sma_slow'] and last_candle['sma_fast'] < last_candle['sma_slow']
-        if is_death_cross and position_open:
-            logger.info("Death Cross detected. Generating SELL signal to close position.", symbol=symbol)
-            return {'action': 'SELL', 'symbol': symbol}
+        # 4. Generate Signal
+        signal = {
+            'symbol': self.symbol,
+            'action': action.upper(),
+            'confidence': confidence,
+            'strategy': 'AIEnsembleStrategy',
+            'regime': regime
+        }
+        logger.info("Generated AI signal", **signal)
+        return signal
 
-        return None
-
-class AIEnsembleStrategy(TradingStrategy):
-    """Placeholder for the advanced AI ensemble strategy."""
+class SimpleMACrossoverStrategy(TradingStrategy):
+    """A simple moving average crossover strategy for testing and as a baseline."""
     def __init__(self, config: StrategyConfig):
-        super().__init__(config)
-        logger.info("AIEnsembleStrategy initialized (placeholder).")
-        # In a future iteration, this would initialize the EnsembleLearner, etc.
+        self.config = config.simple_ma
+        self.symbol = config.symbol
+        logger.info("SimpleMACrossoverStrategy initialized.")
 
-    async def analyze_market(self, df: pd.DataFrame, open_positions: List[Position]) -> Optional[Dict]:
-        logger.debug("AIEnsembleStrategy analyze_market called. No logic implemented yet.")
-        # TODO: Implement AI-based signal generation using EnsembleLearner and RegimeDetector
+    async def analyze_market(self, df: pd.DataFrame, open_positions: Dict) -> Optional[Dict[str, Any]]:
+        if 'sma_fast' not in df.columns or 'sma_slow' not in df.columns:
+            logger.warning("MA indicators not found in DataFrame.")
+            return None
+
+        last_row = df.iloc[-1]
+        prev_row = df.iloc[-2]
+
+        # Check for crossover
+        fast_above_slow_now = last_row['sma_fast'] > last_row['sma_slow']
+        fast_above_slow_before = prev_row['sma_fast'] > prev_row['sma_slow']
+
+        action = None
+        if fast_above_slow_now and not fast_above_slow_before:
+            action = 'BUY'
+        elif not fast_above_slow_now and fast_above_slow_before:
+            action = 'SELL'
+
+        if action:
+            signal = {
+                'symbol': self.symbol,
+                'action': action,
+                'confidence': 0.8, # Fixed confidence for simple strategy
+                'strategy': 'SimpleMACrossoverStrategy'
+            }
+            logger.info("Generated MA Crossover signal", **signal)
+            return signal
+        
         return None
