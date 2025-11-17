@@ -1,7 +1,3 @@
 # bot_core/__init__.py
-import logging
-import os
-
-# Configure basic logging for the package
-logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# This file makes the bot_core directory a Python package.
+# Logging is configured via the bot_core.logger module.
