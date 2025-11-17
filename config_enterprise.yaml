@@ -12,14 +12,19 @@ strategy:
   name: AIEnsembleStrategy # 'AIEnsembleStrategy' or 'SimpleMACrossoverStrategy'
   symbol: "BTC/USDT" # Trading pair
   interval_seconds: 60 # Strategy execution interval in seconds
-  trade_quantity: 0.001 # Base quantity for trading
+
   # AIEnsembleStrategy specific parameters
-  feature_columns: ['close', 'rsi', 'macd', 'volume']
-  confidence_threshold: 0.60 # Minimum model confidence to open a trade
-  model_path: "models/ensemble" # Directory to save/load AI models
+  ai_ensemble:
+    feature_columns: ['close', 'rsi', 'macd', 'volume']
+    confidence_threshold: 0.60 # Minimum model confidence to open a trade
+    model_path: "models/ensemble" # Directory to save/load AI models
+    use_regime_filter: true
+    use_ppo_agent: false
+
   # SimpleMACrossoverStrategy specific parameters
-  fast_ma_period: 10
-  slow_ma_period: 20
+  simple_ma:
+    fast_ma_period: 10
+    slow_ma_period: 20
 
 risk_management:
   max_position_size_usd: 1000.0 # Maximum value of a single position in USD
