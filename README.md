@@ -12,6 +12,7 @@ The bot's architecture is centered around a core set of decoupled components loc
 *   **`position_manager.py`**: Manages the state of all trading positions, persisting them to an SQLite database for durability using SQLAlchemy.
 *   **`risk_manager.py`**: Implements pre-trade and portfolio-level risk controls, including dynamic position sizing, ATR-based stop loss, and a portfolio-wide circuit breaker.
 *   **`strategy.py`**: Defines the `TradingStrategy` interface and provides concrete implementations like `SimpleMACrossoverStrategy` and the advanced `AIEnsembleStrategy`.
+*   **`telegram_bot.py`**: An optional component for remote control and monitoring via Telegram.
 
 Key supporting files in the root directory include:
 
@@ -26,6 +27,7 @@ Key supporting files in the root directory include:
 *   **Advanced AI Strategy**: Includes a powerful ensemble strategy using XGBoost, RandomForest, and other models for sophisticated signal generation.
 *   **Robust Risk Management**: Features dynamic position sizing, ATR-based stop loss, multiple take-profit levels, and a portfolio-level circuit breaker to protect capital.
 *   **Persistent State**: All trades are logged to an SQLite database using SQLAlchemy, ensuring state is not lost on restart.
+*   **Remote Control via Telegram**: Includes an optional Telegram bot for real-time status monitoring, performance checks, and a 'kill switch' to halt trading remotely.
 *   **Asynchronous Core**: Built with `asyncio` for efficient, non-blocking I/O, critical for handling real-time market data and API requests.
 *   **Type-Safe Configuration**: Uses Pydantic for configuration loading and validation, preventing runtime errors from incorrect settings.
 *   **Graceful Shutdown**: Handles `SIGINT` and `SIGTERM` signals to ensure clean termination and resource cleanup.
@@ -50,8 +52,9 @@ Key supporting files in the root directory include:
     *   **`exchange`**: Set `name` to `MockExchange` for testing or a `ccxt`-supported exchange like `binance`. For a real exchange, provide your `api_key` and `api_secret` (it's highly recommended to use environment variables for these in production).
     *   **`strategy`**: Choose the `name` of the strategy to run (e.g., `AIEnsembleStrategy` or `SimpleMACrossoverStrategy`) and configure its parameters.
     *   **`risk_management`**: Define your risk tolerance with `max_position_size_usd`, `max_daily_loss_usd`, etc.
+    *   **`telegram`**: To enable the remote control feature, create a bot with BotFather on Telegram, get the token, and find your chat ID. Add them to the `bot_token` and `admin_chat_ids` fields.
 
-    **IMPORTANT**: For production, load API keys from environment variables or a secure vault, not directly from the YAML file.
+    **IMPORTANT**: For production, load API keys and tokens from environment variables or a secure vault, not directly from the YAML file.
 
 ## Running the Bot
 
@@ -61,7 +64,7 @@ To start the trading bot, simply run the main entry point:
 python start_bot.py
 ```
 
-The bot will initialize all components based on your configuration and begin its main trading loop. To stop the bot gracefully, press `Ctrl+C`.
+The bot will initialize all components based on your configuration and begin its main trading loop. If configured, the Telegram bot will also start polling for commands. To stop the bot gracefully, press `Ctrl+C`.
 
 ## Development
 
