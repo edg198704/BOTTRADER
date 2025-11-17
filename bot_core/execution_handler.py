@@ -1,11 +1,11 @@
-import logging
 from typing import Dict, Any
 import pandas as pd
 
+from bot_core.logger import get_logger
 from bot_core.order_manager import OrderManager
 from bot_core.risk_manager import RiskManager
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class ExecutionHandler:
     """Translates strategy signals into concrete order requests for the OrderManager."""
@@ -22,12 +22,12 @@ class ExecutionHandler:
         confidence = trade_proposal.get('confidence', 0.5)
 
         if not all([action_type, symbol]) or action_type not in ['BUY', 'SELL']:
-            logger.warning(f"Invalid trade proposal received: {trade_proposal}")
+            logger.warning("Invalid trade proposal received", proposal=trade_proposal)
             return
 
         # 1. Get current price from the latest candle for sizing and risk checks
         if ohlcv_df.empty:
-            logger.error(f"Cannot execute trade for {symbol}, OHLCV data is empty.")
+            logger.error("Cannot execute trade, OHLCV data is empty.", symbol=symbol)
             return
         current_price = ohlcv_df['close'].iloc[-1]
 
@@ -38,12 +38,12 @@ class ExecutionHandler:
         # 3. Calculate Position Size based on risk
         quantity = self.risk_manager.calculate_position_size(current_price, stop_loss_price)
         if quantity <= 0:
-            logger.warning(f"Calculated position size is zero or negative for {symbol}. Aborting trade.")
+            logger.warning("Calculated position size is zero or negative. Aborting trade.", symbol=symbol, calculated_size=quantity)
             return
 
         # 4. Perform final pre-trade checks
         if not self.risk_manager.check_trade_allowed(symbol, action_type, quantity, current_price):
-            logger.warning(f"Trade {action_type} {quantity} {symbol} denied by risk manager.")
+            logger.warning("Trade denied by risk manager.", action=action_type, quantity=quantity, symbol=symbol)
             return
 
         # 5. Prepare metadata for the order
@@ -55,7 +55,7 @@ class ExecutionHandler:
 
         # 6. Submit the order to the OrderManager
         try:
-            logger.info(f"Submitting {action_type} order for {quantity} of {symbol} to OrderManager.")
+            logger.info("Submitting order to OrderManager.", action=action_type, quantity=quantity, symbol=symbol)
             order = await self.order_manager.submit_order(
                 symbol=symbol,
                 side=action_type,
@@ -65,9 +65,9 @@ class ExecutionHandler:
             )
             
             if order.status in ['REJECTED', 'ERROR']:
-                logger.error(f"Order submission failed for {symbol}. Reason: {order.error_message}")
+                logger.error("Order submission failed.", symbol=symbol, reason=order.error_message)
             else:
-                logger.info(f"Order for {symbol} submitted with client ID: {order.client_order_id}")
+                logger.info("Order submitted successfully.", symbol=symbol, client_order_id=order.client_order_id)
 
         except Exception as e:
-            logger.error(f"Error submitting order for {symbol} to OrderManager: {e}", exc_info=True)
+            logger.error("Error submitting order to OrderManager", symbol=symbol, error=str(e), exc_info=True)
