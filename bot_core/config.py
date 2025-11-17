@@ -13,6 +13,8 @@ class AIStrategyConfig(BaseModel):
     model_path: str = "models/ensemble"
     use_regime_filter: bool = True
     use_ppo_agent: bool = False # Disabled by default as it's more experimental
+    retrain_interval_hours: int = 24
+    training_epochs: int = 10
 
 class SimpleMAStrategyConfig(BaseModel):
     fast_ma_period: int = 10
