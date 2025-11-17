@@ -1,28 +1,31 @@
+import asyncio
 from typing import Dict, Any
 import pandas as pd
 
 from bot_core.logger import get_logger
 from bot_core.order_manager import OrderManager
 from bot_core.risk_manager import RiskManager
+from bot_core.data_handler import SignalEvent, OrderEvent
 
 logger = get_logger(__name__)
 
 class ExecutionHandler:
-    """Translates strategy signals into concrete order requests for the OrderManager."""
+    """Translates strategy signals into concrete order events for the OrderManager."""
 
-    def __init__(self, order_manager: OrderManager, risk_manager: RiskManager):
+    def __init__(self, event_queue: asyncio.Queue, order_manager: OrderManager, risk_manager: RiskManager):
+        self.event_queue = event_queue
         self.order_manager = order_manager
         self.risk_manager = risk_manager
         logger.info("ExecutionHandler initialized.")
 
-    async def execute_trade_proposal(self, trade_proposal: Dict[str, Any], ohlcv_df: pd.DataFrame):
-        """Receives a trade proposal, validates it, and submits it to the OrderManager."""
-        action_type = trade_proposal.get('action')
-        symbol = trade_proposal.get('symbol')
-        confidence = trade_proposal.get('confidence', 0.5)
+    async def on_signal_event(self, event: SignalEvent, ohlcv_df: pd.DataFrame):
+        """Receives a signal event, validates it, and creates an order event."""
+        action_type = event.action
+        symbol = event.symbol
+        confidence = event.confidence
 
         if not all([action_type, symbol]) or action_type not in ['BUY', 'SELL']:
-            logger.warning("Invalid trade proposal received", proposal=trade_proposal)
+            logger.warning("Invalid signal event received", event=event)
             return
 
         # 1. Get current price from the latest candle for sizing and risk checks
@@ -53,21 +56,17 @@ class ExecutionHandler:
             "take_profit_levels": take_profit_levels
         }
 
-        # 6. Submit the order to the OrderManager
+        # 6. Create and queue the OrderEvent
         try:
-            logger.info("Submitting order to OrderManager.", action=action_type, quantity=quantity, symbol=symbol)
-            order = await self.order_manager.submit_order(
+            logger.info("Queuing OrderEvent.", action=action_type, quantity=quantity, symbol=symbol)
+            order_event = OrderEvent(
                 symbol=symbol,
                 side=action_type,
                 order_type='MARKET',
                 quantity=quantity,
                 metadata=metadata
             )
-            
-            if order.status in ['REJECTED', 'ERROR']:
-                logger.error("Order submission failed.", symbol=symbol, reason=order.error_message)
-            else:
-                logger.info("Order submitted successfully.", symbol=symbol, client_order_id=order.client_order_id)
+            await self.event_queue.put(order_event)
 
         except Exception as e:
-            logger.error("Error submitting order to OrderManager", symbol=symbol, error=str(e), exc_info=True)
+            logger.error("Error queuing OrderEvent", symbol=symbol, error=str(e), exc_info=True)
