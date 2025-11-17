@@ -1,5 +1,7 @@
 # Enterprise configuration for the modular trading bot.
 
+initial_capital: 10000.0
+
 exchange:
   name: MockExchange # 'MockExchange' for testing, or a ccxt-supported exchange like 'binance'
   api_key: YOUR_API_KEY
@@ -27,6 +29,7 @@ risk_management:
   use_trailing_stop: true # Enable/disable trailing stop loss
   atr_stop_multiplier: 2.0 # Multiplier for ATR-based stop loss calculation
   stop_loss_fallback_pct: 0.05 # Fallback stop loss percentage if ATR fails
+  risk_per_trade_pct: 0.01 # Risk 1% of portfolio equity per trade
 
 database:
   path: "position_ledger.db" # Path to the SQLite database for position tracking
