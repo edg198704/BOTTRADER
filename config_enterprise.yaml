@@ -20,6 +20,8 @@ strategy:
     model_path: "models/ensemble" # Directory to save/load AI models
     use_regime_filter: true
     use_ppo_agent: false
+    retrain_interval_hours: 24
+    training_epochs: 10
 
   # SimpleMACrossoverStrategy specific parameters
   simple_ma:
