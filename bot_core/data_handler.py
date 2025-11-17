@@ -1,14 +1,14 @@
 import pandas as pd
 import numpy as np
-import logging
+from bot_core.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 def create_dataframe(ohlcv_data: list) -> pd.DataFrame | None:
     """Create DataFrame from OHLCV data with validation."""
     try:
         if not ohlcv_data or len(ohlcv_data) < 20:
-            logger.warning("Insufficient OHLCV data to create DataFrame.")
+            logger.warning("Insufficient OHLCV data to create DataFrame.", data_length=len(ohlcv_data) if ohlcv_data else 0)
             return None
 
         df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -22,18 +22,18 @@ def create_dataframe(ohlcv_data: list) -> pd.DataFrame | None:
         df.dropna(inplace=True)
 
         if len(df) < 20:
-            logger.warning(f"Insufficient data rows ({len(df)}) after cleaning.")
+            logger.warning("Insufficient data rows after cleaning.", row_count=len(df))
             return None
 
         return df
     except Exception as e:
-        logger.error(f"Error creating DataFrame: {e}", exc_info=True)
+        logger.error("Error creating DataFrame", error=str(e), exc_info=True)
         return None
 
 def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Calculate all necessary technical indicators."""
     if df is None or len(df) < 50:
-        logger.warning(f"DataFrame has insufficient data ({len(df) if df is not None else 0}) for all indicators.")
+        logger.warning("DataFrame has insufficient data for all indicators.", data_length=len(df) if df is not None else 0)
         return df
 
     df_out = df.copy()
@@ -65,5 +65,5 @@ def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df_out['atr'] = tr.ewm(alpha=1/14, adjust=False).mean()
 
     df_out.dropna(inplace=True)
-    logger.debug(f"Technical indicators calculated for DataFrame with {len(df_out)} rows.")
+    logger.debug("Technical indicators calculated", row_count=len(df_out))
     return df_out
