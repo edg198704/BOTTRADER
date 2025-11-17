@@ -1,14 +1,14 @@
 import asyncio
-import logging
 import random
 from typing import Dict, Any, List, Optional
 from enum import Enum
 from dataclasses import dataclass, field
 import time
 
+from bot_core.logger import get_logger
 from bot_core.exchange_api import ExchangeAPI
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class OrderStatus(Enum):
     PENDING = "PENDING"
@@ -94,16 +94,16 @@ class OrderManager:
             if order_response and order_response.get('orderId'):
                 order.exchange_order_id = order_response['orderId']
                 order.status = OrderStatus.OPEN
-                logger.info(f"Order submitted successfully: {order}")
+                logger.info("Order submitted successfully", order=order)
             else:
                 order.status = OrderStatus.REJECTED
                 order.error_message = order_response.get('error', 'Submission failed, no order ID returned.')
-                logger.error(f"Order submission failed: {order}")
+                logger.error("Order submission failed", order=order)
 
         except Exception as e:
             order.status = OrderStatus.ERROR
             order.error_message = str(e)
-            logger.error(f"Exception placing order {client_order_id}: {e}", exc_info=True)
+            logger.error("Exception placing order", client_order_id=client_order_id, error=str(e), exc_info=True)
         
         order.updated_at = time.time()
         return order
@@ -125,7 +125,7 @@ class OrderManager:
                 if not open_orders:
                     continue
 
-                logger.debug(f"Tracking {len(open_orders)} open orders.")
+                logger.debug("Tracking open orders", count=len(open_orders))
                 for order in open_orders:
                     await self._check_order_status(order)
 
@@ -133,13 +133,13 @@ class OrderManager:
                 logger.info("Order tracking loop cancelled.")
                 break
             except Exception as e:
-                logger.error(f"Error in order tracking loop: {e}", exc_info=True)
+                logger.error("Error in order tracking loop", error=str(e), exc_info=True)
 
     async def _check_order_status(self, order: Order):
         """Fetches the latest status of a single order from the exchange."""
         try:
             if not order.exchange_order_id:
-                logger.warning(f"Cannot track order {order.client_order_id} without exchange_order_id.")
+                logger.warning("Cannot track order without exchange_order_id", client_order_id=order.client_order_id)
                 return
 
             status_response = await self.exchange_api.fetch_order(order.exchange_order_id, order.symbol)
@@ -152,7 +152,7 @@ class OrderManager:
             filled_qty = float(status_response.get('filled', 0.0))
             
             if new_status != order.status or filled_qty > order.filled_quantity:
-                logger.info(f"Order {order.client_order_id} status changed: {order.status.value} -> {new_status.value}, Filled: {filled_qty}/{order.quantity}")
+                logger.info("Order status changed", client_order_id=order.client_order_id, old_status=order.status.value, new_status=new_status.value, filled_qty=filled_qty, total_qty=order.quantity)
                 
                 fill_amount = filled_qty - order.filled_quantity
                 if fill_amount > 0:
@@ -165,7 +165,7 @@ class OrderManager:
                 order.updated_at = time.time()
 
         except Exception as e:
-            logger.error(f"Failed to check status for order {order.client_order_id}: {e}")
+            logger.error("Failed to check order status", client_order_id=order.client_order_id, error=str(e))
             order.status = OrderStatus.ERROR
             order.error_message = str(e)
 
@@ -180,4 +180,4 @@ class OrderManager:
             metadata=order.metadata
         )
         await self._fill_queue.put(fill)
-        logger.info(f"Fill event generated: {fill}")
+        logger.info("Fill event generated", fill=fill)
