@@ -1,124 +1,197 @@
-# bot_core/strategy.py
 import abc
 import logging
 from typing import Dict, Any, List, Optional
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.model_selection import train_test_split
 
 logger = logging.getLogger(__name__)
 
+# --- Helper Functions for AI Strategy ---
+def _calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or len(df) < 26: # Need enough data for MACD
+        return df
+    df = df.copy()
+    # RSI
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).ewm(com=13, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(com=13, adjust=False).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+    # MACD
+    exp1 = df['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = exp1 - exp2
+    df.fillna(method='bfill', inplace=True)
+    return df
+
+class AdvancedEnsembleLearner:
+    """A self-contained ML model for the AI strategy."""
+    def __init__(self, feature_columns: List[str]):
+        self.feature_columns = feature_columns
+        self.models = {
+            'rf': RandomForestClassifier(n_estimators=50, max_depth=10, random_state=42),
+            'gb': GradientBoostingClassifier(n_estimators=50, max_depth=5, random_state=42)
+        }
+        self.is_trained = False
+
+    def train(self, df: pd.DataFrame, buy_threshold: float, sell_threshold: float):
+        logger.info("Starting AI model training...")
+        df_with_indicators = _calculate_technical_indicators(df)
+        
+        # Create target variable
+        future_returns = df_with_indicators['close'].pct_change(periods=-1).shift(1)
+        df_with_indicators['target'] = 0 # HOLD
+        df_with_indicators.loc[future_returns > buy_threshold, 'target'] = 1 # BUY
+        df_with_indicators.loc[future_returns < sell_threshold, 'target'] = -1 # SELL
+        df_with_indicators.dropna(inplace=True)
+
+        if len(df_with_indicators) < 100:
+            logger.warning("Not enough data to train AI model.")
+            return
+
+        X = df_with_indicators[self.feature_columns]
+        y = df_with_indicators['target']
+
+        if len(y.unique()) < 2:
+            logger.warning("Not enough class diversity to train AI model.")
+            return
+
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+        for name, model in self.models.items():
+            model.fit(X_train, y_train)
+            score = model.score(X_test, y_test)
+            logger.info(f"Model '{name}' trained with accuracy: {score:.2f}")
+        
+        self.is_trained = True
+        logger.info("AI model training complete.")
+
+    def predict(self, df: pd.DataFrame) -> Dict[str, Any]:
+        if not self.is_trained:
+            return {'signal': 0, 'confidence': 0.0}
+        
+        df_with_indicators = _calculate_technical_indicators(df)
+        latest_features = df_with_indicators[self.feature_columns].iloc[-1:]
+
+        predictions = []
+        confidences = []
+        for model in self.models.values():
+            pred = model.predict(latest_features)[0]
+            proba = model.predict_proba(latest_features)[0]
+            predictions.append(pred)
+            confidences.append(np.max(proba))
+
+        # Simple majority vote
+        final_prediction = int(np.sign(sum(predictions)))
+        avg_confidence = np.mean(confidences)
+
+        return {'signal': final_prediction, 'confidence': avg_confidence}
+
+# --- Strategy Interfaces ---
+
 class TradingStrategy(abc.ABC):
     """Abstract Base Class for a trading strategy."""
-
     def __init__(self, config: Dict[str, Any]):
-        self.symbol = config.get("symbol", "BTCUSDT")
-        self.interval = config.get("interval", 60) # seconds
+        self.symbol = config.get("symbol", "BTC/USDT")
+        self.interval_seconds = config.get("interval_seconds", 60)
         self.trade_quantity = config.get("trade_quantity", 0.001)
-        logger.info(f"Strategy initialized for {self.symbol} with interval {self.interval}s, quantity {self.trade_quantity}")
+        logger.info(f"{self.__class__.__name__} initialized for {self.symbol}.")
 
     @abc.abstractmethod
-    async def analyze_market(self, market_data: Dict[str, Any], open_positions: List[Any]) -> Optional[Dict[str, Any]]:
-        """
-        Analyzes market data and current positions to determine if a trade should be made.
-        Returns a dictionary with trade details (e.g., {'action': 'BUY', 'quantity': 0.001, 'price': 30000})
-        or None if no trade is recommended.
-        """
+    async def analyze_market(self, ohlcv: List[List[float]], open_positions: List[Any]) -> Optional[Dict[str, Any]]:
         pass
 
     @abc.abstractmethod
-    async def manage_positions(self, market_data: Dict[str, Any], open_positions: List[Any]) -> List[Dict[str, Any]]:
-        """
-        Manages existing open positions (e.g., setting stop-loss, take-profit, or closing).
-        Returns a list of dictionaries with actions to take (e.g., [{'action': 'CLOSE', 'position_id': 123, 'price': 30500}]).
-        """
+    async def manage_positions(self, ohlcv: List[List[float]], open_positions: List[Any]) -> List[Dict[str, Any]]:
         pass
 
-class SimpleMACrossoverStrategy(TradingStrategy):
-    """
-    A simple Moving Average Crossover strategy.
-    Buys when fast MA crosses above slow MA, sells when fast MA crosses below slow MA.
-    This is a simplified example and does not actually calculate MAs from historical data.
-    It uses current price and a 'simulated' MA for demonstration.
-    """
+class AIEnsembleStrategy(TradingStrategy):
+    """Trading strategy based on an ensemble of AI models."""
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        self.fast_ma_period = config.get("fast_ma_period", 10) # Not actually used for real MA calculation here
-        self.slow_ma_period = config.get("slow_ma_period", 20) # Not actually used for real MA calculation here
-        self.last_price = None
-        self.simulated_fast_ma = None
-        self.simulated_slow_ma = None
-        self.ma_alpha_fast = 2 / (self.fast_ma_period + 1)
-        self.ma_alpha_slow = 2 / (self.slow_ma_period + 1)
-        logger.info(f"SimpleMACrossoverStrategy initialized for {self.symbol}. Fast MA: {self.fast_ma_period}, Slow MA: {self.slow_ma_period}")
+        self.model = AdvancedEnsembleLearner(config.get('feature_columns', []))
+        self.buy_threshold = config.get('buy_threshold', 0.002)
+        self.sell_threshold = config.get('sell_threshold', -0.0015)
+        self.is_training = False
 
-    async def _update_simulated_mas(self, current_price: float):
-        if self.simulated_fast_ma is None:
-            self.simulated_fast_ma = current_price
-            self.simulated_slow_ma = current_price
-        else:
-            self.simulated_fast_ma = (current_price * self.ma_alpha_fast) + (self.simulated_fast_ma * (1 - self.ma_alpha_fast))
-            self.simulated_slow_ma = (current_price * self.ma_alpha_slow) + (self.simulated_slow_ma * (1 - self.ma_alpha_slow))
-        self.last_price = current_price
+    async def _ensure_model_trained(self, df: pd.DataFrame):
+        if not self.model.is_trained and not self.is_training:
+            self.is_training = True
+            try:
+                # Run training in a separate thread to not block the event loop
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self.model.train, df, self.buy_threshold, self.sell_threshold)
+            finally:
+                self.is_training = False
 
-    async def analyze_market(self, market_data: Dict[str, Any], open_positions: List[Any]) -> Optional[Dict[str, Any]]:
-        current_price = float(market_data.get("lastPrice", 0.0))
-        if current_price == 0.0:
-            logger.warning(f"No valid lastPrice in market data for {self.symbol}.")
+    async def analyze_market(self, ohlcv: List[List[float]], open_positions: List[Any]) -> Optional[Dict[str, Any]]:
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        await self._ensure_model_trained(df)
+
+        if not self.model.is_trained or len(open_positions) > 0:
             return None
 
-        await self._update_simulated_mas(current_price)
+        prediction = self.model.predict(df)
+        signal = prediction['signal']
+        confidence = prediction['confidence']
 
-        if self.simulated_fast_ma is None or self.simulated_slow_ma is None:
-            logger.debug("Waiting for MA initialization.")
+        if signal == 1 and confidence > 0.6: # BUY signal
+            return {'action': 'BUY', 'quantity': self.trade_quantity, 'order_type': 'MARKET'}
+        elif signal == -1 and confidence > 0.6: # SELL signal
+            return {'action': 'SELL', 'quantity': self.trade_quantity, 'order_type': 'MARKET'}
+        
+        return None
+
+    async def manage_positions(self, ohlcv: List[List[float]], open_positions: List[Any]) -> List[Dict[str, Any]]:
+        # For this strategy, we close positions based on an opposite signal or risk management (handled elsewhere)
+        # A more advanced version could use the model to decide when to hold or close.
+        return []
+
+class SimpleMACrossoverStrategy(TradingStrategy):
+    """A simple Moving Average Crossover strategy."""
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        self.fast_ma_period = config.get("fast_ma_period", 10)
+        self.slow_ma_period = config.get("slow_ma_period", 20)
+
+    async def analyze_market(self, ohlcv: List[List[float]], open_positions: List[Any]) -> Optional[Dict[str, Any]]:
+        if not ohlcv or len(ohlcv) < self.slow_ma_period:
             return None
 
-        logger.debug(f"Market analysis for {self.symbol}: Price={current_price:.2f}, FastMA={self.simulated_fast_ma:.2f}, SlowMA={self.simulated_slow_ma:.2f}")
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['fast_ma'] = df['close'].rolling(window=self.fast_ma_period).mean()
+        df['slow_ma'] = df['close'].rolling(window=self.slow_ma_period).mean()
+        
+        last_row = df.iloc[-1]
+        prev_row = df.iloc[-2]
 
-        has_open_buy = any(p.side == 'BUY' for p in open_positions)
-        has_open_sell = any(p.side == 'SELL' for p in open_positions)
+        has_open_position = len(open_positions) > 0
 
         # Buy signal: Fast MA crosses above Slow MA
-        if self.simulated_fast_ma > self.simulated_slow_ma and not has_open_buy:
-            if has_open_sell:
-                logger.info(f"Strategy: Sell signal detected, but an open SELL position exists. Will manage existing position first.")
-                return None # Prioritize managing existing position
-            logger.info(f"Strategy: BUY signal for {self.symbol} at {current_price:.2f}")
-            return {'action': 'BUY', 'quantity': self.trade_quantity, 'price': current_price, 'order_type': 'MARKET'}
-
-        # Sell signal: Fast MA crosses below Slow MA
-        elif self.simulated_fast_ma < self.simulated_slow_ma and not has_open_sell:
-            if has_open_buy:
-                logger.info(f"Strategy: Buy signal detected, but an open BUY position exists. Will manage existing position first.")
-                return None # Prioritize managing existing position
-            logger.info(f"Strategy: SELL signal for {self.symbol} at {current_price:.2f}")
-            return {'action': 'SELL', 'quantity': self.trade_quantity, 'price': current_price, 'order_type': 'MARKET'}
+        if last_row['fast_ma'] > last_row['slow_ma'] and prev_row['fast_ma'] <= prev_row['slow_ma'] and not has_open_position:
+            logger.info(f"Strategy: BUY signal for {self.symbol} at {last_row['close']:.2f}")
+            return {'action': 'BUY', 'quantity': self.trade_quantity, 'order_type': 'MARKET'}
 
         return None
 
-    async def manage_positions(self, market_data: Dict[str, Any], open_positions: List[Any]) -> List[Dict[str, Any]]:
+    async def manage_positions(self, ohlcv: List[List[float]], open_positions: List[Any]) -> List[Dict[str, Any]]:
         actions = []
-        current_price = float(market_data.get("lastPrice", 0.0))
-        if current_price == 0.0:
+        if not ohlcv or len(open_positions) == 0:
             return actions
 
-        await self._update_simulated_mas(current_price)
-
-        if self.simulated_fast_ma is None or self.simulated_slow_ma is None:
-            return actions
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['fast_ma'] = df['close'].rolling(window=self.fast_ma_period).mean()
+        df['slow_ma'] = df['close'].rolling(window=self.slow_ma_period).mean()
+        
+        last_row = df.iloc[-1]
+        prev_row = df.iloc[-2]
 
         for position in open_positions:
-            # Simple exit logic: close position if MA crossover reverses
-            if position.side == 'BUY' and self.simulated_fast_ma < self.simulated_slow_ma:
-                logger.info(f"Strategy: Closing BUY position {position.id} for {position.symbol} due to MA crossover reversal.")
-                actions.append({'action': 'CLOSE', 'position_id': position.id, 'price': current_price, 'order_type': 'MARKET'})
-            elif position.side == 'SELL' and self.simulated_fast_ma < self.simulated_slow_ma:
-                logger.info(f"Strategy: Closing SELL position {position.id} for {position.symbol} due to MA crossover reversal.")
-                actions.append({'action': 'CLOSE', 'position_id': position.id, 'price': current_price, 'order_type': 'MARKET'})
-            # Add more sophisticated position management here (e.g., stop-loss, take-profit)
-            # For example:
-            # if position.side == 'BUY' and current_price <= position.entry_price * (1 - 0.01): # 1% stop loss
-            #     logger.info(f"Strategy: Closing BUY position {position.id} due to stop loss.")
-            #     actions.append({'action': 'CLOSE', 'position_id': position.id, 'price': current_price, 'order_type': 'MARKET'})
-            # elif position.side == 'BUY' and current_price >= position.entry_price * (1 + 0.02): # 2% take profit
-            #     logger.info(f"Strategy: Closing BUY position {position.id} due to take profit.")
-            #     actions.append({'action': 'CLOSE', 'position_id': position.id, 'price': current_price, 'order_type': 'MARKET'})
-
+            # Close signal: Fast MA crosses below Slow MA
+            if position.side == 'BUY' and last_row['fast_ma'] < last_row['slow_ma'] and prev_row['fast_ma'] >= prev_row['slow_ma']:
+                logger.info(f"Strategy: Closing BUY position {position.id} for {position.symbol}.")
+                actions.append({'action': 'CLOSE', 'position_id': position.id, 'order_type': 'MARKET'})
+        
         return actions
