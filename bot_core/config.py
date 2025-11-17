@@ -7,18 +7,23 @@ class ExchangeConfig(BaseModel):
     api_secret: Optional[str] = None
     testnet: bool = True
 
+class AIStrategyConfig(BaseModel):
+    feature_columns: List[str] = Field(default_factory=lambda: ['close', 'rsi', 'macd', 'volume'])
+    confidence_threshold: float = 0.60
+    model_path: str = "models/ensemble"
+    use_regime_filter: bool = True
+    use_ppo_agent: bool = False # Disabled by default as it's more experimental
+
+class SimpleMAStrategyConfig(BaseModel):
+    fast_ma_period: int = 10
+    slow_ma_period: int = 20
+
 class StrategyConfig(BaseModel):
     name: str = "AIEnsembleStrategy"
     symbol: str = "BTC/USDT"
     interval_seconds: int = 60
-    trade_quantity: float = 0.001
-    # AIEnsembleStrategy specific parameters
-    feature_columns: List[str] = Field(default_factory=lambda: ['close', 'rsi', 'macd', 'volume'])
-    confidence_threshold: float = 0.60
-    model_path: str = "models/ensemble"
-    # SimpleMACrossoverStrategy specific parameters
-    fast_ma_period: int = 10
-    slow_ma_period: int = 20
+    ai_ensemble: AIStrategyConfig = Field(default_factory=AIStrategyConfig)
+    simple_ma: SimpleMAStrategyConfig = Field(default_factory=SimpleMAStrategyConfig)
 
 class RiskManagementConfig(BaseModel):
     max_position_size_usd: float = 1000.0
