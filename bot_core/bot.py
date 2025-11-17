@@ -2,7 +2,8 @@ import asyncio
 import logging
 import time
 import pandas as pd
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+from datetime import datetime, timezone
 import ccxt
 
 from bot_core.exchange_api import ExchangeAPI
@@ -31,8 +32,58 @@ class TradingBot:
         self.symbol = self.strategy.symbol
         self.trade_interval_seconds = self.strategy.interval_seconds
         self.running = False
+        self.is_halted = False
+        self.start_time = datetime.now(timezone.utc)
         self.tasks = []
         logger.info(f"TradingBot initialized for symbol: {self.symbol}, interval: {self.trade_interval_seconds}s")
+
+    def halt_trading(self):
+        """Halts the bot from opening new positions."""
+        logger.warning("Trading HALTED by external command.")
+        self.is_halted = True
+
+    def resume_trading(self):
+        """Resumes normal trading operations."""
+        logger.info("Trading RESUMED by external command.")
+        self.is_halted = False
+
+    def get_status(self) -> Dict[str, Any]:
+        """Returns a dictionary with the current status of the bot."""
+        uptime_delta = datetime.now(timezone.utc) - self.start_time
+        return {
+            "is_running": self.running,
+            "is_halted": self.is_halted,
+            "uptime": str(uptime_delta).split('.')[0],
+            "equity": self.risk_manager.get_portfolio_value(),
+            "unrealized_pnl": self.position_manager.get_total_unrealized_pnl(),
+            "open_positions_count": len(self.position_manager.get_open_positions(self.symbol)),
+        }
+
+    def get_open_positions_summary(self) -> List[Dict[str, Any]]:
+        """Returns a summary of all open positions."""
+        positions = self.position_manager.get_open_positions()
+        summary = []
+        for pos in positions:
+            pnl_pct = (pos.unrealized_pnl / (pos.entry_price * pos.quantity)) * 100 if pos.entry_price > 0 else 0
+            summary.append({
+                "symbol": pos.symbol,
+                "side": pos.side,
+                "quantity": pos.quantity,
+                "entry_price": pos.entry_price,
+                "current_price": pos.current_price,
+                "pnl": pos.unrealized_pnl,
+                "pnl_pct": pnl_pct
+            })
+        return summary
+
+    def get_performance_metrics(self) -> Dict[str, Any]:
+        """Returns key performance and risk metrics."""
+        return {
+            "daily_realized_pnl": self.position_manager.get_daily_realized_pnl(),
+            "total_unrealized_pnl": self.position_manager.get_total_unrealized_pnl(),
+            "portfolio_value": self.risk_manager.get_portfolio_value(),
+            "portfolio_drawdown": (self.risk_manager.get_portfolio_value() - self.config.initial_capital) / self.config.initial_capital
+        }
 
     async def _fetch_and_process_market_data(self) -> Optional[Dict[str, Any]]:
         """Fetches, processes, and enriches market data with technical indicators."""
@@ -60,7 +111,6 @@ class TradingBot:
         for fill in fills:
             logger.info(f"Processing fill event: {fill}")
             try:
-                # The PositionManager now handles the logic of opening/closing
                 self.position_manager.update_from_fill(fill)
             except Exception as e:
                 logger.error(f"Error processing fill event in PositionManager: {e}", exc_info=True)
@@ -73,7 +123,6 @@ class TradingBot:
 
         close_side = 'SELL' if position.side == 'BUY' else 'BUY'
         try:
-            # Submit a closing order with metadata indicating which position to close
             metadata = {"intent": "CLOSE", "position_id_to_close": position.id}
             await self.order_manager.submit_order(
                 symbol=position.symbol, 
@@ -95,10 +144,8 @@ class TradingBot:
         while self.running:
             start_time = time.monotonic()
             try:
-                # 1. Process fills to update position state first
                 await self._process_fill_events()
 
-                # 2. Fetch and process new market data
                 market_data = await self._fetch_and_process_market_data()
                 if not market_data:
                     await asyncio.sleep(self.trade_interval_seconds)
@@ -107,41 +154,32 @@ class TradingBot:
                 ohlcv_df = market_data['ohlcv_df']
                 current_price = market_data['last_price']
 
-                # 3. Update PnL for open positions
                 open_positions = self.position_manager.get_open_positions(self.symbol)
                 for pos in open_positions:
                     self.position_manager.update_position_pnl(pos.id, current_price)
                 
-                # 4. Update risk metrics and check for halts
                 self.risk_manager.update_risk_metrics()
                 self.risk_manager.update_trailing_stops()
 
                 if self.risk_manager.is_halted:
                     logger.warning("Trading halted by risk manager. Monitoring only.")
-                    # Still check for stop loss hits to close risky positions
                 
-                # 5. Check for stop loss triggers
                 positions_to_check = self.position_manager.get_open_positions(self.symbol)
                 for pos in positions_to_check:
                     if pos.stop_loss and ((pos.side == 'BUY' and current_price <= pos.stop_loss) or \
                        (pos.side == 'SELL' and current_price >= pos.stop_loss)):
                         logger.info(f"Stop loss hit for position {pos.id} at price {current_price}")
                         await self._close_position_by_id(pos.id, reason="stop loss")
-                        # Continue to next loop iteration after closing to get fresh state
                         continue
 
-                # 6. If not halted, ask strategy for signals
-                if not self.risk_manager.is_halted:
-                    # Get fresh positions state after potential closes
+                if not self.risk_manager.is_halted and not self.is_halted:
                     current_open_positions = self.position_manager.get_open_positions(self.symbol)
                     
-                    # Ask for new trade signals
                     trade_signal = await self.strategy.analyze_market(ohlcv_df, current_open_positions)
                     if trade_signal:
                         logger.info(f"Strategy generated new trade signal: {trade_signal}")
                         await self.execution_handler.execute_trade_proposal(trade_signal, ohlcv_df)
 
-                    # Ask for position management actions
                     position_management_actions = await self.strategy.manage_positions(ohlcv_df, current_open_positions)
                     for action in position_management_actions:
                         if action.get('action') == 'CLOSE':
