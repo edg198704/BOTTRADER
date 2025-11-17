@@ -65,3 +65,6 @@ jupyter>=1.0.0   # For analysis notebooks
 
 # Note: Some dependencies may require specific Python versions
 # Python 3.8+ is recommended for full compatibility
+
+aiohttp
+pyyaml
