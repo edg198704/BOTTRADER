@@ -1,73 +1,67 @@
+# config_loader.py
 import yaml
 import os
 import logging
+from typing import Dict, Any
 
 logger = logging.getLogger(__name__)
 
 class ConfigLoader:
-    def __init__(self, config_path):
+    """
+    Loads configuration from a YAML file.
+    Provides methods to access configuration values with defaults and validation.
+    """
+    def __init__(self, config_path: str):
         self.config_path = config_path
-        self.config = self._load_config()
+        self.config: Dict[str, Any] = {}
+        self._load_config()
 
     def _load_config(self):
+        """Loads the YAML configuration file."""
         if not os.path.exists(self.config_path):
             logger.error(f"Configuration file not found: {self.config_path}")
             raise FileNotFoundError(f"Configuration file not found: {self.config_path}")
         try:
             with open(self.config_path, 'r') as f:
-                config_data = yaml.safe_load(f)
-            self._validate_config(config_data)
-            return config_data
+                self.config = yaml.safe_load(f)
+            logger.info(f"Configuration loaded successfully from {self.config_path}")
         except yaml.YAMLError as e:
-            logger.error(f"Error parsing YAML configuration: {e}")
+            logger.error(f"Error parsing YAML configuration from {self.config_path}: {e}")
             raise ValueError(f"Invalid YAML configuration: {e}")
         except Exception as e:
-            logger.error(f"An unexpected error occurred while loading config: {e}")
+            logger.error(f"An unexpected error occurred while loading config from {self.config_path}: {e}")
             raise
 
-    def _validate_config(self, config_data):
-        required_sections = ['api', 'market_data', 'strategy', 'risk_management']
-        for section in required_sections:
-            if section not in config_data:
-                raise ValueError(f"Missing required configuration section: '{section}'")
-
-        # Basic validation for API keys
-        if 'api' in config_data:
-            if not all(k in config_data['api'] for k in ['api_key', 'api_secret', 'base_url']):
-                raise ValueError("Missing required API parameters (api_key, api_secret, base_url) in 'api' section.")
-            # Placeholder for environment variable check - recommended for production
-            # if not os.getenv('API_KEY') and not config_data['api'].get('api_key'):
-            #     raise ValueError("API_KEY not found in config or environment variables.")
-
-        # Basic validation for strategy parameters
-        if 'strategy' in config_data:
-            if not all(k in config_data['strategy'] for k in ['symbol', 'interval', 'quantity']):
-                raise ValueError("Missing required strategy parameters (symbol, interval, quantity) in 'strategy' section.")
-
-        # Basic validation for risk management parameters
-        if 'risk_management' in config_data:
-            if not all(k in config_data['risk_management'] for k in ['max_position_size', 'stop_loss_percent', 'take_profit_percent']):
-                raise ValueError("Missing required risk management parameters (max_position_size, stop_loss_percent, take_profit_percent) in 'risk_management' section.")
-            if not isinstance(config_data['risk_management']['max_position_size'], (int, float)) or config_data['risk_management']['max_position_size'] <= 0:
-                raise ValueError("max_position_size must be a positive number.")
-            if not isinstance(config_data['risk_management']['stop_loss_percent'], (int, float)) or not (0 < config_data['risk_management']['stop_loss_percent'] < 1):
-                raise ValueError("stop_loss_percent must be a float between 0 and 1.")
-            if not isinstance(config_data['risk_management']['take_profit_percent'], (int, float)) or not (0 < config_data['risk_management']['take_profit_percent'] < 1):
-                raise ValueError("take_profit_percent must be a float between 0 and 1.")
-
-
-    def get(self, key, default=None):
+    def get(self, key: str, default: Any = None) -> Any:
+        """
+        Retrieves a configuration value.
+        Supports dot notation for nested keys (e.g., "exchange.api_key").
+        """
         keys = key.split('.')
-        val = self.config
-        for k in keys:
-            if isinstance(val, dict) and k in val:
-                val = val[k]
-            else:
+        value = self.config
+        try:
+            for k in keys:
+                value = value[k]
+            return value
+        except (KeyError, TypeError):
+            if default is not None:
+                logger.debug(f"Configuration key '{key}' not found, using default value.")
                 return default
-        return val
+            logger.error(f"Configuration key '{key}' not found and no default value provided.")
+            raise KeyError(f"Missing configuration key: {key}")
 
-    def __getitem__(self, key):
-        return self.get(key)
+    def get_section(self, section: str) -> Dict[str, Any]:
+        """Retrieves an entire section of the configuration."""
+        section_data = self.config.get(section)
+        if section_data is None:
+            logger.warning(f"Configuration section '{section}' not found. Returning empty dictionary.")
+            return {}
+        if not isinstance(section_data, dict):
+            logger.error(f"Configuration section '{section}' is not a dictionary.")
+            raise TypeError(f"Configuration section '{section}' must be a dictionary.")
+        return section_data
 
-    def __str__(self):
-        return str(self.config)
+    def reload_config(self):
+        """Reloads the configuration from the file."""
+        logger.info(f"Reloading configuration from {self.config_path}")
+        self._load_config()
