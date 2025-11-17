@@ -1,22 +1,22 @@
-# Enterprise Bot Configuration
+# BOTTRADER Configuration File
 
-# Initial capital for the portfolio simulation
+# Initial capital for the bot's portfolio
 initial_capital: 10000.0
 
-# --- Exchange Configuration ---
+# Exchange Configuration
 exchange:
-  name: "MockExchange"  # Use "MockExchange" for testing, or a real one like "binance"
-  api_key: "YOUR_API_KEY"      # Recommended to use environment variables instead
-  api_secret: "YOUR_SECRET" # Recommended to use environment variables instead
-  testnet: true           # Use the exchange's testnet/sandbox environment
+  name: "MockExchange"  # MockExchange for testing, or a ccxt-supported exchange like "binance"
+  api_key: "${EXCHANGE_API_KEY:}"      # Load from environment variable, empty string if not set
+  api_secret: "${EXCHANGE_API_SECRET:}"  # Load from environment variable
+  testnet: true         # Use the exchange's testnet/sandbox environment
 
-# --- Strategy Configuration ---
+# Strategy Configuration
 strategy:
-  name: "AIEnsembleStrategy" # Can be "AIEnsembleStrategy" or "SimpleMACrossoverStrategy"
+  name: "SimpleMACrossoverStrategy" # Name of the strategy class to use
   symbol: "BTC/USDT"
-  interval_seconds: 60 # How often the main trading loop runs
+  interval_seconds: 60 # How often the bot's main loop runs
 
-  # Settings for AIEnsembleStrategy
+  # Parameters for AIEnsembleStrategy
   ai_ensemble:
     feature_columns: ['close', 'rsi', 'macd', 'volume']
     confidence_threshold: 0.60
@@ -25,30 +25,34 @@ strategy:
     retrain_interval_hours: 24
     training_epochs: 10
 
-  # Settings for SimpleMACrossoverStrategy
+  # Parameters for SimpleMACrossoverStrategy
   simple_ma:
     fast_ma_period: 10
     slow_ma_period: 20
 
-# --- Risk Management Configuration ---
+# Risk Management Configuration
 risk_management:
   max_position_size_usd: 1000.0   # Max value of a single position in USD
-  max_daily_loss_usd: 500.0       # Bot will halt trading for the day if this loss is realized
+  max_daily_loss_usd: 500.0       # Bot will halt if daily PnL drops below this value (e.g., -500)
   max_open_positions: 5           # Max number of concurrent open positions
-  circuit_breaker_threshold: -0.10 # Halt permanently if portfolio drops 10%
+  circuit_breaker_threshold: -0.10 # Halt trading if portfolio value drops 10% from peak
   use_trailing_stop: true
-  atr_stop_multiplier: 2.0        # Multiplier for ATR-based stop loss
-  stop_loss_fallback_pct: 0.05    # 5% stop loss if ATR fails
+  atr_stop_multiplier: 2.0
+  stop_loss_fallback_pct: 0.05
   risk_per_trade_pct: 0.01        # Risk 1% of total equity on any single trade
 
-# --- Database Configuration ---
+# Database Configuration
 database:
   path: "position_ledger.db"
 
-# --- Telegram Bot Configuration ---
+# Telegram Bot Configuration (Optional)
 telegram:
-  # Create a bot with BotFather on Telegram to get a token
-  bot_token: "YOUR_TELEGRAM_BOT_TOKEN" # Recommended to use environment variables
-  # Get your chat ID from a bot like @userinfobot
+  bot_token: "${TELEGRAM_BOT_TOKEN:}" # Load from environment variable
   admin_chat_ids:
-    - 123456789 # Replace with your admin chat ID
+    - 123456789 # Replace with your Telegram chat ID
+
+# Logging Configuration
+logging:
+  level: "INFO" # DEBUG, INFO, WARNING, ERROR
+  file_path: "logs/trading_bot.log"
+  use_json: false
