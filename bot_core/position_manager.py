@@ -87,7 +87,7 @@ class PositionManager:
                     current_price=entry_price,
                     status='OPEN',
                     stop_loss=stop_loss,
-                    take_profit_levels=json.dumps(take_profit_levels)
+                    take_profit_levels=json.dumps(take_profit_levels) if take_profit_levels else None
                 )
                 session.add(position)
                 session.commit()
