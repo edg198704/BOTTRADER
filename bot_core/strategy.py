@@ -9,6 +9,9 @@ import numpy as np
 
 # ML Imports with safe fallbacks
 try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
     from sklearn.ensemble import VotingClassifier, RandomForestClassifier
     from sklearn.linear_model import LogisticRegression
     from xgboost import XGBClassifier
@@ -20,6 +23,8 @@ except ImportError:
     class RandomForestClassifier: pass
     class LogisticRegression: pass
     class XGBClassifier: pass
+    class nn:
+        class Module: pass
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +101,34 @@ class SimpleMACrossoverStrategy(TradingStrategy):
 class AIEnsembleStrategy(TradingStrategy):
     """Trading strategy based on an ensemble of AI models."""
 
+    class LSTMPredictor(nn.Module):
+        def __init__(self, input_dim, hidden_dim):
+            super().__init__()
+            self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+            self.fc = nn.Linear(hidden_dim, 3)
+
+        def forward(self, x):
+            _, (hn, _) = self.lstm(x)
+            return F.softmax(self.fc(hn[0]), dim=1)
+
+    class AttentionNetwork(nn.Module):
+        def __init__(self, input_dim, hidden_dim):
+            super().__init__()
+            self.embedding = nn.Linear(input_dim, hidden_dim)
+            self.transformer = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, batch_first=True), 
+                num_layers=2
+            )
+            self.fc = nn.Linear(hidden_dim, 3)
+
+        def forward(self, x):
+            if len(x.shape) == 2:
+                x = x.unsqueeze(1)
+            x = self.embedding(x)
+            x = self.transformer(x)
+            x = x.mean(dim=1)
+            return F.softmax(self.fc(x), dim=1)
+
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         if not ML_AVAILABLE:
@@ -105,18 +138,26 @@ class AIEnsembleStrategy(TradingStrategy):
         self.confidence_threshold = config.get('confidence_threshold', 0.6)
         self.model_path = config.get('model_path', 'models/ensemble')
         
-        self.model: Optional[VotingClassifier] = None
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.models: Dict[str, Any] = {}
         self.is_trained = False
-        self._initialize_model()
-        self._load_model()
+        self._initialize_models()
+        self._load_models()
 
-    def _initialize_model(self):
+    def _initialize_models(self):
         """Initializes the ensemble model structure."""
-        clf1 = RandomForestClassifier(n_estimators=50, random_state=1)
-        clf2 = XGBClassifier(n_estimators=50, random_state=1, use_label_encoder=False, eval_metric='logloss')
-        clf3 = LogisticRegression(random_state=1)
-        self.model = VotingClassifier(estimators=[('rf', clf1), ('xgb', clf2), ('lr', clf3)], voting='soft')
-        logger.info("AI ensemble model initialized.")
+        try:
+            self.models['lstm'] = self.LSTMPredictor(len(self.feature_columns), 64).to(self.device)
+            self.models['attention'] = self.AttentionNetwork(len(self.feature_columns), 64).to(self.device)
+            self.models['gb'] = XGBClassifier(n_estimators=10, max_depth=5, random_state=42, verbosity=0, use_label_encoder=False, eval_metric='logloss')
+            self.models['technical'] = VotingClassifier(estimators=[
+                ('rf', RandomForestClassifier(n_estimators=10, max_depth=5, random_state=42)),
+                ('lr', LogisticRegression(max_iter=100, random_state=42))
+            ], voting='soft')
+            logger.info("AI ensemble models initialized.")
+        except Exception as e:
+            logger.error(f"Failed to initialize AI models: {e}")
+            self.models = {}
 
     def _calculate_features(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
@@ -134,25 +175,27 @@ class AIEnsembleStrategy(TradingStrategy):
         return df
 
     async def analyze_market(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> Optional[Dict[str, Any]]:
-        df = self._calculate_features(ohlcv_df)
-        if df is None or df.empty:
+        df_with_features = self._calculate_features(ohlcv_df)
+        if df_with_features is None or df_with_features.empty:
             return None
 
         if not self.is_trained:
-            logger.warning("AI model is not trained. Cannot generate signals. Please train the model first.")
+            logger.warning("AI model is not trained. Cannot generate signals.")
             return None
 
         if any(p.symbol == self.symbol for p in open_positions):
             return None # Don't open a new position if one already exists for this symbol
 
-        prediction = self._predict(df)
+        prediction = self._predict(df_with_features)
         action = prediction['action']
         confidence = prediction['confidence']
 
         logger.debug(f"AI prediction for {self.symbol}: action={action}, confidence={confidence:.2f}")
 
         if action != 'HOLD' and confidence > self.confidence_threshold:
-            return {'action': action, 'confidence': confidence}
+            # Map to BUY/SELL for the bot core
+            final_action = 'BUY' if action == 'buy' else 'SELL'
+            return {'action': final_action, 'confidence': confidence}
         
         return None
 
@@ -162,16 +205,15 @@ class AIEnsembleStrategy(TradingStrategy):
         if ohlcv_df.empty or not position_to_manage or not self.is_trained:
             return actions
 
-        df = self._calculate_features(ohlcv_df)
-        if df is None or df.empty:
+        df_with_features = self._calculate_features(ohlcv_df)
+        if df_with_features is None or df_with_features.empty:
             return actions
 
-        prediction = self._predict(df)
+        prediction = self._predict(df_with_features)
         current_signal = prediction['action']
 
-        # Close if signal is opposite to current position
-        is_opposing_signal = (position_to_manage.side == 'BUY' and current_signal == 'SELL') or \
-                               (position_to_manage.side == 'SELL' and current_signal == 'BUY')
+        is_opposing_signal = (position_to_manage.side == 'BUY' and current_signal == 'sell') or \
+                               (position_to_manage.side == 'SELL' and current_signal == 'buy')
 
         if is_opposing_signal and prediction['confidence'] > self.confidence_threshold:
             logger.info(f"Strategy: Closing {position_to_manage.side} position {position_to_manage.id} for {self.symbol} due to opposing signal '{current_signal}'.")
@@ -180,40 +222,88 @@ class AIEnsembleStrategy(TradingStrategy):
         return actions
 
     def _predict(self, df: pd.DataFrame) -> Dict[str, Any]:
-        latest_features = df[self.feature_columns].iloc[-1:]
-        
-        pred_proba = self.model.predict_proba(latest_features)[0]
-        
-        # Classes are assumed to be trained as: 0=SELL, 1=HOLD, 2=BUY
-        if len(pred_proba) != 3:
-            logger.error("Model prediction shape is incorrect. Expected 3 classes.")
+        if not self.is_trained or not self.models:
             return {'action': 'HOLD', 'confidence': 0.0}
 
-        confidence = np.max(pred_proba)
-        signal_idx = np.argmax(pred_proba)
-
-        action_map = {0: 'SELL', 1: 'HOLD', 2: 'BUY'}
-        final_action = action_map.get(signal_idx, 'HOLD')
-
-        return {'action': final_action, 'confidence': confidence}
-
-    def _save_model(self):
-        os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
-        model_file = os.path.join(self.model_path, f"{self.symbol.replace('/', '_')}_ensemble.joblib")
         try:
-            joblib.dump(self.model, model_file)
-            logger.info(f"AI model saved to {model_file}")
+            latest_features = df[self.feature_columns].iloc[-1:].values
+            latest_features = np.nan_to_num(latest_features, nan=0.0, posinf=0.0, neginf=0.0)
+
+            predictions = []
+            weights = []
+
+            # LSTM prediction
+            if 'lstm' in self.models:
+                features_lstm = latest_features.reshape(1, 1, -1)
+                with torch.no_grad():
+                    lstm_out = self.models['lstm'](torch.FloatTensor(features_lstm).to(self.device))
+                    predictions.append(F.softmax(lstm_out, dim=1).cpu().numpy()[0])
+                    weights.append(0.3)
+            
+            # Attention prediction
+            if 'attention' in self.models:
+                features_attn = latest_features.reshape(1, 1, -1)
+                with torch.no_grad():
+                    attn_out = self.models['attention'](torch.FloatTensor(features_attn).to(self.device))
+                    predictions.append(F.softmax(attn_out, dim=1).cpu().numpy()[0])
+                    weights.append(0.3)
+
+            # Gradient Boosting prediction
+            if 'gb' in self.models:
+                predictions.append(self.models['gb'].predict_proba(latest_features)[0])
+                weights.append(0.25)
+
+            # Technical models prediction
+            if 'technical' in self.models:
+                predictions.append(self.models['technical'].predict_proba(latest_features)[0])
+                weights.append(0.15)
+
+            if not predictions:
+                return {'action': 'HOLD', 'confidence': 0.0}
+
+            ensemble_pred = np.average(predictions, weights=weights, axis=0)
+            action_idx = np.argmax(ensemble_pred)
+            confidence = float(ensemble_pred[action_idx])
+
+            action_map = {0: 'sell', 1: 'hold', 2: 'buy'} # Assumes classes: 0=sell, 1=hold, 2=buy
+            final_action = action_map.get(action_idx, 'hold')
+
+            return {'action': final_action, 'confidence': confidence}
         except Exception as e:
-            logger.error(f"Error saving AI model: {e}")
+            logger.error(f"Error during prediction: {e}")
+            return {'action': 'HOLD', 'confidence': 0.0}
 
-    def _load_model(self):
-        model_file = os.path.join(self.model_path, f"{self.symbol.replace('/', '_')}_ensemble.joblib")
-        if not os.path.exists(model_file):
-            logger.warning(f"No pre-trained AI model found at {model_file}. Model needs training.")
-            return
+    def _save_models(self):
+        os.makedirs(self.model_path, exist_ok=True)
+        symbol_safe = self.symbol.replace('/', '_')
         try:
-            self.model = joblib.load(model_file)
+            joblib.dump(self.models['gb'], os.path.join(self.model_path, f"{symbol_safe}_gb.joblib"))
+            joblib.dump(self.models['technical'], os.path.join(self.model_path, f"{symbol_safe}_technical.joblib"))
+            torch.save(self.models['lstm'].state_dict(), os.path.join(self.model_path, f"{symbol_safe}_lstm.pth"))
+            torch.save(self.models['attention'].state_dict(), os.path.join(self.model_path, f"{symbol_safe}_attention.pth"))
+            logger.info(f"AI models for {self.symbol} saved to {self.model_path}")
+        except Exception as e:
+            logger.error(f"Error saving AI models: {e}")
+
+    def _load_models(self):
+        symbol_safe = self.symbol.replace('/', '_')
+        try:
+            gb_path = os.path.join(self.model_path, f"{symbol_safe}_gb.joblib")
+            tech_path = os.path.join(self.model_path, f"{symbol_safe}_technical.joblib")
+            lstm_path = os.path.join(self.model_path, f"{symbol_safe}_lstm.pth")
+            attn_path = os.path.join(self.model_path, f"{symbol_safe}_attention.pth")
+
+            if not all(os.path.exists(p) for p in [gb_path, tech_path, lstm_path, attn_path]):
+                logger.warning(f"No pre-trained AI models found for {self.symbol} in {self.model_path}. Model needs training.")
+                return
+
+            self.models['gb'] = joblib.load(gb_path)
+            self.models['technical'] = joblib.load(tech_path)
+            self.models['lstm'].load_state_dict(torch.load(lstm_path, map_location=self.device))
+            self.models['attention'].load_state_dict(torch.load(attn_path, map_location=self.device))
+            
             self.is_trained = True
-            logger.info(f"AI model loaded from {model_file}")
+            logger.info(f"AI models for {self.symbol} loaded from {self.model_path}")
         except Exception as e:
-            logger.error(f"Error loading AI model: {e}")
+            logger.error(f"Error loading AI models: {e}")
+            self.is_trained = False
