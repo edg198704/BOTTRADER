@@ -23,7 +23,7 @@ Key supporting files in the root directory include:
 ## Key Features
 
 *   **Modular & Extensible**: Easily swap out exchange APIs or trading strategies by modifying the configuration.
-*   **Advanced AI Strategy**: Includes a powerful ensemble strategy using LSTM, XGBoost, and other models for sophisticated signal generation.
+*   **Advanced AI Strategy**: Includes a powerful ensemble strategy using XGBoost, RandomForest, and other models for sophisticated signal generation.
 *   **Robust Risk Management**: Features dynamic position sizing, ATR-based stop loss, multiple take-profit levels, and a portfolio-level circuit breaker to protect capital.
 *   **Persistent State**: All trades are logged to an SQLite database using SQLAlchemy, ensuring state is not lost on restart.
 *   **Asynchronous Core**: Built with `asyncio` for efficient, non-blocking I/O, critical for handling real-time market data and API requests.
@@ -69,8 +69,9 @@ The bot will initialize all components based on your configuration and begin its
 
 1.  Create a new class in `bot_core/strategy.py` that inherits from `TradingStrategy`.
 2.  Implement the `analyze_market` and `manage_positions` abstract methods with your custom logic.
-3.  Update `config_enterprise.yaml` to set `strategy.name` to your new strategy's class name.
-4.  Update the factory function `get_strategy` in `start_bot.py` to recognize and instantiate your new strategy.
+3.  Import your new strategy class in `start_bot.py`.
+4.  Update the factory function `get_strategy` in `start_bot.py` to recognize and instantiate your new strategy by adding its class name to the `strategy_map` dictionary.
+5.  Update `config_enterprise.yaml` to set `strategy.name` to your new strategy's class name.
 
 ### Database Inspection
 
