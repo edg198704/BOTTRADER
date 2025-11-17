@@ -13,8 +13,8 @@ strategy:
   trade_quantity: 0.001 # Base quantity for trading
   # AIEnsembleStrategy specific parameters
   feature_columns: ['close', 'rsi', 'macd', 'volume']
-  buy_threshold: 0.002
-  sell_threshold: -0.0015
+  confidence_threshold: 0.60 # Minimum model confidence to open a trade
+  model_path: "models/ensemble" # Directory to save/load AI models
   # SimpleMACrossoverStrategy specific parameters
   fast_ma_period: 10
   slow_ma_period: 20
@@ -24,6 +24,9 @@ risk_management:
   max_daily_loss_usd: 500.0 # Maximum cumulative realized loss allowed per day in USD
   max_open_positions: 5 # Maximum number of open positions allowed simultaneously
   circuit_breaker_threshold: -0.10 # Halt trading if portfolio drops by 10% in a day
+  use_trailing_stop: true # Enable/disable trailing stop loss
+  atr_stop_multiplier: 2.0 # Multiplier for ATR-based stop loss calculation
+  stop_loss_fallback_pct: 0.05 # Fallback stop loss percentage if ATR fails
 
 database:
   path: "position_ledger.db" # Path to the SQLite database for position tracking
