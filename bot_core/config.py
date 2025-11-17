@@ -28,11 +28,13 @@ class RiskManagementConfig(BaseModel):
     use_trailing_stop: bool = True
     atr_stop_multiplier: float = 2.0
     stop_loss_fallback_pct: float = 0.05
+    risk_per_trade_pct: float = 0.01 # Risk 1% of portfolio equity per trade
 
 class DatabaseConfig(BaseModel):
     path: str = "position_ledger.db"
 
 class BotConfig(BaseModel):
+    initial_capital: float = 10000.0
     exchange: ExchangeConfig
     strategy: StrategyConfig
     risk_management: RiskManagementConfig
