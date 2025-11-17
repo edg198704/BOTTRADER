@@ -116,7 +116,7 @@ class TradingBot:
                 self.risk_manager.update_risk_metrics()
                 self.risk_manager.update_trailing_stops()
 
-                if self.risk_manager.is_trading_halted:
+                if self.risk_manager.is_halted:
                     logger.warning("Trading halted by risk manager. Monitoring only.")
                     # Still check for stop loss hits to close risky positions
                 
@@ -131,7 +131,7 @@ class TradingBot:
                         continue
 
                 # 6. If not halted, ask strategy for signals
-                if not self.risk_manager.is_trading_halted:
+                if not self.risk_manager.is_halted:
                     # Get fresh positions state after potential closes
                     current_open_positions = self.position_manager.get_open_positions(self.symbol)
                     
