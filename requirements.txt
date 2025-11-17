@@ -1,17 +1,27 @@
+# Core Trading & Data Libraries
 ccxt
 pandas
 numpy
-scikit-learn
+
+# AI & Machine Learning
 torch
-gymnasium
-stable-baselines3
+scikit-learn
 xgboost
-optuna
-python-telegram-bot
-influxdb-client
-memory-profiler
-psutil
+
+# Configuration & Utilities
 pydantic
-python-dotenv
-SQLAlchemy
 PyYAML
+python-dotenv
+
+# Database
+SQLAlchemy
+
+# Asynchronous Operations
+httpx # Required by python-telegram-bot v20+
+
+# Optional: Remote Control
+python-telegram-bot
+
+# Optional: Development & Profiling
+psutil
+memory-profiler
