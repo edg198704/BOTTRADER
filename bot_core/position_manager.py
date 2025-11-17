@@ -6,6 +6,8 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, 
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import SQLAlchemyError
 
+from bot_core.order_manager import FillEvent
+
 logger = logging.getLogger(__name__)
 
 Base = declarative_base()
@@ -47,7 +49,29 @@ class PositionManager:
     def _get_session(self):
         return self.Session()
 
-    def add_position(self, symbol: str, side: str, quantity: float, entry_price: float, stop_loss: float, take_profit_levels: List[Dict[str, Any]]) -> Optional[Position]:
+    def update_from_fill(self, fill: FillEvent):
+        """Updates position state based on a fill event."""
+        position_id_to_close = fill.metadata.get('position_id_to_close')
+        
+        if position_id_to_close:
+            position = self.get_position_by_id(position_id_to_close)
+            if position and position.side != fill.side.upper():
+                self.close_position(position_id_to_close, fill.price)
+            else:
+                logger.warning(f"Received closing fill for position {position_id_to_close}, but sides match or position not found.")
+        elif fill.metadata.get("intent") == "OPEN":
+            self.add_position(
+                symbol=fill.symbol,
+                side=fill.side,
+                quantity=fill.quantity,
+                entry_price=fill.price,
+                stop_loss=fill.metadata.get('stop_loss'),
+                take_profit_levels=fill.metadata.get('take_profit_levels', [])
+            )
+        else:
+            logger.warning(f"Received fill with unclear intent: {fill}")
+
+    def add_position(self, symbol: str, side: str, quantity: float, entry_price: float, stop_loss: Optional[float], take_profit_levels: List[Dict[str, Any]]) -> Optional[Position]:
         with self._get_session() as session:
             try:
                 existing_position = session.query(Position).filter_by(symbol=symbol, status='OPEN').first()
@@ -87,12 +111,20 @@ class PositionManager:
                 return []
 
     def get_position_by_symbol(self, symbol: str) -> Optional[Position]:
-        """Retrieves a single open position by its symbol."""
         with self._get_session() as session:
             try:
                 return session.query(Position).filter_by(symbol=symbol, status='OPEN').first()
             except SQLAlchemyError as e:
                 logger.error(f"Error getting position by symbol {symbol}: {e}")
+                return None
+
+    def get_position_by_id(self, position_id: int) -> Optional[Position]:
+        """Retrieves a single open position by its ID."""
+        with self._get_session() as session:
+            try:
+                return session.query(Position).filter_by(id=position_id, status='OPEN').first()
+            except SQLAlchemyError as e:
+                logger.error(f"Error getting position by id {position_id}: {e}")
                 return None
 
     def update_position_pnl(self, position_id: int, current_price: float) -> Optional[Position]:
@@ -153,8 +185,8 @@ class PositionManager:
     def get_total_unrealized_pnl(self) -> float:
         with self._get_session() as session:
             try:
-                open_positions = self.get_open_positions()
-                return sum(p.unrealized_pnl for p in open_positions)
+                total_pnl = session.query(func.sum(Position.unrealized_pnl)).filter_by(status='OPEN').scalar()
+                return total_pnl or 0.0
             except SQLAlchemyError as e:
                 logger.error(f"Error calculating total unrealized PnL: {e}")
                 return 0.0
