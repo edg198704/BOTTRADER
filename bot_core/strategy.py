@@ -5,9 +5,13 @@ import joblib
 import asyncio
 from typing import Dict, Any, List, Optional, Tuple
 from enum import Enum
+import pickle
+from datetime import datetime, timezone
 
 import pandas as pd
 import numpy as np
+
+from bot_core.config import AIStrategyConfig
 
 # ML Imports with safe fallbacks
 try:
@@ -102,14 +106,6 @@ class SimpleMACrossoverStrategy(TradingStrategy):
         return actions
 
 # --- AI Components (Consolidated from monolithic files for integration) ---
-# NOTE: In a full refactor, these large classes would be in their own files.
-
-class _LegacyAIConfig:
-    """A temporary bridge class to make legacy AI components work with the new config."""
-    def __init__(self, config_dict: Dict[str, Any]):
-        self.symbols = [config_dict.get('symbol', 'BTC/USDT')]
-        # Add other fields with defaults as needed by the legacy classes
-        self.ensemble_models = config_dict.get('ensemble_models', ['random_forest', 'gradient_boost', 'logistic_regression', 'xgboost'])
 
 class MarketRegime(Enum):
     BULL = "bull"
@@ -118,8 +114,8 @@ class MarketRegime(Enum):
     VOLATILE = "volatile"
     UNKNOWN = "unknown"
 
-class CompleteMarketRegimeDetector:
-    def __init__(self, config: Dict[str, Any]):
+class _MarketRegimeDetector:
+    def __init__(self, config: AIStrategyConfig):
         self.config = config
 
     async def detect_regime(self, symbol: str, df: pd.DataFrame) -> Dict[str, Any]:
@@ -145,64 +141,130 @@ class CompleteMarketRegimeDetector:
             logger.error(f"Error in regime detection for {symbol}: {e}")
             return {'regime': MarketRegime.UNKNOWN.value, 'confidence': 0.0}
 
-class AdvancedEnsembleLearner:
-    def __init__(self, config: Dict[str, Any]):
+class _EnsembleLearner:
+    class LSTMPredictor(nn.Module):
+        def __init__(self, input_dim, hidden_dim):
+            super().__init__()
+            self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+            self.fc = nn.Linear(hidden_dim, 3)
+
+        def forward(self, x):
+            _, (hn, _) = self.lstm(x)
+            return F.softmax(self.fc(hn[0]), dim=1)
+
+    class AttentionNetwork(nn.Module):
+        def __init__(self, input_dim, hidden_dim):
+            super().__init__()
+            self.embedding = nn.Linear(input_dim, hidden_dim)
+            self.transformer = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, batch_first=True), 
+                num_layers=2
+            )
+            self.fc = nn.Linear(hidden_dim, 3)
+
+        def forward(self, x):
+            if len(x.shape) == 2:
+                x = x.unsqueeze(1)
+            x = self.embedding(x)
+            x = self.transformer(x)
+            x = x.mean(dim=1)
+            return F.softmax(self.fc(x), dim=1)
+
+    def __init__(self, config: AIStrategyConfig):
         if not ML_AVAILABLE: raise ImportError("ML libraries not available")
         self.config = config
-        self.models: Dict[str, Any] = {}
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.symbol_models: Dict[str, Dict[str, Any]] = {}
         self.is_trained = False
         self._initialize_models()
 
     def _initialize_models(self):
-        self.models['gb'] = XGBClassifier(n_estimators=10, max_depth=5, random_state=42, use_label_encoder=False, eval_metric='logloss')
-        self.models['technical'] = VotingClassifier(estimators=[
-            ('rf', RandomForestClassifier(n_estimators=10, max_depth=5, random_state=42)),
-            ('lr', LogisticRegression(max_iter=100, random_state=42))
-        ], voting='soft')
-        logger.info("AI ensemble models initialized.")
+        # This initializes a template. Actual models are created per-symbol.
+        logger.info("AI ensemble model templates initialized.")
         asyncio.create_task(self._load_models())
 
-    async def _load_models(self):
-        model_path = self.config.get('model_path', 'models/ensemble')
-        symbol_safe = self.config.get('symbol', '').replace('/', '_')
-        try:
-            gb_path = os.path.join(model_path, f"gb_model.pkl")
-            tech_path = os.path.join(model_path, f"technical_model.pkl")
-            if os.path.exists(gb_path) and os.path.exists(tech_path):
-                self.models['gb'] = joblib.load(gb_path)
-                self.models['technical'] = joblib.load(tech_path)
-                self.is_trained = True
-                logger.info(f"AI models for {self.config.get('symbol')} loaded from {model_path}")
-        except Exception as e:
-            logger.warning(f"Could not load pre-trained AI models: {e}. Models will need training.")
-            self.is_trained = False
+    def _get_or_create_symbol_models(self, symbol: str) -> Dict[str, Any]:
+        if symbol not in self.symbol_models:
+            logger.info(f"Creating new model set for symbol: {symbol}")
+            self.symbol_models[symbol] = {
+                'lstm': self.LSTMPredictor(4, 64).to(self.device),
+                'gb': XGBClassifier(n_estimators=10, max_depth=5, random_state=42, use_label_encoder=False, eval_metric='logloss'),
+                'attention': self.AttentionNetwork(4, 64).to(self.device),
+                'technical': VotingClassifier(estimators=[
+                    ('rf', RandomForestClassifier(n_estimators=10, max_depth=5, random_state=42)),
+                    ('lr', LogisticRegression(max_iter=100, random_state=42))
+                ], voting='soft')
+            }
+        return self.symbol_models[symbol]
 
-    async def predict(self, df: pd.DataFrame) -> Dict[str, Any]:
+    async def _load_models(self):
+        base_path = self.config.model_path
+        if not os.path.isdir(base_path):
+            return
+
+        for symbol_dir in os.listdir(base_path):
+            symbol_path = os.path.join(base_path, symbol_dir)
+            if os.path.isdir(symbol_path):
+                symbol = symbol_dir.replace('_', '/')
+                try:
+                    models = self._get_or_create_symbol_models(symbol)
+                    models['gb'] = joblib.load(os.path.join(symbol_path, "gb_model.pkl"))
+                    models['technical'] = joblib.load(os.path.join(symbol_path, "technical_model.pkl"))
+                    models['lstm'].load_state_dict(torch.load(os.path.join(symbol_path, "lstm_model.pth")))
+                    models['attention'].load_state_dict(torch.load(os.path.join(symbol_path, "attention_model.pth")))
+                    self.is_trained = True
+                    logger.info(f"Loaded models for {symbol}")
+                except Exception as e:
+                    logger.warning(f"Could not load models for {symbol}: {e}")
+
+    async def predict(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
         if not self.is_trained: return {'action': 'hold', 'confidence': 0.0}
         try:
-            feature_cols = self.config.get('feature_columns', ['close', 'rsi', 'macd', 'volume'])
-            # Ensure all feature columns exist, fill with 0 if not
+            models = self._get_or_create_symbol_models(symbol)
+            feature_cols = self.config.feature_columns
             for col in feature_cols:
                 if col not in df.columns:
                     df[col] = 0
-            latest_features = df[feature_cols].iloc[-1:].values
-            latest_features = np.nan_to_num(latest_features, nan=0.0)
+            
+            features = df[feature_cols].iloc[-1:].values
+            features = np.nan_to_num(features, nan=0.0)
 
-            gb_pred = self.models['gb'].predict_proba(latest_features)[0]
-            tech_pred = self.models['technical'].predict_proba(latest_features)[0]
+            predictions = []
+            weights = []
 
-            ensemble_pred = np.average([gb_pred, tech_pred], weights=[0.6, 0.4], axis=0)
+            # GB Prediction
+            gb_pred = models['gb'].predict_proba(features)[0]
+            predictions.append(gb_pred)
+            weights.append(0.25)
+
+            # Technical Prediction
+            tech_pred = models['technical'].predict_proba(features)[0]
+            predictions.append(tech_pred)
+            weights.append(0.15)
+
+            # NN Predictions
+            features_tensor = torch.FloatTensor(features).unsqueeze(1).to(self.device)
+            with torch.no_grad():
+                lstm_pred = models['lstm'](features_tensor).cpu().numpy()[0]
+                predictions.append(lstm_pred)
+                weights.append(0.3)
+
+                attn_pred = models['attention'](features_tensor).cpu().numpy()[0]
+                predictions.append(attn_pred)
+                weights.append(0.3)
+
+            ensemble_pred = np.average(predictions, weights=weights, axis=0)
             action_idx = np.argmax(ensemble_pred)
             confidence = float(ensemble_pred[action_idx])
             action_map = {0: 'sell', 1: 'hold', 2: 'buy'}
             return {'action': action_map.get(action_idx, 'hold'), 'confidence': confidence}
         except Exception as e:
-            logger.error(f"Error during prediction: {e}")
+            logger.error(f"Error during prediction for {symbol}: {e}")
             return {'action': 'hold', 'confidence': 0.0}
 
-class CompletePPOAgent:
-    def __init__(self, config: Dict[str, Any]): pass
-    async def act(self, df: pd.DataFrame) -> Tuple[int, float]: return (1, 0.5)
+class _PPOAgent:
+    def __init__(self, config: AIStrategyConfig): pass
+    async def act(self, df: pd.DataFrame, current_price: float) -> Tuple[int, float]: return (1, 0.5) # Return hold
 
 # --- AI Ensemble Strategy ---
 
@@ -212,17 +274,16 @@ class AIEnsembleStrategy(TradingStrategy):
         if not ML_AVAILABLE:
             raise ImportError("Required ML libraries not installed for AIEnsembleStrategy.")
         
-        self.ai_config = config.get('ai_ensemble', {})
-        self.confidence_threshold = self.ai_config.get('confidence_threshold', 0.6)
-        self.use_regime_filter = self.ai_config.get('use_regime_filter', True)
-        self.use_ppo_agent = self.ai_config.get('use_ppo_agent', False)
+        # Adapt the dictionary config to the Pydantic model for the components
+        self.ai_config = AIStrategyConfig(**config.get('ai_ensemble', {}))
         
-        # Pass the nested ai_ensemble config to the components
-        ai_component_config = {**self.ai_config, 'symbol': self.symbol}
-
-        self.regime_detector = CompleteMarketRegimeDetector(ai_component_config)
-        self.ensemble_learner = AdvancedEnsembleLearner(ai_component_config)
-        self.ppo_agent = CompletePPOAgent(ai_component_config) if self.use_ppo_agent else None
+        self.confidence_threshold = self.ai_config.confidence_threshold
+        self.use_regime_filter = self.ai_config.use_regime_filter
+        self.use_ppo_agent = self.ai_config.use_ppo_agent
+        
+        self.regime_detector = _MarketRegimeDetector(self.ai_config)
+        self.ensemble_learner = _EnsembleLearner(self.ai_config)
+        self.ppo_agent = _PPOAgent(self.ai_config) if self.use_ppo_agent else None
 
     async def analyze_market(self, ohlcv_df: pd.DataFrame, open_positions: List[Any]) -> Optional[Dict[str, Any]]:
         if ohlcv_df is None or ohlcv_df.empty or not self.ensemble_learner.is_trained:
@@ -236,7 +297,7 @@ class AIEnsembleStrategy(TradingStrategy):
         logger.debug(f"Market regime for {self.symbol}: {regime}")
 
         # 2. Get Ensemble Prediction
-        ensemble_prediction = await self.ensemble_learner.predict(ohlcv_df)
+        ensemble_prediction = await self.ensemble_learner.predict(ohlcv_df, self.symbol)
         logger.debug(f"Ensemble prediction for {self.symbol}: {ensemble_prediction}")
 
         # 3. Combine signals into a final decision
