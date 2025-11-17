@@ -1,7 +1,6 @@
 import yaml
 import os
 import logging
-from typing import Dict, Any
 from bot_core.config import BotConfig
 
 logger = logging.getLogger(__name__)
@@ -34,5 +33,6 @@ class ConfigLoader:
             logger.error(f"Error parsing YAML configuration from {self.config_path}: {e}")
             raise ValueError(f"Invalid YAML configuration: {e}")
         except Exception as e:
+            # This will catch Pydantic validation errors as well
             logger.error(f"An unexpected error occurred while loading or validating config: {e}")
             raise
