@@ -11,6 +11,7 @@ from bot_core.risk_manager import RiskManager
 from bot_core.strategy import TradingStrategy
 from bot_core.config import BotConfig
 from bot_core.execution_handler import ExecutionHandler
+from bot_core.order_manager import OrderManager, FillEvent
 from bot_core.data_handler import create_dataframe, calculate_technical_indicators
 
 logger = logging.getLogger(__name__)
@@ -18,51 +19,65 @@ logger = logging.getLogger(__name__)
 class TradingBot:
     def __init__(self, config: BotConfig, exchange_api: ExchangeAPI,
                  strategy: TradingStrategy, position_manager: PositionManager, 
-                 risk_manager: RiskManager, execution_handler: ExecutionHandler):
+                 risk_manager: RiskManager, execution_handler: ExecutionHandler,
+                 order_manager: OrderManager):
         self.config = config
         self.exchange_api = exchange_api
         self.position_manager = position_manager
         self.risk_manager = risk_manager
         self.strategy = strategy
         self.execution_handler = execution_handler
+        self.order_manager = order_manager
         self.symbol = self.strategy.symbol
         self.trade_interval_seconds = self.strategy.interval_seconds
         self.running = False
+        self.tasks = []
         logger.info(f"TradingBot initialized for symbol: {self.symbol}, interval: {self.trade_interval_seconds}s")
 
     async def _fetch_and_process_market_data(self) -> Optional[Dict[str, Any]]:
         """Fetches, processes, and enriches market data with technical indicators."""
         try:
-            # Fetch raw data
             ohlcv_data_list = await self.exchange_api.get_market_data(self.symbol, '1h', 200)
-            ticker_data = await self.exchange_api.get_market_data(self.symbol)
+            ticker_data = await self.exchange_api.get_ticker_data(self.symbol)
             
             if not isinstance(ohlcv_data_list, list) or not ticker_data or not ticker_data.get('lastPrice'):
                 logger.warning(f"Received invalid or empty market data for {self.symbol}")
                 return None
             
-            # Create DataFrame
             df = create_dataframe(ohlcv_data_list)
-            if df is None:
-                return None
+            if df is None: return None
 
-            # Calculate indicators
             df_with_indicators = calculate_technical_indicators(df)
-
             logger.debug(f"Fetched and processed {len(df_with_indicators)} candles for {self.symbol}")
             return {"ohlcv_df": df_with_indicators, "last_price": float(ticker_data['lastPrice'])}
         except Exception as e:
             logger.error(f"Error fetching or processing market data for {self.symbol}: {e}", exc_info=True)
             return None
 
-    async def _execute_trade_action(self, action: Dict[str, Any], ohlcv_df: pd.DataFrame):
-        """Creates a trade proposal and delegates to the ExecutionHandler."""
-        trade_proposal = {
-            'symbol': self.symbol,
-            'action': action.get('action'),
-            'confidence': action.get('confidence')
-        }
-        await self.execution_handler.execute_trade_proposal(trade_proposal, ohlcv_df)
+    async def _process_fill_events(self):
+        """Processes fill events from the OrderManager to update positions."""
+        fills = await self.order_manager.get_fill_events()
+        for fill in fills:
+            logger.info(f"Processing fill event: {fill}")
+            position = self.position_manager.get_position_by_symbol(fill.symbol)
+            
+            if position and position.side != fill.side: # Closing a position
+                # This is a simplified close logic. A real system would handle partial closes.
+                self.position_manager.close_position(position.id, fill.price)
+            elif not position: # Opening a new position
+                # We need stop loss and take profit info here. This is a limitation.
+                # For now, we'll add the position without them, assuming RiskManager handles it.
+                # A better approach would be to store the intended SL/TP with the order.
+                self.position_manager.add_position(
+                    symbol=fill.symbol,
+                    side=fill.side,
+                    quantity=fill.quantity,
+                    entry_price=fill.price,
+                    stop_loss=0, # Placeholder
+                    take_profit_levels=[] # Placeholder
+                )
+            else: # Increasing a position
+                logger.warning(f"Received fill for an existing position side. This logic is not yet implemented. {fill}")
 
     async def _close_position_by_id(self, position_id: int, reason: str = "strategy signal"):
         position = next((p for p in self.position_manager.get_open_positions() if p.id == position_id), None)
@@ -72,24 +87,24 @@ class TradingBot:
 
         close_side = 'SELL' if position.side == 'BUY' else 'BUY'
         try:
-            order_response = await self.exchange_api.place_order(position.symbol, close_side, 'MARKET', position.quantity)
-            logger.info(f"Closing order for position {position_id} ({reason}): {order_response}")
-            if order_response and order_response.get('status') == 'FILLED':
-                close_price = float(order_response['cummulativeQuoteQty']) / float(order_response['executedQty'])
-                self.position_manager.close_position(position_id, close_price)
-            else:
-                logger.error(f"Failed to close position {position_id}. Order status: {order_response.get('status')}")
+            # Instead of placing order directly, we submit to order manager
+            await self.order_manager.submit_order(position.symbol, close_side, 'MARKET', position.quantity)
+            logger.info(f"Submitted closing order for position {position_id} ({reason})")
         except Exception as e:
-            logger.error(f"Error closing position {position_id} for {position.symbol}: {e}", exc_info=True)
+            logger.error(f"Error submitting closing order for position {position_id}: {e}", exc_info=True)
 
     async def run(self):
         """Main execution loop of the trading bot."""
         self.running = True
+        await self.order_manager.start()
         logger.info(f"Starting TradingBot for {self.symbol}...")
 
         while self.running:
             start_time = time.monotonic()
             try:
+                # Process any fills that have occurred
+                await self._process_fill_events()
+
                 market_data = await self._fetch_and_process_market_data()
                 if not market_data:
                     await asyncio.sleep(self.trade_interval_seconds)
@@ -122,7 +137,7 @@ class TradingBot:
                 trade_signal = await self.strategy.analyze_market(ohlcv_df, open_positions)
                 if trade_signal:
                     logger.info(f"Strategy generated new trade signal: {trade_signal}")
-                    await self._execute_trade_action(trade_signal, ohlcv_df)
+                    await self.execution_handler.execute_trade_proposal(trade_signal, ohlcv_df)
 
                 position_management_actions = await self.strategy.manage_positions(ohlcv_df, open_positions)
                 for action in position_management_actions:
@@ -145,7 +160,8 @@ class TradingBot:
                 sleep_duration = max(0, self.trade_interval_seconds - elapsed_time)
                 await asyncio.sleep(sleep_duration)
 
-    def stop(self):
+    async def stop(self):
         """Stops the trading bot gracefully."""
         logger.info("Stopping TradingBot...")
         self.running = False
+        await self.order_manager.stop()
