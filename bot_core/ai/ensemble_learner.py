@@ -3,7 +3,7 @@ import joblib
 import asyncio
 import copy
 import json
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List
 import pandas as pd
 import numpy as np
 
@@ -21,6 +21,7 @@ try:
     from sklearn.model_selection import train_test_split
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import MinMaxScaler
+    from sklearn.metrics import precision_score, classification_report
     from xgboost import XGBClassifier
     ML_AVAILABLE = True
 except ImportError:
@@ -31,6 +32,8 @@ except ImportError:
     class LogisticRegression: pass
     class XGBClassifier: pass
     class MinMaxScaler: pass
+    def precision_score(*args, **kwargs): return 0.0
+    def classification_report(*args, **kwargs): return ""
     class nn:
         class Module: pass
     class optim: pass
@@ -150,7 +153,6 @@ class EnsembleLearner:
             models = self._get_or_create_symbol_models(symbol)
             scaler = self.symbol_scalers.get(symbol)
             
-            # CRITICAL SAFETY CHECK: Do not predict with unscaled data if scaler is missing.
             if not scaler:
                 logger.error("Scaler not found for symbol. Cannot predict safely.", symbol=symbol)
                 return {'action': 'hold', 'confidence': 0.0}
@@ -159,31 +161,12 @@ class EnsembleLearner:
             features = np.nan_to_num(sequence_df[self.config.feature_columns].values, nan=0.0)
             features_scaled = scaler.transform(features)
 
-            predictions = []
-            weights_config = self.config.ensemble_weights
-            weights = [
-                weights_config.xgboost,
-                weights_config.technical_ensemble,
-                weights_config.lstm,
-                weights_config.attention
-            ]
-
+            # Prepare inputs
             last_step_features = features_scaled[-1, :].reshape(1, -1)
-            gb_pred = models['gb'].predict_proba(last_step_features)[0]
-            predictions.append(gb_pred)
-            tech_pred = models['technical'].predict_proba(last_step_features)[0]
-            predictions.append(tech_pred)
-
             sequence_tensor = torch.FloatTensor(features_scaled).unsqueeze(0).to(self.device)
-            with torch.no_grad():
-                models['lstm'].eval()
-                models['attention'].eval()
-                lstm_pred = models['lstm'](sequence_tensor).cpu().numpy()[0]
-                predictions.append(lstm_pred)
-                attn_pred = models['attention'](sequence_tensor).cpu().numpy()[0]
-                predictions.append(attn_pred)
 
-            ensemble_pred = np.average(predictions, weights=weights, axis=0)
+            ensemble_pred = self._get_ensemble_prediction(models, last_step_features, sequence_tensor)
+            
             action_idx = np.argmax(ensemble_pred)
             confidence = float(ensemble_pred[action_idx])
             action_map = {0: 'sell', 1: 'hold', 2: 'buy'}
@@ -192,6 +175,49 @@ class EnsembleLearner:
         except Exception as e:
             logger.error("Error during prediction", symbol=symbol, error=str(e), exc_info=True)
             return {'action': 'hold', 'confidence': 0.0}
+
+    def _get_ensemble_prediction(self, models: Dict[str, Any], X_flat: np.ndarray, X_seq: torch.Tensor) -> np.ndarray:
+        """Calculates the weighted average prediction from all models."""
+        predictions = []
+        weights_config = self.config.ensemble_weights
+        weights = [
+            weights_config.xgboost,
+            weights_config.technical_ensemble,
+            weights_config.lstm,
+            weights_config.attention
+        ]
+
+        # Scikit-learn models
+        gb_pred = models['gb'].predict_proba(X_flat)
+        predictions.append(gb_pred)
+        tech_pred = models['technical'].predict_proba(X_flat)
+        predictions.append(tech_pred)
+
+        # PyTorch models
+        with torch.no_grad():
+            models['lstm'].eval()
+            models['attention'].eval()
+            
+            # Handle batch dimension if missing (for single prediction)
+            if X_seq.dim() == 2:
+                 X_seq = X_seq.unsqueeze(0)
+
+            lstm_pred = models['lstm'](X_seq).cpu().numpy()
+            predictions.append(lstm_pred)
+            attn_pred = models['attention'](X_seq).cpu().numpy()
+            predictions.append(attn_pred)
+
+        # Ensure all predictions have the same shape (batch_size, 3)
+        # For single prediction, shape is (1, 3). For batch validation, shape is (N, 3).
+        # We need to stack them along a new axis to average.
+        # predictions list: [ (N,3), (N,3), (N,3), (N,3) ]
+        
+        stacked_preds = np.array(predictions) # Shape: (4, N, 3)
+        ensemble_pred = np.average(stacked_preds, weights=weights, axis=0) # Shape: (N, 3)
+        
+        if ensemble_pred.shape[0] == 1:
+            return ensemble_pred[0]
+        return ensemble_pred
 
     def _create_labels(self, df: pd.DataFrame) -> pd.Series:
         horizon = self.config.features.labeling_horizon
@@ -214,7 +240,7 @@ class EnsembleLearner:
             y_seq.append(y[i+seq_length-1])
         return np.array(X_seq), np.array(y_seq)
 
-    def train(self, symbol: str, df: pd.DataFrame):
+    def train(self, symbol: str, df: pd.DataFrame) -> bool:
         logger.info("Starting model training", symbol=symbol)
         try:
             # 1. Create features and labels
@@ -226,7 +252,7 @@ class EnsembleLearner:
 
             if len(np.unique(y)) < 3:
                 logger.warning("Training data has fewer than 3 unique labels. Skipping training.", symbol=symbol, labels=np.unique(y))
-                return
+                return False
 
             # 2. Split data BEFORE scaling to prevent data leakage
             X_train, X_val, y_train, y_val = train_test_split(
@@ -237,9 +263,7 @@ class EnsembleLearner:
             scaler = MinMaxScaler()
             X_train_scaled = scaler.fit_transform(X_train)
             X_val_scaled = scaler.transform(X_val)
-            self.symbol_scalers[symbol] = scaler
-            logger.info("Feature scaler fitted on training data.", symbol=symbol)
-
+            
             # 4. Create sequences from SCALED data
             X_train_seq, y_train_seq = self._create_sequences(X_train_scaled, y_train)
             X_val_seq, y_val_seq = self._create_sequences(X_val_scaled, y_val)
@@ -247,6 +271,8 @@ class EnsembleLearner:
             # 5. Prepare flat data for scikit-learn models from the last step of each sequence
             X_train_flat_scaled = X_train_seq[:, -1, :]
             y_train_flat = y_train_seq
+            X_val_flat_scaled = X_val_seq[:, -1, :]
+            y_val_flat = y_val_seq
             
             models = self._get_or_create_symbol_models(symbol)
 
@@ -254,6 +280,18 @@ class EnsembleLearner:
             logger.info("Training scikit-learn models...", symbol=symbol)
             models['gb'].fit(X_train_flat_scaled, y_train_flat)
             models['technical'].fit(X_train_flat_scaled, y_train_flat)
+            
+            # Log Feature Importance for Tree Models
+            try:
+                feature_names = self.config.feature_columns
+                if hasattr(models['gb'], 'feature_importances_'):
+                    importances = models['gb'].feature_importances_
+                    indices = np.argsort(importances)[::-1][:5]
+                    top_features = {feature_names[i]: float(importances[i]) for i in indices}
+                    logger.info("XGBoost Top 5 Features", symbol=symbol, features=top_features)
+            except Exception as e:
+                logger.warning("Could not log feature importance", error=str(e))
+
             logger.info("Scikit-learn models trained.", symbol=symbol)
 
             # 7. Train PyTorch models on scaled sequence data
@@ -267,13 +305,50 @@ class EnsembleLearner:
             self._train_pytorch_model(models['attention'], X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor)
             logger.info("PyTorch models trained.", symbol=symbol)
 
+            # 8. EVALUATION & VALIDATION (Champion-Challenger Logic)
+            logger.info("Evaluating new models on validation set...", symbol=symbol)
+            
+            # Generate ensemble predictions for the validation set
+            ensemble_probs = self._get_ensemble_prediction(models, X_val_flat_scaled, X_val_tensor)
+            y_pred = np.argmax(ensemble_probs, axis=1)
+            
+            # Calculate metrics
+            # We care most about precision on Buy (2) and Sell (0) signals
+            precision = precision_score(y_val_flat, y_pred, average=None, labels=[0, 1, 2], zero_division=0)
+            # precision array corresponds to [0, 1, 2] -> [Sell, Hold, Buy]
+            
+            sell_precision = precision[0]
+            buy_precision = precision[2]
+            avg_action_precision = (sell_precision + buy_precision) / 2
+            
+            report = classification_report(y_val_flat, y_pred, target_names=['Sell', 'Hold', 'Buy'], zero_division=0)
+            logger.info("Validation Classification Report", symbol=symbol, report=report)
+            
+            threshold = self.config.training.min_precision_threshold
+            logger.info("Model Performance Check", 
+                        symbol=symbol, 
+                        buy_precision=buy_precision, 
+                        sell_precision=sell_precision, 
+                        avg_action_precision=avg_action_precision,
+                        threshold=threshold)
+
+            if avg_action_precision < threshold:
+                logger.warning("New model failed validation threshold. Discarding.", 
+                               symbol=symbol, 
+                               achieved=avg_action_precision, 
+                               required=threshold)
+                return False
+
+            # 9. Save if passed validation
+            self.symbol_scalers[symbol] = scaler # Update the scaler in memory
             self._save_models(symbol)
             self.is_trained = True
-            logger.info("All models trained and saved successfully.", symbol=symbol)
+            logger.info("All models trained, validated, and saved successfully.", symbol=symbol)
+            return True
 
         except Exception as e:
             logger.critical("An error occurred during model training", symbol=symbol, error=str(e), exc_info=True)
-            self.is_trained = False
+            return False
 
     def _train_pytorch_model(self, model: nn.Module, X_train: torch.Tensor, y_train: torch.Tensor, X_val: torch.Tensor, y_val: torch.Tensor):
         train_cfg = self.config.training
