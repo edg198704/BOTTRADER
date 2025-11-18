@@ -7,6 +7,32 @@ class ExchangeConfig(BaseModel):
     api_secret: Optional[str] = None
     testnet: bool = True
 
+class XGBoostConfig(BaseModel):
+    n_estimators: int = 100
+    max_depth: int = 5
+    learning_rate: float = 0.1
+    subsample: float = 0.8
+    colsample_bytree: float = 0.8
+
+class RandomForestConfig(BaseModel):
+    n_estimators: int = 100
+    max_depth: int = 10
+    min_samples_leaf: int = 5
+
+class LogisticRegressionConfig(BaseModel):
+    max_iter: int = 200
+    C: float = 1.0
+
+class EnsembleWeights(BaseModel):
+    xgboost: float = 0.3
+    technical_ensemble: float = 0.2
+    lstm: float = 0.25
+    attention: float = 0.25
+
+class MarketRegimeConfig(BaseModel):
+    trend_strength_threshold: float = 0.01
+    volatility_multiplier: float = 1.5
+
 class AIStrategyConfig(BaseModel):
     feature_columns: List[str] = Field(default_factory=lambda: ['close', 'rsi', 'macd', 'volume'])
     confidence_threshold: float = 0.60
@@ -15,6 +41,13 @@ class AIStrategyConfig(BaseModel):
     use_ppo_agent: bool = False # Disabled by default as it's more experimental
     retrain_interval_hours: int = 24
     training_epochs: int = 10
+
+    # Configurable model parameters
+    xgboost: XGBoostConfig = Field(default_factory=XGBoostConfig)
+    random_forest: RandomForestConfig = Field(default_factory=RandomForestConfig)
+    logistic_regression: LogisticRegressionConfig = Field(default_factory=LogisticRegressionConfig)
+    ensemble_weights: EnsembleWeights = Field(default_factory=EnsembleWeights)
+    market_regime: MarketRegimeConfig = Field(default_factory=MarketRegimeConfig)
 
 class SimpleMAStrategyConfig(BaseModel):
     fast_ma_period: int = 10
