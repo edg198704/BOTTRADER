@@ -201,7 +201,7 @@ class TradingBot:
                     continue
 
                 open_positions = self.position_manager.get_all_open_positions()
-                portfolio_value = self.position_manager.get_portfolio_value(self.latest_prices, self.config.initial_capital, open_positions)
+                portfolio_value = self.position_manager.get_portfolio_value(self.latest_prices, open_positions)
                 self.risk_manager.update_portfolio_risk(portfolio_value)
 
                 # Update shared state for Telegram bot
@@ -269,7 +269,7 @@ class TradingBot:
             return
 
         open_positions = self.position_manager.get_all_open_positions()
-        portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, self.config.initial_capital, open_positions)
+        portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, open_positions)
 
         # --- Handle Opening Positions ---
         if not position:
