@@ -34,7 +34,6 @@ class TradingBot:
         self.start_time = datetime.now(timezone.utc)
         self.latest_prices: Dict[str, float] = {}
         self.tasks: list[asyncio.Task] = []
-        self.last_candle_timestamp: Dict[str, pd.Timestamp] = {}
         
         self._initialize_shared_state()
         logger.info("TradingBot orchestrator initialized.")
@@ -57,156 +56,74 @@ class TradingBot:
         # Start shared loops
         self.tasks.append(asyncio.create_task(self.data_handler.run()))
         self.tasks.append(asyncio.create_task(self._monitoring_loop()))
+        self.tasks.append(asyncio.create_task(self._position_management_loop()))
 
-        # Start a unified trading cycle for each symbol
+        # Start a trading cycle for each symbol
         for symbol in self.config.strategy.symbols:
-            self.tasks.append(asyncio.create_task(self._unified_trading_cycle(symbol)))
+            self.tasks.append(asyncio.create_task(self._trading_cycle_for_symbol(symbol)))
         
         await asyncio.gather(*self.tasks, return_exceptions=True)
 
-    async def _unified_trading_cycle(self, symbol: str):
-        """
-        Runs a unified trading and position management cycle for a single symbol.
-        This loop runs on a fast tick, checks for SL/TP/TSL on every tick,
-        and runs the strategy analysis only when a new candle is detected.
-        """
-        logger.info("Starting unified trading cycle for symbol", symbol=symbol)
+    async def _trading_cycle_for_symbol(self, symbol: str):
+        """Runs the trading logic loop for a single symbol to find entry/exit signals."""
+        logger.info("Starting trading cycle for symbol", symbol=symbol)
         while self.running:
             set_correlation_id()
             try:
-                # --- 1. Get latest price and check open position ---
-                current_price = self.latest_prices.get(symbol)
-                if not current_price:
-                    await asyncio.sleep(self.config.strategy.cycle_interval_seconds)
-                    continue
-
-                position = self.position_manager.get_open_position(symbol)
-
-                # --- 2. Manage open position (SL/TP/TSL) on every tick ---
-                if position:
-                    # --- Trailing Stop Logic ---
-                    if self.config.risk_management.use_trailing_stop:
-                        updated_pos = await self._handle_trailing_stop(position, current_price)
-                        if updated_pos:
-                            position = updated_pos # Refresh position state
-                        else: # Position might have been closed or error occurred
-                            await asyncio.sleep(self.config.strategy.cycle_interval_seconds)
-                            continue # Skip to next cycle as position is gone
-
-                    # --- SL/TP Execution ---
-                    if position.side == 'BUY':
-                        if current_price <= position.stop_loss_price:
-                            logger.info("Stop-loss triggered for LONG position", symbol=position.symbol, price=current_price, sl=position.stop_loss_price)
-                            await self._close_position(position, "Stop-Loss")
-                            await asyncio.sleep(self.config.strategy.cycle_interval_seconds)
-                            continue
-                        if current_price >= position.take_profit_price:
-                            logger.info("Take-profit triggered for LONG position", symbol=position.symbol, price=current_price, tp=position.take_profit_price)
-                            await self._close_position(position, "Take-Profit")
-                            await asyncio.sleep(self.config.strategy.cycle_interval_seconds)
-                            continue
-                    elif position.side == 'SELL':
-                        if current_price >= position.stop_loss_price:
-                            logger.info("Stop-loss triggered for SHORT position", symbol=position.symbol, price=current_price, sl=position.stop_loss_price)
-                            await self._close_position(position, "Stop-Loss")
-                            await asyncio.sleep(self.config.strategy.cycle_interval_seconds)
-                            continue
-                        if current_price <= position.take_profit_price:
-                            logger.info("Take-profit triggered for SHORT position", symbol=position.symbol, price=current_price, tp=position.take_profit_price)
-                            await self._close_position(position, "Take-Profit")
-                            await asyncio.sleep(self.config.strategy.cycle_interval_seconds)
-                            continue
-                
-                # --- 3. Check for new candle and run strategy analysis ---
-                df_with_indicators = self.data_handler.get_market_data(symbol)
-                if df_with_indicators is None or df_with_indicators.empty:
-                    logger.warning("Could not get market data from handler.", symbol=symbol)
-                    await asyncio.sleep(self.config.strategy.cycle_interval_seconds)
-                    continue
-
-                last_candle_ts = df_with_indicators.index[-1]
-                if last_candle_ts > self.last_candle_timestamp.get(symbol, pd.Timestamp(0)):
-                    logger.debug("New candle detected, running strategy analysis.", symbol=symbol, new_ts=last_candle_ts)
-                    self.last_candle_timestamp[symbol] = last_candle_ts
-
-                    if self.risk_manager.is_halted:
-                        logger.warning("Trading is halted by RiskManager circuit breaker.", symbol=symbol)
-                    else:
-                        # Re-fetch position in case it was closed by SL/TP just now
-                        position = self.position_manager.get_open_position(symbol)
-                        signal = await self.strategy.analyze_market(symbol, df_with_indicators, position)
-                        if signal:
-                            await self._handle_signal(signal, df_with_indicators, position)
-
+                await self._run_single_trade_check(symbol)
             except asyncio.CancelledError:
-                logger.info("Unified trading loop cancelled for symbol", symbol=symbol)
+                logger.info("Trading loop cancelled for symbol", symbol=symbol)
                 break
             except Exception as e:
-                logger.critical("Unhandled exception in unified trading cycle", symbol=symbol, error=str(e), exc_info=True)
+                logger.critical("Unhandled exception in trading cycle", symbol=symbol, error=str(e), exc_info=True)
             
-            await asyncio.sleep(self.config.strategy.cycle_interval_seconds)
+            await asyncio.sleep(self.config.strategy.interval_seconds)
 
-    async def _handle_trailing_stop(self, pos: Position, current_price: float) -> Optional[Position]:
-        """Handles the logic for updating a trailing stop loss for both long and short positions."""
-        rm_config = self.config.risk_management
-        needs_update = False
-        
-        new_ref_price = pos.trailing_ref_price
-        trailing_stop_active = pos.trailing_stop_active
-        new_stop_loss = pos.stop_loss_price
+    async def _position_management_loop(self):
+        """Monitors open positions for stop-loss, take-profit, and trailing stop updates."""
+        logger.info("Starting position management loop.")
+        while self.running:
+            try:
+                open_positions = self.position_manager.get_all_open_positions()
+                for pos in open_positions:
+                    current_price = self.latest_prices.get(pos.symbol)
+                    if not current_price:
+                        continue
 
-        if pos.side == 'BUY':
-            # 1. Update peak price
-            new_ref_price = max(pos.trailing_ref_price, current_price)
-            if new_ref_price != pos.trailing_ref_price:
-                needs_update = True
+                    # --- Trailing Stop Logic ---
+                    if self.config.risk_management.use_trailing_stop:
+                        # PositionManager handles the logic and DB updates.
+                        # The returned 'pos' object has the latest state.
+                        pos = self.position_manager.manage_trailing_stop(
+                            pos, current_price, self.config.risk_management
+                        )
 
-            # 2. Check for activation
-            if not trailing_stop_active:
-                activation_price = pos.entry_price * (1 + rm_config.trailing_stop_activation_pct)
-                if current_price >= activation_price:
-                    trailing_stop_active = True
-                    needs_update = True
-                    logger.info("Trailing stop activated for LONG", symbol=pos.symbol, price=current_price, activation_price=activation_price)
+                    # --- SL/TP Execution ---
+                    if pos.side == 'BUY':
+                        if current_price <= pos.stop_loss_price:
+                            logger.info("Stop-loss triggered for LONG position", symbol=pos.symbol, price=current_price, sl=pos.stop_loss_price)
+                            await self._close_position(pos, "Stop-Loss")
+                            continue
+                        if current_price >= pos.take_profit_price:
+                            logger.info("Take-profit triggered for LONG position", symbol=pos.symbol, price=current_price, tp=pos.take_profit_price)
+                            await self._close_position(pos, "Take-Profit")
+                            continue
+                    elif pos.side == 'SELL':
+                        if current_price >= pos.stop_loss_price:
+                            logger.info("Stop-loss triggered for SHORT position", symbol=pos.symbol, price=current_price, sl=pos.stop_loss_price)
+                            await self._close_position(pos, "Stop-Loss")
+                            continue
+                        if current_price <= pos.take_profit_price:
+                            logger.info("Take-profit triggered for SHORT position", symbol=pos.symbol, price=current_price, tp=pos.take_profit_price)
+                            await self._close_position(pos, "Take-Profit")
+                            continue
 
-            # 3. Calculate new stop loss if active
-            if trailing_stop_active:
-                trail_price = new_ref_price * (1 - rm_config.trailing_stop_pct)
-                if trail_price > new_stop_loss:
-                    new_stop_loss = trail_price
-                    needs_update = True
-        
-        elif pos.side == 'SELL':
-            # 1. Update trough price
-            new_ref_price = min(pos.trailing_ref_price, current_price)
-            if new_ref_price != pos.trailing_ref_price:
-                needs_update = True
-
-            # 2. Check for activation
-            if not trailing_stop_active:
-                activation_price = pos.entry_price * (1 - rm_config.trailing_stop_activation_pct)
-                if current_price <= activation_price:
-                    trailing_stop_active = True
-                    needs_update = True
-                    logger.info("Trailing stop activated for SHORT", symbol=pos.symbol, price=current_price, activation_price=activation_price)
-
-            # 3. Calculate new stop loss if active
-            if trailing_stop_active:
-                trail_price = new_ref_price * (1 + rm_config.trailing_stop_pct)
-                if trail_price < new_stop_loss:
-                    new_stop_loss = trail_price
-                    needs_update = True
-
-        # 4. Persist changes to DB if needed
-        if needs_update:
-            return self.position_manager.update_trailing_stop(
-                symbol=pos.symbol,
-                new_stop_loss=new_stop_loss,
-                new_ref_price=new_ref_price,
-                is_active=trailing_stop_active
-            )
-        
-        return pos
+            except asyncio.CancelledError:
+                logger.info("Position management loop cancelled.")
+                break
+            except Exception as e:
+                logger.error("Error in position management loop", error=str(e), exc_info=True)
+            await asyncio.sleep(5) # Check positions frequently
 
     async def _monitoring_loop(self):
         """Periodically runs health checks and portfolio monitoring."""
@@ -238,6 +155,27 @@ class TradingBot:
             except Exception as e:
                 logger.error("Error in monitoring loop", error=str(e))
             await asyncio.sleep(60) # Monitoring interval
+
+    async def _run_single_trade_check(self, symbol: str):
+        logger.debug("Starting new trade check", symbol=symbol)
+
+        if self.risk_manager.is_halted:
+            logger.warning("Trading is halted by RiskManager circuit breaker.")
+            return
+
+        df_with_indicators = self.data_handler.get_market_data(symbol)
+        if df_with_indicators is None:
+            logger.warning("Could not get market data from handler.", symbol=symbol)
+            return
+        
+        if symbol not in self.latest_prices:
+            logger.warning("Latest price for symbol not available yet.", symbol=symbol)
+            return
+
+        position = self.position_manager.get_open_position(symbol)
+        signal = await self.strategy.analyze_market(symbol, df_with_indicators, position)
+
+        if signal: await self._handle_signal(signal, df_with_indicators, position)
 
     async def _await_order_fill(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
         """Polls the exchange for an order's fill status."""
