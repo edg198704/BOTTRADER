@@ -12,6 +12,11 @@ exchange:
     delay_seconds: 2    # Initial delay for retries
     backoff_factor: 2   # Multiplier for subsequent delays (e.g., 2s, 4s, 8s)
 
+execution:
+  default_order_type: "LIMIT" # Can be 'MARKET' or 'LIMIT'. LIMIT is recommended to reduce slippage.
+  limit_price_offset_pct: 0.0005 # 0.05% offset from current price for placing limit orders.
+  order_fill_timeout_seconds: 45 # How long to wait for a fill before cancelling.
+
 data_handler:
   history_limit: 200 # Number of historical candles to load at startup
   update_interval_multiplier: 0.5 # Update data every (strategy.interval_seconds * 0.5) seconds
