@@ -221,7 +221,7 @@ class TradingBot:
                 return
 
             stop_loss = self.risk_manager.calculate_stop_loss(action, current_price, df_with_indicators, market_regime=market_regime)
-            ideal_quantity = self.risk_manager.calculate_position_.size(portfolio_equity, current_price, stop_loss, market_regime=market_regime)
+            ideal_quantity = self.risk_manager.calculate_position_size(portfolio_equity, current_price, stop_loss, market_regime=market_regime)
             
             market_details = self.market_details.get(symbol)
             if not market_details:
