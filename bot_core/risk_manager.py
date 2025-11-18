@@ -1,21 +1,25 @@
-from typing import List, Optional, Any
+from typing import List, Optional, Any, TYPE_CHECKING
 import pandas as pd
 
 from bot_core.config import RiskManagementConfig
 from bot_core.logger import get_logger
 from bot_core.position_manager import Position
 
+if TYPE_CHECKING:
+    from bot_core.monitoring import AlertSystem
+
 logger = get_logger(__name__)
 
 class RiskManager:
-    def __init__(self, config: RiskManagementConfig):
+    def __init__(self, config: RiskManagementConfig, alert_system: Optional['AlertSystem'] = None):
         self.config = config
         self.is_halted = False
         self.initial_capital = None # Will be set on first update
         self.peak_portfolio_value = None
+        self.alert_system = alert_system
         logger.info("RiskManager initialized.")
 
-    def update_portfolio_risk(self, portfolio_value: float):
+    async def update_portfolio_risk(self, portfolio_value: float):
         if self.initial_capital is None:
             self.initial_capital = portfolio_value
             self.peak_portfolio_value = portfolio_value
@@ -28,8 +32,16 @@ class RiskManager:
         if drawdown < self.config.circuit_breaker_threshold:
             if not self.is_halted:
                 self.is_halted = True
-                logger.critical("CIRCUIT BREAKER TRIPPED! Trading halted due to excessive drawdown.", 
-                              drawdown=f"{drawdown:.2%}", threshold=f"{self.config.circuit_breaker_threshold:.2%}")
+                message = f"CIRCUIT BREAKER TRIPPED! Trading halted due to excessive drawdown."
+                details = {
+                    'drawdown': f"{drawdown:.2%}", 
+                    'threshold': f"{self.config.circuit_breaker_threshold:.2%}",
+                    'portfolio_value': portfolio_value,
+                    'peak_portfolio_value': self.peak_portfolio_value
+                }
+                logger.critical(message, **details)
+                if self.alert_system:
+                    await self.alert_system.send_alert(level='critical', message=message, details=details)
         else:
             if self.is_halted:
                 # Note: A manual resume process is safer. This is a simple auto-resume for now.
