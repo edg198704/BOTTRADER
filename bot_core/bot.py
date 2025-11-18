@@ -12,13 +12,15 @@ from bot_core.strategy import TradingStrategy
 from bot_core.config import BotConfig
 from bot_core.data_handler import DataHandler
 from bot_core.monitoring import HealthChecker, InfluxDBMetrics
+from bot_core.order_sizer import OrderSizer
 
 logger = get_logger(__name__)
 
 class TradingBot:
     def __init__(self, config: BotConfig, exchange_api: ExchangeAPI, data_handler: Optional[DataHandler], 
                  strategy: TradingStrategy, position_manager: PositionManager, risk_manager: RiskManager,
-                 health_checker: HealthChecker, metrics_writer: Optional[InfluxDBMetrics] = None,
+                 order_sizer: OrderSizer, health_checker: HealthChecker, 
+                 metrics_writer: Optional[InfluxDBMetrics] = None,
                  shared_bot_state: Optional[Dict[str, Any]] = None):
         self.config = config
         self.exchange_api = exchange_api
@@ -26,6 +28,7 @@ class TradingBot:
         self.strategy = strategy
         self.position_manager = position_manager
         self.risk_manager = risk_manager
+        self.order_sizer = order_sizer
         self.health_checker = health_checker
         self.metrics_writer = metrics_writer
         self.shared_bot_state = shared_bot_state if shared_bot_state is not None else {}
@@ -33,6 +36,7 @@ class TradingBot:
         self.running = False
         self.start_time = datetime.now(timezone.utc)
         self.latest_prices: Dict[str, float] = {}
+        self.market_details: Dict[str, Dict[str, Any]] = {}
         self.tasks: list[asyncio.Task] = []
         
         self._initialize_shared_state()
@@ -47,12 +51,29 @@ class TradingBot:
         self.shared_bot_state['latest_prices'] = self.latest_prices
         self.shared_bot_state['config'] = self.config
 
+    async def _load_market_details(self):
+        """Fetches and caches exchange trading rules for all configured symbols."""
+        logger.info("Loading market details for all symbols...")
+        for symbol in self.config.strategy.symbols:
+            try:
+                details = await self.exchange_api.fetch_market_details(symbol)
+                if details:
+                    self.market_details[symbol] = details
+                    logger.info("Successfully loaded market details", symbol=symbol)
+                else:
+                    logger.error("Failed to load market details for symbol, trading may fail.", symbol=symbol)
+            except Exception as e:
+                logger.critical("Could not load market details for symbol due to an exception.", symbol=symbol, error=str(e))
+        logger.info("Market details loading complete.")
+
     async def run(self):
         """Main entry point to start all bot activities."""
         self.running = True
         self.shared_bot_state['status'] = 'running'
         logger.info("Starting TradingBot...", symbols=self.config.strategy.symbols)
         
+        await self._load_market_details()
+
         # Start shared loops
         self.tasks.append(asyncio.create_task(self.data_handler.run()))
         self.tasks.append(asyncio.create_task(self._monitoring_loop()))
@@ -218,13 +239,21 @@ class TradingBot:
                 return
 
             stop_loss = self.risk_manager.calculate_stop_loss(action, current_price, df_with_indicators, market_regime=market_regime)
-            quantity = self.risk_manager.calculate_position_size(portfolio_equity, current_price, stop_loss, market_regime=market_regime)
-
-            if quantity <= 0:
-                logger.warning("Calculated position size is zero or less. Aborting trade.", symbol=symbol, quantity=quantity)
+            ideal_quantity = self.risk_manager.calculate_position_size(portfolio_equity, current_price, stop_loss, market_regime=market_regime)
+            
+            market_details = self.market_details.get(symbol)
+            if not market_details:
+                logger.error("Cannot place order, market details not available for symbol.", symbol=symbol)
                 return
 
-            order_result = await self.exchange_api.place_order(symbol, action, 'MARKET', quantity)
+            final_quantity = self.order_sizer.adjust_order_quantity(symbol, ideal_quantity, market_details)
+
+            if final_quantity <= 0:
+                logger.warning("Calculated position size is zero or less after adjustments. Aborting trade.", 
+                             symbol=symbol, ideal_quantity=ideal_quantity, final_quantity=final_quantity)
+                return
+
+            order_result = await self.exchange_api.place_order(symbol, action, 'MARKET', final_quantity)
             if order_result and order_result.get('orderId'):
                 filled_order = await self._await_order_fill(order_result['orderId'], symbol)
                 if filled_order and filled_order.get('status') == 'FILLED':
@@ -247,7 +276,20 @@ class TradingBot:
 
     async def _close_position(self, position: Position, reason: str):
         close_side = 'SELL' if position.side == 'BUY' else 'BUY'
-        order_result = await self.exchange_api.place_order(position.symbol, close_side, 'MARKET', position.quantity)
+        
+        market_details = self.market_details.get(position.symbol)
+        if not market_details:
+            logger.error("Cannot close position, market details not available for symbol.", symbol=position.symbol)
+            # Attempt to close anyway, might fail
+            close_quantity = position.quantity
+        else:
+            close_quantity = self.order_sizer.adjust_order_quantity(position.symbol, position.quantity, market_details)
+
+        if close_quantity <= 0:
+            logger.error("Cannot close position, adjusted quantity is zero.", symbol=position.symbol, original_qty=position.quantity)
+            return
+
+        order_result = await self.exchange_api.place_order(position.symbol, close_side, 'MARKET', close_quantity)
         if order_result and order_result.get('orderId'):
             filled_order = await self._await_order_fill(order_result['orderId'], position.symbol)
             if filled_order and filled_order.get('status') == 'FILLED':
