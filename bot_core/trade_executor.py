@@ -67,7 +67,8 @@ class TradeExecutor:
                 await self.close_position(position, "Strategy Signal")
 
     async def _execute_open_position(self, symbol: str, side: str, current_price: float, df: pd.DataFrame, regime: Optional[str]):
-        open_positions = self.position_manager.get_all_open_positions()
+        # Await async DB call
+        open_positions = await self.position_manager.get_all_open_positions()
         if not self.risk_manager.check_trade_allowed(symbol, open_positions):
             return
 
@@ -112,7 +113,9 @@ class TradeExecutor:
             logger.info("Order to open position was filled (fully or partially).", order_id=order_result.get('orderId'), filled_qty=fill_quantity, fill_price=fill_price)
             final_stop_loss = self.risk_manager.calculate_stop_loss(side, fill_price, df, market_regime=regime)
             final_take_profit = self.risk_manager.calculate_take_profit(side, fill_price, final_stop_loss, market_regime=regime)
-            self.position_manager.open_position(symbol, side, fill_quantity, fill_price, final_stop_loss, final_take_profit)
+            
+            # Await async DB call
+            await self.position_manager.open_position(symbol, side, fill_quantity, fill_price, final_stop_loss, final_take_profit)
         else:
             final_status = final_order_state.get('status') if final_order_state else 'UNKNOWN'
             logger.error("Order to open position did not fill.", order_id=order_result.get('orderId'), final_status=final_status)
@@ -163,7 +166,8 @@ class TradeExecutor:
         )
         if final_order_state and final_order_state.get('status') == 'FILLED':
             close_price = final_order_state['average']
-            self.position_manager.close_position(position.symbol, close_price, reason)
+            # Await async DB call
+            await self.position_manager.close_position(position.symbol, close_price, reason)
         else:
             final_status = final_order_state.get('status') if final_order_state else 'UNKNOWN'
             logger.error("Failed to confirm close order fill. Position remains open.", order_id=order_result.get('orderId'), symbol=position.symbol, final_status=final_status)
