@@ -289,9 +289,16 @@ class TradingBot:
             order_result = await self.exchange_api.place_order(symbol, action, order_type, final_quantity, price=limit_price)
             if order_result and order_result.get('orderId'):
                 final_order_state = await self._manage_order_lifecycle(order_result['orderId'], symbol)
-                if final_order_state and final_order_state.get('status') == 'FILLED':
-                    fill_price = final_order_state['average']
-                    fill_quantity = final_order_state['filled']
+                
+                fill_quantity = final_order_state.get('filled', 0.0) if final_order_state else 0.0
+
+                if fill_quantity > 0:
+                    fill_price = final_order_state.get('average')
+                    if not fill_price or fill_price <= 0:
+                        logger.critical("Order filled but average price is invalid. Cannot open position.", order_id=order_result.get('orderId'), final_state=final_order_state)
+                        return # Avoid creating a position with bad data
+
+                    logger.info("Order to open position was filled (fully or partially).", order_id=order_result.get('orderId'), filled_qty=fill_quantity, fill_price=fill_price)
                     # Recalculate SL/TP based on actual fill price for higher accuracy
                     final_stop_loss = self.risk_manager.calculate_stop_loss(action, fill_price, df_with_indicators, market_regime=market_regime)
                     final_take_profit = self.risk_manager.calculate_take_profit(action, fill_price, final_stop_loss, market_regime=market_regime)
