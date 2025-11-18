@@ -195,14 +195,103 @@ class TradingBot:
 
         if signal: await self._handle_signal(signal, df_with_indicators, position)
 
-    async def _manage_order_lifecycle(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
+    async def _manage_order_lifecycle(self, initial_order: Dict[str, Any], symbol: str, side: str, quantity: float, initial_price: Optional[float]) -> Optional[Dict[str, Any]]:
+        """
+        Manages an order's lifecycle, including polling, chasing, and timeout handling.
+        """
+        exec_config = self.config.execution
+        order_id = initial_order.get('orderId')
+        if not order_id:
+            logger.error("Cannot manage order lifecycle without an order ID.", initial_order=initial_order)
+            return None
+
+        logger.info("Managing lifecycle for order", order_id=order_id, symbol=symbol)
+        
+        is_chaseable = exec_config.default_order_type == 'LIMIT' and exec_config.use_order_chasing
+        if not is_chaseable:
+            return await self._poll_order_until_filled_or_timeout(order_id, symbol)
+
+        # --- Advanced Order Chasing for LIMIT orders ---
+        chase_attempts = 0
+        current_order_id = order_id
+        current_order_price = initial_price
+
+        while chase_attempts <= exec_config.max_chase_attempts:
+            await asyncio.sleep(exec_config.chase_interval_seconds)
+
+            order_status = await self.exchange_api.fetch_order(current_order_id, symbol)
+            if order_status and order_status.get('status') == 'FILLED':
+                logger.info("Chased order filled", order_id=current_order_id, attempt=chase_attempts)
+                return order_status
+            
+            if order_status and order_status.get('status') not in ['OPEN', 'UNKNOWN']:
+                logger.warning("Chased order in terminal state without fill", order_id=current_order_id, status=order_status.get('status'))
+                return order_status
+
+            market_price = self.latest_prices.get(symbol)
+            if not market_price:
+                logger.warning("Cannot check for order chasing, latest price is unavailable.", symbol=symbol)
+                continue
+
+            is_behind_market = (side == 'BUY' and market_price > current_order_price) or \
+                               (side == 'SELL' and market_price < current_order_price)
+
+            if not is_behind_market:
+                logger.debug("Order is still competitive, not chasing.", order_id=current_order_id, order_price=current_order_price, market_price=market_price)
+                continue
+
+            # --- Execute Chase ---
+            chase_attempts += 1
+            if chase_attempts > exec_config.max_chase_attempts:
+                break
+
+            logger.info("Market moved away, chasing order.", order_id=current_order_id, attempt=f"{chase_attempts}/{exec_config.max_chase_attempts}")
+            
+            try:
+                await self.exchange_api.cancel_order(current_order_id, symbol)
+                logger.info("Successfully cancelled old order for chasing.", old_order_id=current_order_id)
+
+                price_improvement = market_price * exec_config.chase_aggressiveness_pct
+                new_price = market_price + price_improvement if side == 'BUY' else market_price - price_improvement
+
+                new_order_result = await self.exchange_api.place_order(symbol, side, 'LIMIT', quantity, price=new_price)
+                if new_order_result and new_order_result.get('orderId'):
+                    current_order_id = new_order_result['orderId']
+                    current_order_price = new_price
+                    logger.info("Placed new, more aggressive order.", new_order_id=current_order_id, new_price=new_price)
+                else:
+                    logger.error("Failed to place new chased order. Aborting chase.", symbol=symbol)
+                    return None
+            except Exception as e:
+                logger.error("Exception during order chase. Aborting.", error=str(e), exc_info=True)
+                return None
+
+        # --- Handle chase timeout ---
+        logger.warning("Max chase attempts reached for order.", original_order_id=order_id)
+        if exec_config.execute_on_timeout:
+            logger.info("Executing a MARKET order as a fallback.", symbol=symbol)
+            try:
+                await self.exchange_api.cancel_order(current_order_id, symbol)
+                market_order = await self.exchange_api.place_order(symbol, side, 'MARKET', quantity)
+                if market_order and market_order.get('orderId'):
+                    return await self._poll_order_until_filled_or_timeout(market_order['orderId'], symbol, timeout_override=15)
+                else:
+                    logger.critical("Failed to place fallback MARKET order.", symbol=symbol)
+                    return None
+            except Exception as e:
+                logger.critical("Exception during fallback MARKET order execution.", error=str(e))
+                return None
+        else:
+            logger.info("execute_on_timeout is false. Cancelling final order.", order_id=current_order_id)
+            return await self._cancel_and_get_final_status(current_order_id, symbol)
+
+    async def _poll_order_until_filled_or_timeout(self, order_id: str, symbol: str, timeout_override: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """
         Tracks an order until it's filled or a timeout is reached.
         If timeout occurs for an open order, it attempts to cancel it.
         """
-        logger.info("Managing lifecycle for order", order_id=order_id, symbol=symbol)
         start_time = time.time()
-        timeout = self.config.execution.order_fill_timeout_seconds
+        timeout = timeout_override or self.config.execution.order_fill_timeout_seconds
 
         while time.time() - start_time < timeout:
             try:
@@ -221,22 +310,20 @@ class TradingBot:
                 logger.error("Error while polling for order fill", order_id=order_id, error=str(e))
                 await asyncio.sleep(5)
 
-        # Timeout reached, try to cancel
         logger.warning("Order fill timeout reached. Attempting to cancel.", order_id=order_id, symbol=symbol)
+        return await self._cancel_and_get_final_status(order_id, symbol)
+
+    async def _cancel_and_get_final_status(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
+        """Cancels an order and fetches its final status."""
         try:
             await self.exchange_api.cancel_order(order_id, symbol)
             logger.info("Cancellation request sent for order", order_id=order_id)
-            # Final check on order status after cancellation attempt
             final_status = await self.exchange_api.fetch_order(order_id, symbol)
-            if final_status:
-                logger.info("Final order status after cancellation attempt", order_id=order_id, status=final_status.get('status'))
-                return final_status
-            else:
-                logger.warning("Could not fetch final order status after cancellation.", order_id=order_id)
-                return {'id': order_id, 'status': 'UNKNOWN'}
+            logger.info("Final order status after cancellation attempt", order_id=order_id, status=final_status.get('status') if final_status else 'UNKNOWN')
+            return final_status
         except Exception as e:
             logger.critical("Failed to cancel timed-out order", order_id=order_id, error=str(e))
-            return None
+            return {'id': order_id, 'status': 'UNKNOWN'}
 
     async def _handle_signal(self, signal: Dict, df_with_indicators: pd.DataFrame, position: Optional[Position]):
         action = signal.get('action')
@@ -279,13 +366,19 @@ class TradingBot:
             if order_type == 'LIMIT':
                 offset = self.config.execution.limit_price_offset_pct
                 if action == 'BUY':
-                    limit_price = current_price * (1 + offset)
+                    limit_price = current_price * (1 - offset) # Place below market for buys
                 else: # SELL
-                    limit_price = current_price * (1 - offset)
+                    limit_price = current_price * (1 + offset) # Place above market for sells
 
             order_result = await self.exchange_api.place_order(symbol, action, order_type, final_quantity, price=limit_price)
             if order_result and order_result.get('orderId'):
-                final_order_state = await self._manage_order_lifecycle(order_result['orderId'], symbol)
+                final_order_state = await self._manage_order_lifecycle(
+                    initial_order=order_result,
+                    symbol=symbol,
+                    side=action,
+                    quantity=final_quantity,
+                    initial_price=limit_price
+                )
                 
                 fill_quantity = final_order_state.get('filled', 0.0) if final_order_state else 0.0
 
@@ -340,7 +433,13 @@ class TradingBot:
 
         order_result = await self.exchange_api.place_order(position.symbol, close_side, order_type, close_quantity, price=limit_price)
         if order_result and order_result.get('orderId'):
-            final_order_state = await self._manage_order_lifecycle(order_result['orderId'], position.symbol)
+            final_order_state = await self._manage_order_lifecycle(
+                initial_order=order_result,
+                symbol=position.symbol,
+                side=close_side,
+                quantity=close_quantity,
+                initial_price=limit_price
+            )
             if final_order_state and final_order_state.get('status') == 'FILLED':
                 close_price = final_order_state['average']
                 self.position_manager.close_position(position.symbol, close_price, reason)
