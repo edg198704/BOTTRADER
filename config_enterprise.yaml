@@ -10,7 +10,7 @@ exchange:
 
 strategy:
   name: "AIEnsembleStrategy" # Strategy to use ('AIEnsembleStrategy' or 'SimpleMACrossoverStrategy')
-  symbol: "BTC/USDT"
+  symbols: ["BTC/USDT", "ETH/USDT"] # List of symbols to trade
   interval_seconds: 60      # Time in seconds between each trading cycle
 
   # Settings for AIEnsembleStrategy
@@ -30,7 +30,7 @@ strategy:
 risk_management:
   max_position_size_usd: 1000.0
   max_daily_loss_usd: 500.0
-  max_open_positions: 1 # For simplicity in this example
+  max_open_positions: 5 # Increased to allow for multi-symbol trading
   circuit_breaker_threshold: -0.10 # Halt trading if portfolio drops 10%
   use_trailing_stop: true
   atr_stop_multiplier: 2.0
