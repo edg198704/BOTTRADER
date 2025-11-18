@@ -45,8 +45,54 @@ strategy:
     model_path: "models/ensemble"
     use_regime_filter: true
     retrain_interval_hours: 24
-    training_epochs: 10
     sequence_length: 30 # Lookback window for sequential models like LSTM/Attention
+    training_data_limit: 5000 # How many candles to fetch for retraining
+    labeling_horizon: 5 # How many candles into the future to look for labeling
+    labeling_threshold: 0.005 # % price change to define a buy/sell label
+
+    # --- Model Training Parameters ---
+    training:
+      epochs: 50 # Max epochs to train for
+      batch_size: 64
+      learning_rate: 0.001
+      early_stopping_patience: 5 # Stop training if validation loss doesn't improve for this many epochs
+      validation_split: 0.15 # Percentage of training data to use for validation
+
+    # --- Model Hyperparameters ---
+    xgboost:
+      n_estimators: 100
+      max_depth: 3
+      learning_rate: 0.1
+      subsample: 0.8
+      colsample_bytree: 0.8
+    random_forest:
+      n_estimators: 100
+      max_depth: 10
+      min_samples_leaf: 5
+    logistic_regression:
+      max_iter: 1000
+      C: 1.0
+    lstm:
+      hidden_dim: 64
+      num_layers: 2
+      dropout: 0.2
+    attention:
+      hidden_dim: 64
+      num_layers: 2
+      nhead: 4
+      dropout: 0.2
+
+    # --- Ensemble Configuration ---
+    ensemble_weights:
+      xgboost: 0.3
+      technical_ensemble: 0.3
+      lstm: 0.2
+      attention: 0.2
+
+    # --- Market Regime Detector ---
+    market_regime:
+      trend_strength_threshold: 0.015 # e.g., 1.5% difference between SMAs
+      volatility_multiplier: 1.5 # How much higher current volatility must be than average to be 'volatile'
 
   # Settings for SimpleMACrossoverStrategy
   simple_ma:
