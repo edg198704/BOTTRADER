@@ -2,7 +2,7 @@ import datetime
 import asyncio
 from typing import List, Optional, Dict, TYPE_CHECKING
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLAlchemyEnum, func, Boolean
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLAlchemyEnum, func, Boolean, cast, Date
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 from bot_core.logger import get_logger
@@ -190,6 +190,24 @@ class PositionManager:
             logger.error("Failed to manage trailing stop", symbol=pos.symbol, error=str(e))
             session.rollback()
             return pos # Return original object on error
+        finally:
+            session.close()
+
+    async def get_daily_realized_pnl(self) -> float:
+        """Calculates the realized PnL for the current UTC day."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._calculate_daily_pnl_sync)
+
+    def _calculate_daily_pnl_sync(self) -> float:
+        """Synchronous method to query the database for today's PnL."""
+        session = self.SessionLocal()
+        try:
+            today_utc = datetime.datetime.utcnow().date()
+            daily_pnl = session.query(func.sum(Position.pnl)).filter(
+                Position.status == 'CLOSED',
+                cast(Position.close_timestamp, Date) == today_utc
+            ).scalar()
+            return daily_pnl or 0.0
         finally:
             session.close()
 
