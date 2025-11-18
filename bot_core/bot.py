@@ -2,6 +2,7 @@ import asyncio
 import time
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
+import pandas as pd
 
 from bot_core.logger import get_logger, set_correlation_id
 from bot_core.exchange_api import ExchangeAPI
@@ -40,6 +41,7 @@ class TradingBot:
         # Start shared loops
         self.tasks.append(asyncio.create_task(self._monitoring_loop()))
         self.tasks.append(asyncio.create_task(self._ticker_update_loop()))
+        self.tasks.append(asyncio.create_task(self._position_management_loop()))
 
         # Start a trading cycle for each symbol
         for symbol in self.config.strategy.symbols:
@@ -55,7 +57,7 @@ class TradingBot:
                     ticker_data = await self.exchange_api.get_ticker_data(symbol)
                     if ticker_data and ticker_data.get('lastPrice'):
                         self.latest_prices[symbol] = float(ticker_data['lastPrice'])
-                await asyncio.sleep(10) # Update prices every 10 seconds
+                await asyncio.sleep(5) # Update prices more frequently for SL/TP checks
             except asyncio.CancelledError:
                 logger.info("Ticker update loop cancelled.")
                 break
@@ -64,7 +66,7 @@ class TradingBot:
                 await asyncio.sleep(30) # Wait longer on error
 
     async def _trading_cycle_for_symbol(self, symbol: str):
-        """Runs the trading logic loop for a single symbol."""
+        """Runs the trading logic loop for a single symbol to find entry/exit signals."""
         logger.info("Starting trading cycle for symbol", symbol=symbol)
         while self.running:
             set_correlation_id()
@@ -78,6 +80,34 @@ class TradingBot:
             
             await asyncio.sleep(self.config.strategy.interval_seconds)
 
+    async def _position_management_loop(self):
+        """Monitors open positions for stop-loss and take-profit triggers."""
+        logger.info("Starting position management loop.")
+        while self.running:
+            try:
+                open_positions = self.position_manager.get_all_open_positions()
+                for pos in open_positions:
+                    current_price = self.latest_prices.get(pos.symbol)
+                    if not current_price:
+                        continue
+
+                    # Check for stop-loss
+                    if pos.side == 'BUY' and current_price <= pos.stop_loss_price:
+                        logger.info("Stop-loss triggered for position", symbol=pos.symbol, price=current_price, sl=pos.stop_loss_price)
+                        await self._close_position(pos, current_price, "Stop-Loss")
+                    
+                    # Check for take-profit
+                    if pos.side == 'BUY' and current_price >= pos.take_profit_price:
+                        logger.info("Take-profit triggered for position", symbol=pos.symbol, price=current_price, tp=pos.take_profit_price)
+                        await self._close_position(pos, current_price, "Take-Profit")
+
+            except asyncio.CancelledError:
+                logger.info("Position management loop cancelled.")
+                break
+            except Exception as e:
+                logger.error("Error in position management loop", error=str(e))
+            await asyncio.sleep(5) # Check positions frequently
+
     async def _monitoring_loop(self):
         """Periodically runs health checks and portfolio monitoring."""
         while self.running:
@@ -87,12 +117,12 @@ class TradingBot:
                 if self.metrics_writer and self.metrics_writer.enabled:
                     await self.metrics_writer.write_metric('health', fields=health_status)
                 
-                # Wait for initial price fetch
                 if not self.latest_prices:
                     await asyncio.sleep(5)
                     continue
 
-                portfolio_value = self.position_manager.get_portfolio_value(self.latest_prices, self.config.initial_capital)
+                open_positions = self.position_manager.get_all_open_positions()
+                portfolio_value = self.position_manager.get_portfolio_value(self.latest_prices, self.config.initial_capital, open_positions)
                 self.risk_manager.update_portfolio_risk(portfolio_value)
 
                 if self.metrics_writer and self.metrics_writer.enabled:
@@ -117,7 +147,6 @@ class TradingBot:
             if not ohlcv_data:
                 logger.warning("Could not fetch OHLCV data.", symbol=symbol)
                 return
-            # Ensure latest price is available from the ticker loop
             if symbol not in self.latest_prices:
                 logger.warning("Latest price for symbol not available yet.", symbol=symbol)
                 return
@@ -129,12 +158,11 @@ class TradingBot:
         if df is None: return
         df_with_indicators = calculate_technical_indicators(df)
 
-        open_positions = self.position_manager.get_all_open_positions()
-        signal = await self.strategy.analyze_market(df_with_indicators, open_positions, symbol)
+        signal = await self.strategy.analyze_market(df_with_indicators, symbol)
 
-        if signal: await self._handle_signal(signal)
+        if signal: await self._handle_signal(signal, df_with_indicators)
 
-    async def _handle_signal(self, signal: Dict):
+    async def _handle_signal(self, signal: Dict, df_with_indicators: pd.DataFrame):
         action = signal.get('action')
         symbol = signal.get('symbol')
         current_price = self.latest_prices.get(symbol)
@@ -146,19 +174,28 @@ class TradingBot:
         position = self.position_manager.get_open_position(symbol)
 
         if action == 'BUY' and not position:
-            portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, self.config.initial_capital)
+            open_positions = self.position_manager.get_all_open_positions()
+            if not self.risk_manager.check_trade_allowed(symbol, open_positions):
+                return
+
+            portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, self.config.initial_capital, open_positions)
             position_size_usd = self.risk_manager.calculate_position_size(portfolio_equity)
             quantity = position_size_usd / current_price
 
-            if self.risk_manager.check_trade_allowed(symbol, quantity, current_price):
-                order_result = await self.exchange_api.place_order(symbol, 'BUY', 'MARKET', quantity)
-                if order_result and order_result.get('orderId'):
-                    self.position_manager.open_position(symbol, 'BUY', quantity, current_price)
+            stop_loss = self.risk_manager.calculate_stop_loss('BUY', current_price, df_with_indicators)
+            take_profit = self.risk_manager.calculate_take_profit('BUY', current_price, stop_loss)
+
+            order_result = await self.exchange_api.place_order(symbol, 'BUY', 'MARKET', quantity)
+            if order_result and order_result.get('orderId'):
+                self.position_manager.open_position(symbol, 'BUY', quantity, current_price, stop_loss, take_profit)
         
         elif action == 'SELL' and position:
-            order_result = await self.exchange_api.place_order(symbol, 'SELL', 'MARKET', position.quantity)
-            if order_result and order_result.get('orderId'):
-                self.position_manager.close_position(symbol, current_price)
+            await self._close_position(position, current_price, "Strategy Signal")
+
+    async def _close_position(self, position, close_price: float, reason: str):
+        order_result = await self.exchange_api.place_order(position.symbol, 'SELL', 'MARKET', position.quantity)
+        if order_result and order_result.get('orderId'):
+            self.position_manager.close_position(position.symbol, close_price, reason)
 
     async def stop(self):
         logger.info("Stopping TradingBot...")
@@ -167,7 +204,6 @@ class TradingBot:
             if not task.done():
                 task.cancel()
         
-        # Wait for tasks to finish cancelling
         await asyncio.gather(*[task for task in self.tasks if not task.done()], return_exceptions=True)
 
         if self.exchange_api: await self.exchange_api.close()
