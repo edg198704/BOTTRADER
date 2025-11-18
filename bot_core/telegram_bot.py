@@ -1,11 +1,13 @@
-from typing import List, Optional, Dict
+import asyncio
+from typing import Dict, Any, List, Callable
+
 from bot_core.logger import get_logger
 from bot_core.config import TelegramConfig
 
-# Safe import for telegram library
+# Safe import for telegram
 try:
     from telegram import Update
-    from telegram.ext import Application, CommandHandler, ContextTypes
+    from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
     TELEGRAM_AVAILABLE = True
 except ImportError:
     TELEGRAM_AVAILABLE = False
@@ -13,90 +15,84 @@ except ImportError:
 logger = get_logger(__name__)
 
 class TelegramBot:
-    def __init__(self, config: TelegramConfig, bot_instance):
+    def __init__(self, config: TelegramConfig, bot_state: Dict[str, Any]):
         if not TELEGRAM_AVAILABLE:
-            logger.warning("python-telegram-bot is not installed. Telegram features are disabled.")
-            self.enabled = False
+            raise ImportError("python-telegram-bot is not installed. Cannot start TelegramBot.")
+        
+        self.config = config
+        self.bot_state = bot_state # Shared state with the main TradingBot
+        if not config.bot_token or not config.admin_chat_ids:
+            logger.warning("Telegram bot token or admin chat IDs not provided. Telegram bot disabled.")
+            self.application = None
             return
 
-        self.config = config
-        self.bot_instance = bot_instance
-        self.application = None
-        self.enabled = bool(self.config.bot_token and self.config.admin_chat_ids)
+        self.application = Application.builder().token(config.bot_token).build()
+        self._setup_handlers()
+        logger.info("TelegramBot initialized.")
 
-        if self.enabled:
-            self.application = Application.builder().token(self.config.bot_token).build()
-            self._register_handlers()
-            logger.info("TelegramBot initialized.")
-        else:
-            logger.warning("TelegramBot disabled due to missing token or admin chat IDs.")
-
-    def _register_handlers(self):
+    def _setup_handlers(self):
+        if not self.application:
+            return
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("status", self.status_command))
-        self.application.add_handler(CommandHandler("stop", self.stop_command))
-        self.application.add_handler(CommandHandler("resume", self.resume_command))
+        self.application.add_handler("stop", CommandHandler("stop", self.stop_command))
         self.application.add_handler(CommandHandler("positions", self.positions_command))
 
     async def _is_admin(self, update: Update) -> bool:
-        is_admin = update.effective_chat.id in self.config.admin_chat_ids
-        if not is_admin:
-            await update.message.reply_text("You are not authorized to use this bot.")
-        return is_admin
+        user_id = update.effective_user.id
+        if user_id not in self.config.admin_chat_ids:
+            await update.message.reply_text("You are not authorized to use this command.")
+            logger.warning("Unauthorized access attempt from user", user_id=user_id)
+            return False
+        return True
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._is_admin(update): return
-        help_text = (
-            "/status - Get the current status of the bot.\n"
-            "/positions - View all open positions.\n"
-            "/stop - Gracefully stop the bot (kill switch).\n"
-            "/resume - Resume bot operations (if stopped)."
+        await update.message.reply_text(
+            "Welcome to the Trading Bot!\n" 
+            "/status - Get bot status\n"
+            "/positions - View open positions\n"
+            "/stop - Halt all trading activity"
         )
-        await update.message.reply_text(f"Welcome! Trading Bot is active.\n\n{help_text}")
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._is_admin(update): return
-        status = "Running" if self.bot_instance.running else "Stopped"
-        portfolio_value = self.bot_instance.position_manager.get_portfolio_value(self.bot_instance.latest_prices, self.bot_instance.config.initial_capital)
-        await update.message.reply_text(f"Bot Status: {status}\nPortfolio Value: ${portfolio_value:,.2f}")
+        status = self.bot_state.get('status', 'UNKNOWN')
+        equity = self.bot_state.get('equity', 0.0)
+        await update.message.reply_text(f"Bot Status: {status}\nCurrent Equity: ${equity:,.2f}")
 
     async def stop_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._is_admin(update): return
-        if not self.bot_instance.running:
-            await update.message.reply_text("Bot is already stopped.")
-            return
-        self.bot_instance.running = False
-        logger.critical("Bot stop command received from Telegram user.", user_id=update.effective_chat.id)
-        await update.message.reply_text("Stop command received. The bot will shut down gracefully after the current cycle.")
-
-    async def resume_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._is_admin(update): return
-        await update.message.reply_text("Resume functionality is not implemented. Please restart the bot application.")
+        stop_bot_callback = self.bot_state.get('stop_bot_callback')
+        if stop_bot_callback:
+            asyncio.create_task(stop_bot_callback())
+            await update.message.reply_text("Stop signal sent. The bot will shut down gracefully.")
+        else:
+            await update.message.reply_text("Could not send stop signal to the bot.")
 
     async def positions_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._is_admin(update): return
-        open_positions = self.bot_instance.position_manager.get_all_open_positions()
-        if not open_positions:
+        positions = self.bot_state.get('open_positions', [])
+        if not positions:
             await update.message.reply_text("No open positions.")
             return
         
         message = "Open Positions:\n"
-        for symbol, pos in open_positions.items():
-            message += f"- {symbol} ({pos.side}): {pos.quantity:.4f} @ ${pos.entry_price:,.2f}\n"
+        for pos in positions:
+            message += f"- {pos.symbol} ({pos.side}): Qty {pos.quantity:.4f} @ ${pos.entry_price:,.2f}\n"
         await update.message.reply_text(message)
 
     async def run(self):
-        if not self.enabled: return
-        logger.info("Starting Telegram bot polling.")
+        if not self.application:
+            return
+        logger.info("Telegram bot is polling for commands...")
         await self.application.initialize()
         await self.application.start()
         await self.application.updater.start_polling()
 
     async def stop(self):
-        if not self.enabled or not self.application: return
-        logger.info("Stopping Telegram bot polling.")
-        if self.application.updater.running:
+        if self.application and self.application.updater.running:
             await self.application.updater.stop()
-        if self.application.running:
             await self.application.stop()
-        await self.application.shutdown()
+            await self.application.shutdown()
+            logger.info("Telegram bot has been stopped.")
