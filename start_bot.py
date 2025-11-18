@@ -119,17 +119,18 @@ def get_exchange_api(config: BotConfig) -> ExchangeAPI:
 def get_strategy(config: BotConfig) -> TradingStrategy:
     """Dynamically loads and instantiates a strategy class by name."""
     logger = get_logger(__name__)
-    # The config.strategy object is now a specific, validated model (e.g., AIEnsembleStrategyConfig)
-    strategy_config = config.strategy
-    strategy_name = strategy_config.name
+    # The strategy name is now inside the validated params object
+    strategy_name = config.strategy.params.name
+    strategy_params = config.strategy.params
+
     try:
         strategy_class = getattr(strategy_module, strategy_name)
         if not issubclass(strategy_class, TradingStrategy):
             raise TypeError(f"Strategy '{strategy_name}' is not a valid subclass of TradingStrategy.")
         
         logger.info(f"Loading strategy: {strategy_name}")
-        # Pass the strongly-typed, specific config object to the constructor
-        return strategy_class(strategy_config)
+        # Pass the specific, validated params object to the constructor
+        return strategy_class(strategy_params)
     except AttributeError:
         logger.critical(f"Strategy class '{strategy_name}' not found in bot_core/strategy.py.")
         raise ValueError(f"Unknown strategy: {strategy_name}")
