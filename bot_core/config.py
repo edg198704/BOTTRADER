@@ -35,6 +35,7 @@ class AITrainingConfig(BaseModel):
     learning_rate: float = 0.001
     early_stopping_patience: int = 5
     validation_split: float = Field(0.15, ge=0.0, lt=1.0)
+    min_precision_threshold: float = Field(0.5, ge=0.0, le=1.0, description="Minimum precision required on validation set to accept a new model.")
 
 class AILSTMConfig(BaseModel):
     hidden_dim: int = 64
