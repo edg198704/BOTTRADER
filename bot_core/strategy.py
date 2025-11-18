@@ -15,8 +15,8 @@ class TradingStrategy(abc.ABC):
         self.config = config
 
     @abc.abstractmethod
-    async def analyze_market(self, df: pd.DataFrame, symbol: str, position: Optional[Position]) -> Optional[Dict[str, Any]]:
-        """Analyzes market data for a given symbol and returns a trading signal or None."""
+    async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[Dict[str, Any]]:
+        """Analyzes market data and returns a trading signal or None."""
         pass
 
 class SimpleMACrossoverStrategy(TradingStrategy):
@@ -26,7 +26,7 @@ class SimpleMACrossoverStrategy(TradingStrategy):
         self.slow_ma_period = config.simple_ma.slow_ma_period
         logger.info("SimpleMACrossoverStrategy initialized", fast_ma=self.fast_ma_period, slow_ma=self.slow_ma_period)
 
-    async def analyze_market(self, df: pd.DataFrame, symbol: str, position: Optional[Position]) -> Optional[Dict[str, Any]]:
+    async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[Dict[str, Any]]:
         if 'sma_fast' not in df.columns or 'sma_slow' not in df.columns:
             logger.warning("SMA indicators not found in DataFrame.", symbol=symbol)
             return None
@@ -59,7 +59,7 @@ class AIEnsembleStrategy(TradingStrategy):
             logger.critical("Failed to initialize AIEnsembleStrategy due to missing ML libraries", error=str(e))
             raise
 
-    async def analyze_market(self, df: pd.DataFrame, symbol: str, position: Optional[Position]) -> Optional[Dict[str, Any]]:
+    async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[Dict[str, Any]]:
         if not self.ensemble_learner.is_trained:
             logger.debug("AI models not trained yet, skipping analysis.", symbol=symbol)
             return None
@@ -70,7 +70,7 @@ class AIEnsembleStrategy(TradingStrategy):
             regime_result = await self.regime_detector.detect_regime(symbol, df)
             regime = regime_result.get('regime')
             if regime in ['sideways', 'unknown']:
-                logger.debug("Market regime is sideways or unknown, holding position.", symbol=symbol, regime=regime)
+                logger.debug("Market regime is sideways or unknown, holding position.", regime=regime, symbol=symbol)
                 return None
 
         prediction = await self.ensemble_learner.predict(df, symbol)
