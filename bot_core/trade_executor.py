@@ -100,7 +100,12 @@ class TradeExecutor:
             return
 
         final_order_state = await self.order_lifecycle_manager.manage(
-            initial_order=order_result, symbol=symbol, side=side, quantity=final_quantity, initial_price=limit_price
+            initial_order=order_result, 
+            symbol=symbol, 
+            side=side, 
+            quantity=final_quantity, 
+            initial_price=limit_price,
+            market_details=market_details
         )
         
         fill_quantity = final_order_state.get('filled', 0.0) if final_order_state else 0.0
@@ -162,9 +167,15 @@ class TradeExecutor:
             return
 
         final_order_state = await self.order_lifecycle_manager.manage(
-            initial_order=order_result, symbol=position.symbol, side=close_side, quantity=close_quantity, initial_price=limit_price
+            initial_order=order_result, 
+            symbol=position.symbol, 
+            side=close_side, 
+            quantity=close_quantity, 
+            initial_price=limit_price,
+            market_details=market_details
         )
-        if final_order_state and final_order_state.get('status') == 'FILLED':
+        if final_order_state and final_order_state.get('filled', 0.0) > 0:
+            # Use the aggregated average price for PnL calculation
             close_price = final_order_state['average']
             # Await async DB call
             await self.position_manager.close_position(position.symbol, close_price, reason)
