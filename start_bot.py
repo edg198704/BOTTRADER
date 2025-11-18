@@ -17,6 +17,7 @@ from bot_core.monitoring import HealthChecker, InfluxDBMetrics
 from bot_core.data_handler import DataHandler
 from bot_core.order_sizer import OrderSizer
 from bot_core.position_monitor import PositionMonitor
+from bot_core.order_lifecycle_manager import OrderLifecycleManager
 
 # Shared state for communication between components (e.g., Telegram and Bot)
 shared_bot_state: Dict[str, Any] = {}
@@ -49,6 +50,12 @@ async def main():
         shared_latest_prices=latest_prices
     )
 
+    order_lifecycle_manager = OrderLifecycleManager(
+        exchange_api=exchange_api,
+        exec_config=config.execution,
+        shared_latest_prices=latest_prices
+    )
+
     bot = TradingBot(
         config=config,
         exchange_api=exchange_api,
@@ -59,6 +66,7 @@ async def main():
         order_sizer=order_sizer,
         health_checker=health_checker,
         position_monitor=position_monitor,
+        order_lifecycle_manager=order_lifecycle_manager,
         shared_latest_prices=latest_prices,
         metrics_writer=metrics_writer,
         shared_bot_state=shared_bot_state
