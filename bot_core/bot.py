@@ -81,7 +81,7 @@ class TradingBot:
             await asyncio.sleep(self.config.strategy.interval_seconds)
 
     async def _position_management_loop(self):
-        """Monitors open positions for stop-loss and take-profit triggers."""
+        """Monitors open positions for stop-loss, take-profit, and trailing stop updates."""
         logger.info("Starting position management loop.")
         while self.running:
             try:
@@ -91,10 +91,20 @@ class TradingBot:
                     if not current_price:
                         continue
 
+                    # --- Trailing Stop Logic ---
+                    if self.config.risk_management.use_trailing_stop:
+                        updated_pos = await self._handle_trailing_stop(pos, current_price)
+                        if updated_pos:
+                            pos = updated_pos
+                        else: # Position might have been closed or error occurred
+                            continue
+
+                    # --- SL/TP Execution ---
                     # Check for stop-loss
                     if pos.side == 'BUY' and current_price <= pos.stop_loss_price:
                         logger.info("Stop-loss triggered for position", symbol=pos.symbol, price=current_price, sl=pos.stop_loss_price)
                         await self._close_position(pos, current_price, "Stop-Loss")
+                        continue # Move to next position as this one is closed
                     
                     # Check for take-profit
                     if pos.side == 'BUY' and current_price >= pos.take_profit_price:
@@ -105,8 +115,50 @@ class TradingBot:
                 logger.info("Position management loop cancelled.")
                 break
             except Exception as e:
-                logger.error("Error in position management loop", error=str(e))
+                logger.error("Error in position management loop", error=str(e), exc_info=True)
             await asyncio.sleep(5) # Check positions frequently
+
+    async def _handle_trailing_stop(self, pos: Position, current_price: float) -> Optional[Position]:
+        """Handles the logic for updating a trailing stop loss. Returns the updated position."""
+        # This logic currently only supports LONG positions.
+        if pos.side != 'BUY':
+            return pos
+
+        rm_config = self.config.risk_management
+        needs_update = False
+        
+        # 1. Update peak price
+        new_peak_price = max(pos.peak_price, current_price)
+        if new_peak_price != pos.peak_price:
+            needs_update = True
+
+        # 2. Check for activation
+        trailing_stop_active = pos.trailing_stop_active
+        if not trailing_stop_active:
+            activation_price = pos.entry_price * (1 + rm_config.trailing_stop_activation_pct)
+            if current_price >= activation_price:
+                trailing_stop_active = True
+                needs_update = True
+                logger.info("Trailing stop activated", symbol=pos.symbol, price=current_price, activation_price=activation_price)
+
+        # 3. Calculate new stop loss if active
+        new_stop_loss = pos.stop_loss_price
+        if trailing_stop_active:
+            trail_price = new_peak_price * (1 - rm_config.trailing_stop_pct)
+            if trail_price > new_stop_loss:
+                new_stop_loss = trail_price
+                needs_update = True
+
+        # 4. Persist changes to DB if needed
+        if needs_update:
+            return self.position_manager.update_trailing_stop(
+                symbol=pos.symbol,
+                new_stop_loss=new_stop_loss,
+                new_peak_price=new_peak_price,
+                is_active=trailing_stop_active
+            )
+        
+        return pos
 
     async def _monitoring_loop(self):
         """Periodically runs health checks and portfolio monitoring."""
