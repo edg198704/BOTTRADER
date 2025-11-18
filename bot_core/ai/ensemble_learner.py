@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 
 from bot_core.logger import get_logger
-from bot_core.config import AIStrategyConfig
+from bot_core.config import AIEnsembleStrategyParams
 
 # ML Imports with safe fallbacks
 try:
@@ -72,7 +72,7 @@ class EnsembleLearner:
             x = x.mean(dim=1)
             return F.softmax(self.fc(x), dim=1)
 
-    def __init__(self, config: AIStrategyConfig):
+    def __init__(self, config: AIEnsembleStrategyParams):
         if not ML_AVAILABLE:
             raise ImportError("Required ML libraries not installed for EnsembleLearner.")
         
@@ -89,11 +89,12 @@ class EnsembleLearner:
             logger.info("Creating new model set for symbol", symbol=symbol)
             num_features = len(self.config.feature_columns)
             
-            xgb_config = self.config.xgboost
-            rf_config = self.config.random_forest
-            lr_config = self.config.logistic_regression
-            lstm_config = self.config.lstm
-            attn_config = self.config.attention
+            hp = self.config.hyperparameters
+            xgb_config = hp.xgboost
+            rf_config = hp.random_forest
+            lr_config = hp.logistic_regression
+            lstm_config = hp.lstm
+            attn_config = hp.attention
 
             self.symbol_models[symbol] = {
                 'lstm': self.LSTMPredictor(
@@ -153,15 +154,16 @@ class EnsembleLearner:
             logger.debug("Predict called but models are not trained or loaded.")
             return {'action': 'hold', 'confidence': 0.0}
         
-        if len(df) < self.config.sequence_length:
-            logger.warning("Not enough data for a full sequence prediction.", symbol=symbol, data_len=len(df), required=self.config.sequence_length)
+        seq_len = self.config.features.sequence_length
+        if len(df) < seq_len:
+            logger.warning("Not enough data for a full sequence prediction.", symbol=symbol, data_len=len(df), required=seq_len)
             return {'action': 'hold', 'confidence': 0.0}
 
         try:
             models = self._get_or_create_symbol_models(symbol)
             scaler = self.symbol_scalers.get(symbol)
             
-            sequence_df = df.tail(self.config.sequence_length)
+            sequence_df = df.tail(seq_len)
             features = np.nan_to_num(sequence_df[self.config.feature_columns].values, nan=0.0)
 
             if scaler:
@@ -205,8 +207,8 @@ class EnsembleLearner:
             return {'action': 'hold', 'confidence': 0.0}
 
     def _create_labels(self, df: pd.DataFrame) -> pd.Series:
-        horizon = self.config.labeling_horizon
-        threshold = self.config.labeling_threshold
+        horizon = self.config.features.labeling_horizon
+        threshold = self.config.features.labeling_threshold
         
         future_price = df['close'].shift(-horizon)
         price_change_pct = (future_price - df['close']) / df['close']
@@ -218,7 +220,7 @@ class EnsembleLearner:
         return labels.iloc[:-horizon]
 
     def _create_sequences(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        seq_length = self.config.sequence_length
+        seq_length = self.config.features.sequence_length
         X_seq, y_seq = [], []
         for i in range(len(X) - seq_length + 1):
             X_seq.append(X[i:i+seq_length])
