@@ -15,7 +15,7 @@ class RiskManager:
         self.peak_portfolio_value = None
         logger.info("RiskManager initialized.")
 
-    def update_portfolio_risk(self, portfolio_value: float, open_positions: List[Position]):
+    def update_portfolio_risk(self, portfolio_value: float):
         if self.initial_capital is None:
             self.initial_capital = portfolio_value
             self.peak_portfolio_value = portfolio_value
@@ -23,7 +23,7 @@ class RiskManager:
         if portfolio_value > self.peak_portfolio_value:
             self.peak_portfolio_value = portfolio_value
 
-        drawdown = (portfolio_value - self.peak_portfolio_value) / self.peak_portfolio_value
+        drawdown = (portfolio_value - self.peak_portfolio_value) / self.peak_portfolio_value if self.peak_portfolio_value > 0 else 0
 
         if drawdown < self.config.circuit_breaker_threshold:
             if not self.is_halted:
@@ -63,3 +63,12 @@ class RiskManager:
             return entry_price - stop_loss_offset
         else: # SELL
             return entry_price + stop_loss_offset
+
+    def calculate_take_profit(self, side: str, entry_price: float, stop_loss_price: float, reward_to_risk_ratio: float = 1.5) -> float:
+        risk_per_unit = abs(entry_price - stop_loss_price)
+        profit_target = risk_per_unit * reward_to_risk_ratio
+
+        if side == 'BUY':
+            return entry_price + profit_target
+        else: # SELL
+            return entry_price - profit_target
