@@ -1,6 +1,6 @@
 import asyncio
 import functools
-from typing import Tuple, Type
+from typing import Tuple, Type, List, Dict, Any
 
 from bot_core.logger import get_logger
 
@@ -56,3 +56,57 @@ def async_retry(
                         raise
         return wrapper
     return decorator
+
+def generate_indicator_rename_map(indicators_config: List[Dict[str, Any]]) -> Dict[str, str]:
+    """
+    Generates a mapping from verbose pandas-ta column names to simplified, consistent names.
+    This function is the single source of truth for renaming indicators, ensuring consistency
+    between startup validation and runtime data processing.
+    """
+    rename_map = {}
+    for conf in indicators_config:
+        kind = conf.get("kind")
+        if not kind:
+            continue
+
+        alias = conf.get("alias")
+
+        if kind == "rsi":
+            length = conf.get("length", 14)
+            rename_map[f"RSI_{length}"] = alias or "rsi"
+        elif kind == "macd":
+            fast = conf.get("fast", 12)
+            slow = conf.get("slow", 26)
+            signal = conf.get("signal", 9)
+            base = f"MACD_{fast}_{slow}_{signal}"
+            base_alias = alias or "macd"
+            rename_map[base] = base_alias
+            rename_map[f"{base}h"] = f"{base_alias}_hist"
+            rename_map[f"{base}s"] = f"{base_alias}_signal"
+        elif kind == "bbands":
+            length = conf.get("length", 20)
+            std = float(conf.get("std", 2.0))
+            base = f"_{length}_{std:.1f}"
+            base_alias = alias or "bb"
+            rename_map[f"BBL{base}"] = f"{base_alias}_lower"
+            rename_map[f"BBM{base}"] = f"{base_alias}_middle"
+            rename_map[f"BBU{base}"] = f"{base_alias}_upper"
+        elif kind == "atr":
+            length = conf.get("length", 14)
+            rename_map[f"ATRr_{length}"] = alias or "atr"
+        elif kind == "adx":
+            length = conf.get("length", 14)
+            rename_map[f"ADX_{length}"] = alias or "adx"
+        elif kind == "sma":
+            if not alias:
+                raise ValueError(f"Indicator 'sma' with length {conf.get('length')} must have an 'alias' in the configuration to avoid ambiguity.")
+            length = conf.get("length")
+            rename_map[f"SMA_{length}"] = alias
+        else:
+            # Handle generic case with alias
+            if alias:
+                params = "_".join(str(v) for k, v in conf.items() if k not in ['kind', 'alias'])
+                ta_name = f"{kind.upper()}_{params}"
+                rename_map[ta_name] = alias
+
+    return rename_map
