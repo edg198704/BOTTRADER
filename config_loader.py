@@ -1,7 +1,7 @@
 import yaml
-import os
 from typing import Dict, Any
 from pydantic import ValidationError
+from dotenv import load_dotenv
 
 from bot_core.config import BotConfig
 from bot_core.logger import get_logger
@@ -9,11 +9,18 @@ from bot_core.logger import get_logger
 logger = get_logger(__name__)
 
 def load_config(path: str = 'config_enterprise.yaml') -> BotConfig:
-    """Loads configuration from YAML file and environment variables."""
+    """
+    Loads configuration from a YAML file and environment variables.
+    Environment variables (and .env files) have precedence.
+    """
+    # Load .env file if it exists, for local development
+    load_dotenv()
+
     config_data = _load_yaml_config(path)
-    config_data = _override_with_env_vars(config_data)
 
     try:
+        # Pydantic will automatically override with environment variables
+        # where the 'env' attribute is set in the model fields.
         config = BotConfig(**config_data)
         logger.info("Configuration loaded and validated successfully.")
         return config
@@ -32,15 +39,3 @@ def _load_yaml_config(path: str) -> Dict[str, Any]:
     except yaml.YAMLError as e:
         logger.critical(f"Error parsing YAML configuration file: {e}")
         raise
-
-def _override_with_env_vars(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Overrides configuration with environment variables."""
-    if 'BOT_EXCHANGE_API_KEY' in os.environ:
-        config['exchange']['api_key'] = os.environ['BOT_EXCHANGE_API_KEY']
-    if 'BOT_EXCHANGE_API_SECRET' in os.environ:
-        config['exchange']['api_secret'] = os.environ['BOT_EXCHANGE_API_SECRET']
-    if 'BOT_TELEGRAM_BOT_TOKEN' in os.environ:
-        config['telegram']['bot_token'] = os.environ['BOT_TELEGRAM_BOT_TOKEN']
-
-    logger.info("Configuration updated with environment variables.")
-    return config
