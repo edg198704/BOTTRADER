@@ -13,8 +13,10 @@ try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
+    import torch.optim as optim
     from sklearn.ensemble import VotingClassifier, RandomForestClassifier, GradientBoostingClassifier
     from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import train_test_split
     from xgboost import XGBClassifier
     ML_AVAILABLE = True
 except ImportError:
@@ -27,6 +29,8 @@ except ImportError:
     class XGBClassifier: pass
     class nn:
         class Module: pass
+    class optim: pass
+    def train_test_split(*args, **kwargs): pass
 
 logger = get_logger(__name__)
 
@@ -175,3 +179,94 @@ class EnsembleLearner:
         except Exception as e:
             logger.error("Error during prediction", symbol=symbol, error=str(e), exc_info=True)
             return {'action': 'hold', 'confidence': 0.0}
+
+    def _create_labels(self, df: pd.DataFrame) -> pd.Series:
+        """Creates labels for supervised learning."""
+        horizon = self.config.labeling_horizon
+        threshold = self.config.labeling_threshold
+        
+        future_price = df['close'].shift(-horizon)
+        price_change_pct = (future_price - df['close']) / df['close']
+
+        labels = pd.Series(1, index=df.index)  # Default to 'hold'
+        labels[price_change_pct > threshold] = 2  # 'buy'
+        labels[price_change_pct < -threshold] = 0 # 'sell'
+        
+        return labels.iloc[:-horizon] # Drop last rows where future is unknown
+
+    async def train(self, symbol: str, df: pd.DataFrame):
+        """Trains all models in the ensemble for a given symbol."""
+        logger.info("Starting model training", symbol=symbol)
+        try:
+            # 1. Prepare data
+            labels = self._create_labels(df)
+            features = df[self.config.feature_columns].loc[labels.index]
+            
+            X = np.nan_to_num(features.values, nan=0.0)
+            y = labels.values
+
+            if len(np.unique(y)) < 3:
+                logger.warning("Training data has fewer than 3 unique labels. Skipping training.", symbol=symbol, labels=np.unique(y))
+                return
+
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+            
+            models = self._get_or_create_symbol_models(symbol)
+
+            # 2. Train scikit-learn models
+            logger.info("Training scikit-learn models...", symbol=symbol)
+            models['gb'].fit(X_train, y_train)
+            models['technical'].fit(X_train, y_train)
+            logger.info("Scikit-learn models trained.", symbol=symbol)
+
+            # 3. Train PyTorch models
+            logger.info("Training PyTorch models...", symbol=symbol)
+            X_train_tensor = torch.FloatTensor(X_train).to(self.device)
+            y_train_tensor = torch.LongTensor(y_train).to(self.device)
+            
+            await self._train_pytorch_model(models['lstm'], X_train_tensor, y_train_tensor)
+            await self._train_pytorch_model(models['attention'], X_train_tensor, y_train_tensor)
+            logger.info("PyTorch models trained.", symbol=symbol)
+
+            # 4. Save models
+            await self._save_models(symbol)
+            self.is_trained = True
+            logger.info("All models trained and saved successfully.", symbol=symbol)
+
+        except Exception as e:
+            logger.critical("An error occurred during model training", symbol=symbol, error=str(e), exc_info=True)
+            self.is_trained = False # Mark as not trained if it fails
+
+    async def _train_pytorch_model(self, model: nn.Module, X_train: torch.Tensor, y_train: torch.Tensor):
+        """Generic training loop for a PyTorch model."""
+        model.train()
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        criterion = nn.CrossEntropyLoss()
+        
+        # Reshape for LSTM/Transformer if needed
+        if len(X_train.shape) == 2:
+            X_train_reshaped = X_train.unsqueeze(1)
+        else:
+            X_train_reshaped = X_train
+
+        for epoch in range(self.config.training_epochs):
+            optimizer.zero_grad()
+            outputs = model(X_train_reshaped)
+            loss = criterion(outputs, y_train)
+            loss.backward()
+            optimizer.step()
+            if (epoch + 1) % 5 == 0:
+                logger.debug(f"PyTorch model training", model=model.__class__.__name__, epoch=epoch+1, loss=loss.item())
+
+    async def _save_models(self, symbol: str):
+        """Saves all trained models for a symbol to disk."""
+        symbol_path_str = symbol.replace('/', '_')
+        save_path = os.path.join(self.config.model_path, symbol_path_str)
+        os.makedirs(save_path, exist_ok=True)
+        
+        models = self.symbol_models[symbol]
+        joblib.dump(models['gb'], os.path.join(save_path, "gb_model.pkl"))
+        joblib.dump(models['technical'], os.path.join(save_path, "technical_model.pkl"))
+        torch.save(models['lstm'].state_dict(), os.path.join(save_path, "lstm_model.pth"))
+        torch.save(models['attention'].state_dict(), os.path.join(save_path, "attention_model.pth"))
+        logger.info("Saved models to disk", path=save_path)
