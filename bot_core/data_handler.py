@@ -160,23 +160,6 @@ class DataHandler:
         # Apply the strategy
         df_out.ta.strategy(ta_strategy)
 
-        # Rename columns to a consistent, simplified format for use in the application
-        # This is important because pandas-ta creates verbose column names (e.g., 'RSI_14')
-        rename_map = {
-            'RSI_14': 'rsi',
-            'MACD_12_26_9': 'macd',
-            'MACDh_12_26_9': 'macd_hist',
-            'MACDs_12_26_9': 'macd_signal',
-            'BBL_20_2.0': 'bb_lower',
-            'BBM_20_2.0': 'bb_middle',
-            'BBU_20_2.0': 'bb_upper',
-            'ATRr_14': 'atr',
-            'ADX_14': 'adx',
-            'SMA_10': 'sma_fast',
-            'SMA_20': 'sma_slow'
-        }
-        df_out.rename(columns=rename_map, inplace=True, errors='ignore')
-
         df_out.dropna(inplace=True)
         logger.debug("Technical indicators calculated dynamically from config", row_count=len(df_out))
         return df_out
