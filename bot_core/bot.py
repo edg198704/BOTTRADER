@@ -262,6 +262,7 @@ class TradingBot:
         action = signal.get('action')
         symbol = signal.get('symbol')
         current_price = self.latest_prices.get(symbol)
+        market_regime = signal.get('regime')
 
         if not all([action, symbol, current_price]):
             logger.warning("Received invalid signal", signal=signal)
@@ -278,8 +279,8 @@ class TradingBot:
             if not self.risk_manager.check_trade_allowed(symbol, open_positions):
                 return
 
-            stop_loss = self.risk_manager.calculate_stop_loss(action, current_price, df_with_indicators)
-            quantity = self.risk_manager.calculate_position_size(portfolio_equity, current_price, stop_loss)
+            stop_loss = self.risk_manager.calculate_stop_loss(action, current_price, df_with_indicators, market_regime=market_regime)
+            quantity = self.risk_manager.calculate_position_size(portfolio_equity, current_price, stop_loss, market_regime=market_regime)
 
             if quantity <= 0:
                 logger.warning("Calculated position size is zero or less. Aborting trade.", symbol=symbol, quantity=quantity)
@@ -292,8 +293,8 @@ class TradingBot:
                     fill_price = filled_order['average']
                     fill_quantity = filled_order['filled']
                     # Recalculate SL/TP based on actual fill price for higher accuracy
-                    final_stop_loss = self.risk_manager.calculate_stop_loss(action, fill_price, df_with_indicators)
-                    final_take_profit = self.risk_manager.calculate_take_profit(action, fill_price, final_stop_loss)
+                    final_stop_loss = self.risk_manager.calculate_stop_loss(action, fill_price, df_with_indicators, market_regime=market_regime)
+                    final_take_profit = self.risk_manager.calculate_take_profit(action, fill_price, final_stop_loss, market_regime=market_regime)
                     self.position_manager.open_position(symbol, action, fill_quantity, fill_price, final_stop_loss, final_take_profit)
                 else:
                     logger.error("Order failed to fill or timed out.", order_id=order_result.get('orderId'))
