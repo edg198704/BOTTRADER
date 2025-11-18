@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, validator, SecretStr
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal, Union
 
 # --- AI Strategy Sub-configs ---
 
@@ -68,11 +68,20 @@ class AIStrategyConfig(BaseModel):
     lstm: AILSTMConfig = AILSTMConfig()
     attention: AIAttentionConfig = AIAttentionConfig()
 
-# --- Simple Strategy Sub-configs ---
+# --- Strategy Configs (Discriminated Union) ---
 
-class SimpleMAConfig(BaseModel):
+class BaseStrategyConfig(BaseModel):
+    symbols: List[str]
+    interval_seconds: int
+    timeframe: str
+
+class SimpleMACrossoverStrategyConfig(BaseStrategyConfig):
+    name: Literal["SimpleMACrossoverStrategy"]
     fast_ma_period: int
     slow_ma_period: int
+
+class AIEnsembleStrategyConfig(BaseStrategyConfig, AIStrategyConfig):
+    name: Literal["AIEnsembleStrategy"]
 
 # --- Core Component Configs ---
 
@@ -101,13 +110,6 @@ class ExecutionConfig(BaseModel):
 class DataHandlerConfig(BaseModel):
     history_limit: int
     update_interval_multiplier: float
-
-class StrategyConfig(BaseModel):
-    name: str
-    symbols: List[str]
-    interval_seconds: int
-    timeframe: str
-    params: Dict[str, Any] = Field(default_factory=dict)
 
 class RegimeRiskOverride(BaseModel):
     risk_per_trade_pct: Optional[float] = None
@@ -153,7 +155,7 @@ class BotConfig(BaseModel):
     exchange: ExchangeConfig
     execution: ExecutionConfig
     data_handler: DataHandlerConfig
-    strategy: StrategyConfig
+    strategy: Union[AIEnsembleStrategyConfig, SimpleMACrossoverStrategyConfig] = Field(..., discriminator='name')
     risk_management: RiskManagementConfig
     database: DatabaseConfig
     telegram: TelegramConfig
