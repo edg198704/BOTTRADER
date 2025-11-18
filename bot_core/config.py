@@ -46,7 +46,7 @@ class AIStrategyConfig(BaseModel):
     xgboost: XGBoostConfig = Field(default_factory=XGBoostConfig)
     random_forest: RandomForestConfig = Field(default_factory=RandomForestConfig)
     logistic_regression: LogisticRegressionConfig = Field(default_factory=LogisticRegressionConfig)
-    ensemble_weights: EnsembleWeights = Field(default_factory=EnsemblesWeights)
+    ensemble_weights: EnsembleWeights = Field(default_factory=EnsembleWeights)
     market_regime: MarketRegimeConfig = Field(default_factory=MarketRegimeConfig)
 
 class SimpleMAStrategyConfig(BaseModel):
@@ -71,6 +71,9 @@ class RiskManagementConfig(BaseModel):
     stop_loss_fallback_pct: float = 0.05
     risk_per_trade_pct: float = 0.01  # Risk 1% of portfolio equity per trade
     reward_to_risk_ratio: float = 1.5  # Default reward/risk ratio for take-profit calculation
+    # New fields for trailing stop logic
+    trailing_stop_activation_pct: float = 0.02 # e.g., 2% profit before activating
+    trailing_stop_pct: float = 0.01 # e.g., trail by 1%
 
 class DatabaseConfig(BaseModel):
     path: str = "position_ledger.db"
