@@ -30,7 +30,7 @@ async def main():
     health_checker = HealthChecker()
     metrics_writer = InfluxDBMetrics(url=os.getenv('INFLUXDB_URL'), token=os.getenv('INFLUXDB_TOKEN'), org=os.getenv('INFLUXDB_ORG'), bucket=os.getenv('INFLUXDB_BUCKET'))
 
-    bot = TradingBot(config, exchange_api, strategy, position_manager, risk_manager, health_checker, metrics_writer)
+    bot = TradingBot(config, exchange_api, strategy, position_manager, risk_manager, health_checker, metrics_writer, shared_bot_state)
 
     # --- Setup shared state and graceful shutdown ---
     shared_bot_state['stop_bot_callback'] = bot.stop
