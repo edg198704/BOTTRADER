@@ -36,9 +36,32 @@ class RiskManager:
                 self.is_halted = False
                 logger.info("Trading resumed as portfolio recovered from drawdown.")
 
-    def calculate_position_size(self, portfolio_equity: float) -> float:
-        size_usd = portfolio_equity * self.config.risk_per_trade_pct
-        return min(size_usd, self.config.max_position_size_usd)
+    def calculate_position_size(self, portfolio_equity: float, entry_price: float, stop_loss_price: float) -> float:
+        """Calculates position size in asset quantity based on risk."""
+        if entry_price <= 0 or stop_loss_price <= 0:
+            logger.warning("Cannot calculate position size with zero or negative prices.", entry=entry_price, sl=stop_loss_price)
+            return 0.0
+
+        risk_per_unit = abs(entry_price - stop_loss_price)
+        if risk_per_unit == 0:
+            logger.warning("Risk per unit is zero, cannot calculate position size. Check stop-loss logic.")
+            return 0.0
+
+        risk_amount_usd = portfolio_equity * self.config.risk_per_trade_pct
+        quantity = risk_amount_usd / risk_per_unit
+        
+        # Cap the position size based on the max USD value allowed
+        max_quantity_by_usd_cap = self.config.max_position_size_usd / entry_price
+        
+        final_quantity = min(quantity, max_quantity_by_usd_cap)
+
+        if final_quantity < quantity:
+            logger.info("Position size capped by max_position_size_usd.",
+                        risk_based_qty=quantity,
+                        capped_qty=final_quantity,
+                        max_usd=self.config.max_position_size_usd)
+
+        return final_quantity
 
     def check_trade_allowed(self, symbol: str, open_positions: List[Position]) -> bool:
         if self.is_halted:
@@ -64,9 +87,9 @@ class RiskManager:
         else: # SELL
             return entry_price + stop_loss_offset
 
-    def calculate_take_profit(self, side: str, entry_price: float, stop_loss_price: float, reward_to_risk_ratio: float = 1.5) -> float:
+    def calculate_take_profit(self, side: str, entry_price: float, stop_loss_price: float) -> float:
         risk_per_unit = abs(entry_price - stop_loss_price)
-        profit_target = risk_per_unit * reward_to_risk_ratio
+        profit_target = risk_per_unit * self.config.reward_to_risk_ratio
 
         if side == 'BUY':
             return entry_price + profit_target
