@@ -1,11 +1,17 @@
 from pydantic import BaseModel, Field, validator
 from typing import List, Optional
 
+class RetryConfig(BaseModel):
+    max_attempts: int = 3
+    delay_seconds: int = 2
+    backoff_factor: int = 2
+
 class ExchangeConfig(BaseModel):
     name: str = "MockExchange"
     api_key: Optional[str] = None
     api_secret: Optional[str] = None
     testnet: bool = True
+    retry: RetryConfig = Field(default_factory=RetryConfig)
 
 class DataHandlerConfig(BaseModel):
     history_limit: int = 200
@@ -60,7 +66,7 @@ class SimpleMAStrategyConfig(BaseModel):
 class StrategyConfig(BaseModel):
     name: str = "AIEnsembleStrategy"
     symbols: List[str] = Field(default_factory=lambda: ["BTC/USDT"])
-    cycle_interval_seconds: int = 10  # Time in seconds between each trading cycle check.
+    interval_seconds: int = 10  # Time in seconds between each trading cycle check.
     timeframe: str = "1h"  # Timeframe for OHLCV data (e.g., '1m', '5m', '1h', '1d')
     ai_ensemble: AIStrategyConfig = Field(default_factory=AIStrategyConfig)
     simple_ma: SimpleMAStrategyConfig = Field(default_factory=SimpleMAStrategyConfig)
