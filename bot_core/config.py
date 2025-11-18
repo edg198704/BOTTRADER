@@ -8,8 +8,8 @@ class RetryConfig(BaseModel):
 
 class ExchangeConfig(BaseModel):
     name: str = "MockExchange"
-    api_key: Optional[str] = None
-    api_secret: Optional[str] = None
+    api_key: Optional[str] = Field(default=None, env="BOT_EXCHANGE_API_KEY")
+    api_secret: Optional[str] = Field(default=None, env="BOT_EXCHANGE_API_SECRET")
     testnet: bool = True
     retry: RetryConfig = Field(default_factory=RetryConfig)
 
@@ -114,7 +114,7 @@ class DatabaseConfig(BaseModel):
     path: str = "position_ledger.db"
 
 class TelegramConfig(BaseModel):
-    bot_token: Optional[str] = None
+    bot_token: Optional[str] = Field(default=None, env="BOT_TELEGRAM_BOT_TOKEN")
     admin_chat_ids: List[int] = Field(default_factory=list)
 
 class LoggingConfig(BaseModel):
