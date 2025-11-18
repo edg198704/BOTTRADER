@@ -48,7 +48,7 @@ class MockExchangeAPI(ExchangeAPI):
         self.balances = initial_balances if initial_balances is not None else {"USDT": 10000.0, "BTC": 0.0}
         self.order_id_counter = 0
         self.last_price = 30000.0
-        self.open_orders = {}
+        self.open_orders: Dict[str, Dict[str, Any]] = {}
         logger.info("MockExchangeAPI initialized", initial_balances=self.balances)
 
     async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[Any]]:
@@ -77,47 +77,53 @@ class MockExchangeAPI(ExchangeAPI):
     async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None) -> Dict[str, Any]:
         self.order_id_counter += 1
         order_id = f"mock_order_{self.order_id_counter}"
-        fill_price = self.last_price
-        base_asset, quote_asset = symbol.split('/')
-
-        cost = quantity * fill_price
-        can_fill = (side.upper() == "BUY" and self.balances.get(quote_asset, 0) >= cost) or \
-                   (side.upper() == "SELL" and self.balances.get(base_asset, 0) >= quantity)
-
-        if can_fill:
-            if side.upper() == "BUY":
-                self.balances[quote_asset] -= cost
-                self.balances[base_asset] = self.balances.get(base_asset, 0) + quantity
-            else: # SELL
-                self.balances[base_asset] -= quantity
-                self.balances[quote_asset] = self.balances.get(quote_asset, 0) + cost
-            
-            status = "FILLED"
-            logger.info("Mock: Order filled", side=side, quantity=quantity, symbol=symbol, fill_price=fill_price, new_balances=self.balances)
-            self.open_orders[order_id] = {'id': order_id, 'status': 'closed', 'filled': quantity, 'average': fill_price, 'symbol': symbol}
-        else:
-            status = "REJECTED"
-            logger.warning("Mock: Insufficient balance for order", side=side, symbol=symbol)
-            self.open_orders[order_id] = {'id': order_id, 'status': 'rejected', 'symbol': symbol}
-
-        return {
-            "orderId": order_id,
-            "status": status,
-            "executedQty": quantity if status == "FILLED" else 0.0,
-            "cummulativeQuoteQty": cost if status == "FILLED" else 0.0
+        
+        order = {
+            'id': order_id,
+            'symbol': symbol,
+            'side': side.upper(),
+            'type': order_type.upper(),
+            'quantity': quantity,
+            'status': 'OPEN',
+            'filled': 0.0,
+            'average': 0.0
         }
+        self.open_orders[order_id] = order
+        logger.info("Mock: Order placed", **order)
+
+        return {"orderId": order_id, "status": "OPEN"}
 
     async def fetch_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
         order = self.open_orders.get(order_id)
         if not order:
             return None
-        return {
-            'id': order['id'],
-            'status': order['status'],
-            'filled': order.get('filled', 0.0),
-            'average': order.get('average', 0.0),
-            'symbol': order['symbol']
-        }
+
+        # Simulate order fill on first fetch
+        if order['status'] == 'OPEN':
+            fill_price = self.last_price
+            base_asset, quote_asset = symbol.split('/')
+            cost = order['quantity'] * fill_price
+
+            can_fill = (order['side'] == "BUY" and self.balances.get(quote_asset, 0) >= cost) or \
+                       (order['side'] == "SELL" and self.balances.get(base_asset, 0) >= order['quantity'])
+
+            if can_fill:
+                if order['side'] == "BUY":
+                    self.balances[quote_asset] -= cost
+                    self.balances[base_asset] = self.balances.get(base_asset, 0) + order['quantity']
+                else: # SELL
+                    self.balances[base_asset] -= order['quantity']
+                    self.balances[quote_asset] = self.balances.get(quote_asset, 0) + cost
+                
+                order['status'] = 'FILLED'
+                order['filled'] = order['quantity']
+                order['average'] = fill_price
+                logger.info("Mock: Order filled on fetch", order_id=order_id, fill_price=fill_price)
+            else:
+                order['status'] = 'REJECTED'
+                logger.warning("Mock: Insufficient balance for order", order_id=order_id)
+        
+        return order
 
     async def get_balance(self) -> Dict[str, Any]:
         logger.debug("Mock: Getting all balances")
@@ -193,9 +199,16 @@ class CCXTExchangeAPI(ExchangeAPI):
     async def fetch_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
         try:
             order = await self.exchange.fetch_order(order_id, symbol)
+            status_map = {
+                'open': 'OPEN',
+                'closed': 'FILLED',  # 'closed' in ccxt means fully filled
+                'canceled': 'CANCELED',
+                'rejected': 'REJECTED',
+                'expired': 'EXPIRED'
+            }
             return {
                 'id': order.get('id'),
-                'status': order.get('status', 'unknown').upper(),
+                'status': status_map.get(order.get('status'), 'UNKNOWN'),
                 'filled': order.get('filled', 0.0),
                 'average': order.get('average', 0.0),
                 'symbol': order.get('symbol')
