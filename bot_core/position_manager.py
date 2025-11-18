@@ -1,4 +1,5 @@
 import datetime
+import asyncio
 from typing import List, Optional, Dict
 
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLAlchemyEnum, func, Boolean
@@ -33,11 +34,28 @@ class Position(Base):
     trailing_stop_active = Column(Boolean, default=False, nullable=False)
 
 class PositionManager:
-    def __init__(self, config: DatabaseConfig):
+    def __init__(self, config: DatabaseConfig, initial_capital: float):
         self.engine = create_engine(f'sqlite:///{config.path}')
         Base.metadata.create_all(self.engine)
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+        self._initial_capital = initial_capital
+        self._realized_pnl = 0.0
         logger.info("PositionManager initialized and database table created.")
+
+    async def initialize(self):
+        """Calculates initial realized PnL from the database to populate in-memory state."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._calculate_initial_realized_pnl)
+        logger.info("PositionManager state initialized with historical PnL.", realized_pnl=self._realized_pnl)
+
+    def _calculate_initial_realized_pnl(self):
+        """Synchronous method to query the database for historical PnL."""
+        session = self.SessionLocal()
+        try:
+            realized_pnl = session.query(func.sum(Position.pnl)).filter(Position.status == 'CLOSED').scalar()
+            self._realized_pnl = realized_pnl or 0.0
+        finally:
+            session.close()
 
     def open_position(self, symbol: str, side: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float) -> Optional[Position]:
         session = self.SessionLocal()
@@ -81,13 +99,16 @@ class PositionManager:
             if position.side == 'SELL':
                 pnl = -pnl
 
+            # Update in-memory realized PnL for high-performance portfolio tracking
+            self._realized_pnl += pnl
+
             position.status = 'CLOSED'
             position.close_price = close_price
             position.close_timestamp = datetime.datetime.utcnow()
             position.pnl = pnl
             session.commit()
             session.refresh(position)
-            logger.info("Closed position", symbol=symbol, pnl=f"{pnl:.2f}", reason=reason)
+            logger.info("Closed position", symbol=symbol, pnl=f"{pnl:.2f}", reason=reason, total_realized_pnl=self._realized_pnl)
             return position
         except Exception as e:
             logger.error("Failed to close position", symbol=symbol, error=str(e))
@@ -133,25 +154,17 @@ class PositionManager:
         finally:
             session.close()
 
-    def get_portfolio_value(self, latest_prices: Dict[str, float], initial_capital: float, open_positions: List[Position]) -> float:
-        session = self.SessionLocal()
-        try:
-            # Calculate realized PnL from closed positions
-            closed_pnl_query = session.query(func.sum(Position.pnl)).filter(Position.status == 'CLOSED')
-            realized_pnl = closed_pnl_query.scalar() or 0.0
-            
-            # Calculate unrealized PnL from open positions passed as argument
-            unrealized_pnl = 0.0
-            for pos in open_positions:
-                current_price = latest_prices.get(pos.symbol, pos.entry_price)
-                pnl = (current_price - pos.entry_price) * pos.quantity
-                if pos.side == 'SELL':
-                    pnl = -pnl
-                unrealized_pnl += pnl
+    def get_portfolio_value(self, latest_prices: Dict[str, float], open_positions: List[Position]) -> float:
+        """Calculates total portfolio equity using in-memory PnL and current market prices."""
+        unrealized_pnl = 0.0
+        for pos in open_positions:
+            current_price = latest_prices.get(pos.symbol, pos.entry_price)
+            pnl = (current_price - pos.entry_price) * pos.quantity
+            if pos.side == 'SELL':
+                pnl = -pnl
+            unrealized_pnl += pnl
 
-            return initial_capital + realized_pnl + unrealized_pnl
-        finally:
-            session.close()
+        return self._initial_capital + self._realized_pnl + unrealized_pnl
 
     def close(self):
         self.engine.dispose()
