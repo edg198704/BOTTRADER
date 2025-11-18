@@ -28,7 +28,7 @@ class TelegramBot:
             self.application = None
             return
 
-        self.application = Application.builder().token(config.bot_token).build()
+        self.application = Application.builder().token(config.bot_token.get_secret_value()).build()
         self._setup_handlers()
         logger.info("TelegramBot initialized.")
 
