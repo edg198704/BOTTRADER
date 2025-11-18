@@ -1,6 +1,7 @@
 import os
 import joblib
 import asyncio
+import copy
 from typing import Dict, Any, Tuple
 import pandas as pd
 import numpy as np
@@ -14,9 +15,10 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
     import torch.optim as optim
-    from sklearn.ensemble import VotingClassifier, RandomForestClassifier, GradientBoostingClassifier
-    from sklearn.linear_model import LogisticRegression
+    from torch.utils.data import TensorDataset, DataLoader
+    from sklearn.ensemble import VotingClassifier, RandomForestClassifier
     from sklearn.model_selection import train_test_split
+    from sklearn.linear_model import LogisticRegression
     from xgboost import XGBClassifier
     ML_AVAILABLE = True
 except ImportError:
@@ -24,13 +26,14 @@ except ImportError:
     # Define dummy classes if ML libraries are not available
     class VotingClassifier: pass
     class RandomForestClassifier: pass
-    class GradientBoostingClassifier: pass
     class LogisticRegression: pass
     class XGBClassifier: pass
     class nn:
         class Module: pass
     class optim: pass
     def train_test_split(*args, **kwargs): pass
+    class TensorDataset: pass
+    class DataLoader: pass
 
 logger = get_logger(__name__)
 
@@ -40,23 +43,25 @@ class EnsembleLearner:
     This includes loading, training, and predicting using an ensemble of models.
     """
     class LSTMPredictor(nn.Module):
-        def __init__(self, input_dim, hidden_dim):
+        def __init__(self, input_dim, hidden_dim, num_layers, dropout):
             super().__init__()
-            self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+            self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers, 
+                                dropout=dropout, batch_first=True)
             self.fc = nn.Linear(hidden_dim, 3) # 0: sell, 1: hold, 2: buy
 
         def forward(self, x):
             _, (hn, _) = self.lstm(x)
-            return F.softmax(self.fc(hn[0]), dim=1)
+            # Use the hidden state of the last layer
+            return F.softmax(self.fc(hn[-1]), dim=1)
 
     class AttentionNetwork(nn.Module):
-        def __init__(self, input_dim, hidden_dim):
+        def __init__(self, input_dim, hidden_dim, num_layers, nhead, dropout):
             super().__init__()
             self.embedding = nn.Linear(input_dim, hidden_dim)
-            self.transformer = nn.TransformerEncoder(
-                nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, batch_first=True), 
-                num_layers=2
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim, nhead=nhead, batch_first=True, dropout=dropout
             )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
             self.fc = nn.Linear(hidden_dim, 3) # 0: sell, 1: hold, 2: buy
 
         def forward(self, x):
@@ -84,9 +89,13 @@ class EnsembleLearner:
             xgb_config = self.config.xgboost
             rf_config = self.config.random_forest
             lr_config = self.config.logistic_regression
+            lstm_config = self.config.lstm
+            attn_config = self.config.attention
 
             self.symbol_models[symbol] = {
-                'lstm': self.LSTMPredictor(num_features, 64).to(self.device),
+                'lstm': self.LSTMPredictor(
+                    num_features, lstm_config.hidden_dim, lstm_config.num_layers, lstm_config.dropout
+                ).to(self.device),
                 'gb': XGBClassifier(
                     n_estimators=xgb_config.n_estimators,
                     max_depth=xgb_config.max_depth,
@@ -95,7 +104,9 @@ class EnsembleLearner:
                     colsample_bytree=xgb_config.colsample_bytree,
                     random_state=42, use_label_encoder=False, eval_metric='logloss'
                 ),
-                'attention': self.AttentionNetwork(num_features, 64).to(self.device),
+                'attention': self.AttentionNetwork(
+                    num_features, attn_config.hidden_dim, attn_config.num_layers, attn_config.nhead, attn_config.dropout
+                ).to(self.device),
                 'technical': VotingClassifier(estimators=[
                     ('rf', RandomForestClassifier(
                         n_estimators=rf_config.n_estimators,
@@ -145,7 +156,6 @@ class EnsembleLearner:
         try:
             models = self._get_or_create_symbol_models(symbol)
             
-            # Get the last sequence of data
             sequence_df = df.tail(self.config.sequence_length)
             features = np.nan_to_num(sequence_df[self.config.feature_columns].values, nan=0.0)
 
@@ -158,16 +168,16 @@ class EnsembleLearner:
                 weights_config.attention
             ]
 
-            # Scikit-learn models predict on the last timestep
             last_step_features = features[-1, :].reshape(1, -1)
             gb_pred = models['gb'].predict_proba(last_step_features)[0]
             predictions.append(gb_pred)
             tech_pred = models['technical'].predict_proba(last_step_features)[0]
             predictions.append(tech_pred)
 
-            # PyTorch models predict on the full sequence
-            sequence_tensor = torch.FloatTensor(features).unsqueeze(0).to(self.device) # Add batch dimension
+            sequence_tensor = torch.FloatTensor(features).unsqueeze(0).to(self.device)
             with torch.no_grad():
+                models['lstm'].eval()
+                models['attention'].eval()
                 lstm_pred = models['lstm'](sequence_tensor).cpu().numpy()[0]
                 predictions.append(lstm_pred)
                 attn_pred = models['attention'](sequence_tensor).cpu().numpy()[0]
@@ -184,7 +194,6 @@ class EnsembleLearner:
             return {'action': 'hold', 'confidence': 0.0}
 
     def _create_labels(self, df: pd.DataFrame) -> pd.Series:
-        """Creates labels for supervised learning."""
         horizon = self.config.labeling_horizon
         threshold = self.config.labeling_threshold
         
@@ -195,22 +204,19 @@ class EnsembleLearner:
         labels[price_change_pct > threshold] = 2  # 'buy'
         labels[price_change_pct < -threshold] = 0 # 'sell'
         
-        return labels.iloc[:-horizon] # Drop last rows where future is unknown
+        return labels.iloc[:-horizon]
 
     def _create_sequences(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Transforms flat data into sequences for time-series models."""
         seq_length = self.config.sequence_length
         X_seq, y_seq = [], []
         for i in range(len(X) - seq_length + 1):
             X_seq.append(X[i:i+seq_length])
-            y_seq.append(y[i+seq_length-1]) # Label corresponds to the last element
+            y_seq.append(y[i+seq_length-1])
         return np.array(X_seq), np.array(y_seq)
 
     def train(self, symbol: str, df: pd.DataFrame):
-        """Trains all models in the ensemble for a given symbol."""
         logger.info("Starting model training", symbol=symbol)
         try:
-            # 1. Prepare flat data
             labels = self._create_labels(df)
             features = df[self.config.feature_columns].loc[labels.index]
             
@@ -221,66 +227,95 @@ class EnsembleLearner:
                 logger.warning("Training data has fewer than 3 unique labels. Skipping training.", symbol=symbol, labels=np.unique(y_flat))
                 return
 
-            # 2. Create sequences for PyTorch models
             X_seq, y_seq = self._create_sequences(X_flat, y_flat)
-            
-            # 3. Create flat data for scikit-learn models (using last timestep of each sequence)
             X_flat_from_seq = X_seq[:, -1, :]
             y_flat_from_seq = y_seq
 
-            # 4. Split data
-            # Scikit-learn split
-            X_train_flat, X_test_flat, y_train_flat, y_test_flat = train_test_split(
-                X_flat_from_seq, y_flat_from_seq, test_size=0.2, random_state=42, stratify=y_flat_from_seq
+            X_train_flat, _, y_train_flat, _ = train_test_split(
+                X_flat_from_seq, y_flat_from_seq, test_size=self.config.training.validation_split, random_state=42, stratify=y_flat_from_seq
             )
-            # PyTorch split
-            X_train_seq, X_test_seq, y_train_seq, y_test_seq = train_test_split(
-                X_seq, y_seq, test_size=0.2, random_state=42, stratify=y_seq
+            X_train_seq, X_val_seq, y_train_seq, y_val_seq = train_test_split(
+                X_seq, y_seq, test_size=self.config.training.validation_split, random_state=42, stratify=y_seq
             )
             
             models = self._get_or_create_symbol_models(symbol)
 
-            # 5. Train scikit-learn models
             logger.info("Training scikit-learn models...", symbol=symbol)
             models['gb'].fit(X_train_flat, y_train_flat)
             models['technical'].fit(X_train_flat, y_train_flat)
             logger.info("Scikit-learn models trained.", symbol=symbol)
 
-            # 6. Train PyTorch models
             logger.info("Training PyTorch models...", symbol=symbol)
             X_train_tensor = torch.FloatTensor(X_train_seq).to(self.device)
             y_train_tensor = torch.LongTensor(y_train_seq).to(self.device)
+            X_val_tensor = torch.FloatTensor(X_val_seq).to(self.device)
+            y_val_tensor = torch.LongTensor(y_val_seq).to(self.device)
             
-            self._train_pytorch_model(models['lstm'], X_train_tensor, y_train_tensor)
-            self._train_pytorch_model(models['attention'], X_train_tensor, y_train_tensor)
+            self._train_pytorch_model(models['lstm'], X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor)
+            self._train_pytorch_model(models['attention'], X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor)
             logger.info("PyTorch models trained.", symbol=symbol)
 
-            # 7. Save models
             self._save_models(symbol)
             self.is_trained = True
             logger.info("All models trained and saved successfully.", symbol=symbol)
 
         except Exception as e:
             logger.critical("An error occurred during model training", symbol=symbol, error=str(e), exc_info=True)
-            self.is_trained = False # Mark as not trained if it fails
+            self.is_trained = False
 
-    def _train_pytorch_model(self, model: nn.Module, X_train: torch.Tensor, y_train: torch.Tensor):
-        """Generic training loop for a PyTorch model."""
-        model.train()
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
+    def _train_pytorch_model(self, model: nn.Module, X_train: torch.Tensor, y_train: torch.Tensor, X_val: torch.Tensor, y_val: torch.Tensor):
+        train_cfg = self.config.training
+        train_dataset = TensorDataset(X_train, y_train)
+        train_loader = DataLoader(train_dataset, batch_size=train_cfg.batch_size, shuffle=True)
+        val_dataset = TensorDataset(X_val, y_val)
+        val_loader = DataLoader(val_dataset, batch_size=train_cfg.batch_size)
+
+        optimizer = optim.Adam(model.parameters(), lr=train_cfg.learning_rate)
         criterion = nn.CrossEntropyLoss()
 
-        for epoch in range(self.config.training_epochs):
-            optimizer.zero_grad()
-            outputs = model(X_train)
-            loss = criterion(outputs, y_train)
-            loss.backward()
-            optimizer.step()
-            if (epoch + 1) % 5 == 0:
-                logger.debug(f"PyTorch model training", model=model.__class__.__name__, epoch=epoch+1, loss=loss.item())
+        best_val_loss = float('inf')
+        patience_counter = 0
+        best_model_state = None
+
+        logger.info(f"Starting training for {model.__class__.__name__}", epochs=train_cfg.epochs, patience=train_cfg.early_stopping_patience)
+
+        for epoch in range(train_cfg.epochs):
+            model.train()
+            total_train_loss = 0
+            for X_batch, y_batch in train_loader:
+                optimizer.zero_grad()
+                outputs = model(X_batch)
+                loss = criterion(outputs, y_batch)
+                loss.backward()
+                optimizer.step()
+                total_train_loss += loss.item()
+
+            model.eval()
+            total_val_loss = 0
+            with torch.no_grad():
+                for X_batch, y_batch in val_loader:
+                    outputs = model(X_batch)
+                    loss = criterion(outputs, y_batch)
+                    total_val_loss += loss.item()
+            
+            avg_val_loss = total_val_loss / len(val_loader)
+            logger.debug(f"Epoch {epoch+1}/{train_cfg.epochs}", model=model.__class__.__name__, train_loss=total_train_loss/len(train_loader), val_loss=avg_val_loss)
+
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                patience_counter = 0
+                best_model_state = copy.deepcopy(model.state_dict())
+            else:
+                patience_counter += 1
+                if patience_counter >= train_cfg.early_stopping_patience:
+                    logger.info(f"Early stopping triggered at epoch {epoch+1}", model=model.__class__.__name__)
+                    break
+        
+        if best_model_state:
+            model.load_state_dict(best_model_state)
+            logger.info(f"Loaded best model state with validation loss: {best_val_loss:.4f}", model=model.__class__.__name__)
 
     def _save_models(self, symbol: str):
-        """Saves all trained models for a symbol to disk."""
         symbol_path_str = symbol.replace('/', '_')
         save_path = os.path.join(self.config.model_path, symbol_path_str)
         os.makedirs(save_path, exist_ok=True)
