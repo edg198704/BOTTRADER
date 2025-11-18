@@ -187,15 +187,15 @@ class CCXTExchangeAPI(ExchangeAPI):
         if not exchange_class:
             raise ValueError(f"Exchange '{config.name}' is not supported by ccxt.")
         
-        if not config.api_key or not config.api_secret:
-            logger.critical("API key and secret are required for a live exchange but were not found in environment variables (BOT_EXCHANGE_API_KEY, BOT_EXCHANGE_API_SECRET).")
-            raise ValueError("Missing API key/secret for CCXT exchange.")
-
-        self.exchange = exchange_class({
-            'apiKey': config.api_key,
-            'secret': config.api_secret,
+        exchange_config = {
             'enableRateLimit': True,
-        })
+        }
+        if config.api_key:
+            exchange_config['apiKey'] = config.api_key.get_secret_value()
+        if config.api_secret:
+            exchange_config['secret'] = config.api_secret.get_secret_value()
+
+        self.exchange = exchange_class(exchange_config)
         self._markets_cache: Optional[Dict[str, Any]] = None
 
         if config.testnet and self.exchange.has['test']:
