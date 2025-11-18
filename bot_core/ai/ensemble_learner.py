@@ -194,7 +194,7 @@ class EnsembleLearner:
         
         return labels.iloc[:-horizon] # Drop last rows where future is unknown
 
-    async def train(self, symbol: str, df: pd.DataFrame):
+    def train(self, symbol: str, df: pd.DataFrame):
         """Trains all models in the ensemble for a given symbol."""
         logger.info("Starting model training", symbol=symbol)
         try:
@@ -224,12 +224,12 @@ class EnsembleLearner:
             X_train_tensor = torch.FloatTensor(X_train).to(self.device)
             y_train_tensor = torch.LongTensor(y_train).to(self.device)
             
-            await self._train_pytorch_model(models['lstm'], X_train_tensor, y_train_tensor)
-            await self._train_pytorch_model(models['attention'], X_train_tensor, y_train_tensor)
+            self._train_pytorch_model(models['lstm'], X_train_tensor, y_train_tensor)
+            self._train_pytorch_model(models['attention'], X_train_tensor, y_train_tensor)
             logger.info("PyTorch models trained.", symbol=symbol)
 
             # 4. Save models
-            await self._save_models(symbol)
+            self._save_models(symbol)
             self.is_trained = True
             logger.info("All models trained and saved successfully.", symbol=symbol)
 
@@ -237,7 +237,7 @@ class EnsembleLearner:
             logger.critical("An error occurred during model training", symbol=symbol, error=str(e), exc_info=True)
             self.is_trained = False # Mark as not trained if it fails
 
-    async def _train_pytorch_model(self, model: nn.Module, X_train: torch.Tensor, y_train: torch.Tensor):
+    def _train_pytorch_model(self, model: nn.Module, X_train: torch.Tensor, y_train: torch.Tensor):
         """Generic training loop for a PyTorch model."""
         model.train()
         optimizer = optim.Adam(model.parameters(), lr=0.001)
@@ -258,7 +258,7 @@ class EnsembleLearner:
             if (epoch + 1) % 5 == 0:
                 logger.debug(f"PyTorch model training", model=model.__class__.__name__, epoch=epoch+1, loss=loss.item())
 
-    async def _save_models(self, symbol: str):
+    def _save_models(self, symbol: str):
         """Saves all trained models for a symbol to disk."""
         symbol_path_str = symbol.replace('/', '_')
         save_path = os.path.join(self.config.model_path, symbol_path_str)
