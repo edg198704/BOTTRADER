@@ -38,13 +38,13 @@ class SimpleMACrossoverStrategy(TradingStrategy):
         is_bearish_cross = last_row['sma_fast'] < last_row['sma_slow'] and prev_row['sma_fast'] >= prev_row['sma_slow']
 
         if position:
-            # Logic to close existing position
+            # Logic to close existing position with an opposing signal
             if position.side == 'BUY' and is_bearish_cross:
                 logger.info("Close Long signal detected (MA Crossover)", symbol=symbol)
-                return {'action': 'CLOSE', 'symbol': symbol}
+                return {'action': 'SELL', 'symbol': symbol}
             if position.side == 'SELL' and is_bullish_cross:
                 logger.info("Close Short signal detected (MA Crossover)", symbol=symbol)
-                return {'action': 'CLOSE', 'symbol': symbol}
+                return {'action': 'BUY', 'symbol': symbol}
         else:
             # Logic to open new position
             if is_bullish_cross:
@@ -90,20 +90,20 @@ class AIEnsembleStrategy(TradingStrategy):
             return None
 
         if position:
-            # Have a position, look for close signals
+            # Have a position, look for close signals (opposing action)
             if position.side == 'BUY' and action == 'sell':
                 logger.info("AI Close Long signal detected", symbol=symbol, confidence=confidence)
-                return {'action': 'CLOSE', 'symbol': symbol, 'confidence': confidence}
+                return {'action': 'SELL', 'symbol': symbol, 'confidence': confidence}
             if position.side == 'SELL' and action == 'buy':
                 logger.info("AI Close Short signal detected", symbol=symbol, confidence=confidence)
-                return {'action': 'CLOSE', 'symbol': symbol, 'confidence': confidence}
+                return {'action': 'BUY', 'symbol': symbol, 'confidence': confidence}
         else:
             # No position, look for open signals
             if action == 'buy':
                 logger.info("AI Open Long signal detected", symbol=symbol, confidence=confidence)
                 return {'action': 'BUY', 'symbol': symbol, 'confidence': confidence}
             if action == 'sell':
-                logger.info("AI Open Short signal, detected", symbol=symbol, confidence=confidence)
+                logger.info("AI Open Short signal detected", symbol=symbol, confidence=confidence)
                 return {'action': 'SELL', 'symbol': symbol, 'confidence': confidence}
 
         return None
