@@ -46,7 +46,7 @@ class AIStrategyConfig(BaseModel):
     xgboost: XGBoostConfig = Field(default_factory=XGBoostConfig)
     random_forest: RandomForestConfig = Field(default_factory=RandomForestConfig)
     logistic_regression: LogisticRegressionConfig = Field(default_factory=LogisticRegressionConfig)
-    ensemble_weights: EnsembleWeights = Field(default_factory=EnsembleWeights)
+    ensemble_weights: EnsembleWeights = Field(default_factory=EnsemblesWeights)
     market_regime: MarketRegimeConfig = Field(default_factory=MarketRegimeConfig)
 
 class SimpleMAStrategyConfig(BaseModel):
@@ -57,6 +57,7 @@ class StrategyConfig(BaseModel):
     name: str = "AIEnsembleStrategy"
     symbols: List[str] = Field(default_factory=lambda: ["BTC/USDT"])
     interval_seconds: int = 60
+    timeframe: str = "1h"  # Timeframe for OHLCV data (e.g., '1m', '5m', '1h', '1d')
     ai_ensemble: AIStrategyConfig = Field(default_factory=AIStrategyConfig)
     simple_ma: SimpleMAStrategyConfig = Field(default_factory=SimpleMAStrategyConfig)
 
@@ -64,13 +65,12 @@ class RiskManagementConfig(BaseModel):
     max_position_size_usd: float = 1000.0
     max_daily_loss_usd: float = 500.0
     max_open_positions: int = 5
-    circuit_breaker_threshold: float = -0.10 # -10% portfolio drawdown
+    circuit_breaker_threshold: float = -0.10  # -10% portfolio drawdown
     use_trailing_stop: bool = True
-    trailing_stop_activation_pct: float = 0.02 # e.g., 2% profit before trailing
-    trailing_stop_pct: float = 0.015 # e.g., trail by 1.5%
     atr_stop_multiplier: float = 2.0
     stop_loss_fallback_pct: float = 0.05
-    risk_per_trade_pct: float = 0.01 # Risk 1% of portfolio equity per trade
+    risk_per_trade_pct: float = 0.01  # Risk 1% of portfolio equity per trade
+    reward_to_risk_ratio: float = 1.5  # Default reward/risk ratio for take-profit calculation
 
 class DatabaseConfig(BaseModel):
     path: str = "position_ledger.db"
