@@ -35,6 +35,11 @@ class ExchangeAPI(abc.ABC):
         pass
 
     @abc.abstractmethod
+    async def cancel_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
+        """Cancels an open order."""
+        pass
+
+    @abc.abstractmethod
     async def get_balance(self) -> Dict[str, Any]:
         """Retrieves all asset balances."""
         pass
@@ -106,8 +111,9 @@ class MockExchangeAPI(ExchangeAPI):
         if not order:
             return None
 
-        # Simulate order fill on first fetch
-        if order['status'] == 'OPEN':
+        # Simulate order fill on first fetch for MARKET orders or if price is met for LIMIT
+        is_market = order.get('type') == 'MARKET'
+        if order['status'] == 'OPEN' and is_market:
             fill_price = self.last_price
             base_asset, quote_asset = symbol.split('/')
             cost = order['quantity'] * fill_price
@@ -131,6 +137,15 @@ class MockExchangeAPI(ExchangeAPI):
                 order['status'] = 'REJECTED'
                 logger.warning("Mock: Insufficient balance for order", order_id=order_id)
         
+        return order
+
+    async def cancel_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
+        order = self.open_orders.get(order_id)
+        if order and order['status'] == 'OPEN':
+            order['status'] = 'CANCELED'
+            logger.info("Mock: Order canceled", order_id=order_id)
+            return order
+        logger.warning("Mock: Order not found or not open for cancellation", order_id=order_id)
         return order
 
     async def get_balance(self) -> Dict[str, Any]:
@@ -184,6 +199,7 @@ class CCXTExchangeAPI(ExchangeAPI):
         self.get_ticker_data = retry_decorator(self.get_ticker_data)
         self.place_order = retry_decorator(self.place_order)
         self.fetch_order = retry_decorator(self.fetch_order)
+        self.cancel_order = retry_decorator(self.cancel_order)
         self.get_balance = retry_decorator(self.get_balance)
         self.fetch_market_details = retry_decorator(self.fetch_market_details)
 
@@ -262,6 +278,20 @@ class CCXTExchangeAPI(ExchangeAPI):
             return None
         except (NetworkError, ExchangeError) as e:
             logger.error("Final attempt failed for fetch_order", order_id=order_id, error=str(e))
+            raise
+
+    async def cancel_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
+        try:
+            # ccxt's cancel_order returns the order structure
+            await self.exchange.cancel_order(order_id, symbol)
+            # Fetch to get standardized status after cancellation
+            return await self.fetch_order(order_id, symbol)
+        except OrderNotFound:
+            logger.warning("Attempted to cancel an order that was not found (might be already filled or canceled).", order_id=order_id)
+            # Try to fetch it anyway to see its final state
+            return await self.fetch_order(order_id, symbol)
+        except (NetworkError, ExchangeError) as e:
+            logger.error("Final attempt failed for cancel_order", order_id=order_id, error=str(e))
             raise
 
     async def get_balance(self) -> Dict[str, Any]:
