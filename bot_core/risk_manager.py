@@ -124,7 +124,8 @@ class RiskManager:
         return True
 
     def calculate_stop_loss(self, side: str, entry_price: float, df_with_indicators: pd.DataFrame, market_regime: Optional[str] = None) -> float:
-        atr = df_with_indicators['atr'].iloc[-1] if 'atr' in df_with_indicators.columns and not df_with_indicators['atr'].empty else 0
+        atr_col = 'ATRr_14' # Default ATR column name from pandas-ta
+        atr = df_with_indicators[atr_col].iloc[-1] if atr_col in df_with_indicators.columns and not df_with_indicators[atr_col].empty else 0
         
         atr_multiplier = self._get_regime_param('atr_stop_multiplier', market_regime)
 
