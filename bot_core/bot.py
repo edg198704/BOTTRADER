@@ -18,7 +18,8 @@ logger = get_logger(__name__)
 class TradingBot:
     def __init__(self, config: BotConfig, exchange_api: ExchangeAPI, strategy: TradingStrategy, 
                  position_manager: PositionManager, risk_manager: RiskManager,
-                 health_checker: HealthChecker, metrics_writer: Optional[InfluxDBMetrics] = None):
+                 health_checker: HealthChecker, metrics_writer: Optional[InfluxDBMetrics] = None,
+                 shared_bot_state: Optional[Dict[str, Any]] = None):
         self.config = config
         self.exchange_api = exchange_api
         self.strategy = strategy
@@ -26,16 +27,29 @@ class TradingBot:
         self.risk_manager = risk_manager
         self.health_checker = health_checker
         self.metrics_writer = metrics_writer
+        self.shared_bot_state = shared_bot_state if shared_bot_state is not None else {}
         
         self.running = False
         self.start_time = datetime.now(timezone.utc)
         self.latest_prices: Dict[str, float] = {}
         self.tasks: list[asyncio.Task] = []
+        
+        self._initialize_shared_state()
         logger.info("TradingBot orchestrator initialized.")
+
+    def _initialize_shared_state(self):
+        """Initializes the shared state dictionary for external components like Telegram."""
+        self.shared_bot_state['status'] = 'initializing'
+        self.shared_bot_state['start_time'] = self.start_time
+        self.shared_bot_state['position_manager'] = self.position_manager
+        self.shared_bot_state['risk_manager'] = self.risk_manager
+        self.shared_bot_state['latest_prices'] = self.latest_prices
+        self.shared_bot_state['config'] = self.config
 
     async def run(self):
         """Main entry point to start all bot activities."""
         self.running = True
+        self.shared_bot_state['status'] = 'running'
         logger.info("Starting TradingBot...", symbols=self.config.strategy.symbols)
         
         # Start shared loops
@@ -205,6 +219,10 @@ class TradingBot:
                 portfolio_value = self.position_manager.get_portfolio_value(self.latest_prices, self.config.initial_capital, open_positions)
                 self.risk_manager.update_portfolio_risk(portfolio_value)
 
+                # Update shared state for Telegram bot
+                self.shared_bot_state['portfolio_equity'] = portfolio_value
+                self.shared_bot_state['open_positions_count'] = len(open_positions)
+
                 if self.metrics_writer and self.metrics_writer.enabled:
                     await self.metrics_writer.write_metric('portfolio', fields={'equity': portfolio_value})
 
@@ -324,6 +342,7 @@ class TradingBot:
     async def stop(self):
         logger.info("Stopping TradingBot...")
         self.running = False
+        self.shared_bot_state['status'] = 'stopping'
         for task in self.tasks:
             if not task.done():
                 task.cancel()
@@ -334,3 +353,4 @@ class TradingBot:
         if self.position_manager: self.position_manager.close()
         if self.metrics_writer: await self.metrics_writer.close()
         logger.info("TradingBot stopped gracefully.")
+        self.shared_bot_state['status'] = 'stopped'
