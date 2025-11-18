@@ -78,13 +78,34 @@ class EnsembleLearner:
         if symbol not in self.symbol_models:
             logger.info("Creating new model set for symbol", symbol=symbol)
             num_features = len(self.config.feature_columns)
+            
+            xgb_config = self.config.xgboost
+            rf_config = self.config.random_forest
+            lr_config = self.config.logistic_regression
+
             self.symbol_models[symbol] = {
                 'lstm': self.LSTMPredictor(num_features, 64).to(self.device),
-                'gb': XGBClassifier(n_estimators=10, max_depth=5, random_state=42, use_label_encoder=False, eval_metric='logloss'),
+                'gb': XGBClassifier(
+                    n_estimators=xgb_config.n_estimators,
+                    max_depth=xgb_config.max_depth,
+                    learning_rate=xgb_config.learning_rate,
+                    subsample=xgb_config.subsample,
+                    colsample_bytree=xgb_config.colsample_bytree,
+                    random_state=42, use_label_encoder=False, eval_metric='logloss'
+                ),
                 'attention': self.AttentionNetwork(num_features, 64).to(self.device),
                 'technical': VotingClassifier(estimators=[
-                    ('rf', RandomForestClassifier(n_estimators=10, max_depth=5, random_state=42)),
-                    ('lr', LogisticRegression(max_iter=100, random_state=42))
+                    ('rf', RandomForestClassifier(
+                        n_estimators=rf_config.n_estimators,
+                        max_depth=rf_config.max_depth,
+                        min_samples_leaf=rf_config.min_samples_leaf,
+                        random_state=42
+                    )),
+                    ('lr', LogisticRegression(
+                        max_iter=lr_config.max_iter,
+                        C=lr_config.C,
+                        random_state=42
+                    ))
                 ], voting='soft')
             }
         return self.symbol_models[symbol]
@@ -123,7 +144,13 @@ class EnsembleLearner:
             features = np.nan_to_num(features_df.values, nan=0.0)
 
             predictions = []
-            weights = [0.25, 0.15, 0.3, 0.3] # gb, technical, lstm, attention
+            weights_config = self.config.ensemble_weights
+            weights = [
+                weights_config.xgboost,
+                weights_config.technical_ensemble,
+                weights_config.lstm,
+                weights_config.attention
+            ]
 
             # Scikit-learn models
             gb_pred = models['gb'].predict_proba(features)[0]
