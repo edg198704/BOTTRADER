@@ -43,28 +43,90 @@ htmlcov/
 .coverage
 .coverage.*
 .cache
-.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
 .hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# PEP 582; used by Poetry, Pipenv, etc.
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
 
 # Environments
 .env
 .venv
 venv/
-ENV/
 env/
 
-# IDEs and editors
-.idea/
-.vscode/
+# Spyder project settings
+.spyderproject
+.spyproject
 
-# Project-specific files
-position_ledger.db
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# Trading Bot Specific
 *.db
+*.db-journal
 *.log
-logs/
 models/
-reports/
-
-# OS-specific
-.DS_Store
-Thumbs.db
+config_enterprise.yaml
