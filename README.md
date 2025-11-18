@@ -78,11 +78,34 @@ The bot will initialize all components based on your configuration and begin its
 
 ### Adding a New Strategy
 
-1.  Create a new class in `bot_core/strategy.py` that inherits from `TradingStrategy`.
-2.  Implement the `analyze_market` abstract method with your custom logic.
-3.  Import your new strategy class in `start_bot.py`.
-4.  Update the factory function `get_strategy` in `start_bot.py` to recognize and instantiate your new strategy.
-5.  Update `config_enterprise.yaml` to set `strategy.name` to your new strategy's class name.
+The bot is designed for easy strategy extension without modifying core application files.
+
+1.  **Create the Strategy Class**: In `bot_core/strategy.py`, create a new class that inherits from `TradingStrategy`. Your new class will be automatically available to the bot.
+    ```python
+    # In bot_core/strategy.py
+    class MyAwesomeStrategy(TradingStrategy):
+        def __init__(self, config: StrategyConfig):
+            super().__init__(config)
+            # Add any strategy-specific initialization here.
+            # You can add a config model for your strategy in bot_core/config.py
+
+        async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[Dict[str, Any]]:
+            # Implement your custom trading logic here
+            # Return a signal dictionary or None
+            pass
+    ```
+
+2.  **Configure the Bot**: Open `config_enterprise.yaml` and update the `strategy` section to use your new class.
+    ```yaml
+    strategy:
+      name: "MyAwesomeStrategy" # Must match your class name exactly
+      symbols: ["BTC/USDT"]
+      interval_seconds: 10
+      timeframe: "5m"
+      # Add any custom config parameters for your strategy here
+    ```
+
+That's it. The bot will automatically find and load your strategy class from `bot_core/strategy.py` by its name. There is no need to modify `start_bot.py`.
 
 ### Database Inspection
 
