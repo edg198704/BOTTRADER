@@ -28,8 +28,8 @@ class Position(Base):
     close_timestamp = Column(DateTime, nullable=True)
     close_price = Column(Float, nullable=True)
     pnl = Column(Float, nullable=True)
-    # New columns for trailing stop
-    peak_price = Column(Float, nullable=True)
+    # Renamed from peak_price for clarity with short positions
+    trailing_ref_price = Column(Float, nullable=True)
     trailing_stop_active = Column(Boolean, default=False, nullable=False)
 
 class PositionManager:
@@ -54,8 +54,8 @@ class PositionManager:
                 stop_loss_price=stop_loss,
                 take_profit_price=take_profit,
                 status='OPEN',
-                peak_price=entry_price, # Initialize peak price
-                trailing_stop_active=False # Initialize trailing stop status
+                trailing_ref_price=entry_price, # Initialize reference price
+                trailing_stop_active=False
             )
             session.add(new_position)
             session.commit()
@@ -78,7 +78,7 @@ class PositionManager:
                 return None
 
             pnl = (close_price - position.entry_price) * position.quantity
-            if position.side == 'SELL': # Assuming short positions, though not fully implemented
+            if position.side == 'SELL':
                 pnl = -pnl
 
             position.status = 'CLOSED'
@@ -96,7 +96,7 @@ class PositionManager:
         finally:
             session.close()
 
-    def update_trailing_stop(self, symbol: str, new_stop_loss: float, new_peak_price: float, is_active: bool) -> Optional[Position]:
+    def update_trailing_stop(self, symbol: str, new_stop_loss: float, new_ref_price: float, is_active: bool) -> Optional[Position]:
         session = self.SessionLocal()
         try:
             position = session.query(Position).filter(Position.symbol == symbol, Position.status == 'OPEN').first()
@@ -105,12 +105,12 @@ class PositionManager:
                 return None
 
             position.stop_loss_price = new_stop_loss
-            position.peak_price = new_peak_price
+            position.trailing_ref_price = new_ref_price
             position.trailing_stop_active = is_active
             
             session.commit()
             session.refresh(position)
-            logger.debug("Updated trailing stop for position", symbol=symbol, new_sl=new_stop_loss, peak_price=new_peak_price)
+            logger.debug("Updated trailing stop for position", symbol=symbol, new_sl=new_stop_loss, ref_price=new_ref_price)
             return position
         except Exception as e:
             logger.error("Failed to update trailing stop", symbol=symbol, error=str(e))
