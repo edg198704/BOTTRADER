@@ -113,7 +113,8 @@ class TelegramBot:
             await update.message.reply_text("Position manager not available.")
             return
 
-        positions = position_manager.get_all_open_positions()
+        # Await async DB call
+        positions = await position_manager.get_all_open_positions()
         if not positions:
             await update.message.reply_text("No open positions.")
             return
@@ -136,73 +137,5 @@ class TelegramBot:
             symbol_md = pos.symbol.replace('-', '\-').replace('.', '\.')
             
             message += (
-                f"{side_emoji} *{symbol_md}* \\({pos.side}\\)\n"
-                f"  *Qty*: `{pos.quantity}`\n"
-                f"  *Entry*: `${pos.entry_price:,.4f}`\n"
-                f"  *Current*: `${current_price:,.4f}`\n"
-                f"  *SL*: `${pos.stop_loss_price:,.4f}`\n"
-                f"  *TP*: `${pos.take_profit_price:,.4f}`\n"
-                f"  {pnl_emoji} *PnL*: `${pnl:,.2f}` \\(`{pnl_pct:+.2f}%`\\)\n\n"
-            )
-        
-        pnl_emoji = "🟢" if total_unrealized_pnl >= 0 else "🔴"
-        message += f"*Total Unrealized PnL*: {pnl_emoji} `${total_unrealized_pnl:,.2f}`"
-        
-        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN_V2)
-
-    def create_alert_handler(self) -> Callable[[Dict[str, Any]], Awaitable[None]]:
-        """Creates and returns an async function to handle alerts."""
-        async def handler(alert_data: Dict[str, Any]):
-            if not self.application:
-                return
-
-            level = alert_data.get('level', 'info').upper()
-            message = alert_data.get('message', 'An alert was triggered.')
-            details = alert_data.get('details', {})
-
-            level_emoji_map = {
-                'INFO': 'ℹ️',
-                'WARNING': '⚠️',
-                'ERROR': '🔴',
-                'CRITICAL': '🔥'
-            }
-            emoji = level_emoji_map.get(level, '⚙️')
-
-            # Format details into a readable string
-            details_str = ""
-            if details:
-                details_str = "\n\n*Details:*\n"
-                for key, value in details.items():
-                    # Escape special characters for MarkdownV2
-                    key_md = str(key).replace('_', '\\_')
-                    value_md = str(value).replace('.', '\\.').replace('-', '\\-')
-                    details_str += f" `{key_md}`: `{value_md}`\n"
-
-            full_message = f"{emoji} *{level}*\n\n{message}{details_str}"
-
-            for chat_id in self.config.admin_chat_ids:
-                try:
-                    await self.application.bot.send_message(
-                        chat_id=chat_id,
-                        text=full_message,
-                        parse_mode=ParseMode.MARKDOWN_V2
-                    )
-                except Exception as e:
-                    logger.error("Failed to send Telegram alert", chat_id=chat_id, error=str(e))
-        
-        return handler
-
-    async def run(self):
-        if not self.application:
-            return
-        logger.info("Telegram bot is polling for commands...")
-        await self.application.initialize()
-        await self.application.start()
-        await self.application.updater.start_polling()
-
-    async def stop(self):
-        if self.application and self.application.updater and self.application.updater.running:
-            await self.application.updater.stop()
-            await self.application.stop()
-            await self.application.shutdown()
-            logger.info("Telegram bot has been stopped.")
+                f"{side_emoji} *{symbol_md}* \({pos.side}\)\n"
+                f
