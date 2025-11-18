@@ -200,7 +200,9 @@ class TradingBot:
                             loop = asyncio.get_running_loop()
                             await loop.run_in_executor(
                                 None, 
-                                lambda: asyncio.run(self.strategy.retrain(symbol, training_df))
+                                self.strategy.retrain,
+                                symbol,
+                                training_df
                             )
                         else:
                             logger.error("Could not fetch training data, skipping retraining for now.", symbol=symbol)
