@@ -100,24 +100,16 @@ class TradingBot:
                             continue
 
                     # --- SL/TP Execution ---
-                    if pos.side == 'BUY':
-                        if current_price <= pos.stop_loss_price:
-                            logger.info("Stop-loss triggered for LONG position", symbol=pos.symbol, price=current_price, sl=pos.stop_loss_price)
-                            await self._close_position(pos, current_price, "Stop-Loss")
-                            continue
-                        if current_price >= pos.take_profit_price:
-                            logger.info("Take-profit triggered for LONG position", symbol=pos.symbol, price=current_price, tp=pos.take_profit_price)
-                            await self._close_position(pos, current_price, "Take-Profit")
-                            continue
-                    elif pos.side == 'SELL':
-                        if current_price >= pos.stop_loss_price:
-                            logger.info("Stop-loss triggered for SHORT position", symbol=pos.symbol, price=current_price, sl=pos.stop_loss_price)
-                            await self._close_position(pos, current_price, "Stop-Loss")
-                            continue
-                        if current_price <= pos.take_profit_price:
-                            logger.info("Take-profit triggered for SHORT position", symbol=pos.symbol, price=current_price, tp=pos.take_profit_price)
-                            await self._close_position(pos, current_price, "Take-Profit")
-                            continue
+                    # Check for stop-loss
+                    if pos.side == 'BUY' and current_price <= pos.stop_loss_price:
+                        logger.info("Stop-loss triggered for position", symbol=pos.symbol, price=current_price, sl=pos.stop_loss_price)
+                        await self._close_position(pos, "Stop-Loss")
+                        continue # Move to next position as this one is closed
+                    
+                    # Check for take-profit
+                    if pos.side == 'BUY' and current_price >= pos.take_profit_price:
+                        logger.info("Take-profit triggered for position", symbol=pos.symbol, price=current_price, tp=pos.take_profit_price)
+                        await self._close_position(pos, "Take-Profit")
 
             except asyncio.CancelledError:
                 logger.info("Position management loop cancelled.")
@@ -127,61 +119,42 @@ class TradingBot:
             await asyncio.sleep(5) # Check positions frequently
 
     async def _handle_trailing_stop(self, pos: Position, current_price: float) -> Optional[Position]:
-        """Handles the logic for updating a trailing stop loss for both long and short positions."""
+        """Handles the logic for updating a trailing stop loss. Returns the updated position."""
+        # This logic currently only supports LONG positions.
+        if pos.side != 'BUY':
+            return pos
+
         rm_config = self.config.risk_management
         needs_update = False
-        trailing_stop_active = pos.trailing_stop_active
-        new_stop_loss = pos.stop_loss_price
-        new_ref_price = pos.trailing_ref_price
-
-        if pos.side == 'BUY':
-            # 1. Update peak price
-            if current_price > new_ref_price:
-                new_ref_price = current_price
-                needs_update = True
-            
-            # 2. Check for activation
-            if not trailing_stop_active:
-                activation_price = pos.entry_price * (1 + rm_config.trailing_stop_activation_pct)
-                if current_price >= activation_price:
-                    trailing_stop_active = True
-                    needs_update = True
-                    logger.info("Trailing stop activated for LONG", symbol=pos.symbol, price=current_price, activation_price=activation_price)
-            
-            # 3. Calculate new stop loss if active
-            if trailing_stop_active:
-                trail_price = new_ref_price * (1 - rm_config.trailing_stop_pct)
-                if trail_price > new_stop_loss:
-                    new_stop_loss = trail_price
-                    needs_update = True
         
-        elif pos.side == 'SELL':
-            # 1. Update trough price
-            if current_price < new_ref_price:
-                new_ref_price = current_price
-                needs_update = True
+        # 1. Update peak price
+        new_peak_price = max(pos.peak_price, current_price)
+        if new_peak_price != pos.peak_price:
+            needs_update = True
 
-            # 2. Check for activation
-            if not trailing_stop_active:
-                activation_price = pos.entry_price * (1 - rm_config.trailing_stop_activation_pct)
-                if current_price <= activation_price:
-                    trailing_stop_active = True
-                    needs_update = True
-                    logger.info("Trailing stop activated for SHORT", symbol=pos.symbol, price=current_price, activation_price=activation_price)
-            
-            # 3. Calculate new stop loss if active
-            if trailing_stop_active:
-                trail_price = new_ref_price * (1 + rm_config.trailing_stop_pct)
-                if trail_price < new_stop_loss:
-                    new_stop_loss = trail_price
-                    needs_update = True
+        # 2. Check for activation
+        trailing_stop_active = pos.trailing_stop_active
+        if not trailing_stop_active:
+            activation_price = pos.entry_price * (1 + rm_config.trailing_stop_activation_pct)
+            if current_price >= activation_price:
+                trailing_stop_active = True
+                needs_update = True
+                logger.info("Trailing stop activated", symbol=pos.symbol, price=current_price, activation_price=activation_price)
+
+        # 3. Calculate new stop loss if active
+        new_stop_loss = pos.stop_loss_price
+        if trailing_stop_active:
+            trail_price = new_peak_price * (1 - rm_config.trailing_stop_pct)
+            if trail_price > new_stop_loss:
+                new_stop_loss = trail_price
+                needs_update = True
 
         # 4. Persist changes to DB if needed
         if needs_update:
             return self.position_manager.update_trailing_stop(
                 symbol=pos.symbol,
                 new_stop_loss=new_stop_loss,
-                new_ref_price=new_ref_price,
+                new_peak_price=new_peak_price,
                 is_active=trailing_stop_active
             )
         
@@ -242,6 +215,25 @@ class TradingBot:
 
         if signal: await self._handle_signal(signal, df_with_indicators, position)
 
+    async def _await_order_fill(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
+        """Polls the exchange for an order's fill status."""
+        logger.info("Awaiting fill confirmation for order", order_id=order_id, symbol=symbol)
+        for _ in range(10):  # Poll up to 10 times (e.g., 10 * 3s = 30s timeout)
+            try:
+                order_status = await self.exchange_api.fetch_order(order_id, symbol)
+                if order_status and order_status.get('status') == 'FILLED':
+                    logger.info("Order fill confirmed", order_id=order_id, symbol=symbol, fill_price=order_status.get('average'))
+                    return order_status
+                elif order_status and order_status.get('status') not in ['OPEN', 'UNKNOWN']:
+                    logger.warning("Order is no longer open but not filled", order_id=order_id, status=order_status.get('status'))
+                    return order_status # Return terminal status like CANCELED or REJECTED
+                await asyncio.sleep(3)
+            except Exception as e:
+                logger.error("Error while polling for order fill", order_id=order_id, error=str(e))
+                await asyncio.sleep(5)  # Wait longer on error
+        logger.warning("Order fill confirmation timed out", order_id=order_id, symbol=symbol)
+        return None
+
     async def _handle_signal(self, signal: Dict, df_with_indicators: pd.DataFrame, position: Optional[Position]):
         action = signal.get('action')
         symbol = signal.get('symbol')
@@ -251,15 +243,12 @@ class TradingBot:
             logger.warning("Received invalid signal", signal=signal)
             return
 
-        # Handle opening a new position (long or short)
-        if action in ['BUY', 'SELL'] and not position:
+        if action == 'BUY' and not position:
             open_positions = self.position_manager.get_all_open_positions()
             if not self.risk_manager.check_trade_allowed(symbol, open_positions):
                 return
 
-            side = action # 'BUY' for long, 'SELL' for short
-            stop_loss = self.risk_manager.calculate_stop_loss(side, current_price, df_with_indicators)
-            
+            stop_loss = self.risk_manager.calculate_stop_loss('BUY', current_price, df_with_indicators)
             portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, self.config.initial_capital, open_positions)
             quantity = self.risk_manager.calculate_position_size(portfolio_equity, current_price, stop_loss)
 
@@ -267,21 +256,31 @@ class TradingBot:
                 logger.warning("Calculated position size is zero or less. Aborting trade.", symbol=symbol, quantity=quantity)
                 return
 
-            take_profit = self.risk_manager.calculate_take_profit(side, current_price, stop_loss)
-
-            order_result = await self.exchange_api.place_order(symbol, side, 'MARKET', quantity)
+            order_result = await self.exchange_api.place_order(symbol, 'BUY', 'MARKET', quantity)
             if order_result and order_result.get('orderId'):
-                self.position_manager.open_position(symbol, side, quantity, current_price, stop_loss, take_profit)
+                filled_order = await self._await_order_fill(order_result['orderId'], symbol)
+                if filled_order and filled_order.get('status') == 'FILLED':
+                    fill_price = filled_order['average']
+                    fill_quantity = filled_order['filled']
+                    # Recalculate SL/TP based on actual fill price for higher accuracy
+                    final_stop_loss = self.risk_manager.calculate_stop_loss('BUY', fill_price, df_with_indicators)
+                    final_take_profit = self.risk_manager.calculate_take_profit('BUY', fill_price, final_stop_loss)
+                    self.position_manager.open_position(symbol, 'BUY', fill_quantity, fill_price, final_stop_loss, final_take_profit)
+                else:
+                    logger.error("Order failed to fill or timed out.", order_id=order_result.get('orderId'))
         
-        # Handle closing an existing position
-        elif action == 'CLOSE' and position:
-            await self._close_position(position, current_price, "Strategy Signal")
+        elif action == 'SELL' and position:
+            await self._close_position(position, "Strategy Signal")
 
-    async def _close_position(self, position: Position, close_price: float, reason: str):
-        close_side = 'SELL' if position.side == 'BUY' else 'BUY'
-        order_result = await self.exchange_api.place_order(position.symbol, close_side, 'MARKET', position.quantity)
+    async def _close_position(self, position: Position, reason: str):
+        order_result = await self.exchange_api.place_order(position.symbol, 'SELL', 'MARKET', position.quantity)
         if order_result and order_result.get('orderId'):
-            self.position_manager.close_position(position.symbol, close_price, reason)
+            filled_order = await self._await_order_fill(order_result['orderId'], position.symbol)
+            if filled_order and filled_order.get('status') == 'FILLED':
+                close_price = filled_order['average']
+                self.position_manager.close_position(position.symbol, close_price, reason)
+            else:
+                logger.error("Failed to confirm close order fill.", order_id=order_result.get('orderId'), symbol=position.symbol)
 
     async def stop(self):
         logger.info("Stopping TradingBot...")
