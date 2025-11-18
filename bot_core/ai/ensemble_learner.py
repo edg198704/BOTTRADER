@@ -1,7 +1,7 @@
 import os
 import joblib
 import asyncio
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 import pandas as pd
 import numpy as np
 
@@ -60,8 +60,6 @@ class EnsembleLearner:
             self.fc = nn.Linear(hidden_dim, 3) # 0: sell, 1: hold, 2: buy
 
         def forward(self, x):
-            if len(x.shape) == 2:
-                x = x.unsqueeze(1)
             x = self.embedding(x)
             x = self.transformer(x)
             x = x.mean(dim=1)
@@ -139,13 +137,17 @@ class EnsembleLearner:
         if not self.is_trained:
             logger.debug("Predict called but models are not trained or loaded.")
             return {'action': 'hold', 'confidence': 0.0}
+        
+        if len(df) < self.config.sequence_length:
+            logger.warning("Not enough data for a full sequence prediction.", symbol=symbol, data_len=len(df), required=self.config.sequence_length)
+            return {'action': 'hold', 'confidence': 0.0}
+
         try:
             models = self._get_or_create_symbol_models(symbol)
-            feature_cols = self.config.feature_columns
             
-            current_features = {col: df[col].iloc[-1] if col in df.columns and not df[col].empty else 0 for col in feature_cols}
-            features_df = pd.DataFrame([current_features], columns=feature_cols)
-            features = np.nan_to_num(features_df.values, nan=0.0)
+            # Get the last sequence of data
+            sequence_df = df.tail(self.config.sequence_length)
+            features = np.nan_to_num(sequence_df[self.config.feature_columns].values, nan=0.0)
 
             predictions = []
             weights_config = self.config.ensemble_weights
@@ -156,18 +158,19 @@ class EnsembleLearner:
                 weights_config.attention
             ]
 
-            # Scikit-learn models
-            gb_pred = models['gb'].predict_proba(features)[0]
+            # Scikit-learn models predict on the last timestep
+            last_step_features = features[-1, :].reshape(1, -1)
+            gb_pred = models['gb'].predict_proba(last_step_features)[0]
             predictions.append(gb_pred)
-            tech_pred = models['technical'].predict_proba(features)[0]
+            tech_pred = models['technical'].predict_proba(last_step_features)[0]
             predictions.append(tech_pred)
 
-            # PyTorch models
-            features_tensor = torch.FloatTensor(features).unsqueeze(1).to(self.device)
+            # PyTorch models predict on the full sequence
+            sequence_tensor = torch.FloatTensor(features).unsqueeze(0).to(self.device) # Add batch dimension
             with torch.no_grad():
-                lstm_pred = models['lstm'](features_tensor).cpu().numpy()[0]
+                lstm_pred = models['lstm'](sequence_tensor).cpu().numpy()[0]
                 predictions.append(lstm_pred)
-                attn_pred = models['attention'](features_tensor).cpu().numpy()[0]
+                attn_pred = models['attention'](sequence_tensor).cpu().numpy()[0]
                 predictions.append(attn_pred)
 
             ensemble_pred = np.average(predictions, weights=weights, axis=0)
@@ -194,41 +197,65 @@ class EnsembleLearner:
         
         return labels.iloc[:-horizon] # Drop last rows where future is unknown
 
+    def _create_sequences(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Transforms flat data into sequences for time-series models."""
+        seq_length = self.config.sequence_length
+        X_seq, y_seq = [], []
+        for i in range(len(X) - seq_length + 1):
+            X_seq.append(X[i:i+seq_length])
+            y_seq.append(y[i+seq_length-1]) # Label corresponds to the last element
+        return np.array(X_seq), np.array(y_seq)
+
     def train(self, symbol: str, df: pd.DataFrame):
         """Trains all models in the ensemble for a given symbol."""
         logger.info("Starting model training", symbol=symbol)
         try:
-            # 1. Prepare data
+            # 1. Prepare flat data
             labels = self._create_labels(df)
             features = df[self.config.feature_columns].loc[labels.index]
             
-            X = np.nan_to_num(features.values, nan=0.0)
-            y = labels.values
+            X_flat = np.nan_to_num(features.values, nan=0.0)
+            y_flat = labels.values
 
-            if len(np.unique(y)) < 3:
-                logger.warning("Training data has fewer than 3 unique labels. Skipping training.", symbol=symbol, labels=np.unique(y))
+            if len(np.unique(y_flat)) < 3:
+                logger.warning("Training data has fewer than 3 unique labels. Skipping training.", symbol=symbol, labels=np.unique(y_flat))
                 return
 
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+            # 2. Create sequences for PyTorch models
+            X_seq, y_seq = self._create_sequences(X_flat, y_flat)
+            
+            # 3. Create flat data for scikit-learn models (using last timestep of each sequence)
+            X_flat_from_seq = X_seq[:, -1, :]
+            y_flat_from_seq = y_seq
+
+            # 4. Split data
+            # Scikit-learn split
+            X_train_flat, X_test_flat, y_train_flat, y_test_flat = train_test_split(
+                X_flat_from_seq, y_flat_from_seq, test_size=0.2, random_state=42, stratify=y_flat_from_seq
+            )
+            # PyTorch split
+            X_train_seq, X_test_seq, y_train_seq, y_test_seq = train_test_split(
+                X_seq, y_seq, test_size=0.2, random_state=42, stratify=y_seq
+            )
             
             models = self._get_or_create_symbol_models(symbol)
 
-            # 2. Train scikit-learn models
+            # 5. Train scikit-learn models
             logger.info("Training scikit-learn models...", symbol=symbol)
-            models['gb'].fit(X_train, y_train)
-            models['technical'].fit(X_train, y_train)
+            models['gb'].fit(X_train_flat, y_train_flat)
+            models['technical'].fit(X_train_flat, y_train_flat)
             logger.info("Scikit-learn models trained.", symbol=symbol)
 
-            # 3. Train PyTorch models
+            # 6. Train PyTorch models
             logger.info("Training PyTorch models...", symbol=symbol)
-            X_train_tensor = torch.FloatTensor(X_train).to(self.device)
-            y_train_tensor = torch.LongTensor(y_train).to(self.device)
+            X_train_tensor = torch.FloatTensor(X_train_seq).to(self.device)
+            y_train_tensor = torch.LongTensor(y_train_seq).to(self.device)
             
             self._train_pytorch_model(models['lstm'], X_train_tensor, y_train_tensor)
             self._train_pytorch_model(models['attention'], X_train_tensor, y_train_tensor)
             logger.info("PyTorch models trained.", symbol=symbol)
 
-            # 4. Save models
+            # 7. Save models
             self._save_models(symbol)
             self.is_trained = True
             logger.info("All models trained and saved successfully.", symbol=symbol)
@@ -242,16 +269,10 @@ class EnsembleLearner:
         model.train()
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         criterion = nn.CrossEntropyLoss()
-        
-        # Reshape for LSTM/Transformer if needed
-        if len(X_train.shape) == 2:
-            X_train_reshaped = X_train.unsqueeze(1)
-        else:
-            X_train_reshaped = X_train
 
         for epoch in range(self.config.training_epochs):
             optimizer.zero_grad()
-            outputs = model(X_train_reshaped)
+            outputs = model(X_train)
             loss = criterion(outputs, y_train)
             loss.backward()
             optimizer.step()
