@@ -2,18 +2,19 @@ import os
 import joblib
 import asyncio
 import copy
+import json
 from typing import Dict, Any, Tuple
 import pandas as pd
 import numpy as np
 
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams
+from bot_core.ai.models import LSTMPredictor, AttentionNetwork
 
 # ML Imports with safe fallbacks
 try:
     import torch
     import torch.nn as nn
-    import torch.nn.functional as F
     import torch.optim as optim
     from torch.utils.data import TensorDataset, DataLoader
     from sklearn.ensemble import VotingClassifier, RandomForestClassifier
@@ -44,33 +45,6 @@ class EnsembleLearner:
     Manages a suite of AI/ML models for generating trading predictions.
     This includes loading, training, and predicting using an ensemble of models.
     """
-    class LSTMPredictor(nn.Module):
-        def __init__(self, input_dim, hidden_dim, num_layers, dropout):
-            super().__init__()
-            self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers, 
-                                dropout=dropout, batch_first=True)
-            self.fc = nn.Linear(hidden_dim, 3) # 0: sell, 1: hold, 2: buy
-
-        def forward(self, x):
-            _, (hn, _) = self.lstm(x)
-            # Use the hidden state of the last layer
-            return F.softmax(self.fc(hn[-1]), dim=1)
-
-    class AttentionNetwork(nn.Module):
-        def __init__(self, input_dim, hidden_dim, num_layers, nhead, dropout):
-            super().__init__()
-            self.embedding = nn.Linear(input_dim, hidden_dim)
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=hidden_dim, nhead=nhead, batch_first=True, dropout=dropout
-            )
-            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-            self.fc = nn.Linear(hidden_dim, 3) # 0: sell, 1: hold, 2: buy
-
-        def forward(self, x):
-            x = self.embedding(x)
-            x = self.transformer(x)
-            x = x.mean(dim=1)
-            return F.softmax(self.fc(x), dim=1)
 
     def __init__(self, config: AIEnsembleStrategyParams):
         if not ML_AVAILABLE:
@@ -97,7 +71,7 @@ class EnsembleLearner:
             attn_config = hp.attention
 
             self.symbol_models[symbol] = {
-                'lstm': self.LSTMPredictor(
+                'lstm': LSTMPredictor(
                     num_features, lstm_config.hidden_dim, lstm_config.num_layers, lstm_config.dropout
                 ).to(self.device),
                 'gb': XGBClassifier(
@@ -108,7 +82,7 @@ class EnsembleLearner:
                     colsample_bytree=xgb_config.colsample_bytree,
                     random_state=42, use_label_encoder=False, eval_metric='logloss'
                 ),
-                'attention': self.AttentionNetwork(
+                'attention': AttentionNetwork(
                     num_features, attn_config.hidden_dim, attn_config.num_layers, attn_config.nhead, attn_config.dropout
                 ).to(self.device),
                 'technical': VotingClassifier(estimators=[
@@ -138,6 +112,19 @@ class EnsembleLearner:
             if os.path.isdir(symbol_path):
                 symbol = symbol_dir.replace('_', '/')
                 try:
+                    # 1. Validate Metadata
+                    meta_path = os.path.join(symbol_path, "metadata.json")
+                    if os.path.exists(meta_path):
+                        with open(meta_path, 'r') as f:
+                            meta = json.load(f)
+                            if meta.get('feature_columns') != self.config.feature_columns:
+                                logger.warning("Model feature mismatch. Skipping load to force retrain.", symbol=symbol)
+                                continue
+                    else:
+                        logger.warning("No metadata found for model. Skipping load to be safe.", symbol=symbol)
+                        continue
+
+                    # 2. Load Models
                     models = self._get_or_create_symbol_models(symbol)
                     self.symbol_scalers[symbol] = joblib.load(os.path.join(symbol_path, "scaler.pkl"))
                     models['gb'] = joblib.load(os.path.join(symbol_path, "gb_model.pkl"))
@@ -163,14 +150,14 @@ class EnsembleLearner:
             models = self._get_or_create_symbol_models(symbol)
             scaler = self.symbol_scalers.get(symbol)
             
+            # CRITICAL SAFETY CHECK: Do not predict with unscaled data if scaler is missing.
+            if not scaler:
+                logger.error("Scaler not found for symbol. Cannot predict safely.", symbol=symbol)
+                return {'action': 'hold', 'confidence': 0.0}
+            
             sequence_df = df.tail(seq_len)
             features = np.nan_to_num(sequence_df[self.config.feature_columns].values, nan=0.0)
-
-            if scaler:
-                features_scaled = scaler.transform(features)
-            else:
-                logger.warning("Scaler not found for symbol, predicting with unscaled data.", symbol=symbol)
-                features_scaled = features
+            features_scaled = scaler.transform(features)
 
             predictions = []
             weights_config = self.config.ensemble_weights
@@ -348,6 +335,14 @@ class EnsembleLearner:
         models = self.symbol_models[symbol]
         scaler = self.symbol_scalers.get(symbol)
 
+        # Save Metadata for validation on load
+        metadata = {
+            'feature_columns': self.config.feature_columns,
+            'timestamp': str(pd.Timestamp.utcnow())
+        }
+        with open(os.path.join(save_path, "metadata.json"), 'w') as f:
+            json.dump(metadata, f)
+
         if scaler:
             joblib.dump(scaler, os.path.join(save_path, "scaler.pkl"))
 
@@ -355,4 +350,4 @@ class EnsembleLearner:
         joblib.dump(models['technical'], os.path.join(save_path, "technical_model.pkl"))
         torch.save(models['lstm'].state_dict(), os.path.join(save_path, "lstm_model.pth"))
         torch.save(models['attention'].state_dict(), os.path.join(save_path, "attention_model.pth"))
-        logger.info("Saved models and scaler to disk", path=save_path)
+        logger.info("Saved models, scaler, and metadata to disk", path=save_path)
