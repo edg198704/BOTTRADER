@@ -22,7 +22,7 @@ class SimpleMAStrategyConfig(BaseModel):
 
 class StrategyConfig(BaseModel):
     name: str = "AIEnsembleStrategy"
-    symbol: str = "BTC/USDT"
+    symbols: List[str] = Field(default_factory=lambda: ["BTC/USDT"])
     interval_seconds: int = 60
     ai_ensemble: AIStrategyConfig = Field(default_factory=AIStrategyConfig)
     simple_ma: SimpleMAStrategyConfig = Field(default_factory=SimpleMAStrategyConfig)
@@ -59,7 +59,10 @@ class BotConfig(BaseModel):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
     @validator('strategy')
-    def validate_strategy_symbol(cls, v):
-        if '/' not in v.symbol:
-            raise ValueError('Strategy symbol should be a valid trading pair, e.g., BTC/USDT')
+    def validate_strategy_symbols(cls, v):
+        if not v.symbols:
+            raise ValueError('Strategy symbols list cannot be empty')
+        for symbol in v.symbols:
+            if '/' not in symbol:
+                raise ValueError(f'Strategy symbol "{symbol}" should be a valid trading pair, e.g., BTC/USDT')
         return v
