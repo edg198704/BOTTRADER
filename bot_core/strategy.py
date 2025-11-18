@@ -33,17 +33,26 @@ class SimpleMACrossoverStrategy(TradingStrategy):
 
         last_row = df.iloc[-1]
         prev_row = df.iloc[-2]
-        position_open = position is not None
 
-        # Buy signal: fast MA crosses above slow MA
-        if last_row['sma_fast'] > last_row['sma_slow'] and prev_row['sma_fast'] <= prev_row['sma_slow'] and not position_open:
-            logger.info("Buy signal detected (MA Crossover)", symbol=symbol)
-            return {'action': 'BUY', 'symbol': symbol}
+        is_bullish_cross = last_row['sma_fast'] > last_row['sma_slow'] and prev_row['sma_fast'] <= prev_row['sma_slow']
+        is_bearish_cross = last_row['sma_fast'] < last_row['sma_slow'] and prev_row['sma_fast'] >= prev_row['sma_slow']
 
-        # Sell signal: fast MA crosses below slow MA
-        if last_row['sma_fast'] < last_row['sma_slow'] and prev_row['sma_fast'] >= prev_row['sma_slow'] and position_open:
-            logger.info("Sell signal detected (MA Crossover)", symbol=symbol)
-            return {'action': 'SELL', 'symbol': symbol}
+        if position:
+            # Logic to close existing position
+            if position.side == 'BUY' and is_bearish_cross:
+                logger.info("Close Long signal detected (MA Crossover)", symbol=symbol)
+                return {'action': 'CLOSE', 'symbol': symbol}
+            if position.side == 'SELL' and is_bullish_cross:
+                logger.info("Close Short signal detected (MA Crossover)", symbol=symbol)
+                return {'action': 'CLOSE', 'symbol': symbol}
+        else:
+            # Logic to open new position
+            if is_bullish_cross:
+                logger.info("Open Long signal detected (MA Crossover)", symbol=symbol)
+                return {'action': 'BUY', 'symbol': symbol}
+            if is_bearish_cross:
+                logger.info("Open Short signal detected (MA Crossover)", symbol=symbol)
+                return {'action': 'SELL', 'symbol': symbol}
 
         return None
 
@@ -64,8 +73,6 @@ class AIEnsembleStrategy(TradingStrategy):
             logger.debug("AI models not trained yet, skipping analysis.", symbol=symbol)
             return None
 
-        position_open = position is not None
-
         if self.ai_config.use_regime_filter:
             regime_result = await self.regime_detector.detect_regime(symbol, df)
             regime = regime_result.get('regime')
@@ -82,12 +89,21 @@ class AIEnsembleStrategy(TradingStrategy):
         if confidence < self.ai_config.confidence_threshold:
             return None
 
-        if action == 'buy' and not position_open:
-            logger.info("AI Buy signal detected", symbol=symbol, confidence=confidence)
-            return {'action': 'BUY', 'symbol': symbol, 'confidence': confidence}
-        
-        if action == 'sell' and position_open:
-            logger.info("AI Sell signal detected", symbol=symbol, confidence=confidence)
-            return {'action': 'SELL', 'symbol': symbol, 'confidence': confidence}
+        if position:
+            # Have a position, look for close signals
+            if position.side == 'BUY' and action == 'sell':
+                logger.info("AI Close Long signal detected", symbol=symbol, confidence=confidence)
+                return {'action': 'CLOSE', 'symbol': symbol, 'confidence': confidence}
+            if position.side == 'SELL' and action == 'buy':
+                logger.info("AI Close Short signal detected", symbol=symbol, confidence=confidence)
+                return {'action': 'CLOSE', 'symbol': symbol, 'confidence': confidence}
+        else:
+            # No position, look for open signals
+            if action == 'buy':
+                logger.info("AI Open Long signal detected", symbol=symbol, confidence=confidence)
+                return {'action': 'BUY', 'symbol': symbol, 'confidence': confidence}
+            if action == 'sell':
+                logger.info("AI Open Short signal, detected", symbol=symbol, confidence=confidence)
+                return {'action': 'SELL', 'symbol': symbol, 'confidence': confidence}
 
         return None
