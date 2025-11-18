@@ -18,6 +18,7 @@ from bot_core.data_handler import DataHandler
 from bot_core.order_sizer import OrderSizer
 from bot_core.position_monitor import PositionMonitor
 from bot_core.order_lifecycle_manager import OrderLifecycleManager
+from bot_core.trade_executor import TradeExecutor
 
 # Shared state for communication between components (e.g., Telegram and Bot)
 shared_bot_state: Dict[str, Any] = {}
@@ -64,6 +65,19 @@ async def main():
         shared_latest_prices=latest_prices
     )
 
+    # The TradeExecutor encapsulates all execution logic
+    trade_executor = TradeExecutor(
+        config=config,
+        exchange_api=exchange_api,
+        position_manager=position_manager,
+        risk_manager=risk_manager,
+        order_sizer=order_sizer,
+        order_lifecycle_manager=order_lifecycle_manager,
+        alert_system=alert_system,
+        shared_latest_prices=latest_prices,
+        market_details={} # This will be populated by the bot after loading
+    )
+
     bot = TradingBot(
         config=config,
         exchange_api=exchange_api,
@@ -71,10 +85,9 @@ async def main():
         strategy=strategy,
         position_manager=position_manager,
         risk_manager=risk_manager,
-        order_sizer=order_sizer,
         health_checker=health_checker,
         position_monitor=position_monitor,
-        order_lifecycle_manager=order_lifecycle_manager,
+        trade_executor=trade_executor,
         alert_system=alert_system,
         shared_latest_prices=latest_prices,
         metrics_writer=metrics_writer,
