@@ -41,10 +41,6 @@ def _override_with_env_vars(config: Dict[str, Any]) -> Dict[str, Any]:
         config['exchange']['api_secret'] = os.environ['BOT_EXCHANGE_API_SECRET']
     if 'BOT_TELEGRAM_BOT_TOKEN' in os.environ:
         config['telegram']['bot_token'] = os.environ['BOT_TELEGRAM_BOT_TOKEN']
-    
-    # Example for nested value override
-    if 'BOT_STRATEGY_SYMBOL' in os.environ:
-        config['strategy']['symbol'] = os.environ['BOT_STRATEGY_SYMBOL']
 
     logger.info("Configuration updated with environment variables.")
     return config
