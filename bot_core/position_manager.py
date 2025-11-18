@@ -36,6 +36,13 @@ class Position(Base):
     trailing_ref_price = Column(Float, nullable=True)
     trailing_stop_active = Column(Boolean, default=False, nullable=False)
 
+class PortfolioState(Base):
+    __tablename__ = 'portfolio_state'
+    id = Column(Integer, primary_key=True) # Singleton row, always ID 1
+    initial_capital = Column(Float, nullable=False)
+    peak_equity = Column(Float, nullable=False)
+    last_update = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
 class PositionManager:
     def __init__(self, config: DatabaseConfig, initial_capital: float, alert_system: Optional['AlertSystem'] = None):
         self.engine = create_engine(f'sqlite:///{config.path}')
@@ -47,9 +54,10 @@ class PositionManager:
         logger.info("PositionManager initialized and database table created.")
 
     async def initialize(self):
-        """Calculates initial realized PnL from the database to populate in-memory state."""
+        """Calculates initial realized PnL and ensures portfolio state exists."""
         self._realized_pnl = await self._run_in_executor(self._calculate_initial_realized_pnl_sync)
-        logger.info("PositionManager state initialized with historical PnL.", realized_pnl=self._realized_pnl)
+        await self._run_in_executor(self._initialize_portfolio_state_sync)
+        logger.info("PositionManager state initialized.", realized_pnl=self._realized_pnl)
 
     async def _run_in_executor(self, func, *args):
         """Helper to run blocking sync methods in the default executor."""
@@ -62,6 +70,65 @@ class PositionManager:
         try:
             realized_pnl = session.query(func.sum(Position.pnl)).filter(Position.status == 'CLOSED').scalar()
             return realized_pnl or 0.0
+        finally:
+            session.close()
+
+    def _initialize_portfolio_state_sync(self):
+        """Ensures the singleton PortfolioState row exists."""
+        session = self.SessionLocal()
+        try:
+            state = session.query(PortfolioState).filter(PortfolioState.id == 1).first()
+            if not state:
+                logger.info("Initializing new PortfolioState in database.", initial_capital=self._initial_capital)
+                state = PortfolioState(
+                    id=1,
+                    initial_capital=self._initial_capital,
+                    peak_equity=self._initial_capital
+                )
+                session.add(state)
+                session.commit()
+        except Exception as e:
+            logger.error("Failed to initialize portfolio state", error=str(e))
+            session.rollback()
+        finally:
+            session.close()
+
+    async def get_portfolio_state(self) -> Optional[Dict[str, float]]:
+        """Returns the persisted portfolio state (initial capital, peak equity)."""
+        return await self._run_in_executor(self._get_portfolio_state_sync)
+
+    def _get_portfolio_state_sync(self) -> Optional[Dict[str, float]]:
+        session = self.SessionLocal()
+        try:
+            state = session.query(PortfolioState).filter(PortfolioState.id == 1).first()
+            if state:
+                return {'initial_capital': state.initial_capital, 'peak_equity': state.peak_equity}
+            return None
+        finally:
+            session.close()
+
+    async def update_portfolio_high_water_mark(self, new_peak: float):
+        """Updates the peak equity in the database."""
+        await self._run_in_executor(self._update_portfolio_high_water_mark_sync, new_peak)
+
+    def _update_portfolio_high_water_mark_sync(self, new_peak: float):
+        session = self.SessionLocal()
+        try:
+            state = session.query(PortfolioState).filter(PortfolioState.id == 1).first()
+            if state:
+                if new_peak > state.peak_equity:
+                    old_peak = state.peak_equity
+                    state.peak_equity = new_peak
+                    session.commit()
+                    logger.info("Updated Portfolio High Water Mark", old_peak=old_peak, new_peak=new_peak)
+            else:
+                # Should not happen if initialized correctly
+                state = PortfolioState(id=1, initial_capital=self._initial_capital, peak_equity=new_peak)
+                session.add(state)
+                session.commit()
+        except Exception as e:
+            logger.error("Failed to update portfolio high water mark", error=str(e))
+            session.rollback()
         finally:
             session.close()
 
