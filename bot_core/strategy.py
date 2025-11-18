@@ -21,7 +21,7 @@ class TradingStrategy(abc.ABC):
         pass
 
     @abc.abstractmethod
-    async def retrain(self, symbol: str, df: pd.DataFrame):
+    def retrain(self, symbol: str, df: pd.DataFrame):
         """Triggers the retraining of the strategy's underlying models."""
         pass
 
@@ -67,7 +67,7 @@ class SimpleMACrossoverStrategy(TradingStrategy):
 
         return None
 
-    async def retrain(self, symbol: str, df: pd.DataFrame):
+    def retrain(self, symbol: str, df: pd.DataFrame):
         # No models to retrain for this strategy
         pass
 
@@ -128,14 +128,14 @@ class AIEnsembleStrategy(TradingStrategy):
 
         return None
 
-    async def retrain(self, symbol: str, df: pd.DataFrame):
+    def retrain(self, symbol: str, df: pd.DataFrame):
         """Initiates the retraining process for the ensemble learner."""
         if not hasattr(self, 'ensemble_learner'):
             logger.warning("Ensemble learner not available, cannot retrain.")
             return
         
         logger.info("Strategy is triggering model retraining.", symbol=symbol)
-        await self.ensemble_learner.train(symbol, df)
+        self.ensemble_learner.train(symbol, df)
         self.last_retrained_at[symbol] = datetime.utcnow()
         logger.info("Model retraining process completed.", symbol=symbol)
 
