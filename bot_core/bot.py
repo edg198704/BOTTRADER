@@ -18,7 +18,7 @@ from bot_core.position_monitor import PositionMonitor
 logger = get_logger(__name__)
 
 class TradingBot:
-    def __init__(self, config: BotConfig, exchange_api: ExchangeAPI, data_handler: Optional[DataHandler], 
+    def __init__(self, config: BotConfig, exchange_api: ExchangeAPI, data_handler: DataHandler, 
                  strategy: TradingStrategy, position_manager: PositionManager, risk_manager: RiskManager,
                  order_sizer: OrderSizer, health_checker: HealthChecker, position_monitor: PositionMonitor,
                  shared_latest_prices: Dict[str, float],
@@ -451,10 +451,8 @@ class TradingBot:
         self.running = False
         self.shared_bot_state['status'] = 'stopping'
         
-        if self.data_handler:
-            await self.data_handler.stop()
-        if self.position_monitor:
-            await self.position_monitor.stop()
+        await self.data_handler.stop()
+        await self.position_monitor.stop()
 
         for task in self.tasks:
             if not task.done():
