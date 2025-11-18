@@ -51,13 +51,22 @@ Key supporting files in the root directory include:
 
 3.  **Configure the bot:**
     Copy the `config_enterprise.yaml` file and customize the settings:
-    *   **`exchange`**: Set `name` to `MockExchange` for testing or a `ccxt`-supported exchange like `binance`. For a real exchange, you will need to set environment variables for your API key and secret.
+    *   **`exchange`**: Set `name` to `MockExchange` for testing or a `ccxt`-supported exchange like `binance`. For a real exchange, you will need to set environment variables for your API key and secret (see step 4).
     *   **`strategy`**: Choose the `name` of the strategy to run (e.g., `AIEnsembleStrategy`) and define the list of `symbols` to trade.
     *   **`risk_management`**: Define your risk tolerance.
     *   **`telegram`**: To enable remote control, create a bot with BotFather on Telegram, get the token, find your chat ID, and add them to the config and environment variables.
 
 4.  **Set up Environment Variables:**
-    For production, API keys and tokens must be loaded from environment variables. You can create a `.env` file in the root directory (this file is git-ignored):
+    For production, API keys and tokens **must** be loaded from environment variables. The bot uses Pydantic to automatically and securely load these values. They should **not** be written in `config_enterprise.yaml`.
+
+    You can set them in your shell before running the bot:
+    ```bash
+    export BOT_EXCHANGE_API_KEY="your_exchange_api_key"
+    export BOT_EXCHANGE_API_SECRET="your_exchange_api_secret"
+    export BOT_TELEGRAM_BOT_TOKEN="your_telegram_bot_token"
+    ```
+
+    Alternatively, for local development, you can create a `.env` file in the root directory (this file is git-ignored), and the bot will load it automatically on startup:
     ```
     BOT_EXCHANGE_API_KEY="your_exchange_api_key"
     BOT_EXCHANGE_API_SECRET="your_exchange_api_secret"
