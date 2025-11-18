@@ -45,6 +45,21 @@ risk_management:
   trailing_stop_activation_pct: 0.02 # Activate TSL after 2% profit
   trailing_stop_pct: 0.01 # Trail by 1% of peak price
 
+  regime_based_risk:
+    # Override default risk parameters based on the detected market regime.
+    # If a parameter is not set here, the default value above will be used.
+    bull:
+      risk_per_trade_pct: 0.015 # Take slightly more risk in a clear bull trend
+      atr_stop_multiplier: 2.5   # Allow more room for pullbacks
+    bear:
+      reward_to_risk_ratio: 2.0  # Demand higher reward for shorting
+    volatile:
+      risk_per_trade_pct: 0.005 # Reduce position size significantly
+      atr_stop_multiplier: 3.0   # Use wider stops to avoid getting shaken out
+    sideways:
+      # No overrides, will use default risk parameters.
+      # Could also set risk_per_trade_pct to 0 to avoid trading.
+
 database:
   path: "position_ledger.db"
 
