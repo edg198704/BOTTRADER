@@ -11,7 +11,7 @@ from bot_core.risk_manager import RiskManager
 from bot_core.strategy import TradingStrategy
 from bot_core.config import BotConfig
 from bot_core.data_handler import DataHandler
-from bot_core.monitoring import HealthChecker, InfluxDBMetrics
+from bot_core.monitoring import HealthChecker, InfluxDBMetrics, AlertSystem
 from bot_core.order_sizer import OrderSizer
 from bot_core.position_monitor import PositionMonitor
 from bot_core.order_lifecycle_manager import OrderLifecycleManager
@@ -22,7 +22,7 @@ class TradingBot:
     def __init__(self, config: BotConfig, exchange_api: ExchangeAPI, data_handler: DataHandler, 
                  strategy: TradingStrategy, position_manager: PositionManager, risk_manager: RiskManager,
                  order_sizer: OrderSizer, health_checker: HealthChecker, position_monitor: PositionMonitor,
-                 order_lifecycle_manager: OrderLifecycleManager,
+                 order_lifecycle_manager: OrderLifecycleManager, alert_system: AlertSystem,
                  shared_latest_prices: Dict[str, float],
                  metrics_writer: Optional[InfluxDBMetrics] = None,
                  shared_bot_state: Optional[Dict[str, Any]] = None):
@@ -36,6 +36,7 @@ class TradingBot:
         self.health_checker = health_checker
         self.position_monitor = position_monitor
         self.order_lifecycle_manager = order_lifecycle_manager
+        self.alert_system = alert_system
         self.metrics_writer = metrics_writer
         self.shared_bot_state = shared_bot_state if shared_bot_state is not None else {}
         
@@ -122,7 +123,7 @@ class TradingBot:
 
                 open_positions = self.position_manager.get_all_open_positions()
                 portfolio_value = self.position_manager.get_portfolio_value(self.latest_prices, open_positions)
-                self.risk_manager.update_portfolio_risk(portfolio_value)
+                await self.risk_manager.update_portfolio_risk(portfolio_value)
 
                 # Update shared state for Telegram bot
                 self.shared_bot_state['portfolio_equity'] = portfolio_value
@@ -220,7 +221,7 @@ class TradingBot:
                 return
 
             stop_loss = self.risk_manager.calculate_stop_loss(action, current_price, df_with_indicators, market_regime=market_regime)
-            ideal_quantity = self.risk_manager.calculate_position_size(portfolio_equity, current_price, stop_loss, market_regime=market_regime)
+            ideal_quantity = self.risk_manager.calculate_position_.size(portfolio_equity, current_price, stop_loss, market_regime=market_regime)
             
             market_details = self.market_details.get(symbol)
             if not market_details:
@@ -267,7 +268,13 @@ class TradingBot:
                     final_take_profit = self.risk_manager.calculate_take_profit(action, fill_price, final_stop_loss, market_regime=market_regime)
                     self.position_manager.open_position(symbol, action, fill_quantity, fill_price, final_stop_loss, final_take_profit)
                 else:
-                    logger.error("Order to open position did not fill.", order_id=order_result.get('orderId'), final_status=final_order_state.get('status') if final_order_state else 'UNKNOWN')
+                    final_status = final_order_state.get('status') if final_order_state else 'UNKNOWN'
+                    logger.error("Order to open position did not fill.", order_id=order_result.get('orderId'), final_status=final_status)
+                    await self.alert_system.send_alert(
+                        level='error',
+                        message=f"🔴 Failed to open position for {symbol}. Order did not fill.",
+                        details={'symbol': symbol, 'order_id': order_result.get('orderId'), 'final_status': final_status}
+                    )
         
         # --- Handle Closing Positions ---
         elif position:
@@ -317,7 +324,13 @@ class TradingBot:
                 close_price = final_order_state['average']
                 self.position_manager.close_position(position.symbol, close_price, reason)
             else:
-                logger.error("Failed to confirm close order fill. Position remains open.", order_id=order_result.get('orderId'), symbol=position.symbol, final_status=final_order_state.get('status') if final_order_state else 'UNKNOWN')
+                final_status = final_order_state.get('status') if final_order_state else 'UNKNOWN'
+                logger.error("Failed to confirm close order fill. Position remains open.", order_id=order_result.get('orderId'), symbol=position.symbol, final_status=final_status)
+                await self.alert_system.send_alert(
+                    level='critical',
+                    message=f"🔥 FAILED TO CLOSE position for {position.symbol}. Manual intervention may be required.",
+                    details={'symbol': position.symbol, 'order_id': order_result.get('orderId'), 'reason': reason, 'final_status': final_status}
+                )
 
     async def stop(self):
         logger.info("Stopping TradingBot...")
