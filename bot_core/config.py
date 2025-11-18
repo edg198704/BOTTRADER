@@ -65,6 +65,17 @@ class StrategyConfig(BaseModel):
     ai_ensemble: AIStrategyConfig = Field(default_factory=AIStrategyConfig)
     simple_ma: SimpleMAStrategyConfig = Field(default_factory=SimpleMAStrategyConfig)
 
+class MarketRegimeRiskParameters(BaseModel):
+    risk_per_trade_pct: Optional[float] = None
+    atr_stop_multiplier: Optional[float] = None
+    reward_to_risk_ratio: Optional[float] = None
+
+class MarketRegimeRiskConfig(BaseModel):
+    bull: MarketRegimeRiskParameters = Field(default_factory=MarketRegimeRiskParameters)
+    bear: MarketRegimeRiskParameters = Field(default_factory=MarketRegimeRiskParameters)
+    volatile: MarketRegimeRiskParameters = Field(default_factory=MarketRegimeRiskParameters)
+    sideways: MarketRegimeRiskParameters = Field(default_factory=MarketRegimeRiskParameters)
+
 class RiskManagementConfig(BaseModel):
     max_position_size_usd: float = 1000.0
     max_daily_loss_usd: float = 500.0
@@ -77,6 +88,7 @@ class RiskManagementConfig(BaseModel):
     reward_to_risk_ratio: float = 1.5  # Default reward/risk ratio for take-profit calculation
     trailing_stop_activation_pct: float = 0.02 # e.g., activate after 2% profit
     trailing_stop_pct: float = 0.01 # e.g., trail by 1%
+    regime_based_risk: MarketRegimeRiskConfig = Field(default_factory=MarketRegimeRiskConfig)
 
 class DatabaseConfig(BaseModel):
     path: str = "position_ledger.db"
