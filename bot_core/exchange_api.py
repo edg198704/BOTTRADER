@@ -96,6 +96,7 @@ class MockExchangeAPI(ExchangeAPI):
             'symbol': symbol,
             'side': side.upper(),
             'type': order_type.upper(),
+            'price': price,
             'quantity': quantity,
             'status': 'OPEN',
             'filled': 0.0,
@@ -111,31 +112,42 @@ class MockExchangeAPI(ExchangeAPI):
         if not order:
             return None
 
-        # Simulate order fill on first fetch for MARKET orders or if price is met for LIMIT
-        is_market = order.get('type') == 'MARKET'
-        if order['status'] == 'OPEN' and is_market:
+        # Simulate order fill
+        if order['status'] == 'OPEN':
             fill_price = self.last_price
-            base_asset, quote_asset = symbol.split('/')
-            cost = order['quantity'] * fill_price
+            
+            can_fill_price = False
+            if order['type'] == 'MARKET':
+                can_fill_price = True
+            elif order['type'] == 'LIMIT':
+                if order['side'] == 'BUY' and self.last_price <= order['price']:
+                    can_fill_price = True
+                    fill_price = order['price'] # Assume no slippage for mock limit
+                elif order['side'] == 'SELL' and self.last_price >= order['price']:
+                    can_fill_price = True
+                    fill_price = order['price']
 
-            can_fill = (order['side'] == "BUY" and self.balances.get(quote_asset, 0) >= cost) or \
-                       (order['side'] == "SELL" and self.balances.get(base_asset, 0) >= order['quantity'])
+            if can_fill_price:
+                base_asset, quote_asset = symbol.split('/')
+                cost = order['quantity'] * fill_price
+                can_fill_balance = (order['side'] == "BUY" and self.balances.get(quote_asset, 0) >= cost) or \
+                                   (order['side'] == "SELL" and self.balances.get(base_asset, 0) >= order['quantity'])
 
-            if can_fill:
-                if order['side'] == "BUY":
-                    self.balances[quote_asset] -= cost
-                    self.balances[base_asset] = self.balances.get(base_asset, 0) + order['quantity']
-                else: # SELL
-                    self.balances[base_asset] -= order['quantity']
-                    self.balances[quote_asset] = self.balances.get(quote_asset, 0) + cost
-                
-                order['status'] = 'FILLED'
-                order['filled'] = order['quantity']
-                order['average'] = fill_price
-                logger.info("Mock: Order filled on fetch", order_id=order_id, fill_price=fill_price)
-            else:
-                order['status'] = 'REJECTED'
-                logger.warning("Mock: Insufficient balance for order", order_id=order_id)
+                if can_fill_balance:
+                    if order['side'] == "BUY":
+                        self.balances[quote_asset] -= cost
+                        self.balances[base_asset] = self.balances.get(base_asset, 0) + order['quantity']
+                    else: # SELL
+                        self.balances[base_asset] -= order['quantity']
+                        self.balances[quote_asset] = self.balances.get(quote_asset, 0) + cost
+                    
+                    order['status'] = 'FILLED'
+                    order['filled'] = order['quantity']
+                    order['average'] = fill_price
+                    logger.info("Mock: Order filled on fetch", order_id=order_id, fill_price=fill_price)
+                else:
+                    order['status'] = 'REJECTED'
+                    logger.warning("Mock: Insufficient balance for order", order_id=order_id)
         
         return order
 
@@ -271,7 +283,10 @@ class CCXTExchangeAPI(ExchangeAPI):
                 'status': status_map.get(order.get('status'), 'UNKNOWN'),
                 'filled': order.get('filled', 0.0),
                 'average': order.get('average', 0.0),
-                'symbol': order.get('symbol')
+                'symbol': order.get('symbol'),
+                'price': order.get('price', 0.0),
+                'side': order.get('side'),
+                'type': order.get('type')
             }
         except OrderNotFound:
             logger.warning("Order not found on exchange, not retrying.", order_id=order_id, symbol=symbol)
