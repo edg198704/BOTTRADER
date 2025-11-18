@@ -6,7 +6,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, 
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 from bot_core.logger import get_logger
-from bot_core.config import DatabaseConfig
+from bot_core.config import DatabaseConfig, RiskManagementConfig
 
 logger = get_logger(__name__)
 Base = declarative_base()
@@ -117,26 +117,58 @@ class PositionManager:
         finally:
             session.close()
 
-    def update_trailing_stop(self, symbol: str, new_stop_loss: float, new_ref_price: float, is_active: bool) -> Optional[Position]:
+    def manage_trailing_stop(self, pos: Position, current_price: float, rm_config: RiskManagementConfig) -> Position:
+        """
+        Checks and updates the trailing stop for a position based on the current price.
+        This method encapsulates the logic and database transaction.
+        """
         session = self.SessionLocal()
         try:
-            position = session.query(Position).filter(Position.symbol == symbol, Position.status == 'OPEN').first()
-            if not position:
-                logger.warning("No open position found to update trailing stop for", symbol=symbol)
-                return None
+            session.add(pos) # Re-attach the object to a new session
+            original_stop_loss = pos.stop_loss_price
 
-            position.stop_loss_price = new_stop_loss
-            position.trailing_ref_price = new_ref_price
-            position.trailing_stop_active = is_active
+            if pos.side == 'BUY':
+                # Activate TSL if price crosses activation threshold
+                if not pos.trailing_stop_active:
+                    activation_price = pos.entry_price * (1 + rm_config.trailing_stop_activation_pct)
+                    if current_price >= activation_price:
+                        pos.trailing_stop_active = True
+                        logger.info("Trailing stop activated for LONG", symbol=pos.symbol, price=current_price, activation_price=activation_price)
+                
+                # Update peak price reference
+                pos.trailing_ref_price = max(pos.trailing_ref_price, current_price)
+
+                # If TSL is active, calculate new stop loss and update if it's higher
+                if pos.trailing_stop_active:
+                    new_stop_price = pos.trailing_ref_price * (1 - rm_config.trailing_stop_pct)
+                    pos.stop_loss_price = max(pos.stop_loss_price, new_stop_price)
+
+            elif pos.side == 'SELL':
+                # Activate TSL
+                if not pos.trailing_stop_active:
+                    activation_price = pos.entry_price * (1 - rm_config.trailing_stop_activation_pct)
+                    if current_price <= activation_price:
+                        pos.trailing_stop_active = True
+                        logger.info("Trailing stop activated for SHORT", symbol=pos.symbol, price=current_price, activation_price=activation_price)
+
+                # Update trough price reference
+                pos.trailing_ref_price = min(pos.trailing_ref_price, current_price)
+
+                # If TSL is active, calculate new stop loss and update if it's lower
+                if pos.trailing_stop_active:
+                    new_stop_price = pos.trailing_ref_price * (1 + rm_config.trailing_stop_pct)
+                    pos.stop_loss_price = min(pos.stop_loss_price, new_stop_price)
+
+            if session.is_modified(pos):
+                logger.debug("Updating trailing stop for position", symbol=pos.symbol, new_sl=pos.stop_loss_price, old_sl=original_stop_loss)
+                session.commit()
+                session.refresh(pos)
             
-            session.commit()
-            session.refresh(position)
-            logger.debug("Updated trailing stop for position", symbol=symbol, new_sl=new_stop_loss, ref_price=new_ref_price)
-            return position
+            return pos
         except Exception as e:
-            logger.error("Failed to update trailing stop", symbol=symbol, error=str(e))
+            logger.error("Failed to manage trailing stop", symbol=pos.symbol, error=str(e))
             session.rollback()
-            return None
+            return pos # Return original object on error
         finally:
             session.close()
 
