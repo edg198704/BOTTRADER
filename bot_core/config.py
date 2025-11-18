@@ -7,6 +7,10 @@ class ExchangeConfig(BaseModel):
     api_secret: Optional[str] = None
     testnet: bool = True
 
+class DataHandlerConfig(BaseModel):
+    history_limit: int = 200
+    update_interval_multiplier: float = 0.5 # Multiplier of strategy interval for data updates
+
 class XGBoostConfig(BaseModel):
     n_estimators: int = 100
     max_depth: int = 5
@@ -89,6 +93,7 @@ class LoggingConfig(BaseModel):
 class BotConfig(BaseModel):
     initial_capital: float = 10000.0
     exchange: ExchangeConfig
+    data_handler: DataHandlerConfig = Field(default_factory=DataHandlerConfig)
     strategy: StrategyConfig
     risk_management: RiskManagementConfig
     database: DatabaseConfig
