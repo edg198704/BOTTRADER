@@ -151,8 +151,13 @@ class TradingBot:
                     if self.strategy.needs_retraining(symbol):
                         logger.info("Retraining needed for symbol, initiating process.", symbol=symbol)
                         
+                        training_data_limit = self.strategy.get_training_data_limit()
+                        if training_data_limit <= 0:
+                            logger.info("Strategy does not require training data, skipping.", symbol=symbol, strategy=self.strategy.__class__.__name__)
+                            continue
+
                         training_df = await self.data_handler.fetch_full_history_for_symbol(
-                            symbol, self.config.strategy.ai_ensemble.training_data_limit
+                            symbol, training_data_limit
                         )
 
                         if training_df is not None and not training_df.empty:
