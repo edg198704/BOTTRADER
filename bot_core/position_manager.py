@@ -1,12 +1,15 @@
 import datetime
 import asyncio
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, TYPE_CHECKING
 
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLAlchemyEnum, func, Boolean
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 from bot_core.logger import get_logger
 from bot_core.config import DatabaseConfig, RiskManagementConfig
+
+if TYPE_CHECKING:
+    from bot_core.monitoring import AlertSystem
 
 logger = get_logger(__name__)
 Base = declarative_base()
@@ -34,12 +37,13 @@ class Position(Base):
     trailing_stop_active = Column(Boolean, default=False, nullable=False)
 
 class PositionManager:
-    def __init__(self, config: DatabaseConfig, initial_capital: float):
+    def __init__(self, config: DatabaseConfig, initial_capital: float, alert_system: Optional['AlertSystem'] = None):
         self.engine = create_engine(f'sqlite:///{config.path}')
         Base.metadata.create_all(self.engine)
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
         self._initial_capital = initial_capital
         self._realized_pnl = 0.0
+        self.alert_system = alert_system
         logger.info("PositionManager initialized and database table created.")
 
     async def initialize(self):
@@ -79,6 +83,14 @@ class PositionManager:
             session.commit()
             session.refresh(new_position)
             logger.info("Opened new position", symbol=symbol, side=side, quantity=quantity, entry_price=entry_price, sl=stop_loss, tp=take_profit)
+            
+            if self.alert_system:
+                asyncio.create_task(self.alert_system.send_alert(
+                    level='info',
+                    message=f"🟢 Opened {side} position for {symbol}",
+                    details={'symbol': symbol, 'side': side, 'quantity': quantity, 'entry_price': entry_price}
+                ))
+
             return new_position
         except Exception as e:
             logger.error("Failed to open position", symbol=symbol, error=str(e))
@@ -109,6 +121,15 @@ class PositionManager:
             session.commit()
             session.refresh(position)
             logger.info("Closed position", symbol=symbol, pnl=f"{pnl:.2f}", reason=reason, total_realized_pnl=self._realized_pnl)
+
+            if self.alert_system:
+                pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+                asyncio.create_task(self.alert_system.send_alert(
+                    level='info',
+                    message=f"{pnl_emoji} Closed position for {symbol} due to {reason}",
+                    details={'symbol': symbol, 'pnl': f'{pnl:.2f}', 'reason': reason, 'close_price': close_price}
+                ))
+
             return position
         except Exception as e:
             logger.error("Failed to close position", symbol=symbol, error=str(e))
