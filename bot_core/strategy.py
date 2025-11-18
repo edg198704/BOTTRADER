@@ -40,18 +40,22 @@ class SimpleMACrossoverStrategy(TradingStrategy):
         super().__init__(config)
         self.fast_ma_period = config.fast_ma_period
         self.slow_ma_period = config.slow_ma_period
+        # Dynamically generate column names from config
+        self.fast_ma_col = f"SMA_{self.fast_ma_period}"
+        self.slow_ma_col = f"SMA_{self.slow_ma_period}"
         logger.info("SimpleMACrossoverStrategy initialized", fast_ma=self.fast_ma_period, slow_ma=self.slow_ma_period)
 
     async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[Dict[str, Any]]:
-        if 'sma_fast' not in df.columns or 'sma_slow' not in df.columns:
-            logger.warning("SMA indicators not found in DataFrame.", symbol=symbol)
+        if self.fast_ma_col not in df.columns or self.slow_ma_col not in df.columns:
+            logger.warning("Required SMA indicators not found in DataFrame.", 
+                         symbol=symbol, required=[self.fast_ma_col, self.slow_ma_col])
             return None
 
         last_row = df.iloc[-1]
         prev_row = df.iloc[-2]
 
-        is_bullish_cross = last_row['sma_fast'] > last_row['sma_slow'] and prev_row['sma_fast'] <= prev_row['sma_slow']
-        is_bearish_cross = last_row['sma_fast'] < last_row['sma_slow'] and prev_row['sma_fast'] >= prev_row['sma_slow']
+        is_bullish_cross = last_row[self.fast_ma_col] > last_row[self.slow_ma_col] and prev_row[self.fast_ma_col] <= prev_row[self.slow_ma_col]
+        is_bearish_cross = last_row[self.fast_ma_col] < last_row[self.slow_ma_col] and prev_row[self.fast_ma_col] >= prev_row[self.slow_ma_col]
 
         if position:
             # Logic to close existing position with an opposing signal
