@@ -42,11 +42,14 @@ class MarketRegimeDetector:
 
             trend_strength = (sma_20 - sma_50) / sma_50 if sma_50 > 0 else 0
 
-            if trend_strength > 0.01:
+            trend_thresh = self.config.market_regime.trend_strength_threshold
+            vol_mult = self.config.market_regime.volatility_multiplier
+
+            if trend_strength > trend_thresh:
                 regime = MarketRegime.BULL
-            elif trend_strength < -0.01:
+            elif trend_strength < -trend_thresh:
                 regime = MarketRegime.BEAR
-            elif volatility > df['close'].pct_change().rolling(50).std().mean() * 1.5:
+            elif volatility > df['close'].pct_change().rolling(50).std().mean() * vol_mult:
                 regime = MarketRegime.VOLATILE
             else:
                 regime = MarketRegime.SIDEWAYS
