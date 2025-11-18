@@ -25,7 +25,7 @@ async def main():
 
     # --- Dependency Injection ---
     exchange_api = get_exchange_api(config)
-    position_manager = PositionManager(config.database)
+    position_manager = PositionManager(config.database, config.initial_capital)
     risk_manager = RiskManager(config.risk_management)
     strategy = get_strategy(config)
     health_checker = HealthChecker()
@@ -59,6 +59,7 @@ async def main():
         loop.add_signal_handler(sig, lambda: asyncio.create_task(bot.stop()))
 
     # --- Initialize and run components ---
+    await position_manager.initialize() # Load historical PnL before starting
     await data_handler.initialize_data() # Load historical data before starting
     telegram_bot = TelegramBot(config.telegram, shared_bot_state)
     
