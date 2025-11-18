@@ -7,6 +7,7 @@ from ccxt.base.errors import NetworkError, ExchangeError, InsufficientFunds, Ord
 
 from bot_core.logger import get_logger
 from bot_core.utils import async_retry
+from bot_core.config import ExchangeConfig
 
 logger = get_logger(__name__)
 
@@ -136,24 +137,36 @@ class MockExchangeAPI(ExchangeAPI):
 
 class CCXTExchangeAPI(ExchangeAPI):
     """Concrete implementation for a real exchange using ccxt."""
-    def __init__(self, name: str, api_key: Optional[str], api_secret: Optional[str], testnet: bool):
-        exchange_class = getattr(ccxt, name.lower(), None)
+    def __init__(self, config: ExchangeConfig):
+        exchange_class = getattr(ccxt, config.name.lower(), None)
         if not exchange_class:
-            raise ValueError(f"Exchange '{name}' is not supported by ccxt.")
+            raise ValueError(f"Exchange '{config.name}' is not supported by ccxt.")
         
         self.exchange = exchange_class({
-            'apiKey': api_key,
-            'secret': api_secret,
+            'apiKey': config.api_key,
+            'secret': config.api_secret,
             'enableRateLimit': True,
         })
 
-        if testnet and self.exchange.has['test']:
+        if config.testnet and self.exchange.has['test']:
             self.exchange.set_sandbox_mode(True)
-            logger.info("CCXTExchangeAPI initialized in TESTNET mode", exchange=name)
+            logger.info("CCXTExchangeAPI initialized in TESTNET mode", exchange=config.name)
         else:
-            logger.info("CCXTExchangeAPI initialized in LIVE mode", exchange=name)
+            logger.info("CCXTExchangeAPI initialized in LIVE mode", exchange=config.name)
 
-    @async_retry(exceptions=(NetworkError, ExchangeError))
+        # Dynamically apply the configured retry decorator to instance methods
+        retry_decorator = async_retry(
+            max_attempts=config.retry.max_attempts,
+            delay_seconds=config.retry.delay_seconds,
+            backoff_factor=config.retry.backoff_factor,
+            exceptions=(NetworkError, ExchangeError)
+        )
+        self.get_market_data = retry_decorator(self.get_market_data)
+        self.get_ticker_data = retry_decorator(self.get_ticker_data)
+        self.place_order = retry_decorator(self.place_order)
+        self.fetch_order = retry_decorator(self.fetch_order)
+        self.get_balance = retry_decorator(self.get_balance)
+
     async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[Any]]:
         try:
             return await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
@@ -161,7 +174,6 @@ class CCXTExchangeAPI(ExchangeAPI):
             logger.error("Final attempt failed for get_market_data", symbol=symbol, error=str(e))
             raise
 
-    @async_retry(exceptions=(NetworkError, ExchangeError))
     async def get_ticker_data(self, symbol: str) -> Dict[str, Any]:
         try:
             ticker = await self.exchange.fetch_ticker(symbol)
@@ -170,7 +182,6 @@ class CCXTExchangeAPI(ExchangeAPI):
             logger.error("Final attempt failed for get_ticker_data", symbol=symbol, error=str(e))
             raise
 
-    @async_retry(exceptions=(NetworkError, ExchangeError))
     async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None) -> Dict[str, Any]:
         try:
             if order_type.upper() == 'MARKET':
@@ -195,7 +206,6 @@ class CCXTExchangeAPI(ExchangeAPI):
             logger.error("Final attempt failed for place_order", symbol=symbol, error=str(e))
             raise
 
-    @async_retry(exceptions=(NetworkError, ExchangeError))
     async def fetch_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
         try:
             order = await self.exchange.fetch_order(order_id, symbol)
@@ -220,7 +230,6 @@ class CCXTExchangeAPI(ExchangeAPI):
             logger.error("Final attempt failed for fetch_order", order_id=order_id, error=str(e))
             raise
 
-    @async_retry(exceptions=(NetworkError, ExchangeError))
     async def get_balance(self) -> Dict[str, Any]:
         try:
             balance = await self.exchange.fetch_balance()
