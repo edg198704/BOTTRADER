@@ -92,12 +92,12 @@ class TradingBot:
                         continue
 
                     # Check for stop-loss
-                    if pos.side == 'BUY' and pos.stop_loss_price and current_price <= pos.stop_loss_price:
+                    if pos.side == 'BUY' and current_price <= pos.stop_loss_price:
                         logger.info("Stop-loss triggered for position", symbol=pos.symbol, price=current_price, sl=pos.stop_loss_price)
                         await self._close_position(pos, current_price, "Stop-Loss")
                     
                     # Check for take-profit
-                    if pos.side == 'BUY' and pos.take_profit_price and current_price >= pos.take_profit_price:
+                    if pos.side == 'BUY' and current_price >= pos.take_profit_price:
                         logger.info("Take-profit triggered for position", symbol=pos.symbol, price=current_price, tp=pos.take_profit_price)
                         await self._close_position(pos, current_price, "Take-Profit")
 
@@ -159,11 +159,11 @@ class TradingBot:
         df_with_indicators = calculate_technical_indicators(df)
 
         position = self.position_manager.get_open_position(symbol)
-        signal = await self.strategy.analyze_market(df_with_indicators, symbol, position)
+        signal = await self.strategy.analyze_market(symbol, df_with_indicators, position)
 
-        if signal: await self._handle_signal(signal, df_with_indicators)
+        if signal: await self._handle_signal(signal, df_with_indicators, position)
 
-    async def _handle_signal(self, signal: Dict, df_with_indicators: pd.DataFrame):
+    async def _handle_signal(self, signal: Dict, df_with_indicators: pd.DataFrame, position: Optional[Position]):
         action = signal.get('action')
         symbol = signal.get('symbol')
         current_price = self.latest_prices.get(symbol)
@@ -171,8 +171,6 @@ class TradingBot:
         if not all([action, symbol, current_price]):
             logger.warning("Received invalid signal", signal=signal)
             return
-
-        position = self.position_manager.get_open_position(symbol)
 
         if action == 'BUY' and not position:
             open_positions = self.position_manager.get_all_open_positions()
