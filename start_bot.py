@@ -24,7 +24,7 @@ async def main():
 
     # --- Dependency Injection ---
     exchange_api = get_exchange_api(config)
-    position_manager = PositionManager(config.database.path)
+    position_manager = PositionManager(config.database)
     risk_manager = RiskManager(config.risk_management)
     strategy = get_strategy(config)
     health_checker = HealthChecker()
