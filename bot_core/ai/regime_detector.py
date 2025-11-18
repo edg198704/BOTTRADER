@@ -3,7 +3,7 @@ import pandas as pd
 from typing import Dict, Any
 
 from bot_core.logger import get_logger
-from bot_core.config import AIStrategyConfig
+from bot_core.config import AIEnsembleStrategyParams
 
 logger = get_logger(__name__)
 
@@ -16,7 +16,7 @@ class MarketRegime(Enum):
 
 class MarketRegimeDetector:
     """Detects the current market regime based on technical indicators."""
-    def __init__(self, config: AIStrategyConfig):
+    def __init__(self, config: AIEnsembleStrategyParams):
         self.config = config
         logger.info("MarketRegimeDetector initialized.")
 
