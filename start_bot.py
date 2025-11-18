@@ -77,12 +77,7 @@ async def main():
 def get_exchange_api(config: BotConfig) -> ExchangeAPI:
     if config.exchange.name == "MockExchange":
         return MockExchangeAPI()
-    return CCXTExchangeAPI(
-        name=config.exchange.name,
-        api_key=config.exchange.api_key,
-        api_secret=config.exchange.api_secret,
-        testnet=config.exchange.testnet
-    )
+    return CCXTExchangeAPI(config.exchange)
 
 def get_strategy(config: BotConfig) -> TradingStrategy:
     strategy_map = {
