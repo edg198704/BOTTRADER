@@ -1,24 +1,21 @@
-# Core Trading & Data
-ccxt>=4.0.0
-pandas>=2.0.0
-numpy>=1.24.0
-SQLAlchemy>=2.0.0
-
-# Configuration & Utilities
-pydantic>=1.10.0
-PyYAML>=6.0
-python-dotenv>=1.0.0
+# Core Dependencies
+ccxt
+pandas
+numpy
+SQLAlchemy
+pydantic
+PyYAML
+python-dotenv
 
 # AI & Machine Learning
-scikit-learn>=1.3.0
-xgboost>=1.7.0
-torch>=2.0.0
-joblib>=1.2.0
+torch
+scikit-learn
+xgboost
+joblib
 
 # Monitoring & System
-python-telegram-bot[ext]>=20.5
-influxdb-client[ciso]>=1.39.0
-psutil>=5.9.0
+influxdb-client
+psutil
 
-# Optional for RL (if enabled in future)
-# gymnasium>=0.29.0
+# Telegram Bot
+python-telegram-bot
