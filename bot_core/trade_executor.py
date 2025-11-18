@@ -80,7 +80,7 @@ class TradeExecutor:
             logger.error("Cannot place order, market details not available for symbol.", symbol=symbol)
             return
 
-        final_quantity = self.order_sizer.adjust_order_quantity(symbol, ideal_quantity, market_details)
+        final_quantity = self.order_sizer.adjust_order_quantity(symbol, ideal_quantity, current_price, market_details)
 
         if final_quantity <= 0:
             logger.warning("Calculated position size is zero or less after adjustments. Aborting trade.", 
@@ -126,11 +126,20 @@ class TradeExecutor:
         close_side = 'SELL' if position.side == 'BUY' else 'BUY'
         
         market_details = self.market_details.get(position.symbol)
+        current_price = self.latest_prices.get(position.symbol)
+
         if not market_details:
             logger.error("Cannot close position, market details not available for symbol.", symbol=position.symbol)
             close_quantity = position.quantity
         else:
-            close_quantity = self.order_sizer.adjust_order_quantity(position.symbol, position.quantity, market_details)
+            if not current_price:
+                logger.warning("Latest price not available for sizing close order, cost check will be skipped.", symbol=position.symbol)
+            close_quantity = self.order_sizer.adjust_order_quantity(
+                position.symbol, 
+                position.quantity, 
+                current_price or 0.0, # Pass 0 if price is unknown, sizer will skip cost check
+                market_details
+            )
 
         if close_quantity <= 0:
             logger.error("Cannot close position, adjusted quantity is zero.", symbol=position.symbol, original_qty=position.quantity)
@@ -138,7 +147,6 @@ class TradeExecutor:
 
         order_type = self.config.execution.default_order_type
         limit_price = None
-        current_price = self.latest_prices.get(position.symbol)
         if order_type == 'LIMIT' and current_price:
             offset = self.config.execution.limit_price_offset_pct
             limit_price = current_price * (1 + offset) if close_side == 'BUY' else current_price * (1 - offset)
