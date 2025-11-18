@@ -19,7 +19,7 @@ class OrderLifecycleManager:
         self.latest_prices = shared_latest_prices
         logger.info("OrderLifecycleManager initialized.")
 
-    async def manage(self, initial_order: Dict[str, Any], symbol: str, side: str, quantity: float, initial_price: Optional[float]) -> Optional[Dict[str, Any]]:
+    async def manage(self, initial_order: Dict[str, Any], symbol: str, side: str, quantity: float, initial_price: Optional[float], market_details: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """
         Main entry point to manage an order's lifecycle.
         """
@@ -34,25 +34,63 @@ class OrderLifecycleManager:
         if not is_chaseable:
             return await self._poll_order_until_filled_or_timeout(order_id, symbol)
 
-        return await self._chase_order_lifecycle(order_id, symbol, side, quantity, initial_price)
+        return await self._chase_order_lifecycle(order_id, symbol, side, quantity, initial_price, market_details)
 
-    async def _chase_order_lifecycle(self, initial_order_id: str, symbol: str, side: str, quantity: float, initial_price: Optional[float]) -> Optional[Dict[str, Any]]:
-        """Handles the advanced order chasing logic for LIMIT orders."""
-        chase_attempts = 0
+    async def _chase_order_lifecycle(self, initial_order_id: str, symbol: str, side: str, total_quantity: float, initial_price: Optional[float], market_details: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """
+        Handles the advanced order chasing logic for LIMIT orders, accounting for partial fills.
+        """
+        cumulative_filled = 0.0
+        cumulative_cost = 0.0
         current_order_id = initial_order_id
         current_order_price = initial_price
+        chase_attempts = 0
+
+        # Get min amount from market details to avoid dust errors
+        min_amount = 0.0
+        if market_details and 'limits' in market_details:
+            min_amount = market_details['limits'].get('amount', {}).get('min', 0.0)
 
         while chase_attempts <= self.config.max_chase_attempts:
             await asyncio.sleep(self.config.chase_interval_seconds)
 
+            # 1. Check status of current order
             order_status = await self.exchange_api.fetch_order(current_order_id, symbol)
-            if order_status and order_status.get('status') == 'FILLED':
-                logger.info("Chased order filled", order_id=current_order_id, attempt=chase_attempts)
-                return order_status
+            if not order_status:
+                logger.warning("Could not fetch order status during chase. Retrying.", order_id=current_order_id)
+                continue
             
-            if order_status and order_status.get('status') not in ['OPEN', 'UNKNOWN']:
-                logger.warning("Chased order in terminal state without fill", order_id=current_order_id, status=order_status.get('status'))
-                return order_status
+            current_filled = order_status.get('filled', 0.0)
+            current_avg = order_status.get('average', 0.0) or current_order_price or 0.0
+            status = order_status.get('status')
+
+            if status == 'FILLED':
+                # Success: Add this order's contribution to cumulative and return
+                final_filled = cumulative_filled + current_filled
+                final_cost = cumulative_cost + (current_filled * current_avg)
+                avg_price = final_cost / final_filled if final_filled > 0 else 0.0
+                
+                logger.info("Order fully filled during chase cycle.", total_filled=final_filled, avg_price=avg_price)
+                return {
+                    'orderId': current_order_id,
+                    'status': 'FILLED',
+                    'filled': final_filled,
+                    'average': avg_price,
+                    'symbol': symbol,
+                    'side': side
+                }
+            
+            if status not in ['OPEN', 'UNKNOWN']:
+                # Order dead (rejected, expired, etc.) without full fill
+                # We treat this as a partial fill scenario and try to chase the rest if possible
+                logger.warning("Order reached terminal state during chase.", status=status, filled=current_filled)
+                # We will fall through to the chase logic to place a new order for the remainder
+                # But first we must update cumulative stats from this dead order
+                cumulative_filled += current_filled
+                cumulative_cost += (current_filled * current_avg)
+                # We don't need to cancel it, it's already done.
+                # We just need to set current_order_id to None so we don't try to cancel it below
+                current_order_id = None 
 
             market_price = self.latest_prices.get(symbol)
             if not market_price:
@@ -62,8 +100,8 @@ class OrderLifecycleManager:
             is_behind_market = (side.upper() == 'BUY' and market_price > current_order_price) or \
                                (side.upper() == 'SELL' and market_price < current_order_price)
 
-            if not is_behind_market:
-                logger.debug("Order is still competitive, not chasing.", order_id=current_order_id, order_price=current_order_price, market_price=market_price)
+            if not is_behind_market and status == 'OPEN':
+                logger.debug("Order is still competitive, not chasing.", order_id=current_order_id)
                 continue
 
             # --- Execute Chase ---
@@ -71,45 +109,60 @@ class OrderLifecycleManager:
             if chase_attempts > self.config.max_chase_attempts:
                 break
 
-            logger.info("Market moved away, chasing order.", order_id=current_order_id, attempt=f"{chase_attempts}/{self.config.max_chase_attempts}")
+            logger.info("Market moved or order dead, chasing.", attempt=f"{chase_attempts}/{self.config.max_chase_attempts}")
+            
+            # 2. Cancel current order if it's still open to get final fill amount
+            if current_order_id and status == 'OPEN':
+                try:
+                    cancel_res = await self.exchange_api.cancel_order(current_order_id, symbol)
+                    if cancel_res:
+                        final_cancel_filled = cancel_res.get('filled', 0.0)
+                        final_cancel_avg = cancel_res.get('average', 0.0) or current_order_price or 0.0
+                        cumulative_filled += final_cancel_filled
+                        cumulative_cost += (final_cancel_filled * final_cancel_avg)
+                        logger.info("Cancelled order for chase.", filled_so_far=cumulative_filled)
+                except Exception as e:
+                    logger.error("Failed to cancel order during chase. Aborting chase.", error=str(e))
+                    break
+            
+            # 3. Calculate remaining quantity
+            remaining_qty = total_quantity - cumulative_filled
+            
+            # Check for dust / min limits
+            if remaining_qty <= 0 or (min_amount > 0 and remaining_qty < min_amount):
+                logger.info("Remaining quantity is dust or zero. Stopping chase.", remaining=remaining_qty, min_amount=min_amount)
+                break
+
+            # 4. Place new order
+            price_improvement = market_price * self.config.chase_aggressiveness_pct
+            new_price = market_price + price_improvement if side.upper() == 'BUY' else market_price - price_improvement
             
             try:
-                await self.exchange_api.cancel_order(current_order_id, symbol)
-                logger.info("Successfully cancelled old order for chasing.", old_order_id=current_order_id)
-
-                price_improvement = market_price * self.config.chase_aggressiveness_pct
-                new_price = market_price + price_improvement if side.upper() == 'BUY' else market_price - price_improvement
-
-                new_order_result = await self.exchange_api.place_order(symbol, side, 'LIMIT', quantity, price=new_price)
+                new_order_result = await self.exchange_api.place_order(symbol, side, 'LIMIT', remaining_qty, price=new_price)
                 if new_order_result and new_order_result.get('orderId'):
                     current_order_id = new_order_result['orderId']
                     current_order_price = new_price
-                    logger.info("Placed new, more aggressive order.", new_order_id=current_order_id, new_price=new_price)
+                    logger.info("Placed new chase order.", new_order_id=current_order_id, price=new_price, qty=remaining_qty)
                 else:
-                    logger.error("Failed to place new chased order. Aborting chase.", symbol=symbol)
-                    return None
+                    logger.error("Failed to place new chased order. Aborting.", symbol=symbol)
+                    break
             except Exception as e:
-                logger.error("Exception during order chase. Aborting.", error=str(e), exc_info=True)
-                return None
+                logger.error("Exception placing chase order.", error=str(e))
+                break
 
-        # --- Handle chase timeout ---
-        logger.warning("Max chase attempts reached for order.", original_order_id=initial_order_id)
-        if self.config.execute_on_timeout:
-            logger.info("Executing a MARKET order as a fallback.", symbol=symbol)
-            try:
-                await self.exchange_api.cancel_order(current_order_id, symbol)
-                market_order = await self.exchange_api.place_order(symbol, side, 'MARKET', quantity)
-                if market_order and market_order.get('orderId'):
-                    return await self._poll_order_until_filled_or_timeout(market_order['orderId'], symbol, timeout_override=15)
-                else:
-                    logger.critical("Failed to place fallback MARKET order.", symbol=symbol)
-                    return None
-            except Exception as e:
-                logger.critical("Exception during fallback MARKET order execution.", error=str(e))
-                return None
-        else:
-            logger.info("execute_on_timeout is false. Cancelling final order.", order_id=current_order_id)
-            return await self._cancel_and_get_final_status(current_order_id, symbol)
+        # --- Final Result Construction ---
+        # If we exit the loop, we return the aggregated result
+        avg_price = cumulative_cost / cumulative_filled if cumulative_filled > 0 else 0.0
+        status = 'FILLED' if cumulative_filled >= (total_quantity * 0.99) else 'PARTIALLY_FILLED'
+        
+        return {
+            'orderId': current_order_id or initial_order_id, # Return last active ID
+            'status': status,
+            'filled': cumulative_filled,
+            'average': avg_price,
+            'symbol': symbol,
+            'side': side
+        }
 
     async def _poll_order_until_filled_or_timeout(self, order_id: str, symbol: str, timeout_override: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """
