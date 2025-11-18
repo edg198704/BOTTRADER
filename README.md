@@ -1,6 +1,6 @@
 # BOTTRADER - Modular Algorithmic Trading Bot
 
-This repository contains a production-ready, modular algorithmic trading bot built with Python. The architecture is designed for robustness, extensibility, and clear separation of concerns, making it easy to develop, test, and deploy new trading strategies.
+This repository contains a production-ready, modular algorithmic trading bot built with Python. The architecture is designed for robustness, extensibility, and a clear separation of concerns, making it easy to develop, test, and deploy new trading strategies.
 
 ## Architecture Overview
 
@@ -13,6 +13,7 @@ The bot's architecture is centered around a core set of decoupled components loc
 *   **`risk_manager.py`**: Implements pre-trade and portfolio-level risk controls, including dynamic position sizing, ATR-based stop loss, and a portfolio-wide circuit breaker.
 *   **`strategy.py`**: Defines the `TradingStrategy` interface and provides concrete implementations like `SimpleMACrossoverStrategy` and the advanced `AIEnsembleStrategy`.
 *   **`telegram_bot.py`**: An optional component for remote control and monitoring via Telegram.
+*   **`logger.py`**: Configures a structured, context-aware logger for the application.
 
 Key supporting files in the root directory include:
 
@@ -25,9 +26,9 @@ Key supporting files in the root directory include:
 
 *   **Modular & Extensible**: Easily swap out exchange APIs or trading strategies by modifying the configuration.
 *   **Advanced AI Strategy**: Includes a powerful ensemble strategy using XGBoost, RandomForest, and other models for sophisticated signal generation.
-*   **Robust Risk Management**: Features dynamic position sizing, ATR-based stop loss, multiple take-profit levels, and a portfolio-level circuit breaker to protect capital.
+*   **Robust Risk Management**: Features dynamic position sizing, ATR-based stop loss, and a portfolio-level circuit breaker to protect capital.
 *   **Persistent State**: All trades are logged to an SQLite database using SQLAlchemy, ensuring state is not lost on restart.
-*   **Remote Control via Telegram**: Includes an optional Telegram bot for real-time status monitoring, performance checks, and a 'kill switch' to halt trading remotely.
+*   **Remote Control via Telegram**: Includes an optional Telegram bot for real-time status monitoring and an emergency 'stop' command.
 *   **Asynchronous Core**: Built with `asyncio` for efficient, non-blocking I/O, critical for handling real-time market data and API requests.
 *   **Type-Safe Configuration**: Uses Pydantic for configuration loading and validation, preventing runtime errors from incorrect settings.
 *   **Graceful Shutdown**: Handles `SIGINT` and `SIGTERM` signals to ensure clean termination and resource cleanup.
@@ -48,13 +49,19 @@ Key supporting files in the root directory include:
     ```
 
 3.  **Configure the bot:**
-    Open `config_enterprise.yaml` and customize the settings:
-    *   **`exchange`**: Set `name` to `MockExchange` for testing or a `ccxt`-supported exchange like `binance`. For a real exchange, provide your `api_key` and `api_secret` (it's highly recommended to use environment variables for these in production).
-    *   **`strategy`**: Choose the `name` of the strategy to run (e.g., `AIEnsembleStrategy` or `SimpleMACrossoverStrategy`) and configure its parameters.
-    *   **`risk_management`**: Define your risk tolerance with `max_position_size_usd`, `max_daily_loss_usd`, etc.
-    *   **`telegram`**: To enable the remote control feature, create a bot with BotFather on Telegram, get the token, and find your chat ID. Add them to the `bot_token` and `admin_chat_ids` fields.
+    Copy the `config_enterprise.yaml` file and customize the settings:
+    *   **`exchange`**: Set `name` to `MockExchange` for testing or a `ccxt`-supported exchange like `binance`. For a real exchange, you will need to set environment variables for your API key and secret.
+    *   **`strategy`**: Choose the `name` of the strategy to run (e.g., `AIEnsembleStrategy` or `SimpleMACrossoverStrategy`).
+    *   **`risk_management`**: Define your risk tolerance.
+    *   **`telegram`**: To enable remote control, create a bot with BotFather on Telegram, get the token, find your chat ID, and add them to the config and environment variables.
 
-    **IMPORTANT**: For production, load API keys and tokens from environment variables or a secure vault, not directly from the YAML file. The bot will automatically look for `BOT_EXCHANGE_API_KEY`, `BOT_EXCHANGE_API_SECRET`, and `BOT_TELEGRAM_BOT_TOKEN` environment variables.
+4.  **Set up Environment Variables:**
+    For production, API keys and tokens must be loaded from environment variables. You can create a `.env` file in the root directory (this file is git-ignored):
+    ```
+    BOT_EXCHANGE_API_KEY="your_exchange_api_key"
+    BOT_EXCHANGE_API_SECRET="your_exchange_api_secret"
+    BOT_TELEGRAM_BOT_TOKEN="your_telegram_bot_token"
+    ```
 
 ## Running the Bot
 
@@ -73,7 +80,7 @@ The bot will initialize all components based on your configuration and begin its
 1.  Create a new class in `bot_core/strategy.py` that inherits from `TradingStrategy`.
 2.  Implement the `analyze_market` abstract method with your custom logic.
 3.  Import your new strategy class in `start_bot.py`.
-4.  Update the factory function `get_strategy` in `start_bot.py` to recognize and instantiate your new strategy by adding its class name to the `strategy_map` dictionary.
+4.  Update the factory function `get_strategy` in `start_bot.py` to recognize and instantiate your new strategy.
 5.  Update `config_enterprise.yaml` to set `strategy.name` to your new strategy's class name.
 
 ### Database Inspection
