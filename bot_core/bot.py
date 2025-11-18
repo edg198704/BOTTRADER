@@ -6,7 +6,7 @@ import pandas as pd
 
 from bot_core.logger import get_logger, set_correlation_id
 from bot_core.exchange_api import ExchangeAPI
-from bot_core.position_manager import PositionManager
+from bot_core.position_manager import PositionManager, Position
 from bot_core.risk_manager import RiskManager
 from bot_core.strategy import TradingStrategy
 from bot_core.config import BotConfig
@@ -92,12 +92,12 @@ class TradingBot:
                         continue
 
                     # Check for stop-loss
-                    if pos.side == 'BUY' and current_price <= pos.stop_loss_price:
+                    if pos.side == 'BUY' and pos.stop_loss_price and current_price <= pos.stop_loss_price:
                         logger.info("Stop-loss triggered for position", symbol=pos.symbol, price=current_price, sl=pos.stop_loss_price)
                         await self._close_position(pos, current_price, "Stop-Loss")
                     
                     # Check for take-profit
-                    if pos.side == 'BUY' and current_price >= pos.take_profit_price:
+                    if pos.side == 'BUY' and pos.take_profit_price and current_price >= pos.take_profit_price:
                         logger.info("Take-profit triggered for position", symbol=pos.symbol, price=current_price, tp=pos.take_profit_price)
                         await self._close_position(pos, current_price, "Take-Profit")
 
@@ -158,7 +158,8 @@ class TradingBot:
         if df is None: return
         df_with_indicators = calculate_technical_indicators(df)
 
-        signal = await self.strategy.analyze_market(df_with_indicators, symbol)
+        position = self.position_manager.get_open_position(symbol)
+        signal = await self.strategy.analyze_market(df_with_indicators, symbol, position)
 
         if signal: await self._handle_signal(signal, df_with_indicators)
 
@@ -192,7 +193,7 @@ class TradingBot:
         elif action == 'SELL' and position:
             await self._close_position(position, current_price, "Strategy Signal")
 
-    async def _close_position(self, position, close_price: float, reason: str):
+    async def _close_position(self, position: Position, close_price: float, reason: str):
         order_result = await self.exchange_api.place_order(position.symbol, 'SELL', 'MARKET', position.quantity)
         if order_result and order_result.get('orderId'):
             self.position_manager.close_position(position.symbol, close_price, reason)
