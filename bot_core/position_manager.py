@@ -28,7 +28,7 @@ class Position(Base):
     close_timestamp = Column(DateTime, nullable=True)
     close_price = Column(Float, nullable=True)
     pnl = Column(Float, nullable=True)
-    # Renamed from peak_price for clarity with short positions
+    # trailing_ref_price tracks peak price for longs, and trough price for shorts
     trailing_ref_price = Column(Float, nullable=True)
     trailing_stop_active = Column(Boolean, default=False, nullable=False)
 
@@ -54,7 +54,7 @@ class PositionManager:
                 stop_loss_price=stop_loss,
                 take_profit_price=take_profit,
                 status='OPEN',
-                trailing_ref_price=entry_price, # Initialize reference price
+                trailing_ref_price=entry_price, # Initialize reference price to entry price
                 trailing_stop_active=False
             )
             session.add(new_position)
