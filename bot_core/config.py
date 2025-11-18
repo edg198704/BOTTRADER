@@ -1,151 +1,158 @@
 from pydantic import BaseModel, Field, validator
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
-class RetryConfig(BaseModel):
-    max_attempts: int = 3
-    delay_seconds: int = 2
-    backoff_factor: int = 2
-
-class ExchangeConfig(BaseModel):
-    name: str = "MockExchange"
-    api_key: Optional[str] = Field(default=None, env="BOT_EXCHANGE_API_KEY")
-    api_secret: Optional[str] = Field(default=None, env="BOT_EXCHANGE_API_SECRET")
-    testnet: bool = True
-    retry: RetryConfig = Field(default_factory=RetryConfig)
-
-class ExecutionConfig(BaseModel):
-    default_order_type: str = "MARKET"  # 'MARKET' or 'LIMIT'
-    limit_price_offset_pct: float = 0.0005  # 0.05% offset for limit orders
-    order_fill_timeout_seconds: int = 45  # Time to wait for an order to fill before cancelling
-
-    # Order Chasing parameters for LIMIT orders
-    use_order_chasing: bool = True
-    chase_interval_seconds: int = 5 # Time to wait before checking if the order needs chasing
-    max_chase_attempts: int = 3 # Number of times to chase the order
-    chase_aggressiveness_pct: float = 0.0002 # 0.02% price improvement on each chase
-    execute_on_timeout: bool = False # If true, place a MARKET order after all chases fail
-
-    @validator('default_order_type')
-    def validate_order_type(cls, v):
-        if v.upper() not in ['MARKET', 'LIMIT']:
-            raise ValueError('default_order_type must be either "MARKET" or "LIMIT"')
-        return v.upper()
-
-class DataHandlerConfig(BaseModel):
-    history_limit: int = 200
-    update_interval_multiplier: float = 0.5 # Multiplier of strategy interval for data updates
+# --- AI Strategy Sub-configs ---
 
 class XGBoostConfig(BaseModel):
     n_estimators: int = 100
-    max_depth: int = 5
+    max_depth: int = 3
     learning_rate: float = 0.1
     subsample: float = 0.8
     colsample_bytree: float = 0.8
 
 class RandomForestConfig(BaseModel):
     n_estimators: int = 100
-    max_depth: int = 10
+    max_depth: Optional[int] = 10
     min_samples_leaf: int = 5
 
 class LogisticRegressionConfig(BaseModel):
-    max_iter: int = 200
+    max_iter: int = 1000
     C: float = 1.0
 
-class EnsembleWeights(BaseModel):
+class EnsembleWeightsConfig(BaseModel):
     xgboost: float = 0.3
-    technical_ensemble: float = 0.2
-    lstm: float = 0.25
-    attention: float = 0.25
+    technical_ensemble: float = 0.3
+    lstm: float = 0.2
+    attention: float = 0.2
 
 class MarketRegimeConfig(BaseModel):
-    trend_strength_threshold: float = 0.01
+    trend_strength_threshold: float = 0.015
     volatility_multiplier: float = 1.5
 
+class AITrainingConfig(BaseModel):
+    epochs: int = 50
+    batch_size: int = 64
+    learning_rate: float = 0.001
+    early_stopping_patience: int = 5
+    validation_split: float = Field(0.15, ge=0.0, lt=1.0)
+
+class AILSTMConfig(BaseModel):
+    hidden_dim: int = 64
+    num_layers: int = 2
+    dropout: float = Field(0.2, ge=0.0, lt=1.0)
+
+class AIAttentionConfig(BaseModel):
+    hidden_dim: int = 64
+    num_layers: int = 2
+    nhead: int = 4
+    dropout: float = Field(0.2, ge=0.0, lt=1.0)
+
 class AIStrategyConfig(BaseModel):
-    feature_columns: List[str] = Field(default_factory=lambda: ['close', 'rsi', 'macd', 'volume'])
-    confidence_threshold: float = 0.60
-    model_path: str = "models/ensemble"
-    use_regime_filter: bool = True
-    use_ppo_agent: bool = False # Disabled by default as it's more experimental
-    retrain_interval_hours: int = 24
-    training_epochs: int = 10
+    feature_columns: List[str]
+    confidence_threshold: float = Field(..., ge=0.0, le=1.0)
+    model_path: str
+    use_regime_filter: bool
+    retrain_interval_hours: int
+    sequence_length: int
     training_data_limit: int = 5000
     labeling_horizon: int = 5
-    labeling_threshold: float = 0.001
-    sequence_length: int = 30 # Lookback window for sequential models like LSTM
+    labeling_threshold: float = 0.005
 
-    # Configurable model parameters
-    xgboost: XGBoostConfig = Field(default_factory=XGBoostConfig)
-    random_forest: RandomForestConfig = Field(default_factory=RandomForestConfig)
-    logistic_regression: LogisticRegressionConfig = Field(default_factory=LogisticRegressionConfig)
-    ensemble_weights: EnsembleWeights = Field(default_factory=EnsembleWeights)
-    market_regime: MarketRegimeConfig = Field(default_factory=MarketRegimeConfig)
+    # Nested model configs
+    xgboost: XGBoostConfig = XGBoostConfig()
+    random_forest: RandomForestConfig = RandomForestConfig()
+    logistic_regression: LogisticRegressionConfig = LogisticRegressionConfig()
+    ensemble_weights: EnsembleWeightsConfig = EnsembleWeightsConfig()
+    market_regime: MarketRegimeConfig = MarketRegimeConfig()
+    training: AITrainingConfig = AITrainingConfig()
+    lstm: AILSTMConfig = AILSTMConfig()
+    attention: AIAttentionConfig = AIAttentionConfig()
 
-class SimpleMAStrategyConfig(BaseModel):
-    fast_ma_period: int = 10
-    slow_ma_period: int = 20
+# --- Simple Strategy Sub-configs ---
+
+class SimpleMAConfig(BaseModel):
+    fast_ma_period: int
+    slow_ma_period: int
+
+# --- Core Component Configs ---
+
+class RetryConfig(BaseModel):
+    max_attempts: int
+    delay_seconds: int
+    backoff_factor: int
+
+class ExchangeConfig(BaseModel):
+    name: str
+    testnet: bool
+    retry: RetryConfig
+
+class ExecutionConfig(BaseModel):
+    default_order_type: str
+    limit_price_offset_pct: float
+    order_fill_timeout_seconds: int
+    use_order_chasing: bool
+    chase_interval_seconds: int
+    max_chase_attempts: int
+    chase_aggressiveness_pct: float
+    execute_on_timeout: bool
+
+class DataHandlerConfig(BaseModel):
+    history_limit: int
+    update_interval_multiplier: float
 
 class StrategyConfig(BaseModel):
-    name: str = "AIEnsembleStrategy"
-    symbols: List[str] = Field(default_factory=lambda: ["BTC/USDT"])
-    interval_seconds: int = 10  # Time in seconds between each trading cycle check.
-    timeframe: str = "1h"  # Timeframe for OHLCV data (e.g., '1m', '5m', '1h', '1d')
-    ai_ensemble: AIStrategyConfig = Field(default_factory=AIStrategyConfig)
-    simple_ma: SimpleMAStrategyConfig = Field(default_factory=SimpleMAStrategyConfig)
+    name: str
+    symbols: List[str]
+    interval_seconds: int
+    timeframe: str
+    ai_ensemble: AIStrategyConfig
+    simple_ma: SimpleMAConfig
 
-class MarketRegimeRiskParameters(BaseModel):
+class RegimeRiskOverride(BaseModel):
     risk_per_trade_pct: Optional[float] = None
     atr_stop_multiplier: Optional[float] = None
     reward_to_risk_ratio: Optional[float] = None
 
-class MarketRegimeRiskConfig(BaseModel):
-    bull: MarketRegimeRiskParameters = Field(default_factory=MarketRegimeRiskParameters)
-    bear: MarketRegimeRiskParameters = Field(default_factory=MarketRegimeRiskParameters)
-    volatile: MarketRegimeRiskParameters = Field(default_factory=MarketRegimeRiskParameters)
-    sideways: MarketRegimeRiskParameters = Field(default_factory=MarketRegimeRiskParameters)
+class RegimeBasedRiskConfig(BaseModel):
+    bull: RegimeRiskOverride = RegimeRiskOverride()
+    bear: RegimeRiskOverride = RegimeRiskOverride()
+    volatile: RegimeRiskOverride = RegimeRiskOverride()
+    sideways: RegimeRiskOverride = RegimeRiskOverride()
 
 class RiskManagementConfig(BaseModel):
-    max_position_size_usd: float = 1000.0
-    max_daily_loss_usd: float = 500.0
-    max_open_positions: int = 5
-    circuit_breaker_threshold: float = -0.10  # -10% portfolio drawdown
-    use_trailing_stop: bool = True
-    atr_stop_multiplier: float = 2.0
-    stop_loss_fallback_pct: float = 0.05
-    risk_per_trade_pct: float = 0.01  # Risk 1% of portfolio equity per trade
-    reward_to_risk_ratio: float = 1.5  # Default reward/risk ratio for take-profit calculation
-    trailing_stop_activation_pct: float = 0.02 # e.g., activate after 2% profit
-    trailing_stop_pct: float = 0.01 # e.g., trail by 1%
-    regime_based_risk: MarketRegimeRiskConfig = Field(default_factory=MarketRegimeRiskConfig)
+    max_position_size_usd: float
+    max_daily_loss_usd: float
+    max_open_positions: int
+    circuit_breaker_threshold: float
+    use_trailing_stop: bool
+    atr_stop_multiplier: float
+    stop_loss_fallback_pct: float
+    risk_per_trade_pct: float
+    reward_to_risk_ratio: float
+    trailing_stop_activation_pct: float
+    trailing_stop_pct: float
+    regime_based_risk: RegimeBasedRiskConfig
 
 class DatabaseConfig(BaseModel):
-    path: str = "position_ledger.db"
+    path: str
 
 class TelegramConfig(BaseModel):
-    bot_token: Optional[str] = Field(default=None, env="BOT_TELEGRAM_BOT_TOKEN")
-    admin_chat_ids: List[int] = Field(default_factory=list)
+    admin_chat_ids: List[int]
 
 class LoggingConfig(BaseModel):
-    level: str = "INFO"
-    file_path: Optional[str] = "logs/trading_bot.log"
-    use_json: bool = True
+    level: str
+    file_path: str
+    use_json: bool
+
+# --- Top-Level Bot Config ---
 
 class BotConfig(BaseModel):
-    initial_capital: float = 10000.0
+    initial_capital: float
     exchange: ExchangeConfig
-    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
-    data_handler: DataHandlerConfig = Field(default_factory=DataHandlerConfig)
+    execution: ExecutionConfig
+    data_handler: DataHandlerConfig
     strategy: StrategyConfig
     risk_management: RiskManagementConfig
     database: DatabaseConfig
-    telegram: TelegramConfig = Field(default_factory=TelegramConfig)
-    logging: LoggingConfig = Field(default_factory=LoggingConfig)
-
-    @validator('strategy')
-    def validate_strategy_symbols(cls, v):
-        if not v.symbols:
-            raise ValueError('Strategy symbols list cannot be empty')
-        for symbol in v.symbols:
-            if '/' not in symbol:
-                raise ValueError(f'Strategy symbol "{symbol}" should be a valid trading pair, e.g., BTC/USDT')
-        return v
+    telegram: TelegramConfig
+    logging: LoggingConfig
