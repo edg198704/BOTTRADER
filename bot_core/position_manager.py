@@ -236,9 +236,22 @@ class PositionManager:
         finally:
             session.close()
 
+    async def get_aggregated_open_positions(self) -> Dict[str, float]:
+        """Returns a dictionary of {symbol: total_quantity} for all OPEN positions."""
+        return await self._run_in_executor(self._get_aggregated_open_positions_sync)
+
+    def _get_aggregated_open_positions_sync(self) -> Dict[str, float]:
+        session = self.SessionLocal()
+        try:
+            results = session.query(Position.symbol, func.sum(Position.quantity))\
+                .filter(Position.status == 'OPEN')\
+                .group_by(Position.symbol).all()
+            return {r[0]: r[1] for r in results}
+        finally:
+            session.close()
+
     def get_portfolio_value(self, latest_prices: Dict[str, float], open_positions: List[Position]) -> float:
         """Calculates total portfolio equity using in-memory PnL and current market prices."""
-        # This method is CPU-bound and fast, safe to run in main loop as long as _realized_pnl is updated safely.
         unrealized_pnl = 0.0
         for pos in open_positions:
             current_price = latest_prices.get(pos.symbol, pos.entry_price)
