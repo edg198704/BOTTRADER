@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, SecretStr
 from typing import List, Optional, Dict, Any
 
 # --- AI Strategy Sub-configs ---
@@ -85,8 +85,8 @@ class ExchangeConfig(BaseModel):
     name: str
     testnet: bool
     retry: RetryConfig
-    api_key: Optional[str] = Field(None, env="BOT_EXCHANGE_API_KEY")
-    api_secret: Optional[str] = Field(None, env="BOT_EXCHANGE_API_SECRET")
+    api_key: Optional[SecretStr] = Field(None, env="BOT_EXCHANGE_API_KEY")
+    api_secret: Optional[SecretStr] = Field(None, env="BOT_EXCHANGE_API_SECRET")
 
 class ExecutionConfig(BaseModel):
     default_order_type: str
@@ -140,7 +140,7 @@ class DatabaseConfig(BaseModel):
 
 class TelegramConfig(BaseModel):
     admin_chat_ids: List[int]
-    bot_token: Optional[str] = Field(None, env="BOT_TELEGRAM_BOT_TOKEN")
+    bot_token: Optional[SecretStr] = Field(None, env="BOT_TELEGRAM_BOT_TOKEN")
 
 class LoggingConfig(BaseModel):
     level: str
