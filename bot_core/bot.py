@@ -73,6 +73,43 @@ class TradingBot:
         self.trade_executor.market_details = self.market_details
         logger.info("Market details loading complete and passed to TradeExecutor.")
 
+    async def _reconcile_start_state(self):
+        """Performs safety checks and state reconciliation on startup."""
+        logger.info("Performing startup state reconciliation...")
+        
+        # 1. Cancel all open orders to ensure clean slate (remove orphans)
+        for symbol in self.config.strategy.symbols:
+            try:
+                cancelled = await self.exchange_api.cancel_all_orders(symbol)
+                if cancelled:
+                    logger.info("Cancelled orphaned orders on startup", symbol=symbol, count=len(cancelled))
+            except Exception as e:
+                logger.error("Failed to cancel orders on startup", symbol=symbol, error=str(e))
+
+        # 2. Verify Balances vs Positions
+        try:
+            balances = await self.exchange_api.get_balance()
+            expected_positions = await self.position_manager.get_aggregated_open_positions()
+            
+            for symbol, expected_qty in expected_positions.items():
+                base_asset = symbol.split('/')[0]
+                # Check 'total' because we just cancelled orders, so 'used' should be 0
+                actual_qty = balances.get(base_asset, {}).get('total', 0.0)
+                
+                # Allow for small dust difference (e.g. fees)
+                if actual_qty < (expected_qty * 0.98): 
+                    logger.critical("CRITICAL: Balance mismatch detected!", 
+                                    symbol=symbol, 
+                                    expected_db=expected_qty, 
+                                    actual_wallet=actual_qty)
+                    await self.alert_system.send_alert(
+                        level='critical',
+                        message=f"🚨 Balance Mismatch for {symbol}",
+                        details={'expected_db': expected_qty, 'actual_wallet': actual_qty}
+                    )
+        except Exception as e:
+            logger.error("Error during balance reconciliation", error=str(e))
+
     async def run(self):
         """Main entry point to start all bot activities."""
         self.running = True
@@ -80,6 +117,7 @@ class TradingBot:
         logger.info("Starting TradingBot...", symbols=self.config.strategy.symbols)
         
         await self._load_market_details()
+        await self._reconcile_start_state()
 
         # Start shared loops
         self.tasks.append(asyncio.create_task(self.data_handler.run()))
