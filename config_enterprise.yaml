@@ -41,8 +41,9 @@ strategy:
   interval_seconds: 10      # Time in seconds between each trading cycle check.
   timeframe: "5m"           # Timeframe for OHLCV data (e.g., '1m', '5m', '1h', '1d')
 
-  # Settings for AIEnsembleStrategy
-  ai_ensemble:
+  # Generic parameters block. The selected strategy ('AIEnsembleStrategy') will parse this.
+  params:
+    # --- Settings for AIEnsembleStrategy ---
     feature_columns: ['close', 'rsi', 'macd', 'volume', 'bb_upper', 'bb_lower']
     confidence_threshold: 0.65
     model_path: "models/ensemble"
@@ -97,10 +98,9 @@ strategy:
       trend_strength_threshold: 0.015 # e.g., 1.5% difference between SMAs
       volatility_multiplier: 1.5 # How much higher current volatility must be than average to be 'volatile'
 
-  # Settings for SimpleMACrossoverStrategy
-  simple_ma:
-    fast_ma_period: 10
-    slow_ma_period: 20
+    # --- Settings for SimpleMACrossoverStrategy (for reference) ---
+    # fast_ma_period: 10
+    # slow_ma_period: 20
 
 risk_management:
   max_position_size_usd: 1000.0
