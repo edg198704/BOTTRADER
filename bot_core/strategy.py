@@ -147,9 +147,13 @@ class AIEnsembleStrategy(TradingStrategy):
             return
         
         logger.info("Strategy is triggering model retraining.", symbol=symbol)
-        self.ensemble_learner.train(symbol, df)
-        self.last_retrained_at[symbol] = datetime.utcnow()
-        logger.info("Model retraining process completed.", symbol=symbol)
+        success = self.ensemble_learner.train(symbol, df)
+        
+        if success:
+            self.last_retrained_at[symbol] = datetime.utcnow()
+            logger.info("Model retraining process completed and accepted.", symbol=symbol)
+        else:
+            logger.warning("Model retraining completed but rejected due to poor performance.", symbol=symbol)
 
     def needs_retraining(self, symbol: str) -> bool:
         """Checks if enough time has passed since the last retraining."""
