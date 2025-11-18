@@ -22,6 +22,7 @@ class DataHandler:
         self.timeframe = config.strategy.timeframe
         self.history_limit = config.data_handler.history_limit
         self.update_interval = config.strategy.interval_seconds * config.data_handler.update_interval_multiplier
+        self.indicators_config = config.strategy.indicators
         
         self._dataframes: Dict[str, pd.DataFrame] = {}
         self._shared_latest_prices = shared_latest_prices
@@ -43,7 +44,7 @@ class DataHandler:
                 df = create_dataframe(ohlcv_data)
                 if df is not None and not df.empty:
                     # Pre-calculate indicators on initialization
-                    self._dataframes[symbol] = calculate_technical_indicators(df)
+                    self._dataframes[symbol] = self.calculate_technical_indicators(df)
                     self._update_latest_price(symbol, self._dataframes[symbol])
                     logger.info("Loaded and processed initial historical data", symbol=symbol, records=len(df))
             else:
@@ -100,7 +101,7 @@ class DataHandler:
                 combined_df = latest_df
 
             # Re-calculate indicators on the updated, raw dataframe
-            self._dataframes[symbol] = calculate_technical_indicators(combined_df)
+            self._dataframes[symbol] = self.calculate_technical_indicators(combined_df)
             self._update_latest_price(symbol, self._dataframes[symbol])
             logger.debug("Market data updated and indicators recalculated", symbol=symbol)
 
@@ -132,7 +133,7 @@ class DataHandler:
                 df = create_dataframe(ohlcv_data)
                 if df is not None and not df.empty:
                     # Calculate indicators on the full dataset
-                    full_df = calculate_technical_indicators(df)
+                    full_df = self.calculate_technical_indicators(df)
                     logger.info("Successfully fetched and processed training data", symbol=symbol, records=len(full_df))
                     return full_df
             logger.warning("Could not fetch sufficient training data.", symbol=symbol)
@@ -140,6 +141,45 @@ class DataHandler:
         except Exception as e:
             logger.error("Failed to fetch full historical data", symbol=symbol, error=str(e))
             return None
+
+    def calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate technical indicators dynamically based on the strategy configuration."""
+        if df is None or len(df) < 50:
+            logger.debug("DataFrame has insufficient data for indicators.", data_length=len(df) if df is not None else 0)
+            return df
+
+        df_out = df.copy()
+
+        # Create a pandas-ta strategy from the configuration
+        ta_strategy = ta.Strategy(
+            name="BotTrader Dynamic Indicators",
+            description="Indicators dynamically loaded from config.",
+            ta=self.indicators_config
+        )
+
+        # Apply the strategy
+        df_out.ta.strategy(ta_strategy)
+
+        # Rename columns to a consistent, simplified format for use in the application
+        # This is important because pandas-ta creates verbose column names (e.g., 'RSI_14')
+        rename_map = {
+            'RSI_14': 'rsi',
+            'MACD_12_26_9': 'macd',
+            'MACDh_12_26_9': 'macd_hist',
+            'MACDs_12_26_9': 'macd_signal',
+            'BBL_20_2.0': 'bb_lower',
+            'BBM_20_2.0': 'bb_middle',
+            'BBU_20_2.0': 'bb_upper',
+            'ATRr_14': 'atr',
+            'ADX_14': 'adx',
+            'SMA_10': 'sma_fast',
+            'SMA_20': 'sma_slow'
+        }
+        df_out.rename(columns=rename_map, inplace=True, errors='ignore')
+
+        df_out.dropna(inplace=True)
+        logger.debug("Technical indicators calculated dynamically from config", row_count=len(df_out))
+        return df_out
 
 def create_dataframe(ohlcv_data: list) -> pd.DataFrame | None:
     """Create DataFrame from OHLCV data with complete validation."""
@@ -173,49 +213,3 @@ def create_dataframe(ohlcv_data: list) -> pd.DataFrame | None:
     except Exception as e:
         logger.error("Failed to create DataFrame", error=str(e), exc_info=True)
         return None
-
-def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate a comprehensive set of technical indicators using pandas-ta."""
-    if df is None or len(df) < 50:
-        logger.debug("DataFrame has insufficient data for all indicators.", data_length=len(df) if df is not None else 0)
-        return df
-
-    df_out = df.copy()
-
-    # Define the strategy for pandas-ta
-    ta_strategy = ta.Strategy(
-        name="BotTrader Indicators",
-        description="A collection of standard indicators for the trading bot.",
-        ta=[
-            {"kind": "rsi", "length": 14},
-            {"kind": "macd", "fast": 12, "slow": 26, "signal": 9},
-            {"kind": "bbands", "length": 20, "std": 2},
-            {"kind": "atr", "length": 14},
-            {"kind": "adx", "length": 14},
-            {"kind": "sma", "length": 10},
-            {"kind": "sma", "length": 20},
-        ]
-    )
-
-    # Apply the strategy
-    df_out.ta.strategy(ta_strategy)
-
-    # Rename columns to match application's expectations
-    rename_map = {
-        'RSI_14': 'rsi',
-        'MACD_12_26_9': 'macd',
-        'MACDh_12_26_9': 'macd_hist',
-        'MACDs_12_26_9': 'macd_signal',
-        'BBL_20_2.0': 'bb_lower',
-        'BBM_20_2.0': 'bb_middle',
-        'BBU_20_2.0': 'bb_upper',
-        'ATRr_14': 'atr',
-        'ADX_14': 'adx',
-        'SMA_10': 'sma_fast',
-        'SMA_20': 'sma_slow'
-    }
-    df_out.rename(columns=rename_map, inplace=True)
-
-    df_out.dropna(inplace=True)
-    logger.debug("Technical indicators calculated using pandas-ta", row_count=len(df_out))
-    return df_out
