@@ -3,6 +3,9 @@
 initial_capital: 10000.0
 
 exchange:
+  # For real exchanges, API key and secret MUST be set via environment variables:
+  # BOT_EXCHANGE_API_KEY="your_key"
+  # BOT_EXCHANGE_API_SECRET="your_secret"
   name: "MockExchange"  # Exchange name (e.g., 'binance', 'bybit'). Use 'MockExchange' for testing.
   testnet: true         # Use the exchange's testnet/sandbox environment
   retry:
@@ -131,6 +134,8 @@ database:
   path: "position_ledger.db"
 
 telegram:
+  # The bot token MUST be set via the environment variable:
+  # BOT_TELEGRAM_BOT_TOKEN="your_token"
   admin_chat_ids:
     - 123456789 # Replace with your Telegram admin chat ID
 
