@@ -13,7 +13,7 @@ from bot_core.strategy import TradingStrategy
 from bot_core import strategy as strategy_module
 from bot_core.bot import TradingBot
 from bot_core.telegram_bot import TelegramBot
-from bot_core.monitoring import HealthChecker, InfluxDBMetrics
+from bot_core.monitoring import HealthChecker, InfluxDBMetrics, AlertSystem
 from bot_core.data_handler import DataHandler
 from bot_core.order_sizer import OrderSizer
 from bot_core.position_monitor import PositionMonitor
@@ -29,10 +29,18 @@ async def main():
 
     # --- Shared State & Dependency Injection ---
     latest_prices: Dict[str, float] = {}
+    alert_system = AlertSystem()
 
     exchange_api = get_exchange_api(config)
-    position_manager = PositionManager(config.database, config.initial_capital)
-    risk_manager = RiskManager(config.risk_management)
+    position_manager = PositionManager(
+        config.database, 
+        config.initial_capital,
+        alert_system=alert_system
+    )
+    risk_manager = RiskManager(
+        config.risk_management,
+        alert_system=alert_system
+    )
     strategy = get_strategy(config)
     order_sizer = OrderSizer()
     health_checker = HealthChecker()
@@ -67,6 +75,7 @@ async def main():
         health_checker=health_checker,
         position_monitor=position_monitor,
         order_lifecycle_manager=order_lifecycle_manager,
+        alert_system=alert_system,
         shared_latest_prices=latest_prices,
         metrics_writer=metrics_writer,
         shared_bot_state=shared_bot_state
@@ -86,6 +95,11 @@ async def main():
     await data_handler.initialize_data() # Load historical data before starting
     telegram_bot = TelegramBot(config.telegram, shared_bot_state)
     
+    # Register Telegram as an alert handler if it's configured
+    if telegram_bot.application:
+        alert_system.register_handler(telegram_bot.create_alert_handler())
+        logger.info("Telegram alert handler registered.")
+
     try:
         bot_task = asyncio.create_task(bot.run())
         telegram_task = asyncio.create_task(telegram_bot.run())
