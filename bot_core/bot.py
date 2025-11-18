@@ -121,7 +121,8 @@ class TradingBot:
                     await asyncio.sleep(5)
                     continue
 
-                open_positions = self.position_manager.get_all_open_positions()
+                # Await the async DB call
+                open_positions = await self.position_manager.get_all_open_positions()
                 portfolio_value = self.position_manager.get_portfolio_value(self.latest_prices, open_positions)
                 
                 daily_pnl = await self.position_manager.get_daily_realized_pnl()
@@ -202,7 +203,8 @@ class TradingBot:
             logger.warning("Latest price for symbol not available yet.", symbol=symbol)
             return
 
-        position = self.position_manager.get_open_position(symbol)
+        # Await the async DB call
+        position = await self.position_manager.get_open_position(symbol)
         signal = await self.strategy.analyze_market(symbol, df_with_indicators, position)
 
         if signal: await self._handle_signal(signal, df_with_indicators, position)
