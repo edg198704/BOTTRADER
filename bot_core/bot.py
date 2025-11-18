@@ -78,6 +78,7 @@ class TradingBot:
         self.tasks.append(asyncio.create_task(self.data_handler.run()))
         self.tasks.append(asyncio.create_task(self._monitoring_loop()))
         self.tasks.append(asyncio.create_task(self._position_management_loop()))
+        self.tasks.append(asyncio.create_task(self._retraining_loop()))
 
         # Start a trading cycle for each symbol
         for symbol in self.config.strategy.symbols:
@@ -176,6 +177,43 @@ class TradingBot:
             except Exception as e:
                 logger.error("Error in monitoring loop", error=str(e))
             await asyncio.sleep(60) # Monitoring interval
+
+    async def _retraining_loop(self):
+        """Periodically checks if the strategy models need retraining and triggers it."""
+        logger.info("Starting model retraining loop.")
+        # Wait a bit on startup to let data load
+        await asyncio.sleep(60)
+
+        while self.running:
+            try:
+                for symbol in self.config.strategy.symbols:
+                    if self.strategy.needs_retraining(symbol):
+                        logger.info("Retraining needed for symbol, initiating process.", symbol=symbol)
+                        
+                        training_df = await self.data_handler.fetch_full_history_for_symbol(
+                            symbol, self.config.strategy.ai_ensemble.training_data_limit
+                        )
+
+                        if training_df is not None and not training_df.empty:
+                            # Run the potentially CPU-intensive training in a separate thread
+                            # to avoid blocking the main async event loop.
+                            loop = asyncio.get_running_loop()
+                            await loop.run_in_executor(
+                                None, 
+                                lambda: asyncio.run(self.strategy.retrain(symbol, training_df))
+                            )
+                        else:
+                            logger.error("Could not fetch training data, skipping retraining for now.", symbol=symbol)
+                
+                # Check again in an hour
+                await asyncio.sleep(3600)
+
+            except asyncio.CancelledError:
+                logger.info("Retraining loop cancelled.")
+                break
+            except Exception as e:
+                logger.error("Error in retraining loop", error=str(e), exc_info=True)
+                await asyncio.sleep(3600) # Wait before retrying on error
 
     async def _run_single_trade_check(self, symbol: str):
         logger.debug("Starting new trade check", symbol=symbol)
