@@ -7,6 +7,7 @@ import pandas_ta as ta
 from bot_core.logger import get_logger
 from bot_core.config import BotConfig
 from bot_core.exchange_api import ExchangeAPI
+from bot_core.utils import generate_indicator_rename_map
 
 logger = get_logger(__name__)
 
@@ -159,6 +160,15 @@ class DataHandler:
 
         # Apply the strategy
         df_out.ta.strategy(ta_strategy)
+
+        # Rename columns to a consistent, simplified format using the utility function
+        try:
+            rename_map = generate_indicator_rename_map(self.indicators_config)
+            df_out.rename(columns=rename_map, inplace=True, errors='ignore')
+        except ValueError as e:
+            logger.error("Failed to generate indicator rename map. Check config.", error=str(e))
+            # Return dataframe with original pandas-ta names on error
+            return df_out
 
         df_out.dropna(inplace=True)
         logger.debug("Technical indicators calculated dynamically from config", row_count=len(df_out))
