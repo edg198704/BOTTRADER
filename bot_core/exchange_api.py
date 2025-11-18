@@ -3,8 +3,10 @@ import time
 import random
 from typing import Dict, Any, List, Optional
 import ccxt.async_support as ccxt
+from ccxt.base.errors import NetworkError, ExchangeError, InsufficientFunds, OrderNotFound
 
 from bot_core.logger import get_logger
+from bot_core.utils import async_retry
 
 logger = get_logger(__name__)
 
@@ -151,27 +153,24 @@ class CCXTExchangeAPI(ExchangeAPI):
         else:
             logger.info("CCXTExchangeAPI initialized in LIVE mode", exchange=name)
 
+    @async_retry(exceptions=(NetworkError, ExchangeError))
     async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[Any]]:
         try:
             return await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        except ccxt.NetworkError as e:
-            logger.error("Network error fetching OHLCV", symbol=symbol, error=str(e))
-            raise
-        except ccxt.ExchangeError as e:
-            logger.error("Exchange error fetching OHLCV", symbol=symbol, error=str(e))
+        except (NetworkError, ExchangeError) as e:
+            logger.error("Final attempt failed for get_market_data", symbol=symbol, error=str(e))
             raise
 
+    @async_retry(exceptions=(NetworkError, ExchangeError))
     async def get_ticker_data(self, symbol: str) -> Dict[str, Any]:
         try:
             ticker = await self.exchange.fetch_ticker(symbol)
             return {"symbol": symbol, "lastPrice": str(ticker['last'])}
-        except ccxt.NetworkError as e:
-            logger.error("Network error fetching ticker", symbol=symbol, error=str(e))
-            raise
-        except ccxt.ExchangeError as e:
-            logger.error("Exchange error fetching ticker", symbol=symbol, error=str(e))
+        except (NetworkError, ExchangeError) as e:
+            logger.error("Final attempt failed for get_ticker_data", symbol=symbol, error=str(e))
             raise
 
+    @async_retry(exceptions=(NetworkError, ExchangeError))
     async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None) -> Dict[str, Any]:
         try:
             if order_type.upper() == 'MARKET':
@@ -189,13 +188,14 @@ class CCXTExchangeAPI(ExchangeAPI):
                 "executedQty": order.get('filled', 0.0),
                 "cummulativeQuoteQty": order.get('cost', 0.0)
             }
-        except ccxt.InsufficientFunds as e:
-            logger.error("Insufficient funds to place order", symbol=symbol, error=str(e))
+        except InsufficientFunds as e:
+            logger.error("Insufficient funds to place order, not retrying.", symbol=symbol, error=str(e))
             raise
-        except ccxt.ExchangeError as e:
-            logger.error("Exchange error placing order", symbol=symbol, error=str(e))
+        except (NetworkError, ExchangeError) as e:
+            logger.error("Final attempt failed for place_order", symbol=symbol, error=str(e))
             raise
 
+    @async_retry(exceptions=(NetworkError, ExchangeError))
     async def fetch_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
         try:
             order = await self.exchange.fetch_order(order_id, symbol)
@@ -213,19 +213,20 @@ class CCXTExchangeAPI(ExchangeAPI):
                 'average': order.get('average', 0.0),
                 'symbol': order.get('symbol')
             }
-        except ccxt.OrderNotFound:
-            logger.warning("Order not found on exchange", order_id=order_id, symbol=symbol)
+        except OrderNotFound:
+            logger.warning("Order not found on exchange, not retrying.", order_id=order_id, symbol=symbol)
             return None
-        except ccxt.ExchangeError as e:
-            logger.error("Error fetching order", order_id=order_id, error=str(e))
+        except (NetworkError, ExchangeError) as e:
+            logger.error("Final attempt failed for fetch_order", order_id=order_id, error=str(e))
             raise
 
+    @async_retry(exceptions=(NetworkError, ExchangeError))
     async def get_balance(self) -> Dict[str, Any]:
         try:
             balance = await self.exchange.fetch_balance()
             return balance.get('total', {})
-        except ccxt.ExchangeError as e:
-            logger.error("Error fetching balance", error=str(e))
+        except (NetworkError, ExchangeError) as e:
+            logger.error("Final attempt failed for get_balance", error=str(e))
             raise
 
     async def close(self):
