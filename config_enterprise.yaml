@@ -36,67 +36,80 @@ data_handler:
   update_interval_multiplier: 0.5 # Update data every (strategy.interval_seconds * 0.5) seconds
 
 strategy:
-  # This block is now type-safe. The 'name' field determines which model is used for validation.
-  # All parameters below are specific to the 'AIEnsembleStrategy'.
-  name: "AIEnsembleStrategy" # Strategy to use ('AIEnsembleStrategy' or 'SimpleMACrossoverStrategy')
   symbols: ["BTC/USDT", "ETH/USDT"] # List of symbols to trade
   interval_seconds: 10      # Time in seconds between each trading cycle check.
   timeframe: "5m"           # Timeframe for OHLCV data (e.g., '1m', '5m', '1h', '1d')
 
-  # --- Settings for AIEnsembleStrategy ---
-  feature_columns: ['close', 'rsi', 'macd', 'volume', 'bb_upper', 'bb_lower']
-  confidence_threshold: 0.65
-  model_path: "models/ensemble"
-  use_regime_filter: true
-  retrain_interval_hours: 24
-  sequence_length: 30 # Lookback window for sequential models like LSTM/Attention
-  training_data_limit: 5000 # How many candles to fetch for retraining
-  labeling_horizon: 5 # How many candles into the future to look for labeling
-  labeling_threshold: 0.005 # % price change to define a buy/sell label
+  # The 'params' block now contains the strategy name and its specific parameters.
+  # Pydantic uses the 'name' field to validate the rest of the parameters
+  # against the correct strategy model from config.py.
+  params:
+    name: "AIEnsembleStrategy" # Strategy to use. MUST match a strategy class name.
 
-  # --- Model Training Parameters ---
-  training:
-    epochs: 50 # Max epochs to train for
-    batch_size: 64
-    learning_rate: 0.001
-    early_stopping_patience: 5 # Stop training if validation loss doesn't improve for this many epochs
-    validation_split: 0.15 # Percentage of training data to use for validation
+    # --- Settings for AIEnsembleStrategy ---
+    feature_columns: ['close', 'rsi', 'macd', 'volume', 'bb_upper', 'bb_lower']
+    confidence_threshold: 0.65
+    model_path: "models/ensemble"
+    use_regime_filter: true
+    retrain_interval_hours: 24
+    sequence_length: 30 # Lookback window for sequential models like LSTM/Attention
+    training_data_limit: 5000 # How many candles to fetch for retraining
+    labeling_horizon: 5 # How many candles into the future to look for labeling
+    labeling_threshold: 0.005 # % price change to define a buy/sell label
 
-  # --- Model Hyperparameters ---
-  xgboost:
-    n_estimators: 100
-    max_depth: 3
-    learning_rate: 0.1
-    subsample: 0.8
-    colsample_bytree: 0.8
-  random_forest:
-    n_estimators: 100
-    max_depth: 10
-    min_samples_leaf: 5
-  logistic_regression:
-    max_iter: 1000
-    C: 1.0
-  lstm:
-    hidden_dim: 64
-    num_layers: 2
-    dropout: 0.2
-  attention:
-    hidden_dim: 64
-    num_layers: 2
-    nhead: 4
-    dropout: 0.2
+    # --- Model Training Parameters ---
+    training:
+      epochs: 50 # Max epochs to train for
+      batch_size: 64
+      learning_rate: 0.001
+      early_stopping_patience: 5 # Stop training if validation loss doesn't improve for this many epochs
+      validation_split: 0.15 # Percentage of training data to use for validation
 
-  # --- Ensemble Configuration ---
-  ensemble_weights:
-    xgboost: 0.3
-    technical_ensemble: 0.3
-    lstm: 0.2
-    attention: 0.2
+    # --- Model Hyperparameters ---
+    xgboost:
+      n_estimators: 100
+      max_depth: 3
+      learning_rate: 0.1
+      subsample: 0.8
+      colsample_bytree: 0.8
+    random_forest:
+      n_estimators: 100
+      max_depth: 10
+      min_samples_leaf: 5
+    logistic_regression:
+      max_iter: 1000
+      C: 1.0
+    lstm:
+      hidden_dim: 64
+      num_layers: 2
+      dropout: 0.2
+    attention:
+      hidden_dim: 64
+      num_layers: 2
+      nhead: 4
+      dropout: 0.2
 
-  # --- Market Regime Detector ---
-  market_regime:
-    trend_strength_threshold: 0.015 # e.g., 1.5% difference between SMAs
-    volatility_multiplier: 1.5 # How much higher current volatility must be than average to be 'volatile'
+    # --- Ensemble Configuration ---
+    ensemble_weights:
+      xgboost: 0.3
+      technical_ensemble: 0.3
+      lstm: 0.2
+      attention: 0.2
+
+    # --- Market Regime Detector ---
+    market_regime:
+      trend_strength_threshold: 0.015 # e.g., 1.5% difference between SMAs
+      volatility_multiplier: 1.5 # How much higher current volatility must be than average to be 'volatile'
+
+# --- Example for SimpleMACrossoverStrategy (for reference) ---
+# strategy:
+#   symbols: ["BTC/USDT"]
+#   interval_seconds: 60
+#   timeframe: "1h"
+#   params:
+#     name: "SimpleMACrossoverStrategy"
+#     fast_ma_period: 10
+#     slow_ma_period: 20
 
 risk_management:
   max_position_size_usd: 1000.0
