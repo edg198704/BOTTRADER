@@ -14,6 +14,7 @@ from bot_core.bot import TradingBot
 from bot_core.telegram_bot import TelegramBot
 from bot_core.monitoring import HealthChecker, InfluxDBMetrics
 from bot_core.data_handler import DataHandler
+from bot_core.order_sizer import OrderSizer
 
 # Shared state for communication between components (e.g., Telegram and Bot)
 shared_bot_state: Dict[str, Any] = {}
@@ -28,6 +29,7 @@ async def main():
     position_manager = PositionManager(config.database, config.initial_capital)
     risk_manager = RiskManager(config.risk_management)
     strategy = get_strategy(config)
+    order_sizer = OrderSizer()
     health_checker = HealthChecker()
     metrics_writer = InfluxDBMetrics(url=os.getenv('INFLUXDB_URL'), token=os.getenv('INFLUXDB_TOKEN'), org=os.getenv('INFLUXDB_ORG'), bucket=os.getenv('INFLUXDB_BUCKET'))
 
@@ -40,6 +42,7 @@ async def main():
         strategy=strategy,
         position_manager=position_manager,
         risk_manager=risk_manager,
+        order_sizer=order_sizer,
         health_checker=health_checker,
         metrics_writer=metrics_writer,
         shared_bot_state=shared_bot_state
