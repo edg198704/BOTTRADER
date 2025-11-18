@@ -62,6 +62,7 @@ class TelegramBot:
         
         status = self.bot_state.get('status', 'UNKNOWN')
         equity = self.bot_state.get('portfolio_equity', 0.0)
+        daily_pnl = self.bot_state.get('daily_pnl', 0.0)
         pos_count = self.bot_state.get('open_positions_count', 0)
         start_time = self.bot_state.get('start_time')
         risk_manager = self.bot_state.get('risk_manager')
@@ -73,13 +74,21 @@ class TelegramBot:
 
         risk_status = "OK"
         if risk_manager and risk_manager.is_halted:
-            risk_status = "HALTED (Circuit Breaker)"
+            if risk_manager.circuit_breaker_halted:
+                risk_status = "HALTED (Circuit Breaker)"
+            elif risk_manager.daily_loss_halted:
+                risk_status = "HALTED (Daily Loss Limit)"
+            else:
+                risk_status = "HALTED"
+
+        pnl_emoji = "🟢" if daily_pnl >= 0 else "🔴"
 
         message = (
             f"🤖 *Bot Status*\n\n"
             f"*Status*: `{status.upper()}`\n"
             f"*Uptime*: `{uptime_str}`\n"
             f"*Portfolio Equity*: `${equity:,.2f}`\n"
+            f"*Today's Realized PnL*: {pnl_emoji} `${daily_pnl:,.2f}`\n"
             f"*Open Positions*: `{pos_count}`\n"
             f"*Risk Status*: `{risk_status}`"
         )
