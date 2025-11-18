@@ -67,7 +67,18 @@ class MockExchangeAPI(ExchangeAPI):
     async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[Any]]:
         logger.debug("Mock: Fetching market data", symbol=symbol, limit=limit)
         now = int(time.time() * 1000)
-        interval_ms = 3600 * 1000 # 1h
+        
+        # Parse timeframe to milliseconds for accurate mock generation
+        # Assumes standard format like '1m', '5m', '1h', '1d'
+        try:
+            unit = timeframe[-1]
+            value = int(timeframe[:-1])
+            multipliers = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}
+            interval_ms = value * multipliers.get(unit, 60) * 1000
+        except (ValueError, IndexError):
+            logger.warning("Mock: Could not parse timeframe, defaulting to 1h", timeframe=timeframe)
+            interval_ms = 3600 * 1000
+
         ohlcv = []
         price = self.last_price
         for i in range(limit):
@@ -235,7 +246,56 @@ class CCXTExchangeAPI(ExchangeAPI):
 
     async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[Any]]:
         try:
-            return await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            # Optimization: For small limits (live trading updates), use standard fetch
+            # to ensure we get the absolute latest data without clock skew risks.
+            if limit <= 1000:
+                return await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+
+            # Pagination Logic for Deep History (Training Data)
+            # Calculate duration of one candle in milliseconds
+            duration = self.exchange.parse_timeframe(timeframe) * 1000
+            
+            # Calculate 'since' timestamp with a buffer to account for gaps/maintenance
+            now = self.exchange.milliseconds()
+            # 1.1 buffer factor to ensure we cover enough time even with some gaps
+            since = now - int(limit * duration * 1.1)
+            
+            all_ohlcv = []
+            
+            while True:
+                remaining = limit - len(all_ohlcv)
+                if remaining <= 0:
+                    break
+                
+                # Request a bit more than needed to handle gaps, but rely on exchange capping
+                request_limit = remaining + 50
+                
+                batch = await self.exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=request_limit)
+                
+                if not batch:
+                    break
+                
+                # Filter out duplicates if 'since' overlaps
+                if all_ohlcv:
+                    last_ts = all_ohlcv[-1][0]
+                    batch = [candle for candle in batch if candle[0] > last_ts]
+                    if not batch:
+                        break
+
+                all_ohlcv.extend(batch)
+                
+                # Update 'since' for the next iteration
+                since = batch[-1][0] + 1
+                
+                if since >= now:
+                    break
+
+            # Return exactly the requested number of candles, taking the most recent ones
+            if len(all_ohlcv) > limit:
+                return all_ohlcv[-limit:]
+            
+            return all_ohlcv
+
         except (NetworkError, ExchangeError) as e:
             logger.error("Final attempt failed for get_market_data", symbol=symbol, error=str(e))
             raise
