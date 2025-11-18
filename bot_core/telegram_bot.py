@@ -1,5 +1,5 @@
 import asyncio
-from typing import Dict, Any
+from typing import Dict, Any, Callable, Awaitable
 from datetime import datetime, timezone
 
 from bot_core.logger import get_logger
@@ -124,7 +124,7 @@ class TelegramBot:
             pnl_emoji = "🟢" if pnl >= 0 else "🔴"
 
             # Escape special characters for MarkdownV2
-            symbol_md = pos.symbol.replace('-', '\\-').replace('.', '\\.')
+            symbol_md = pos.symbol.replace('-', '\-').replace('.', '\.')
             
             message += (
                 f"{side_emoji} *{symbol_md}* \\({pos.side}\\)\n"
@@ -140,6 +140,48 @@ class TelegramBot:
         message += f"*Total Unrealized PnL*: {pnl_emoji} `${total_unrealized_pnl:,.2f}`"
         
         await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN_V2)
+
+    def create_alert_handler(self) -> Callable[[Dict[str, Any]], Awaitable[None]]:
+        """Creates and returns an async function to handle alerts."""
+        async def handler(alert_data: Dict[str, Any]):
+            if not self.application:
+                return
+
+            level = alert_data.get('level', 'info').upper()
+            message = alert_data.get('message', 'An alert was triggered.')
+            details = alert_data.get('details', {})
+
+            level_emoji_map = {
+                'INFO': 'ℹ️',
+                'WARNING': '⚠️',
+                'ERROR': '🔴',
+                'CRITICAL': '🔥'
+            }
+            emoji = level_emoji_map.get(level, '⚙️')
+
+            # Format details into a readable string
+            details_str = ""
+            if details:
+                details_str = "\n\n*Details:*\n"
+                for key, value in details.items():
+                    # Escape special characters for MarkdownV2
+                    key_md = str(key).replace('_', '\\_')
+                    value_md = str(value).replace('.', '\\.').replace('-', '\\-')
+                    details_str += f" `{key_md}`: `{value_md}`\n"
+
+            full_message = f"{emoji} *{level}*\n\n{message}{details_str}"
+
+            for chat_id in self.config.admin_chat_ids:
+                try:
+                    await self.application.bot.send_message(
+                        chat_id=chat_id,
+                        text=full_message,
+                        parse_mode=ParseMode.MARKDOWN_V2
+                    )
+                except Exception as e:
+                    logger.error("Failed to send Telegram alert", chat_id=chat_id, error=str(e))
+        
+        return handler
 
     async def run(self):
         if not self.application:
