@@ -127,43 +127,57 @@ class TradingBot:
             await asyncio.sleep(5) # Check positions frequently
 
     async def _handle_trailing_stop(self, pos: Position, current_price: float) -> Optional[Position]:
-        """Handles the logic for updating a trailing stop loss. Returns the updated position."""
+        """Handles the logic for updating a trailing stop loss for both long and short positions."""
         rm_config = self.config.risk_management
         needs_update = False
         
         new_ref_price = pos.trailing_ref_price
-        if pos.side == 'BUY':
-            new_ref_price = max(pos.trailing_ref_price, current_price)
-        elif pos.side == 'SELL':
-            new_ref_price = min(pos.trailing_ref_price, current_price)
-        
-        if new_ref_price != pos.trailing_ref_price:
-            needs_update = True
-
         trailing_stop_active = pos.trailing_stop_active
-        if not trailing_stop_active:
-            if pos.side == 'BUY' and current_price >= pos.entry_price * (1 + rm_config.trailing_stop_activation_pct):
-                trailing_stop_active = True
-                needs_update = True
-                logger.info("Trailing stop activated for LONG", symbol=pos.symbol, price=current_price)
-            elif pos.side == 'SELL' and current_price <= pos.entry_price * (1 - rm_config.trailing_stop_activation_pct):
-                trailing_stop_active = True
-                needs_update = True
-                logger.info("Trailing stop activated for SHORT", symbol=pos.symbol, price=current_price)
-
         new_stop_loss = pos.stop_loss_price
-        if trailing_stop_active:
-            if pos.side == 'BUY':
+
+        if pos.side == 'BUY':
+            # 1. Update peak price
+            new_ref_price = max(pos.trailing_ref_price, current_price)
+            if new_ref_price != pos.trailing_ref_price:
+                needs_update = True
+
+            # 2. Check for activation
+            if not trailing_stop_active:
+                activation_price = pos.entry_price * (1 + rm_config.trailing_stop_activation_pct)
+                if current_price >= activation_price:
+                    trailing_stop_active = True
+                    needs_update = True
+                    logger.info("Trailing stop activated for LONG", symbol=pos.symbol, price=current_price, activation_price=activation_price)
+
+            # 3. Calculate new stop loss if active
+            if trailing_stop_active:
                 trail_price = new_ref_price * (1 - rm_config.trailing_stop_pct)
                 if trail_price > new_stop_loss:
                     new_stop_loss = trail_price
                     needs_update = True
-            elif pos.side == 'SELL':
+        
+        elif pos.side == 'SELL':
+            # 1. Update trough price
+            new_ref_price = min(pos.trailing_ref_price, current_price)
+            if new_ref_price != pos.trailing_ref_price:
+                needs_update = True
+
+            # 2. Check for activation
+            if not trailing_stop_active:
+                activation_price = pos.entry_price * (1 - rm_config.trailing_stop_activation_pct)
+                if current_price <= activation_price:
+                    trailing_stop_active = True
+                    needs_update = True
+                    logger.info("Trailing stop activated for SHORT", symbol=pos.symbol, price=current_price, activation_price=activation_price)
+
+            # 3. Calculate new stop loss if active
+            if trailing_stop_active:
                 trail_price = new_ref_price * (1 + rm_config.trailing_stop_pct)
                 if trail_price < new_stop_loss:
                     new_stop_loss = trail_price
                     needs_update = True
 
+        # 4. Persist changes to DB if needed
         if needs_update:
             return self.position_manager.update_trailing_stop(
                 symbol=pos.symbol,
@@ -257,20 +271,18 @@ class TradingBot:
             logger.warning("Received invalid signal", signal=signal)
             return
 
-        # --- Position Closing Logic ---
-        if position:
-            if (position.side == 'BUY' and action == 'SELL') or (position.side == 'SELL' and action == 'BUY'):
-                await self._close_position(position, "Strategy Signal")
-            return # Ignore signals that would open a position when one is already open
+        open_positions = self.position_manager.get_all_open_positions()
+        portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, self.config.initial_capital, open_positions)
 
-        # --- Position Opening Logic ---
-        if not position and action in ['BUY', 'SELL']:
-            open_positions = self.position_manager.get_all_open_positions()
+        # --- Handle Opening Positions ---
+        if not position:
+            if action not in ['BUY', 'SELL']:
+                return # Ignore other signals if no position is open
+
             if not self.risk_manager.check_trade_allowed(symbol, open_positions):
                 return
 
             stop_loss = self.risk_manager.calculate_stop_loss(action, current_price, df_with_indicators)
-            portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, self.config.initial_capital, open_positions)
             quantity = self.risk_manager.calculate_position_size(portfolio_equity, current_price, stop_loss)
 
             if quantity <= 0:
@@ -289,6 +301,14 @@ class TradingBot:
                     self.position_manager.open_position(symbol, action, fill_quantity, fill_price, final_stop_loss, final_take_profit)
                 else:
                     logger.error("Order failed to fill or timed out.", order_id=order_result.get('orderId'))
+        
+        # --- Handle Closing Positions ---
+        elif position:
+            is_close_long_signal = (action == 'SELL' or action == 'CLOSE') and position.side == 'BUY'
+            is_close_short_signal = (action == 'BUY' or action == 'CLOSE') and position.side == 'SELL'
+            
+            if is_close_long_signal or is_close_short_signal:
+                await self._close_position(position, "Strategy Signal")
 
     async def _close_position(self, position: Position, reason: str):
         close_side = 'SELL' if position.side == 'BUY' else 'BUY'
