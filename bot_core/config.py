@@ -72,6 +72,7 @@ class AIStrategyConfig(BaseModel):
     training_data_limit: int = 5000
     labeling_horizon: int = 5
     labeling_threshold: float = 0.001
+    sequence_length: int = 30 # Lookback window for sequential models like LSTM
 
     # Configurable model parameters
     xgboost: XGBoostConfig = Field(default_factory=XGBoostConfig)
