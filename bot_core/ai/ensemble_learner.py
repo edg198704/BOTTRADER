@@ -19,6 +19,7 @@ try:
     from sklearn.ensemble import VotingClassifier, RandomForestClassifier
     from sklearn.model_selection import train_test_split
     from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import MinMaxScaler
     from xgboost import XGBClassifier
     ML_AVAILABLE = True
 except ImportError:
@@ -28,6 +29,7 @@ except ImportError:
     class RandomForestClassifier: pass
     class LogisticRegression: pass
     class XGBClassifier: pass
+    class MinMaxScaler: pass
     class nn:
         class Module: pass
     class optim: pass
@@ -77,6 +79,7 @@ class EnsembleLearner:
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.symbol_models: Dict[str, Dict[str, Any]] = {}
+        self.symbol_scalers: Dict[str, MinMaxScaler] = {}
         self.is_trained = False
         logger.info("EnsembleLearner initialized.", device=str(self.device))
         asyncio.create_task(self._load_models())
@@ -135,12 +138,13 @@ class EnsembleLearner:
                 symbol = symbol_dir.replace('_', '/')
                 try:
                     models = self._get_or_create_symbol_models(symbol)
+                    self.symbol_scalers[symbol] = joblib.load(os.path.join(symbol_path, "scaler.pkl"))
                     models['gb'] = joblib.load(os.path.join(symbol_path, "gb_model.pkl"))
                     models['technical'] = joblib.load(os.path.join(symbol_path, "technical_model.pkl"))
                     models['lstm'].load_state_dict(torch.load(os.path.join(symbol_path, "lstm_model.pth"), map_location=self.device))
                     models['attention'].load_state_dict(torch.load(os.path.join(symbol_path, "attention_model.pth"), map_location=self.device))
                     self.is_trained = True
-                    logger.info("Loaded models for symbol", symbol=symbol)
+                    logger.info("Loaded models and scaler for symbol", symbol=symbol)
                 except Exception as e:
                     logger.warning("Could not load models for symbol", symbol=symbol, error=str(e))
 
@@ -155,9 +159,16 @@ class EnsembleLearner:
 
         try:
             models = self._get_or_create_symbol_models(symbol)
+            scaler = self.symbol_scalers.get(symbol)
             
             sequence_df = df.tail(self.config.sequence_length)
             features = np.nan_to_num(sequence_df[self.config.feature_columns].values, nan=0.0)
+
+            if scaler:
+                features_scaled = scaler.transform(features)
+            else:
+                logger.warning("Scaler not found for symbol, predicting with unscaled data.", symbol=symbol)
+                features_scaled = features
 
             predictions = []
             weights_config = self.config.ensemble_weights
@@ -168,13 +179,13 @@ class EnsembleLearner:
                 weights_config.attention
             ]
 
-            last_step_features = features[-1, :].reshape(1, -1)
+            last_step_features = features_scaled[-1, :].reshape(1, -1)
             gb_pred = models['gb'].predict_proba(last_step_features)[0]
             predictions.append(gb_pred)
             tech_pred = models['technical'].predict_proba(last_step_features)[0]
             predictions.append(tech_pred)
 
-            sequence_tensor = torch.FloatTensor(features).unsqueeze(0).to(self.device)
+            sequence_tensor = torch.FloatTensor(features_scaled).unsqueeze(0).to(self.device)
             with torch.no_grad():
                 models['lstm'].eval()
                 models['attention'].eval()
@@ -217,34 +228,46 @@ class EnsembleLearner:
     def train(self, symbol: str, df: pd.DataFrame):
         logger.info("Starting model training", symbol=symbol)
         try:
+            # 1. Create features and labels
             labels = self._create_labels(df)
-            features = df[self.config.feature_columns].loc[labels.index]
+            features_df = df[self.config.feature_columns].loc[labels.index]
             
-            X_flat = np.nan_to_num(features.values, nan=0.0)
-            y_flat = labels.values
+            X = np.nan_to_num(features_df.values, nan=0.0)
+            y = labels.values
 
-            if len(np.unique(y_flat)) < 3:
-                logger.warning("Training data has fewer than 3 unique labels. Skipping training.", symbol=symbol, labels=np.unique(y_flat))
+            if len(np.unique(y)) < 3:
+                logger.warning("Training data has fewer than 3 unique labels. Skipping training.", symbol=symbol, labels=np.unique(y))
                 return
 
-            X_seq, y_seq = self._create_sequences(X_flat, y_flat)
-            X_flat_from_seq = X_seq[:, -1, :]
-            y_flat_from_seq = y_seq
+            # 2. Split data BEFORE scaling to prevent data leakage
+            X_train, X_val, y_train, y_val = train_test_split(
+                X, y, test_size=self.config.training.validation_split, random_state=42, stratify=y
+            )
 
-            X_train_flat, _, y_train_flat, _ = train_test_split(
-                X_flat_from_seq, y_flat_from_seq, test_size=self.config.training.validation_split, random_state=42, stratify=y_flat_from_seq
-            )
-            X_train_seq, X_val_seq, y_train_seq, y_val_seq = train_test_split(
-                X_seq, y_seq, test_size=self.config.training.validation_split, random_state=42, stratify=y_seq
-            )
+            # 3. Fit scaler on training data and transform both sets
+            scaler = MinMaxScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_val_scaled = scaler.transform(X_val)
+            self.symbol_scalers[symbol] = scaler
+            logger.info("Feature scaler fitted on training data.", symbol=symbol)
+
+            # 4. Create sequences from SCALED data
+            X_train_seq, y_train_seq = self._create_sequences(X_train_scaled, y_train)
+            X_val_seq, y_val_seq = self._create_sequences(X_val_scaled, y_val)
+
+            # 5. Prepare flat data for scikit-learn models from the last step of each sequence
+            X_train_flat_scaled = X_train_seq[:, -1, :]
+            y_train_flat = y_train_seq
             
             models = self._get_or_create_symbol_models(symbol)
 
+            # 6. Train scikit-learn models on scaled flat data
             logger.info("Training scikit-learn models...", symbol=symbol)
-            models['gb'].fit(X_train_flat, y_train_flat)
-            models['technical'].fit(X_train_flat, y_train_flat)
+            models['gb'].fit(X_train_flat_scaled, y_train_flat)
+            models['technical'].fit(X_train_flat_scaled, y_train_flat)
             logger.info("Scikit-learn models trained.", symbol=symbol)
 
+            # 7. Train PyTorch models on scaled sequence data
             logger.info("Training PyTorch models...", symbol=symbol)
             X_train_tensor = torch.FloatTensor(X_train_seq).to(self.device)
             y_train_tensor = torch.LongTensor(y_train_seq).to(self.device)
@@ -321,8 +344,13 @@ class EnsembleLearner:
         os.makedirs(save_path, exist_ok=True)
         
         models = self.symbol_models[symbol]
+        scaler = self.symbol_scalers.get(symbol)
+
+        if scaler:
+            joblib.dump(scaler, os.path.join(save_path, "scaler.pkl"))
+
         joblib.dump(models['gb'], os.path.join(save_path, "gb_model.pkl"))
         joblib.dump(models['technical'], os.path.join(save_path, "technical_model.pkl"))
         torch.save(models['lstm'].state_dict(), os.path.join(save_path, "lstm_model.pth"))
         torch.save(models['attention'].state_dict(), os.path.join(save_path, "attention_model.pth"))
-        logger.info("Saved models to disk", path=save_path)
+        logger.info("Saved models and scaler to disk", path=save_path)
