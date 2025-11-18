@@ -4,7 +4,7 @@ from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 
 from bot_core.logger import get_logger
-from bot_core.config import StrategyConfig
+from bot_core.config import StrategyConfig, AIStrategyConfig, SimpleMAConfig
 from bot_core.ai.ensemble_learner import EnsembleLearner
 from bot_core.ai.regime_detector import MarketRegimeDetector
 from bot_core.position_manager import Position
@@ -30,11 +30,17 @@ class TradingStrategy(abc.ABC):
         """Checks if the strategy needs to be retrained."""
         pass
 
+    @abc.abstractmethod
+    def get_training_data_limit(self) -> int:
+        """Returns the number of historical candles needed for training."""
+        pass
+
 class SimpleMACrossoverStrategy(TradingStrategy):
     def __init__(self, config: StrategyConfig):
         super().__init__(config)
-        self.fast_ma_period = config.simple_ma.fast_ma_period
-        self.slow_ma_period = config.simple_ma.slow_ma_period
+        self.ma_config = SimpleMAConfig(**config.params)
+        self.fast_ma_period = self.ma_config.fast_ma_period
+        self.slow_ma_period = self.ma_config.slow_ma_period
         logger.info("SimpleMACrossoverStrategy initialized", fast_ma=self.fast_ma_period, slow_ma=self.slow_ma_period)
 
     async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[Dict[str, Any]]:
@@ -74,10 +80,13 @@ class SimpleMACrossoverStrategy(TradingStrategy):
     def needs_retraining(self, symbol: str) -> bool:
         return False
 
+    def get_training_data_limit(self) -> int:
+        return 0 # This strategy does not require training data.
+
 class AIEnsembleStrategy(TradingStrategy):
     def __init__(self, config: StrategyConfig):
         super().__init__(config)
-        self.ai_config = config.ai_ensemble
+        self.ai_config = AIStrategyConfig(**config.params)
         self.last_retrained_at: Dict[str, datetime] = {}
         try:
             self.ensemble_learner = EnsembleLearner(self.ai_config)
@@ -150,3 +159,7 @@ class AIEnsembleStrategy(TradingStrategy):
         
         time_since_retrain = datetime.utcnow() - last_retrained
         return time_since_retrain >= timedelta(hours=self.ai_config.retrain_interval_hours)
+
+    def get_training_data_limit(self) -> int:
+        """Returns the number of candles required for retraining the AI models."""
+        return self.ai_config.training_data_limit
