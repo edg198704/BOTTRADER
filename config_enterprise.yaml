@@ -46,6 +46,7 @@ strategy:
     use_regime_filter: true
     retrain_interval_hours: 24
     training_epochs: 10
+    sequence_length: 30 # Lookback window for sequential models like LSTM/Attention
 
   # Settings for SimpleMACrossoverStrategy
   simple_ma:
