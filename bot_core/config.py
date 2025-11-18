@@ -62,6 +62,9 @@ class AIStrategyConfig(BaseModel):
     use_ppo_agent: bool = False # Disabled by default as it's more experimental
     retrain_interval_hours: int = 24
     training_epochs: int = 10
+    training_data_limit: int = 5000
+    labeling_horizon: int = 5
+    labeling_threshold: float = 0.001
 
     # Configurable model parameters
     xgboost: XGBoostConfig = Field(default_factory=XGBoostConfig)
