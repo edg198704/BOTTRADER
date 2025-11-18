@@ -11,7 +11,8 @@ exchange:
 strategy:
   name: "AIEnsembleStrategy" # Strategy to use ('AIEnsembleStrategy' or 'SimpleMACrossoverStrategy')
   symbols: ["BTC/USDT", "ETH/USDT"] # List of symbols to trade
-  interval_seconds: 60      # Time in seconds between each trading cycle
+  interval_seconds: 300      # Time in seconds between each trading cycle. Should align with timeframe.
+  timeframe: "5m"           # Timeframe for OHLCV data (e.g., '1m', '5m', '1h', '1d')
 
   # Settings for AIEnsembleStrategy
   ai_ensemble:
@@ -33,11 +34,10 @@ risk_management:
   max_open_positions: 5 # Increased to allow for multi-symbol trading
   circuit_breaker_threshold: -0.10 # Halt trading if portfolio drops 10%
   use_trailing_stop: true
-  trailing_stop_activation_pct: 0.02 # Activate trailing stop after 2% profit
-  trailing_stop_pct: 0.015         # Trail the price by 1.5%
   atr_stop_multiplier: 2.0
   stop_loss_fallback_pct: 0.05
   risk_per_trade_pct: 0.01
+  reward_to_risk_ratio: 1.5
 
 database:
   path: "position_ledger.db"
