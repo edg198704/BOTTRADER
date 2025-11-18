@@ -33,6 +33,8 @@ risk_management:
   max_open_positions: 5 # Increased to allow for multi-symbol trading
   circuit_breaker_threshold: -0.10 # Halt trading if portfolio drops 10%
   use_trailing_stop: true
+  trailing_stop_activation_pct: 0.02 # Activate trailing stop after 2% profit
+  trailing_stop_pct: 0.015         # Trail the price by 1.5%
   atr_stop_multiplier: 2.0
   stop_loss_fallback_pct: 0.05
   risk_per_trade_pct: 0.01
