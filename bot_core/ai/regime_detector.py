@@ -35,10 +35,11 @@ class MarketRegimeDetector:
             return {'regime': MarketRegime.UNKNOWN.value, 'confidence': 0.0}
         
         try:
+            rsi_col = 'RSI_14' # Default RSI column name from pandas-ta
             sma_20 = df['close'].rolling(20).mean().iloc[-1]
             sma_50 = df['close'].rolling(50).mean().iloc[-1]
             volatility = df['close'].pct_change().rolling(20).std().iloc[-1]
-            rsi = df['rsi'].iloc[-1] if 'rsi' in df.columns else 50
+            rsi = df[rsi_col].iloc[-1] if rsi_col in df.columns else 50
 
             trend_strength = (sma_20 - sma_50) / sma_50 if sma_50 > 0 else 0
 
