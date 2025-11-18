@@ -16,8 +16,9 @@ logger = get_logger(__name__)
 class DataHandler:
     """
     Manages the lifecycle of market data for all symbols.
-    Fetches historical data, calculates technical indicators, and efficiently updates it.
-    Includes caching and non-blocking processing to protect the async event loop.
+    Maintains two buffers:
+    1. _raw_buffers: Long-term storage of raw OHLCV data (for AI training).
+    2. _dataframes: Short-term window with calculated indicators (for Strategy analysis).
     """
     def __init__(self, exchange_api: ExchangeAPI, config: BotConfig, shared_latest_prices: Dict[str, float]):
         self.exchange_api = exchange_api
@@ -28,7 +29,11 @@ class DataHandler:
         self.update_interval = config.strategy.interval_seconds * config.data_handler.update_interval_multiplier
         self.indicators_config = config.strategy.indicators
         
+        # _dataframes holds the processed data (with indicators) for the strategy
         self._dataframes: Dict[str, pd.DataFrame] = {}
+        # _raw_buffers holds the raw OHLCV data for history accumulation
+        self._raw_buffers: Dict[str, pd.DataFrame] = {}
+        
         self._shared_latest_prices = shared_latest_prices
         self._running = False
         self._update_task: Optional[asyncio.Task] = None
@@ -37,11 +42,18 @@ class DataHandler:
         self.cache_dir = "market_data_cache"
         os.makedirs(self.cache_dir, exist_ok=True)
         
+        # Buffer Limits
+        self.max_training_buffer = 10000 # Max rows to keep in raw buffer
+        # Analysis window: Enough for indicators to converge (e.g. SMA 200 + warmup)
+        self.analysis_window = max(self.history_limit * 2, 500)
+        
         # Executor for CPU-bound tasks (indicators) and Disk I/O
-        # Using ThreadPoolExecutor as pandas releases GIL for many ops, and it's lighter than ProcessPool
         self._executor = ThreadPoolExecutor(max_workers=min(len(self.symbols) + 2, 8))
         
-        logger.info("DataHandler initialized.", cache_dir=self.cache_dir)
+        logger.info("DataHandler initialized.", 
+                    cache_dir=self.cache_dir, 
+                    analysis_window=self.analysis_window,
+                    max_training_buffer=self.max_training_buffer)
 
     async def initialize_data(self):
         """Fetches the initial batch of historical data for all symbols, utilizing local cache."""
@@ -53,32 +65,30 @@ class DataHandler:
     async def _initialize_symbol(self, symbol: str):
         """Loads cache and fetches fresh data for a single symbol."""
         try:
-            # 1. Load cached data (Non-blocking I/O)
+            # 1. Load cached raw data (Non-blocking I/O)
             cached_df = await self._load_from_cache(symbol)
             
             # 2. Fetch fresh data from API (history_limit)
-            # We always fetch the recent history to ensure we cover the gap since last run
             ohlcv_data = await self.exchange_api.get_market_data(symbol, self.timeframe, self.history_limit)
             fresh_df = create_dataframe(ohlcv_data)
             
-            # 3. Merge
+            # 3. Merge into Raw Buffer
             if cached_df is not None and not cached_df.empty:
                 if fresh_df is not None and not fresh_df.empty:
-                    # Combine and drop duplicates based on index (timestamp)
                     combined = pd.concat([cached_df, fresh_df])
                     combined = combined[~combined.index.duplicated(keep='last')]
                     combined.sort_index(inplace=True)
-                    df = combined
+                    self._raw_buffers[symbol] = combined
                 else:
-                    df = cached_df
+                    self._raw_buffers[symbol] = cached_df
             else:
-                df = fresh_df
+                self._raw_buffers[symbol] = fresh_df
 
-            if df is not None and not df.empty:
-                # 4. Calculate indicators (Non-blocking CPU)
-                self._dataframes[symbol] = await self._calculate_indicators_async(df)
-                self._update_latest_price(symbol, self._dataframes[symbol])
-                logger.info("Loaded initial data", symbol=symbol, total_records=len(df))
+            # 4. Process Indicators on Analysis Window
+            await self._process_analysis_window(symbol)
+            
+            if symbol in self._raw_buffers:
+                logger.info("Loaded initial data", symbol=symbol, total_records=len(self._raw_buffers[symbol]))
             else:
                 logger.warning("No data available for symbol after initialization.", symbol=symbol)
 
@@ -99,9 +109,9 @@ class DataHandler:
         if self._update_task and not self._update_task.done():
             self._update_task.cancel()
         
-        # Save cache on shutdown
+        # Save cache on shutdown (saving the RAW buffers)
         logger.info("Saving market data cache...")
-        save_tasks = [self._save_to_cache(symbol, df) for symbol, df in self._dataframes.items()]
+        save_tasks = [self._save_to_cache(symbol, df) for symbol, df in self._raw_buffers.items()]
         await asyncio.gather(*save_tasks)
         
         self._executor.shutdown(wait=True)
@@ -131,32 +141,49 @@ class DataHandler:
             if latest_df is None or latest_df.empty:
                 return
 
-            if symbol in self._dataframes:
-                # Get the raw data (columns 0-4 are OHLCV)
-                current_df = self._dataframes[symbol]
-                raw_cols = ['open', 'high', 'low', 'close', 'volume']
-                # Ensure we have the raw columns. If indicators renamed them, we might need to be careful.
-                # But create_dataframe ensures these exist.
-                current_raw = current_df[raw_cols]
-                
+            # Update Raw Buffer
+            if symbol in self._raw_buffers:
+                current_raw = self._raw_buffers[symbol]
                 combined_df = pd.concat([current_raw, latest_df])
                 combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
                 
-                # Keep a buffer larger than history_limit to build training data over time,
-                # but cap it to prevent memory explosion (e.g., 10,000 candles).
-                max_buffer = 10000 
-                if len(combined_df) > max_buffer:
-                    combined_df = combined_df.iloc[-max_buffer:]
+                # Cap the raw buffer size to prevent memory explosion
+                if len(combined_df) > self.max_training_buffer:
+                    combined_df = combined_df.iloc[-self.max_training_buffer:]
+                
+                self._raw_buffers[symbol] = combined_df
             else:
-                combined_df = latest_df
+                self._raw_buffers[symbol] = latest_df
 
-            # Re-calculate indicators (Non-blocking CPU)
-            self._dataframes[symbol] = await self._calculate_indicators_async(combined_df)
-            self._update_latest_price(symbol, self._dataframes[symbol])
+            # Process Indicators on Analysis Window
+            await self._process_analysis_window(symbol)
+            
             logger.debug("Market data updated", symbol=symbol)
 
         except Exception as e:
             logger.warning("Failed to update market data for symbol", symbol=symbol, error=str(e))
+
+    async def _process_analysis_window(self, symbol: str):
+        """
+        Slices the raw buffer to the analysis window size, calculates indicators,
+        and updates the shared _dataframes dictionary.
+        """
+        raw_df = self._raw_buffers.get(symbol)
+        if raw_df is None or raw_df.empty:
+            return
+
+        # Slice the last N rows for efficient indicator calculation
+        if len(raw_df) > self.analysis_window:
+            analysis_slice = raw_df.iloc[-self.analysis_window:].copy()
+        else:
+            analysis_slice = raw_df.copy()
+
+        # Calculate indicators (Non-blocking CPU)
+        processed_df = await self._calculate_indicators_async(analysis_slice)
+        
+        # Atomic update of the consumption dataframe
+        self._dataframes[symbol] = processed_df
+        self._update_latest_price(symbol, processed_df)
 
     async def _calculate_indicators_async(self, df: pd.DataFrame) -> pd.DataFrame:
         """Wrapper to run indicator calculation in thread pool."""
@@ -180,35 +207,44 @@ class DataHandler:
         return df.copy() # Return a copy to prevent mutation
 
     async def fetch_full_history_for_symbol(self, symbol: str, limit: int) -> Optional[pd.DataFrame]:
-        """Fetches a large batch of historical data for a symbol, intended for model training."""
+        """
+        Fetches a large batch of historical data for a symbol, intended for model training.
+        Uses the internal raw buffer if sufficient, or fetches from API.
+        Calculates indicators on the FULL dataset on demand.
+        """
         logger.info("Fetching full historical data for training", symbol=symbol, limit=limit)
         
-        # 1. Check current in-memory data first
-        current_df = self._dataframes.get(symbol)
-        if current_df is not None and len(current_df) >= limit:
-            logger.info("Using in-memory data for training", symbol=symbol, records=len(current_df))
-            return current_df.copy()
+        # 1. Check current in-memory raw buffer first
+        raw_df = self._raw_buffers.get(symbol)
+        
+        target_df = None
+        
+        if raw_df is not None and len(raw_df) >= limit:
+            logger.info("Using in-memory raw data for training", symbol=symbol, records=len(raw_df))
+            target_df = raw_df.copy()
+        else:
+            # 2. If not enough, try to fetch from API
+            try:
+                ohlcv_data = await self.exchange_api.get_market_data(symbol, self.timeframe, limit)
+                if ohlcv_data:
+                    df = create_dataframe(ohlcv_data)
+                    if df is not None and not df.empty:
+                        target_df = df
+            except Exception as e:
+                logger.error("Failed to fetch full historical data from API", symbol=symbol, error=str(e))
 
-        # 2. If not enough, try to fetch from API
-        try:
-            ohlcv_data = await self.exchange_api.get_market_data(symbol, self.timeframe, limit)
-            if ohlcv_data:
-                df = create_dataframe(ohlcv_data)
-                if df is not None and not df.empty:
-                    # Calculate indicators on the full dataset (Non-blocking)
-                    full_df = await self._calculate_indicators_async(df)
-                    logger.info("Successfully fetched and processed training data", symbol=symbol, records=len(full_df))
-                    return full_df
-            
-            logger.warning("Could not fetch sufficient training data from API, returning available data.", symbol=symbol)
-            return current_df.copy() if current_df is not None else None
-            
-        except Exception as e:
-            logger.error("Failed to fetch full historical data", symbol=symbol, error=str(e))
-            return None
+        # 3. If we have data (either from buffer or API), calculate indicators on the full set
+        if target_df is not None and not target_df.empty:
+            logger.info("Calculating indicators on full training set...", symbol=symbol, rows=len(target_df))
+            full_df = await self._calculate_indicators_async(target_df)
+            return full_df
+        
+        # Fallback: return whatever we have in the analysis buffer if everything else fails
+        logger.warning("Could not fetch sufficient training data, returning available analysis data.", symbol=symbol)
+        return self.get_market_data(symbol)
 
     async def _save_to_cache(self, symbol: str, df: pd.DataFrame):
-        """Saves dataframe to CSV in executor."""
+        """Saves dataframe to CSV in executor. Saves RAW data."""
         if df is None or df.empty:
             return
         
@@ -219,7 +255,10 @@ class DataHandler:
         try:
             # Save only OHLCV to save space/time, indicators are recalculated on load
             raw_cols = ['open', 'high', 'low', 'close', 'volume']
-            to_save = df[raw_cols]
+            # Ensure we only save columns that exist
+            valid_cols = [c for c in raw_cols if c in df.columns]
+            to_save = df[valid_cols]
+            
             await loop.run_in_executor(self._executor, to_save.to_csv, path)
             logger.debug("Saved cache for symbol", symbol=symbol)
         except Exception as e:
@@ -264,7 +303,11 @@ class DataHandler:
 
         # Apply the strategy
         # This is the CPU intensive part
-        df_out.ta.strategy(ta_strategy)
+        try:
+            df_out.ta.strategy(ta_strategy)
+        except Exception as e:
+            logger.error("Pandas-TA strategy execution failed", error=str(e))
+            return df
 
         # Rename columns to a consistent, simplified format using the utility function
         try:
@@ -275,7 +318,7 @@ class DataHandler:
             return df_out
 
         df_out.dropna(inplace=True)
-        logger.debug("Technical indicators calculated dynamically from config", row_count=len(df_out))
+        # logger.debug("Technical indicators calculated", row_count=len(df_out))
         return df_out
 
 def create_dataframe(ohlcv_data: list) -> pd.DataFrame | None:
