@@ -198,24 +198,48 @@ class TradingBot:
 
         if signal: await self._handle_signal(signal, df_with_indicators, position)
 
-    async def _await_order_fill(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
-        """Polls the exchange for an order's fill status."""
-        logger.info("Awaiting fill confirmation for order", order_id=order_id, symbol=symbol)
-        for _ in range(10):  # Poll up to 10 times (e.g., 10 * 3s = 30s timeout)
+    async def _manage_order_lifecycle(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Tracks an order until it's filled or a timeout is reached.
+        If timeout occurs for an open order, it attempts to cancel it.
+        """
+        logger.info("Managing lifecycle for order", order_id=order_id, symbol=symbol)
+        start_time = time.time()
+        timeout = self.config.execution.order_fill_timeout_seconds
+
+        while time.time() - start_time < timeout:
             try:
                 order_status = await self.exchange_api.fetch_order(order_id, symbol)
-                if order_status and order_status.get('status') == 'FILLED':
-                    logger.info("Order fill confirmed", order_id=order_id, symbol=symbol, fill_price=order_status.get('average'))
-                    return order_status
-                elif order_status and order_status.get('status') not in ['OPEN', 'UNKNOWN']:
-                    logger.warning("Order is no longer open but not filled", order_id=order_id, status=order_status.get('status'))
-                    return order_status # Return terminal status like CANCELED or REJECTED
-                await asyncio.sleep(3)
+                if order_status:
+                    status = order_status.get('status')
+                    if status == 'FILLED':
+                        logger.info("Order fill confirmed", order_id=order_id, symbol=symbol, fill_price=order_status.get('average'))
+                        return order_status
+                    if status not in ['OPEN', 'UNKNOWN']:
+                        logger.warning("Order reached terminal state without being filled", order_id=order_id, status=status)
+                        return order_status
+                
+                await asyncio.sleep(3) # Polling interval
             except Exception as e:
                 logger.error("Error while polling for order fill", order_id=order_id, error=str(e))
-                await asyncio.sleep(5)  # Wait longer on error
-        logger.warning("Order fill confirmation timed out", order_id=order_id, symbol=symbol)
-        return None
+                await asyncio.sleep(5)
+
+        # Timeout reached, try to cancel
+        logger.warning("Order fill timeout reached. Attempting to cancel.", order_id=order_id, symbol=symbol)
+        try:
+            await self.exchange_api.cancel_order(order_id, symbol)
+            logger.info("Cancellation request sent for order", order_id=order_id)
+            # Final check on order status after cancellation attempt
+            final_status = await self.exchange_api.fetch_order(order_id, symbol)
+            if final_status:
+                logger.info("Final order status after cancellation attempt", order_id=order_id, status=final_status.get('status'))
+                return final_status
+            else:
+                logger.warning("Could not fetch final order status after cancellation.", order_id=order_id)
+                return {'id': order_id, 'status': 'UNKNOWN'}
+        except Exception as e:
+            logger.critical("Failed to cancel timed-out order", order_id=order_id, error=str(e))
+            return None
 
     async def _handle_signal(self, signal: Dict, df_with_indicators: pd.DataFrame, position: Optional[Position]):
         action = signal.get('action')
@@ -253,18 +277,27 @@ class TradingBot:
                              symbol=symbol, ideal_quantity=ideal_quantity, final_quantity=final_quantity)
                 return
 
-            order_result = await self.exchange_api.place_order(symbol, action, 'MARKET', final_quantity)
+            order_type = self.config.execution.default_order_type
+            limit_price = None
+            if order_type == 'LIMIT':
+                offset = self.config.execution.limit_price_offset_pct
+                if action == 'BUY':
+                    limit_price = current_price * (1 + offset)
+                else: # SELL
+                    limit_price = current_price * (1 - offset)
+
+            order_result = await self.exchange_api.place_order(symbol, action, order_type, final_quantity, price=limit_price)
             if order_result and order_result.get('orderId'):
-                filled_order = await self._await_order_fill(order_result['orderId'], symbol)
-                if filled_order and filled_order.get('status') == 'FILLED':
-                    fill_price = filled_order['average']
-                    fill_quantity = filled_order['filled']
+                final_order_state = await self._manage_order_lifecycle(order_result['orderId'], symbol)
+                if final_order_state and final_order_state.get('status') == 'FILLED':
+                    fill_price = final_order_state['average']
+                    fill_quantity = final_order_state['filled']
                     # Recalculate SL/TP based on actual fill price for higher accuracy
                     final_stop_loss = self.risk_manager.calculate_stop_loss(action, fill_price, df_with_indicators, market_regime=market_regime)
                     final_take_profit = self.risk_manager.calculate_take_profit(action, fill_price, final_stop_loss, market_regime=market_regime)
                     self.position_manager.open_position(symbol, action, fill_quantity, fill_price, final_stop_loss, final_take_profit)
                 else:
-                    logger.error("Order failed to fill or timed out.", order_id=order_result.get('orderId'))
+                    logger.error("Order to open position did not fill.", order_id=order_result.get('orderId'), final_status=final_order_state.get('status') if final_order_state else 'UNKNOWN')
         
         # --- Handle Closing Positions ---
         elif position:
@@ -289,14 +322,26 @@ class TradingBot:
             logger.error("Cannot close position, adjusted quantity is zero.", symbol=position.symbol, original_qty=position.quantity)
             return
 
-        order_result = await self.exchange_api.place_order(position.symbol, close_side, 'MARKET', close_quantity)
+        order_type = self.config.execution.default_order_type
+        limit_price = None
+        current_price = self.latest_prices.get(position.symbol)
+        if order_type == 'LIMIT' and current_price:
+            offset = self.config.execution.limit_price_offset_pct
+            if close_side == 'BUY':
+                limit_price = current_price * (1 + offset)
+            else: # SELL
+                limit_price = current_price * (1 - offset)
+        else:
+            order_type = 'MARKET' # Fallback if price is missing
+
+        order_result = await self.exchange_api.place_order(position.symbol, close_side, order_type, close_quantity, price=limit_price)
         if order_result and order_result.get('orderId'):
-            filled_order = await self._await_order_fill(order_result['orderId'], position.symbol)
-            if filled_order and filled_order.get('status') == 'FILLED':
-                close_price = filled_order['average']
+            final_order_state = await self._manage_order_lifecycle(order_result['orderId'], position.symbol)
+            if final_order_state and final_order_state.get('status') == 'FILLED':
+                close_price = final_order_state['average']
                 self.position_manager.close_position(position.symbol, close_price, reason)
             else:
-                logger.error("Failed to confirm close order fill.", order_id=order_result.get('orderId'), symbol=position.symbol)
+                logger.error("Failed to confirm close order fill. Position remains open.", order_id=order_result.get('orderId'), symbol=position.symbol, final_status=final_order_state.get('status') if final_order_state else 'UNKNOWN')
 
     async def stop(self):
         logger.info("Stopping TradingBot...")
