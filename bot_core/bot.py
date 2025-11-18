@@ -195,7 +195,7 @@ class TradingBot:
             return
 
         try:
-            ohlcv_data = await self.exchange_api.get_market_data(symbol, '1h', 200)
+            ohlcv_data = await self.exchange_api.get_market_data(symbol, self.config.strategy.timeframe, 200)
             if not ohlcv_data:
                 logger.warning("Could not fetch OHLCV data.", symbol=symbol)
                 return
@@ -229,11 +229,23 @@ class TradingBot:
             if not self.risk_manager.check_trade_allowed(symbol, open_positions):
                 return
 
-            portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, self.config.initial_capital, open_positions)
-            position_size_usd = self.risk_manager.calculate_position_size(portfolio_equity)
-            quantity = position_size_usd / current_price
-
+            # --- Corrected risk calculation logic ---
+            # 1. Calculate stop-loss first, as it's an input for position sizing.
             stop_loss = self.risk_manager.calculate_stop_loss('BUY', current_price, df_with_indicators)
+            if stop_loss >= current_price:
+                logger.warning("Invalid stop-loss calculated. SL is higher than entry for a BUY.",
+                               sl=stop_loss, entry=current_price)
+                return
+
+            # 2. Calculate position size (quantity) based on risk.
+            portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, self.config.initial_capital, open_positions)
+            quantity = self.risk_manager.calculate_position_size(portfolio_equity, current_price, stop_loss)
+            
+            if quantity <= 0:
+                logger.info("Calculated position size is zero or less. Skipping trade.", quantity=quantity)
+                return
+
+            # 3. Calculate take-profit based on the now-defined risk.
             take_profit = self.risk_manager.calculate_take_profit('BUY', current_price, stop_loss)
 
             order_result = await self.exchange_api.place_order(symbol, 'BUY', 'MARKET', quantity)
