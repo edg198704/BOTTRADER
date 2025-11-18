@@ -6,7 +6,7 @@ This repository contains a production-ready, modular algorithmic trading bot bui
 
 The bot's architecture is centered around a core set of decoupled components located in the `bot_core/` directory:
 
-*   **`bot.py`**: The main `TradingBot` class that orchestrates all components and runs the primary trading loop.
+*   **`bot.py`**: The main `TradingBot` class that orchestrates all components and runs the primary trading loop for multiple symbols concurrently.
 *   **`config.py`**: Defines Pydantic models for strict, type-safe configuration validation.
 *   **`exchange_api.py`**: Provides an abstract interface for exchange interactions, with concrete implementations for a `MockExchangeAPI` (for testing) and `CCXTExchangeAPI` (for live/paper trading).
 *   **`position_manager.py`**: Manages the state of all trading positions, persisting them to an SQLite database for durability using SQLAlchemy.
@@ -24,6 +24,7 @@ Key supporting files in the root directory include:
 
 ## Key Features
 
+*   **Multi-Symbol Trading**: Trade multiple currency pairs (e.g., BTC/USDT, ETH/USDT) concurrently from a single configuration.
 *   **Modular & Extensible**: Easily swap out exchange APIs or trading strategies by modifying the configuration.
 *   **Advanced AI Strategy**: Includes a powerful ensemble strategy using XGBoost, RandomForest, and other models for sophisticated signal generation.
 *   **Robust Risk Management**: Features dynamic position sizing, ATR-based stop loss, and a portfolio-level circuit breaker to protect capital.
@@ -51,7 +52,7 @@ Key supporting files in the root directory include:
 3.  **Configure the bot:**
     Copy the `config_enterprise.yaml` file and customize the settings:
     *   **`exchange`**: Set `name` to `MockExchange` for testing or a `ccxt`-supported exchange like `binance`. For a real exchange, you will need to set environment variables for your API key and secret.
-    *   **`strategy`**: Choose the `name` of the strategy to run (e.g., `AIEnsembleStrategy` or `SimpleMACrossoverStrategy`).
+    *   **`strategy`**: Choose the `name` of the strategy to run (e.g., `AIEnsembleStrategy`) and define the list of `symbols` to trade.
     *   **`risk_management`**: Define your risk tolerance.
     *   **`telegram`**: To enable remote control, create a bot with BotFather on Telegram, get the token, find your chat ID, and add them to the config and environment variables.
 
@@ -71,7 +72,7 @@ To start the trading bot, simply run the main entry point:
 python start_bot.py
 ```
 
-The bot will initialize all components based on your configuration and begin its main trading loop. If configured, the Telegram bot will also start polling for commands. To stop the bot gracefully, press `Ctrl+C`.
+The bot will initialize all components based on your configuration and begin its main trading loop for all configured symbols. If configured, the Telegram bot will also start polling for commands. To stop the bot gracefully, press `Ctrl+C`.
 
 ## Development
 
