@@ -100,16 +100,24 @@ class TradingBot:
                             continue
 
                     # --- SL/TP Execution ---
-                    # Check for stop-loss
-                    if pos.side == 'BUY' and current_price <= pos.stop_loss_price:
-                        logger.info("Stop-loss triggered for position", symbol=pos.symbol, price=current_price, sl=pos.stop_loss_price)
-                        await self._close_position(pos, current_price, "Stop-Loss")
-                        continue # Move to next position as this one is closed
-                    
-                    # Check for take-profit
-                    if pos.side == 'BUY' and current_price >= pos.take_profit_price:
-                        logger.info("Take-profit triggered for position", symbol=pos.symbol, price=current_price, tp=pos.take_profit_price)
-                        await self._close_position(pos, current_price, "Take-Profit")
+                    if pos.side == 'BUY':
+                        if current_price <= pos.stop_loss_price:
+                            logger.info("Stop-loss triggered for LONG position", symbol=pos.symbol, price=current_price, sl=pos.stop_loss_price)
+                            await self._close_position(pos, current_price, "Stop-Loss")
+                            continue
+                        if current_price >= pos.take_profit_price:
+                            logger.info("Take-profit triggered for LONG position", symbol=pos.symbol, price=current_price, tp=pos.take_profit_price)
+                            await self._close_position(pos, current_price, "Take-Profit")
+                            continue
+                    elif pos.side == 'SELL':
+                        if current_price >= pos.stop_loss_price:
+                            logger.info("Stop-loss triggered for SHORT position", symbol=pos.symbol, price=current_price, sl=pos.stop_loss_price)
+                            await self._close_position(pos, current_price, "Stop-Loss")
+                            continue
+                        if current_price <= pos.take_profit_price:
+                            logger.info("Take-profit triggered for SHORT position", symbol=pos.symbol, price=current_price, tp=pos.take_profit_price)
+                            await self._close_position(pos, current_price, "Take-Profit")
+                            continue
 
             except asyncio.CancelledError:
                 logger.info("Position management loop cancelled.")
@@ -119,42 +127,61 @@ class TradingBot:
             await asyncio.sleep(5) # Check positions frequently
 
     async def _handle_trailing_stop(self, pos: Position, current_price: float) -> Optional[Position]:
-        """Handles the logic for updating a trailing stop loss. Returns the updated position."""
-        # This logic currently only supports LONG positions.
-        if pos.side != 'BUY':
-            return pos
-
+        """Handles the logic for updating a trailing stop loss for both long and short positions."""
         rm_config = self.config.risk_management
         needs_update = False
-        
-        # 1. Update peak price
-        new_peak_price = max(pos.peak_price, current_price)
-        if new_peak_price != pos.peak_price:
-            needs_update = True
-
-        # 2. Check for activation
         trailing_stop_active = pos.trailing_stop_active
-        if not trailing_stop_active:
-            activation_price = pos.entry_price * (1 + rm_config.trailing_stop_activation_pct)
-            if current_price >= activation_price:
-                trailing_stop_active = True
-                needs_update = True
-                logger.info("Trailing stop activated", symbol=pos.symbol, price=current_price, activation_price=activation_price)
-
-        # 3. Calculate new stop loss if active
         new_stop_loss = pos.stop_loss_price
-        if trailing_stop_active:
-            trail_price = new_peak_price * (1 - rm_config.trailing_stop_pct)
-            if trail_price > new_stop_loss:
-                new_stop_loss = trail_price
+        new_ref_price = pos.trailing_ref_price
+
+        if pos.side == 'BUY':
+            # 1. Update peak price
+            if current_price > new_ref_price:
+                new_ref_price = current_price
                 needs_update = True
+            
+            # 2. Check for activation
+            if not trailing_stop_active:
+                activation_price = pos.entry_price * (1 + rm_config.trailing_stop_activation_pct)
+                if current_price >= activation_price:
+                    trailing_stop_active = True
+                    needs_update = True
+                    logger.info("Trailing stop activated for LONG", symbol=pos.symbol, price=current_price, activation_price=activation_price)
+            
+            # 3. Calculate new stop loss if active
+            if trailing_stop_active:
+                trail_price = new_ref_price * (1 - rm_config.trailing_stop_pct)
+                if trail_price > new_stop_loss:
+                    new_stop_loss = trail_price
+                    needs_update = True
+        
+        elif pos.side == 'SELL':
+            # 1. Update trough price
+            if current_price < new_ref_price:
+                new_ref_price = current_price
+                needs_update = True
+
+            # 2. Check for activation
+            if not trailing_stop_active:
+                activation_price = pos.entry_price * (1 - rm_config.trailing_stop_activation_pct)
+                if current_price <= activation_price:
+                    trailing_stop_active = True
+                    needs_update = True
+                    logger.info("Trailing stop activated for SHORT", symbol=pos.symbol, price=current_price, activation_price=activation_price)
+            
+            # 3. Calculate new stop loss if active
+            if trailing_stop_active:
+                trail_price = new_ref_price * (1 + rm_config.trailing_stop_pct)
+                if trail_price < new_stop_loss:
+                    new_stop_loss = trail_price
+                    needs_update = True
 
         # 4. Persist changes to DB if needed
         if needs_update:
             return self.position_manager.update_trailing_stop(
                 symbol=pos.symbol,
                 new_stop_loss=new_stop_loss,
-                new_peak_price=new_peak_price,
+                new_ref_price=new_ref_price,
                 is_active=trailing_stop_active
             )
         
@@ -224,15 +251,15 @@ class TradingBot:
             logger.warning("Received invalid signal", signal=signal)
             return
 
-        if action == 'BUY' and not position:
+        # Handle opening a new position (long or short)
+        if action in ['BUY', 'SELL'] and not position:
             open_positions = self.position_manager.get_all_open_positions()
             if not self.risk_manager.check_trade_allowed(symbol, open_positions):
                 return
 
-            # First, determine the stop loss to calculate risk
-            stop_loss = self.risk_manager.calculate_stop_loss('BUY', current_price, df_with_indicators)
+            side = action # 'BUY' for long, 'SELL' for short
+            stop_loss = self.risk_manager.calculate_stop_loss(side, current_price, df_with_indicators)
             
-            # Then, calculate position size (quantity) based on that risk
             portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, self.config.initial_capital, open_positions)
             quantity = self.risk_manager.calculate_position_size(portfolio_equity, current_price, stop_loss)
 
@@ -240,18 +267,19 @@ class TradingBot:
                 logger.warning("Calculated position size is zero or less. Aborting trade.", symbol=symbol, quantity=quantity)
                 return
 
-            # Finally, calculate take profit and place the order
-            take_profit = self.risk_manager.calculate_take_profit('BUY', current_price, stop_loss)
+            take_profit = self.risk_manager.calculate_take_profit(side, current_price, stop_loss)
 
-            order_result = await self.exchange_api.place_order(symbol, 'BUY', 'MARKET', quantity)
+            order_result = await self.exchange_api.place_order(symbol, side, 'MARKET', quantity)
             if order_result and order_result.get('orderId'):
-                self.position_manager.open_position(symbol, 'BUY', quantity, current_price, stop_loss, take_profit)
+                self.position_manager.open_position(symbol, side, quantity, current_price, stop_loss, take_profit)
         
-        elif action == 'SELL' and position:
+        # Handle closing an existing position
+        elif action == 'CLOSE' and position:
             await self._close_position(position, current_price, "Strategy Signal")
 
     async def _close_position(self, position: Position, close_price: float, reason: str):
-        order_result = await self.exchange_api.place_order(position.symbol, 'SELL', 'MARKET', position.quantity)
+        close_side = 'SELL' if position.side == 'BUY' else 'BUY'
+        order_result = await self.exchange_api.place_order(position.symbol, close_side, 'MARKET', position.quantity)
         if order_result and order_result.get('orderId'):
             self.position_manager.close_position(position.symbol, close_price, reason)
 
