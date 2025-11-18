@@ -3,7 +3,7 @@ import joblib
 import asyncio
 import copy
 import json
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Optional
 import pandas as pd
 import numpy as np
 
@@ -46,7 +46,7 @@ logger = get_logger(__name__)
 class EnsembleLearner:
     """
     Manages a suite of AI/ML models for generating trading predictions.
-    This includes loading, training, and predicting using an ensemble of models.
+    Implements atomic model updates to ensure thread safety during retraining.
     """
 
     def __init__(self, config: AIEnsembleStrategyParams):
@@ -55,54 +55,59 @@ class EnsembleLearner:
         
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # symbol_models maps symbol -> Dict of model objects
         self.symbol_models: Dict[str, Dict[str, Any]] = {}
         self.symbol_scalers: Dict[str, MinMaxScaler] = {}
         self.is_trained = False
+        
         logger.info("EnsembleLearner initialized.", device=str(self.device))
-        asyncio.create_task(self._load_models())
+        
+        # Attempt to load models in the background
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._load_models())
+        except RuntimeError:
+            logger.warning("No running event loop found in EnsembleLearner init. Models will not auto-load.")
 
-    def _get_or_create_symbol_models(self, symbol: str) -> Dict[str, Any]:
-        if symbol not in self.symbol_models:
-            logger.info("Creating new model set for symbol", symbol=symbol)
-            num_features = len(self.config.feature_columns)
-            
-            hp = self.config.hyperparameters
-            xgb_config = hp.xgboost
-            rf_config = hp.random_forest
-            lr_config = hp.logistic_regression
-            lstm_config = hp.lstm
-            attn_config = hp.attention
+    def _create_fresh_models(self) -> Dict[str, Any]:
+        """Creates a fresh set of untrained model instances based on configuration."""
+        num_features = len(self.config.feature_columns)
+        hp = self.config.hyperparameters
+        xgb_config = hp.xgboost
+        rf_config = hp.random_forest
+        lr_config = hp.logistic_regression
+        lstm_config = hp.lstm
+        attn_config = hp.attention
 
-            self.symbol_models[symbol] = {
-                'lstm': LSTMPredictor(
-                    num_features, lstm_config.hidden_dim, lstm_config.num_layers, lstm_config.dropout
-                ).to(self.device),
-                'gb': XGBClassifier(
-                    n_estimators=xgb_config.n_estimators,
-                    max_depth=xgb_config.max_depth,
-                    learning_rate=xgb_config.learning_rate,
-                    subsample=xgb_config.subsample,
-                    colsample_bytree=xgb_config.colsample_bytree,
-                    random_state=42, use_label_encoder=False, eval_metric='logloss'
-                ),
-                'attention': AttentionNetwork(
-                    num_features, attn_config.hidden_dim, attn_config.num_layers, attn_config.nhead, attn_config.dropout
-                ).to(self.device),
-                'technical': VotingClassifier(estimators=[
-                    ('rf', RandomForestClassifier(
-                        n_estimators=rf_config.n_estimators,
-                        max_depth=rf_config.max_depth,
-                        min_samples_leaf=rf_config.min_samples_leaf,
-                        random_state=42
-                    )),
-                    ('lr', LogisticRegression(
-                        max_iter=lr_config.max_iter,
-                        C=lr_config.C,
-                        random_state=42
-                    ))
-                ], voting='soft')
-            }
-        return self.symbol_models[symbol]
+        return {
+            'lstm': LSTMPredictor(
+                num_features, lstm_config.hidden_dim, lstm_config.num_layers, lstm_config.dropout
+            ).to(self.device),
+            'gb': XGBClassifier(
+                n_estimators=xgb_config.n_estimators,
+                max_depth=xgb_config.max_depth,
+                learning_rate=xgb_config.learning_rate,
+                subsample=xgb_config.subsample,
+                colsample_bytree=xgb_config.colsample_bytree,
+                random_state=42, use_label_encoder=False, eval_metric='logloss'
+            ),
+            'attention': AttentionNetwork(
+                num_features, attn_config.hidden_dim, attn_config.num_layers, attn_config.nhead, attn_config.dropout
+            ).to(self.device),
+            'technical': VotingClassifier(estimators=[
+                ('rf', RandomForestClassifier(
+                    n_estimators=rf_config.n_estimators,
+                    max_depth=rf_config.max_depth,
+                    min_samples_leaf=rf_config.min_samples_leaf,
+                    random_state=42
+                )),
+                ('lr', LogisticRegression(
+                    max_iter=lr_config.max_iter,
+                    C=lr_config.C,
+                    random_state=42
+                ))
+            ], voting='soft')
+        }
 
     async def _load_models(self):
         base_path = self.config.model_path
@@ -127,21 +132,30 @@ class EnsembleLearner:
                         logger.warning("No metadata found for model. Skipping load to be safe.", symbol=symbol)
                         continue
 
-                    # 2. Load Models
-                    models = self._get_or_create_symbol_models(symbol)
-                    self.symbol_scalers[symbol] = joblib.load(os.path.join(symbol_path, "scaler.pkl"))
+                    # 2. Load Models into fresh instances
+                    models = self._create_fresh_models()
+                    scaler = joblib.load(os.path.join(symbol_path, "scaler.pkl"))
+                    
                     models['gb'] = joblib.load(os.path.join(symbol_path, "gb_model.pkl"))
                     models['technical'] = joblib.load(os.path.join(symbol_path, "technical_model.pkl"))
                     models['lstm'].load_state_dict(torch.load(os.path.join(symbol_path, "lstm_model.pth"), map_location=self.device))
                     models['attention'].load_state_dict(torch.load(os.path.join(symbol_path, "attention_model.pth"), map_location=self.device))
+                    
+                    # Atomic update
+                    self.symbol_models[symbol] = models
+                    self.symbol_scalers[symbol] = scaler
                     self.is_trained = True
                     logger.info("Loaded models and scaler for symbol", symbol=symbol)
                 except Exception as e:
                     logger.warning("Could not load models for symbol", symbol=symbol, error=str(e))
 
     async def predict(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
-        if not self.is_trained:
-            logger.debug("Predict called but models are not trained or loaded.")
+        # Thread-safe retrieval of the model dict reference
+        models = self.symbol_models.get(symbol)
+        scaler = self.symbol_scalers.get(symbol)
+
+        if not models or not scaler:
+            logger.debug("Predict called but models are not loaded for symbol.", symbol=symbol)
             return {'action': 'hold', 'confidence': 0.0}
         
         seq_len = self.config.features.sequence_length
@@ -150,13 +164,6 @@ class EnsembleLearner:
             return {'action': 'hold', 'confidence': 0.0}
 
         try:
-            models = self._get_or_create_symbol_models(symbol)
-            scaler = self.symbol_scalers.get(symbol)
-            
-            if not scaler:
-                logger.error("Scaler not found for symbol. Cannot predict safely.", symbol=symbol)
-                return {'action': 'hold', 'confidence': 0.0}
-            
             sequence_df = df.tail(seq_len)
             features = np.nan_to_num(sequence_df[self.config.feature_columns].values, nan=0.0)
             features_scaled = scaler.transform(features)
@@ -198,7 +205,6 @@ class EnsembleLearner:
             models['lstm'].eval()
             models['attention'].eval()
             
-            # Handle batch dimension if missing (for single prediction)
             if X_seq.dim() == 2:
                  X_seq = X_seq.unsqueeze(0)
 
@@ -207,11 +213,6 @@ class EnsembleLearner:
             attn_pred = models['attention'](X_seq).cpu().numpy()
             predictions.append(attn_pred)
 
-        # Ensure all predictions have the same shape (batch_size, 3)
-        # For single prediction, shape is (1, 3). For batch validation, shape is (N, 3).
-        # We need to stack them along a new axis to average.
-        # predictions list: [ (N,3), (N,3), (N,3), (N,3) ]
-        
         stacked_preds = np.array(predictions) # Shape: (4, N, 3)
         ensemble_pred = np.average(stacked_preds, weights=weights, axis=0) # Shape: (N, 3)
         
@@ -268,33 +269,32 @@ class EnsembleLearner:
             X_train_seq, y_train_seq = self._create_sequences(X_train_scaled, y_train)
             X_val_seq, y_val_seq = self._create_sequences(X_val_scaled, y_val)
 
-            # 5. Prepare flat data for scikit-learn models from the last step of each sequence
+            # 5. Prepare flat data for scikit-learn models
             X_train_flat_scaled = X_train_seq[:, -1, :]
             y_train_flat = y_train_seq
             X_val_flat_scaled = X_val_seq[:, -1, :]
             y_val_flat = y_val_seq
             
-            models = self._get_or_create_symbol_models(symbol)
+            # 6. Create FRESH models for this training session
+            # This ensures we don't corrupt the live models if training fails or is poor
+            models = self._create_fresh_models()
 
-            # 6. Train scikit-learn models on scaled flat data
+            # 7. Train scikit-learn models
             logger.info("Training scikit-learn models...", symbol=symbol)
             models['gb'].fit(X_train_flat_scaled, y_train_flat)
             models['technical'].fit(X_train_flat_scaled, y_train_flat)
             
-            # Log Feature Importance for Tree Models
+            # Log Feature Importance
             try:
-                feature_names = self.config.feature_columns
                 if hasattr(models['gb'], 'feature_importances_'):
                     importances = models['gb'].feature_importances_
                     indices = np.argsort(importances)[::-1][:5]
-                    top_features = {feature_names[i]: float(importances[i]) for i in indices}
+                    top_features = {self.config.feature_columns[i]: float(importances[i]) for i in indices}
                     logger.info("XGBoost Top 5 Features", symbol=symbol, features=top_features)
             except Exception as e:
                 logger.warning("Could not log feature importance", error=str(e))
 
-            logger.info("Scikit-learn models trained.", symbol=symbol)
-
-            # 7. Train PyTorch models on scaled sequence data
+            # 8. Train PyTorch models
             logger.info("Training PyTorch models...", symbol=symbol)
             X_train_tensor = torch.FloatTensor(X_train_seq).to(self.device)
             y_train_tensor = torch.LongTensor(y_train_seq).to(self.device)
@@ -303,20 +303,14 @@ class EnsembleLearner:
             
             self._train_pytorch_model(models['lstm'], X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor)
             self._train_pytorch_model(models['attention'], X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor)
-            logger.info("PyTorch models trained.", symbol=symbol)
 
-            # 8. EVALUATION & VALIDATION (Champion-Challenger Logic)
+            # 9. EVALUATION & VALIDATION
             logger.info("Evaluating new models on validation set...", symbol=symbol)
             
-            # Generate ensemble predictions for the validation set
             ensemble_probs = self._get_ensemble_prediction(models, X_val_flat_scaled, X_val_tensor)
             y_pred = np.argmax(ensemble_probs, axis=1)
             
-            # Calculate metrics
-            # We care most about precision on Buy (2) and Sell (0) signals
             precision = precision_score(y_val_flat, y_pred, average=None, labels=[0, 1, 2], zero_division=0)
-            # precision array corresponds to [0, 1, 2] -> [Sell, Hold, Buy]
-            
             sell_precision = precision[0]
             buy_precision = precision[2]
             avg_action_precision = (sell_precision + buy_precision) / 2
@@ -339,11 +333,14 @@ class EnsembleLearner:
                                required=threshold)
                 return False
 
-            # 9. Save if passed validation
-            self.symbol_scalers[symbol] = scaler # Update the scaler in memory
-            self._save_models(symbol)
+            # 10. Atomic Update & Save
+            # Only now do we update the live models
+            self.symbol_models[symbol] = models
+            self.symbol_scalers[symbol] = scaler
             self.is_trained = True
-            logger.info("All models trained, validated, and saved successfully.", symbol=symbol)
+            
+            self._save_models(symbol, models, scaler)
+            logger.info("All models trained, validated, and promoted to production.", symbol=symbol)
             return True
 
         except Exception as e:
@@ -364,18 +361,14 @@ class EnsembleLearner:
         patience_counter = 0
         best_model_state = None
 
-        logger.info(f"Starting training for {model.__class__.__name__}", epochs=train_cfg.epochs, patience=train_cfg.early_stopping_patience)
-
         for epoch in range(train_cfg.epochs):
             model.train()
-            total_train_loss = 0
             for X_batch, y_batch in train_loader:
                 optimizer.zero_grad()
                 outputs = model(X_batch)
                 loss = criterion(outputs, y_batch)
                 loss.backward()
                 optimizer.step()
-                total_train_loss += loss.item()
 
             model.eval()
             total_val_loss = 0
@@ -386,7 +379,6 @@ class EnsembleLearner:
                     total_val_loss += loss.item()
             
             avg_val_loss = total_val_loss / len(val_loader)
-            logger.debug(f"Epoch {epoch+1}/{train_cfg.epochs}", model=model.__class__.__name__, train_loss=total_train_loss/len(train_loader), val_loss=avg_val_loss)
 
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
@@ -395,22 +387,17 @@ class EnsembleLearner:
             else:
                 patience_counter += 1
                 if patience_counter >= train_cfg.early_stopping_patience:
-                    logger.info(f"Early stopping triggered at epoch {epoch+1}", model=model.__class__.__name__)
                     break
         
         if best_model_state:
             model.load_state_dict(best_model_state)
-            logger.info(f"Loaded best model state with validation loss: {best_val_loss:.4f}", model=model.__class__.__name__)
 
-    def _save_models(self, symbol: str):
+    def _save_models(self, symbol: str, models: Dict[str, Any], scaler: Any):
         symbol_path_str = symbol.replace('/', '_')
         save_path = os.path.join(self.config.model_path, symbol_path_str)
         os.makedirs(save_path, exist_ok=True)
         
-        models = self.symbol_models[symbol]
-        scaler = self.symbol_scalers.get(symbol)
-
-        # Save Metadata for validation on load
+        # Save Metadata
         metadata = {
             'feature_columns': self.config.feature_columns,
             'timestamp': str(pd.Timestamp.utcnow())
@@ -418,9 +405,7 @@ class EnsembleLearner:
         with open(os.path.join(save_path, "metadata.json"), 'w') as f:
             json.dump(metadata, f)
 
-        if scaler:
-            joblib.dump(scaler, os.path.join(save_path, "scaler.pkl"))
-
+        joblib.dump(scaler, os.path.join(save_path, "scaler.pkl"))
         joblib.dump(models['gb'], os.path.join(save_path, "gb_model.pkl"))
         joblib.dump(models['technical'], os.path.join(save_path, "technical_model.pkl"))
         torch.save(models['lstm'].state_dict(), os.path.join(save_path, "lstm_model.pth"))
