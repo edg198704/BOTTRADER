@@ -12,6 +12,7 @@ torch
 scikit-learn
 xgboost
 joblib
+pandas-ta
 
 # Monitoring & System
 influxdb-client
