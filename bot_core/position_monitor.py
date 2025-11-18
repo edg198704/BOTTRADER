@@ -36,7 +36,8 @@ class PositionMonitor:
         logger.info("Starting position monitoring loop.")
         while self.running:
             try:
-                open_positions = self.position_manager.get_all_open_positions()
+                # Await async DB call
+                open_positions = await self.position_manager.get_all_open_positions()
                 # Create a list of tasks to check all positions concurrently
                 check_tasks = [self._check_position(pos) for pos in open_positions]
                 await asyncio.gather(*check_tasks)
@@ -59,7 +60,8 @@ class PositionMonitor:
         if self.config.risk_management.use_trailing_stop:
             # PositionManager handles the logic and DB updates.
             # The returned 'pos' object has the latest state.
-            pos = self.position_manager.manage_trailing_stop(
+            # Await async DB call
+            pos = await self.position_manager.manage_trailing_stop(
                 pos, current_price, self.config.risk_management
             )
 
