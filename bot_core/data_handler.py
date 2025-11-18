@@ -1,8 +1,122 @@
+import asyncio
 import pandas as pd
 import numpy as np
+from typing import Dict, List, Optional
+
 from bot_core.logger import get_logger
+from bot_core.config import BotConfig
+from bot_core.exchange_api import ExchangeAPI
 
 logger = get_logger(__name__)
+
+class DataHandler:
+    """
+    Manages the lifecycle of market data for all symbols.
+    Fetches historical data once and then efficiently updates it with the latest candles.
+    """
+    def __init__(self, exchange_api: ExchangeAPI, config: BotConfig, shared_latest_prices: Dict[str, float]):
+        self.exchange_api = exchange_api
+        self.config = config
+        self.symbols = config.strategy.symbols
+        self.timeframe = config.strategy.timeframe
+        self.history_limit = config.data_handler.history_limit
+        self.update_interval = config.strategy.interval_seconds * config.data_handler.update_interval_multiplier
+        
+        self._dataframes: Dict[str, pd.DataFrame] = {}
+        self._shared_latest_prices = shared_latest_prices
+        self._running = False
+        self._update_task: Optional[asyncio.Task] = None
+        logger.info("DataHandler initialized.")
+
+    async def initialize_data(self):
+        """Fetches the initial batch of historical data for all symbols."""
+        logger.info("Initializing historical data...", symbols=self.symbols)
+        tasks = [self._fetch_initial_history(symbol) for symbol in self.symbols]
+        await asyncio.gather(*tasks)
+        logger.info("Historical data initialization complete.")
+
+    async def _fetch_initial_history(self, symbol: str):
+        try:
+            ohlcv_data = await self.exchange_api.get_market_data(symbol, self.timeframe, self.history_limit)
+            if ohlcv_data:
+                df = create_dataframe(ohlcv_data)
+                if df is not None:
+                    self._dataframes[symbol] = df
+                    self._update_latest_price(symbol, df)
+                    logger.info("Loaded initial historical data", symbol=symbol, records=len(df))
+            else:
+                logger.warning("Could not fetch initial OHLCV data.", symbol=symbol)
+        except Exception as e:
+            logger.error("Failed to fetch initial market data", symbol=symbol, error=str(e))
+
+    async def run(self):
+        """Starts the background data update loop."""
+        if self._running:
+            return
+        self._running = True
+        self._update_task = asyncio.create_task(self._update_loop())
+        logger.info("DataHandler update loop started.")
+
+    async def stop(self):
+        """Stops the background data update loop."""
+        self._running = False
+        if self._update_task and not self._update_task.done():
+            self._update_task.cancel()
+        logger.info("DataHandler update loop stopped.")
+
+    async def _update_loop(self):
+        while self._running:
+            try:
+                tasks = [self._update_symbol_data(symbol) for symbol in self.symbols]
+                await asyncio.gather(*tasks)
+            except asyncio.CancelledError:
+                logger.info("Data update loop cancelled.")
+                break
+            except Exception as e:
+                logger.error("Error in data update loop", error=str(e), exc_info=True)
+            
+            await asyncio.sleep(self.update_interval)
+
+    async def _update_symbol_data(self, symbol: str):
+        try:
+            # Fetch last 2 candles to handle incomplete current candle
+            latest_ohlcv = await self.exchange_api.get_market_data(symbol, self.timeframe, 2)
+            if not latest_ohlcv:
+                return
+
+            latest_df = create_dataframe(latest_ohlcv)
+            if latest_df is None or latest_df.empty:
+                return
+
+            if symbol in self._dataframes:
+                # Combine and remove duplicates, keeping the latest entry
+                combined_df = pd.concat([self._dataframes[symbol], latest_df])
+                combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
+                self._dataframes[symbol] = combined_df.tail(self.history_limit + 5) # Keep a small buffer
+            else:
+                self._dataframes[symbol] = latest_df
+
+            self._update_latest_price(symbol, self._dataframes[symbol])
+            logger.debug("Market data updated", symbol=symbol)
+
+        except Exception as e:
+            logger.warning("Failed to update market data for symbol", symbol=symbol, error=str(e))
+
+    def _update_latest_price(self, symbol: str, df: pd.DataFrame):
+        if not df.empty:
+            self._shared_latest_prices[symbol] = df['close'].iloc[-1]
+
+    def get_market_data(self, symbol: str) -> Optional[pd.DataFrame]:
+        """
+        Returns the latest DataFrame for a symbol with technical indicators.
+        Returns None if data is not available.
+        """
+        df = self._dataframes.get(symbol)
+        if df is None or df.empty:
+            logger.warning("No market data available for symbol", symbol=symbol)
+            return None
+        
+        return calculate_technical_indicators(df.copy())
 
 def create_dataframe(ohlcv_data: list) -> pd.DataFrame | None:
     """Create DataFrame from OHLCV data with complete validation."""
