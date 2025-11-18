@@ -12,7 +12,7 @@ logger = get_logger(__name__)
 class DataHandler:
     """
     Manages the lifecycle of market data for all symbols.
-    Fetches historical data once and then efficiently updates it with the latest candles.
+    Fetches historical data, calculates technical indicators, and efficiently updates it.
     """
     def __init__(self, exchange_api: ExchangeAPI, config: BotConfig, shared_latest_prices: Dict[str, float]):
         self.exchange_api = exchange_api
@@ -40,10 +40,11 @@ class DataHandler:
             ohlcv_data = await self.exchange_api.get_market_data(symbol, self.timeframe, self.history_limit)
             if ohlcv_data:
                 df = create_dataframe(ohlcv_data)
-                if df is not None:
-                    self._dataframes[symbol] = df
-                    self._update_latest_price(symbol, df)
-                    logger.info("Loaded initial historical data", symbol=symbol, records=len(df))
+                if df is not None and not df.empty:
+                    # Pre-calculate indicators on initialization
+                    self._dataframes[symbol] = calculate_technical_indicators(df)
+                    self._update_latest_price(symbol, self._dataframes[symbol])
+                    logger.info("Loaded and processed initial historical data", symbol=symbol, records=len(df))
             else:
                 logger.warning("Could not fetch initial OHLCV data.", symbol=symbol)
         except Exception as e:
@@ -89,26 +90,29 @@ class DataHandler:
                 return
 
             if symbol in self._dataframes:
-                # Combine and remove duplicates, keeping the latest entry
-                combined_df = pd.concat([self._dataframes[symbol], latest_df])
+                # Get the raw data by dropping indicator columns before merging
+                current_raw_df = self._dataframes[symbol][['open', 'high', 'low', 'close', 'volume']]
+                combined_df = pd.concat([current_raw_df, latest_df])
                 combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
-                self._dataframes[symbol] = combined_df.tail(self.history_limit + 5) # Keep a small buffer
+                combined_df = combined_df.tail(self.history_limit + 50) # Keep a larger buffer for indicator calculations
             else:
-                self._dataframes[symbol] = latest_df
+                combined_df = latest_df
 
+            # Re-calculate indicators on the updated, raw dataframe
+            self._dataframes[symbol] = calculate_technical_indicators(combined_df)
             self._update_latest_price(symbol, self._dataframes[symbol])
-            logger.debug("Market data updated", symbol=symbol)
+            logger.debug("Market data updated and indicators recalculated", symbol=symbol)
 
         except Exception as e:
             logger.warning("Failed to update market data for symbol", symbol=symbol, error=str(e))
 
     def _update_latest_price(self, symbol: str, df: pd.DataFrame):
-        if not df.empty:
+        if df is not None and not df.empty:
             self._shared_latest_prices[symbol] = df['close'].iloc[-1]
 
     def get_market_data(self, symbol: str) -> Optional[pd.DataFrame]:
         """
-        Returns the latest DataFrame for a symbol with technical indicators.
+        Returns the latest DataFrame for a symbol with pre-calculated technical indicators.
         Returns None if data is not available.
         """
         df = self._dataframes.get(symbol)
@@ -116,7 +120,7 @@ class DataHandler:
             logger.warning("No market data available for symbol", symbol=symbol)
             return None
         
-        return calculate_technical_indicators(df.copy())
+        return df.copy() # Return a copy to prevent mutation
 
 def create_dataframe(ohlcv_data: list) -> pd.DataFrame | None:
     """Create DataFrame from OHLCV data with complete validation."""
