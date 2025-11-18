@@ -13,25 +13,32 @@ logger = get_logger(__name__)
 class RiskManager:
     def __init__(self, config: RiskManagementConfig, alert_system: Optional['AlertSystem'] = None):
         self.config = config
-        self.is_halted = False
+        self.circuit_breaker_halted = False
+        self.daily_loss_halted = False
         self.initial_capital = None # Will be set on first update
         self.peak_portfolio_value = None
         self.alert_system = alert_system
         logger.info("RiskManager initialized.")
 
-    async def update_portfolio_risk(self, portfolio_value: float):
+    @property
+    def is_halted(self) -> bool:
+        """Returns True if any risk halt condition is met."""
+        return self.circuit_breaker_halted or self.daily_loss_halted
+
+    async def update_portfolio_risk(self, portfolio_value: float, daily_realized_pnl: float):
         if self.initial_capital is None:
             self.initial_capital = portfolio_value
             self.peak_portfolio_value = portfolio_value
 
+        # 1. Check Circuit Breaker based on drawdown
         if portfolio_value > self.peak_portfolio_value:
             self.peak_portfolio_value = portfolio_value
 
         drawdown = (portfolio_value - self.peak_portfolio_value) / self.peak_portfolio_value if self.peak_portfolio_value > 0 else 0
 
         if drawdown < self.config.circuit_breaker_threshold:
-            if not self.is_halted:
-                self.is_halted = True
+            if not self.circuit_breaker_halted:
+                self.circuit_breaker_halted = True
                 message = f"CIRCUIT BREAKER TRIPPED! Trading halted due to excessive drawdown."
                 details = {
                     'drawdown': f"{drawdown:.2%}", 
@@ -43,10 +50,26 @@ class RiskManager:
                 if self.alert_system:
                     await self.alert_system.send_alert(level='critical', message=message, details=details)
         else:
-            if self.is_halted:
+            if self.circuit_breaker_halted:
                 # Note: A manual resume process is safer. This is a simple auto-resume for now.
-                self.is_halted = False
+                self.circuit_breaker_halted = False
                 logger.info("Trading resumed as portfolio recovered from drawdown.")
+
+        # 2. Check Max Daily Loss
+        # Note: daily_realized_pnl will be negative for a loss.
+        if self.config.max_daily_loss_usd > 0 and daily_realized_pnl < -self.config.max_daily_loss_usd:
+            if not self.daily_loss_halted:
+                self.daily_loss_halted = True
+                message = f"MAX DAILY LOSS REACHED! Trading halted for the day."
+                details = {
+                    'daily_pnl': f"${daily_realized_pnl:.2f}",
+                    'limit': f"$-{self.config.max_daily_loss_usd:.2f}"
+                }
+                logger.critical(message, **details)
+                if self.alert_system:
+                    await self.alert_system.send_alert(level='critical', message=message, details=details)
+        # Note: A daily loss halt typically lasts until the next day. This logic doesn't auto-reset.
+        # A more complex implementation would involve a daily reset task, but for now, this is a safe stop.
 
     def _get_regime_param(self, param_name: str, regime: Optional[str]) -> Any:
         """Gets a risk parameter, using a regime-specific value if available, otherwise the default."""
@@ -90,7 +113,8 @@ class RiskManager:
 
     def check_trade_allowed(self, symbol: str, open_positions: List[Position]) -> bool:
         if self.is_halted:
-            logger.warning("Trade rejected: Trading is halted by circuit breaker.", symbol=symbol)
+            reason = "Circuit Breaker" if self.circuit_breaker_halted else "Max Daily Loss"
+            logger.warning(f"Trade rejected: Trading is halted by {reason}.", symbol=symbol)
             return False
         
         if len(open_positions) >= self.config.max_open_positions:
