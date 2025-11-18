@@ -1,7 +1,7 @@
 import datetime
 from typing import List, Optional, Dict
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLAlchemyEnum
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLAlchemyEnum, func
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 from bot_core.logger import get_logger
@@ -31,7 +31,8 @@ class Position(Base):
 
 class PositionManager:
     def __init__(self, config: DatabaseConfig):
-        self.engine = create_engine(f'sqlite:///{config.path}')
+        db_path = config.path if isinstance(config, DatabaseConfig) else config['path']
+        self.engine = create_engine(f'sqlite:///{db_path}')
         Base.metadata.create_all(self.engine)
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
         logger.info("PositionManager initialized and database table created.")
@@ -55,7 +56,7 @@ class PositionManager:
             session.add(new_position)
             session.commit()
             session.refresh(new_position)
-            logger.info("Opened new position", symbol=symbol, side=side, quantity=quantity, entry_price=entry_price)
+            logger.info("Opened new position", symbol=symbol, side=side, quantity=quantity, entry_price=entry_price, sl=stop_loss, tp=take_profit)
             return new_position
         except Exception as e:
             logger.error("Failed to open position", symbol=symbol, error=str(e))
@@ -64,7 +65,7 @@ class PositionManager:
         finally:
             session.close()
 
-    def close_position(self, symbol: str, close_price: float) -> Optional[Position]:
+    def close_position(self, symbol: str, close_price: float, reason: str = "Unknown") -> Optional[Position]:
         session = self.SessionLocal()
         try:
             position = session.query(Position).filter(Position.symbol == symbol, Position.status == 'OPEN').first()
@@ -82,7 +83,7 @@ class PositionManager:
             position.pnl = pnl
             session.commit()
             session.refresh(position)
-            logger.info("Closed position", symbol=symbol, pnl=pnl)
+            logger.info("Closed position", symbol=symbol, pnl=f"{pnl:.2f}", reason=reason)
             return position
         except Exception as e:
             logger.error("Failed to close position", symbol=symbol, error=str(e))
@@ -105,14 +106,14 @@ class PositionManager:
         finally:
             session.close()
 
-    def get_portfolio_value(self, latest_prices: Dict[str, float], initial_capital: float) -> float:
+    def get_portfolio_value(self, latest_prices: Dict[str, float], initial_capital: float, open_positions: List[Position]) -> float:
         session = self.SessionLocal()
         try:
             # Calculate realized PnL from closed positions
-            closed_pnl = session.query(Float).select_from(Position).filter(Position.status == 'CLOSED').with_entities(sum(Position.pnl)).scalar() or 0.0
+            closed_pnl_query = session.query(func.sum(Position.pnl)).filter(Position.status == 'CLOSED')
+            realized_pnl = closed_pnl_query.scalar() or 0.0
             
-            # Calculate unrealized PnL from open positions
-            open_positions = self.get_all_open_positions()
+            # Calculate unrealized PnL from open positions passed as argument
             unrealized_pnl = 0.0
             for pos in open_positions:
                 current_price = latest_prices.get(pos.symbol, pos.entry_price)
@@ -121,7 +122,7 @@ class PositionManager:
                     pnl = -pnl
                 unrealized_pnl += pnl
 
-            return initial_capital + closed_pnl + unrealized_pnl
+            return initial_capital + realized_pnl + unrealized_pnl
         finally:
             session.close()
 
