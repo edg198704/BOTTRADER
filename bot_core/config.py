@@ -13,6 +13,17 @@ class ExchangeConfig(BaseModel):
     testnet: bool = True
     retry: RetryConfig = Field(default_factory=RetryConfig)
 
+class ExecutionConfig(BaseModel):
+    default_order_type: str = "MARKET"  # 'MARKET' or 'LIMIT'
+    limit_price_offset_pct: float = 0.0005  # 0.05% offset for limit orders
+    order_fill_timeout_seconds: int = 45  # Time to wait for an order to fill before cancelling
+
+    @validator('default_order_type')
+    def validate_order_type(cls, v):
+        if v.upper() not in ['MARKET', 'LIMIT']:
+            raise ValueError('default_order_type must be either "MARKET" or "LIMIT"')
+        return v.upper()
+
 class DataHandlerConfig(BaseModel):
     history_limit: int = 200
     update_interval_multiplier: float = 0.5 # Multiplier of strategy interval for data updates
@@ -111,6 +122,7 @@ class LoggingConfig(BaseModel):
 class BotConfig(BaseModel):
     initial_capital: float = 10000.0
     exchange: ExchangeConfig
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     data_handler: DataHandlerConfig = Field(default_factory=DataHandlerConfig)
     strategy: StrategyConfig
     risk_management: RiskManagementConfig
