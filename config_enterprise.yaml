@@ -38,6 +38,8 @@ risk_management:
   stop_loss_fallback_pct: 0.05
   risk_per_trade_pct: 0.01
   reward_to_risk_ratio: 1.5
+  trailing_stop_activation_pct: 0.02 # Activate trailing stop after price moves 2% in profit
+  trailing_stop_pct: 0.01 # Trail the peak price by 1%
 
 database:
   path: "position_ledger.db"
