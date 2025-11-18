@@ -12,17 +12,16 @@ from bot_core.strategy import TradingStrategy
 from bot_core.config import BotConfig
 from bot_core.data_handler import DataHandler
 from bot_core.monitoring import HealthChecker, InfluxDBMetrics, AlertSystem
-from bot_core.order_sizer import OrderSizer
 from bot_core.position_monitor import PositionMonitor
-from bot_core.order_lifecycle_manager import OrderLifecycleManager
+from bot_core.trade_executor import TradeExecutor
 
 logger = get_logger(__name__)
 
 class TradingBot:
     def __init__(self, config: BotConfig, exchange_api: ExchangeAPI, data_handler: DataHandler, 
                  strategy: TradingStrategy, position_manager: PositionManager, risk_manager: RiskManager,
-                 order_sizer: OrderSizer, health_checker: HealthChecker, position_monitor: PositionMonitor,
-                 order_lifecycle_manager: OrderLifecycleManager, alert_system: AlertSystem,
+                 health_checker: HealthChecker, position_monitor: PositionMonitor,
+                 trade_executor: TradeExecutor, alert_system: AlertSystem,
                  shared_latest_prices: Dict[str, float],
                  metrics_writer: Optional[InfluxDBMetrics] = None,
                  shared_bot_state: Optional[Dict[str, Any]] = None):
@@ -32,10 +31,9 @@ class TradingBot:
         self.strategy = strategy
         self.position_manager = position_manager
         self.risk_manager = risk_manager
-        self.order_sizer = order_sizer
         self.health_checker = health_checker
         self.position_monitor = position_monitor
-        self.order_lifecycle_manager = order_lifecycle_manager
+        self.trade_executor = trade_executor
         self.alert_system = alert_system
         self.metrics_writer = metrics_writer
         self.shared_bot_state = shared_bot_state if shared_bot_state is not None else {}
@@ -71,7 +69,9 @@ class TradingBot:
                     logger.error("Failed to load market details for symbol, trading may fail.", symbol=symbol)
             except Exception as e:
                 logger.critical("Could not load market details for symbol due to an exception.", symbol=symbol, error=str(e))
-        logger.info("Market details loading complete.")
+        # Pass the loaded market details to the trade executor
+        self.trade_executor.market_details = self.market_details
+        logger.info("Market details loading complete and passed to TradeExecutor.")
 
     async def run(self):
         """Main entry point to start all bot activities."""
@@ -208,137 +208,12 @@ class TradingBot:
         if signal: await self._handle_signal(signal, df_with_indicators, position)
 
     async def _handle_signal(self, signal: Dict, df_with_indicators: pd.DataFrame, position: Optional[Position]):
-        action = signal.get('action')
-        symbol = signal.get('symbol')
-        current_price = self.latest_prices.get(symbol)
-        market_regime = signal.get('regime')
-
-        if not all([action, symbol, current_price]):
-            logger.warning("Received invalid signal", signal=signal)
-            return
-
-        open_positions = self.position_manager.get_all_open_positions()
-        portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, open_positions)
-
-        # --- Handle Opening Positions ---
-        if not position:
-            if action not in ['BUY', 'SELL']:
-                return # Ignore other signals if no position is open
-
-            if not self.risk_manager.check_trade_allowed(symbol, open_positions):
-                return
-
-            stop_loss = self.risk_manager.calculate_stop_loss(action, current_price, df_with_indicators, market_regime=market_regime)
-            ideal_quantity = self.risk_manager.calculate_position_size(portfolio_equity, current_price, stop_loss, market_regime=market_regime)
-            
-            market_details = self.market_details.get(symbol)
-            if not market_details:
-                logger.error("Cannot place order, market details not available for symbol.", symbol=symbol)
-                return
-
-            final_quantity = self.order_sizer.adjust_order_quantity(symbol, ideal_quantity, market_details)
-
-            if final_quantity <= 0:
-                logger.warning("Calculated position size is zero or less after adjustments. Aborting trade.", 
-                             symbol=symbol, ideal_quantity=ideal_quantity, final_quantity=final_quantity)
-                return
-
-            order_type = self.config.execution.default_order_type
-            limit_price = None
-            if order_type == 'LIMIT':
-                offset = self.config.execution.limit_price_offset_pct
-                if action == 'BUY':
-                    limit_price = current_price * (1 - offset) # Place below market for buys
-                else: # SELL
-                    limit_price = current_price * (1 + offset) # Place above market for sells
-
-            order_result = await self.exchange_api.place_order(symbol, action, order_type, final_quantity, price=limit_price)
-            if order_result and order_result.get('orderId'):
-                final_order_state = await self.order_lifecycle_manager.manage(
-                    initial_order=order_result,
-                    symbol=symbol,
-                    side=action,
-                    quantity=final_quantity,
-                    initial_price=limit_price
-                )
-                
-                fill_quantity = final_order_state.get('filled', 0.0) if final_order_state else 0.0
-
-                if fill_quantity > 0:
-                    fill_price = final_order_state.get('average')
-                    if not fill_price or fill_price <= 0:
-                        logger.critical("Order filled but average price is invalid. Cannot open position.", order_id=order_result.get('orderId'), final_state=final_order_state)
-                        return # Avoid creating a position with bad data
-
-                    logger.info("Order to open position was filled (fully or partially).", order_id=order_result.get('orderId'), filled_qty=fill_quantity, fill_price=fill_price)
-                    # Recalculate SL/TP based on actual fill price for higher accuracy
-                    final_stop_loss = self.risk_manager.calculate_stop_loss(action, fill_price, df_with_indicators, market_regime=market_regime)
-                    final_take_profit = self.risk_manager.calculate_take_profit(action, fill_price, final_stop_loss, market_regime=market_regime)
-                    self.position_manager.open_position(symbol, action, fill_quantity, fill_price, final_stop_loss, final_take_profit)
-                else:
-                    final_status = final_order_state.get('status') if final_order_state else 'UNKNOWN'
-                    logger.error("Order to open position did not fill.", order_id=order_result.get('orderId'), final_status=final_status)
-                    await self.alert_system.send_alert(
-                        level='error',
-                        message=f"🔴 Failed to open position for {symbol}. Order did not fill.",
-                        details={'symbol': symbol, 'order_id': order_result.get('orderId'), 'final_status': final_status}
-                    )
-        
-        # --- Handle Closing Positions ---
-        elif position:
-            is_close_long_signal = (action == 'SELL' or action == 'CLOSE') and position.side == 'BUY'
-            is_close_short_signal = (action == 'BUY' or action == 'CLOSE') and position.side == 'SELL'
-            
-            if is_close_long_signal or is_close_short_signal:
-                await self._close_position(position, "Strategy Signal")
+        """Delegates signal handling to the TradeExecutor."""
+        await self.trade_executor.execute_trade_signal(signal, df_with_indicators, position)
 
     async def _close_position(self, position: Position, reason: str):
-        close_side = 'SELL' if position.side == 'BUY' else 'BUY'
-        
-        market_details = self.market_details.get(position.symbol)
-        if not market_details:
-            logger.error("Cannot close position, market details not available for symbol.", symbol=position.symbol)
-            # Attempt to close anyway, might fail
-            close_quantity = position.quantity
-        else:
-            close_quantity = self.order_sizer.adjust_order_quantity(position.symbol, position.quantity, market_details)
-
-        if close_quantity <= 0:
-            logger.error("Cannot close position, adjusted quantity is zero.", symbol=position.symbol, original_qty=position.quantity)
-            return
-
-        order_type = self.config.execution.default_order_type
-        limit_price = None
-        current_price = self.latest_prices.get(position.symbol)
-        if order_type == 'LIMIT' and current_price:
-            offset = self.config.execution.limit_price_offset_pct
-            if close_side == 'BUY':
-                limit_price = current_price * (1 + offset)
-            else: # SELL
-                limit_price = current_price * (1 - offset)
-        else:
-            order_type = 'MARKET' # Fallback if price is missing
-
-        order_result = await self.exchange_api.place_order(position.symbol, close_side, order_type, close_quantity, price=limit_price)
-        if order_result and order_result.get('orderId'):
-            final_order_state = await self.order_lifecycle_manager.manage(
-                initial_order=order_result,
-                symbol=position.symbol,
-                side=close_side,
-                quantity=close_quantity,
-                initial_price=limit_price
-            )
-            if final_order_state and final_order_state.get('status') == 'FILLED':
-                close_price = final_order_state['average']
-                self.position_manager.close_position(position.symbol, close_price, reason)
-            else:
-                final_status = final_order_state.get('status') if final_order_state else 'UNKNOWN'
-                logger.error("Failed to confirm close order fill. Position remains open.", order_id=order_result.get('orderId'), symbol=position.symbol, final_status=final_status)
-                await self.alert_system.send_alert(
-                    level='critical',
-                    message=f"🔥 FAILED TO CLOSE position for {position.symbol}. Manual intervention may be required.",
-                    details={'symbol': position.symbol, 'order_id': order_result.get('orderId'), 'reason': reason, 'final_status': final_status}
-                )
+        """Delegates position closing to the TradeExecutor."""
+        await self.trade_executor.close_position(position, reason)
 
     async def stop(self):
         logger.info("Stopping TradingBot...")
