@@ -10,18 +10,19 @@ from bot_core.position_manager import PositionManager, Position
 from bot_core.risk_manager import RiskManager
 from bot_core.strategy import TradingStrategy
 from bot_core.config import BotConfig
-from bot_core.data_handler import create_dataframe, calculate_technical_indicators
+from bot_core.data_handler import DataHandler
 from bot_core.monitoring import HealthChecker, InfluxDBMetrics
 
 logger = get_logger(__name__)
 
 class TradingBot:
-    def __init__(self, config: BotConfig, exchange_api: ExchangeAPI, strategy: TradingStrategy, 
-                 position_manager: PositionManager, risk_manager: RiskManager,
+    def __init__(self, config: BotConfig, exchange_api: ExchangeAPI, data_handler: Optional[DataHandler], 
+                 strategy: TradingStrategy, position_manager: PositionManager, risk_manager: RiskManager,
                  health_checker: HealthChecker, metrics_writer: Optional[InfluxDBMetrics] = None,
                  shared_bot_state: Optional[Dict[str, Any]] = None):
         self.config = config
         self.exchange_api = exchange_api
+        self.data_handler = data_handler
         self.strategy = strategy
         self.position_manager = position_manager
         self.risk_manager = risk_manager
@@ -53,8 +54,8 @@ class TradingBot:
         logger.info("Starting TradingBot...", symbols=self.config.strategy.symbols)
         
         # Start shared loops
+        self.tasks.append(asyncio.create_task(self.data_handler.run()))
         self.tasks.append(asyncio.create_task(self._monitoring_loop()))
-        self.tasks.append(asyncio.create_task(self._ticker_update_loop()))
         self.tasks.append(asyncio.create_task(self._position_management_loop()))
 
         # Start a trading cycle for each symbol
@@ -62,22 +63,6 @@ class TradingBot:
             self.tasks.append(asyncio.create_task(self._trading_cycle_for_symbol(symbol)))
         
         await asyncio.gather(*self.tasks, return_exceptions=True)
-
-    async def _ticker_update_loop(self):
-        """Periodically updates the latest prices for all configured symbols."""
-        while self.running:
-            try:
-                for symbol in self.config.strategy.symbols:
-                    ticker_data = await self.exchange_api.get_ticker_data(symbol)
-                    if ticker_data and ticker_data.get('lastPrice'):
-                        self.latest_prices[symbol] = float(ticker_data['lastPrice'])
-                await asyncio.sleep(5) # Update prices more frequently for SL/TP checks
-            except asyncio.CancelledError:
-                logger.info("Ticker update loop cancelled.")
-                break
-            except Exception as e:
-                logger.error("Error in ticker update loop", error=str(e))
-                await asyncio.sleep(30) # Wait longer on error
 
     async def _trading_cycle_for_symbol(self, symbol: str):
         """Runs the trading logic loop for a single symbol to find entry/exit signals."""
@@ -240,21 +225,14 @@ class TradingBot:
             logger.warning("Trading is halted by RiskManager circuit breaker.")
             return
 
-        try:
-            ohlcv_data = await self.exchange_api.get_market_data(symbol, self.config.strategy.timeframe, 200)
-            if not ohlcv_data:
-                logger.warning("Could not fetch OHLCV data.", symbol=symbol)
-                return
-            if symbol not in self.latest_prices:
-                logger.warning("Latest price for symbol not available yet.", symbol=symbol)
-                return
-        except Exception as e:
-            logger.error("Failed to fetch market data", symbol=symbol, error=str(e))
+        df_with_indicators = self.data_handler.get_market_data(symbol)
+        if df_with_indicators is None:
+            logger.warning("Could not get market data from handler.", symbol=symbol)
             return
-
-        df = create_dataframe(ohlcv_data)
-        if df is None: return
-        df_with_indicators = calculate_technical_indicators(df)
+        
+        if symbol not in self.latest_prices:
+            logger.warning("Latest price for symbol not available yet.", symbol=symbol)
+            return
 
         position = self.position_manager.get_open_position(symbol)
         signal = await self.strategy.analyze_market(symbol, df_with_indicators, position)
@@ -343,6 +321,10 @@ class TradingBot:
         logger.info("Stopping TradingBot...")
         self.running = False
         self.shared_bot_state['status'] = 'stopping'
+        
+        if self.data_handler:
+            await self.data_handler.stop()
+
         for task in self.tasks:
             if not task.done():
                 task.cancel()
