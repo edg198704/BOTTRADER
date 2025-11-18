@@ -40,6 +40,11 @@ class ExchangeAPI(abc.ABC):
         pass
 
     @abc.abstractmethod
+    async def fetch_market_details(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Fetches exchange-specific trading rules for a symbol (precision, limits)."""
+        pass
+
+    @abc.abstractmethod
     async def close(self):
         """Closes the exchange connection."""
         pass
@@ -132,6 +137,19 @@ class MockExchangeAPI(ExchangeAPI):
         logger.debug("Mock: Getting all balances")
         return {asset: {"free": amount, "total": amount} for asset, amount in self.balances.items()}
 
+    async def fetch_market_details(self, symbol: str) -> Optional[Dict[str, Any]]:
+        logger.debug("Mock: Fetching market details", symbol=symbol)
+        # Return mock details that are permissive but allow for testing
+        return {
+            'symbol': symbol,
+            'precision': {'amount': 1e-5, 'price': 1e-2},
+            'limits': {
+                'amount': {'min': 1e-5, 'max': 1000.0},
+                'price': {'min': 0.01, 'max': 1000000.0},
+                'cost': {'min': 10.0, 'max': None}
+            }
+        }
+
     async def close(self):
         logger.info("MockExchangeAPI connection closed.")
 
@@ -147,6 +165,7 @@ class CCXTExchangeAPI(ExchangeAPI):
             'secret': config.api_secret,
             'enableRateLimit': True,
         })
+        self._markets_cache: Optional[Dict[str, Any]] = None
 
         if config.testnet and self.exchange.has['test']:
             self.exchange.set_sandbox_mode(True)
@@ -166,6 +185,21 @@ class CCXTExchangeAPI(ExchangeAPI):
         self.place_order = retry_decorator(self.place_order)
         self.fetch_order = retry_decorator(self.fetch_order)
         self.get_balance = retry_decorator(self.get_balance)
+        self.fetch_market_details = retry_decorator(self.fetch_market_details)
+
+    async def _load_markets_if_needed(self):
+        if self._markets_cache is None:
+            logger.info("Loading exchange markets for the first time...")
+            self._markets_cache = await self.exchange.load_markets()
+            logger.info("Exchange markets loaded and cached.")
+
+    async def fetch_market_details(self, symbol: str) -> Optional[Dict[str, Any]]:
+        try:
+            await self._load_markets_if_needed()
+            return self.exchange.markets.get(symbol)
+        except (NetworkError, ExchangeError) as e:
+            logger.error("Final attempt failed for fetch_market_details", symbol=symbol, error=str(e))
+            raise
 
     async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[Any]]:
         try:
