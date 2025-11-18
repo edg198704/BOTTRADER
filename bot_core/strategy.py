@@ -1,6 +1,6 @@
 import abc
 import pandas as pd
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 
 from bot_core.logger import get_logger
 from bot_core.config import StrategyConfig
@@ -13,11 +13,10 @@ logger = get_logger(__name__)
 class TradingStrategy(abc.ABC):
     def __init__(self, config: StrategyConfig):
         self.config = config
-        self.symbol = config.symbol
 
     @abc.abstractmethod
-    async def analyze_market(self, df: pd.DataFrame, open_positions: List[Position]) -> Optional[Dict[str, Any]]:
-        """Analyzes market data and returns a trading signal or None."""
+    async def analyze_market(self, df: pd.DataFrame, symbol: str, position: Optional[Position]) -> Optional[Dict[str, Any]]:
+        """Analyzes market data for a given symbol and returns a trading signal or None."""
         pass
 
 class SimpleMACrossoverStrategy(TradingStrategy):
@@ -27,24 +26,24 @@ class SimpleMACrossoverStrategy(TradingStrategy):
         self.slow_ma_period = config.simple_ma.slow_ma_period
         logger.info("SimpleMACrossoverStrategy initialized", fast_ma=self.fast_ma_period, slow_ma=self.slow_ma_period)
 
-    async def analyze_market(self, df: pd.DataFrame, open_positions: List[Position]) -> Optional[Dict[str, Any]]:
+    async def analyze_market(self, df: pd.DataFrame, symbol: str, position: Optional[Position]) -> Optional[Dict[str, Any]]:
         if 'sma_fast' not in df.columns or 'sma_slow' not in df.columns:
-            logger.warning("SMA indicators not found in DataFrame.")
+            logger.warning("SMA indicators not found in DataFrame.", symbol=symbol)
             return None
 
         last_row = df.iloc[-1]
         prev_row = df.iloc[-2]
-        position_open = any(p.symbol == self.symbol for p in open_positions)
+        position_open = position is not None
 
         # Buy signal: fast MA crosses above slow MA
         if last_row['sma_fast'] > last_row['sma_slow'] and prev_row['sma_fast'] <= prev_row['sma_slow'] and not position_open:
-            logger.info("Buy signal detected (MA Crossover)", symbol=self.symbol)
-            return {'action': 'BUY', 'symbol': self.symbol}
+            logger.info("Buy signal detected (MA Crossover)", symbol=symbol)
+            return {'action': 'BUY', 'symbol': symbol}
 
         # Sell signal: fast MA crosses below slow MA
         if last_row['sma_fast'] < last_row['sma_slow'] and prev_row['sma_fast'] >= prev_row['sma_slow'] and position_open:
-            logger.info("Sell signal detected (MA Crossover)", symbol=self.symbol)
-            return {'action': 'SELL', 'symbol': self.symbol}
+            logger.info("Sell signal detected (MA Crossover)", symbol=symbol)
+            return {'action': 'SELL', 'symbol': symbol}
 
         return None
 
@@ -60,35 +59,35 @@ class AIEnsembleStrategy(TradingStrategy):
             logger.critical("Failed to initialize AIEnsembleStrategy due to missing ML libraries", error=str(e))
             raise
 
-    async def analyze_market(self, df: pd.DataFrame, open_positions: List[Position]) -> Optional[Dict[str, Any]]:
+    async def analyze_market(self, df: pd.DataFrame, symbol: str, position: Optional[Position]) -> Optional[Dict[str, Any]]:
         if not self.ensemble_learner.is_trained:
-            logger.debug("AI models not trained yet, skipping analysis.")
+            logger.debug("AI models not trained yet, skipping analysis.", symbol=symbol)
             return None
 
-        position_open = any(p.symbol == self.symbol for p in open_positions)
+        position_open = position is not None
 
         if self.ai_config.use_regime_filter:
-            regime_result = await self.regime_detector.detect_regime(self.symbol, df)
+            regime_result = await self.regime_detector.detect_regime(symbol, df)
             regime = regime_result.get('regime')
             if regime in ['sideways', 'unknown']:
-                logger.debug("Market regime is sideways or unknown, holding position.", regime=regime)
+                logger.debug("Market regime is sideways or unknown, holding position.", symbol=symbol, regime=regime)
                 return None
 
-        prediction = await self.ensemble_learner.predict(df, self.symbol)
+        prediction = await self.ensemble_learner.predict(df, symbol)
         action = prediction.get('action')
         confidence = prediction.get('confidence', 0.0)
 
-        logger.debug("AI prediction received", **prediction)
+        logger.debug("AI prediction received", symbol=symbol, **prediction)
 
         if confidence < self.ai_config.confidence_threshold:
             return None
 
         if action == 'buy' and not position_open:
-            logger.info("AI Buy signal detected", symbol=self.symbol, confidence=confidence)
-            return {'action': 'BUY', 'symbol': self.symbol, 'confidence': confidence}
+            logger.info("AI Buy signal detected", symbol=symbol, confidence=confidence)
+            return {'action': 'BUY', 'symbol': symbol, 'confidence': confidence}
         
         if action == 'sell' and position_open:
-            logger.info("AI Sell signal detected", symbol=self.symbol, confidence=confidence)
-            return {'action': 'SELL', 'symbol': self.symbol, 'confidence': confidence}
+            logger.info("AI Sell signal detected", symbol=symbol, confidence=confidence)
+            return {'action': 'SELL', 'symbol': symbol, 'confidence': confidence}
 
         return None
