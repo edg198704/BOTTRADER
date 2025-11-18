@@ -48,23 +48,32 @@ class PositionManager:
 
     async def initialize(self):
         """Calculates initial realized PnL from the database to populate in-memory state."""
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._calculate_initial_realized_pnl)
+        self._realized_pnl = await self._run_in_executor(self._calculate_initial_realized_pnl_sync)
         logger.info("PositionManager state initialized with historical PnL.", realized_pnl=self._realized_pnl)
 
-    def _calculate_initial_realized_pnl(self):
+    async def _run_in_executor(self, func, *args):
+        """Helper to run blocking sync methods in the default executor."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, func, *args)
+
+    def _calculate_initial_realized_pnl_sync(self) -> float:
         """Synchronous method to query the database for historical PnL."""
         session = self.SessionLocal()
         try:
             realized_pnl = session.query(func.sum(Position.pnl)).filter(Position.status == 'CLOSED').scalar()
-            self._realized_pnl = realized_pnl or 0.0
+            return realized_pnl or 0.0
         finally:
             session.close()
 
-    def open_position(self, symbol: str, side: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float) -> Optional[Position]:
+    async def open_position(self, symbol: str, side: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float) -> Optional[Position]:
+        return await self._run_in_executor(
+            self._open_position_sync, symbol, side, quantity, entry_price, stop_loss, take_profit
+        )
+
+    def _open_position_sync(self, symbol: str, side: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float) -> Optional[Position]:
         session = self.SessionLocal()
         try:
-            if self.get_open_position(symbol):
+            if session.query(Position).filter(Position.symbol == symbol, Position.status == 'OPEN').first():
                 logger.warning("Attempted to open a position for a symbol that already has one.", symbol=symbol)
                 return None
 
@@ -76,7 +85,7 @@ class PositionManager:
                 stop_loss_price=stop_loss,
                 take_profit_price=take_profit,
                 status='OPEN',
-                trailing_ref_price=entry_price, # Initialize reference price to entry price
+                trailing_ref_price=entry_price,
                 trailing_stop_active=False
             )
             session.add(new_position)
@@ -85,11 +94,12 @@ class PositionManager:
             logger.info("Opened new position", symbol=symbol, side=side, quantity=quantity, entry_price=entry_price, sl=stop_loss, tp=take_profit)
             
             if self.alert_system:
-                asyncio.create_task(self.alert_system.send_alert(
+                # Fire and forget alert
+                asyncio.run_coroutine_threadsafe(self.alert_system.send_alert(
                     level='info',
                     message=f"🟢 Opened {side} position for {symbol}",
                     details={'symbol': symbol, 'side': side, 'quantity': quantity, 'entry_price': entry_price}
-                ))
+                ), asyncio.get_running_loop())
 
             return new_position
         except Exception as e:
@@ -99,7 +109,14 @@ class PositionManager:
         finally:
             session.close()
 
-    def close_position(self, symbol: str, close_price: float, reason: str = "Unknown") -> Optional[Position]:
+    async def close_position(self, symbol: str, close_price: float, reason: str = "Unknown") -> Optional[Position]:
+        position = await self._run_in_executor(self._close_position_sync, symbol, close_price, reason)
+        if position:
+            # Update realized PnL in the main thread to ensure thread safety
+            self._realized_pnl += position.pnl
+        return position
+
+    def _close_position_sync(self, symbol: str, close_price: float, reason: str) -> Optional[Position]:
         session = self.SessionLocal()
         try:
             position = session.query(Position).filter(Position.symbol == symbol, Position.status == 'OPEN').first()
@@ -111,24 +128,21 @@ class PositionManager:
             if position.side == 'SELL':
                 pnl = -pnl
 
-            # Update in-memory realized PnL for high-performance portfolio tracking
-            self._realized_pnl += pnl
-
             position.status = 'CLOSED'
             position.close_price = close_price
             position.close_timestamp = datetime.datetime.utcnow()
             position.pnl = pnl
             session.commit()
             session.refresh(position)
-            logger.info("Closed position", symbol=symbol, pnl=f"{pnl:.2f}", reason=reason, total_realized_pnl=self._realized_pnl)
+            logger.info("Closed position", symbol=symbol, pnl=f"{pnl:.2f}", reason=reason)
 
             if self.alert_system:
                 pnl_emoji = "🟢" if pnl >= 0 else "🔴"
-                asyncio.create_task(self.alert_system.send_alert(
+                asyncio.run_coroutine_threadsafe(self.alert_system.send_alert(
                     level='info',
                     message=f"{pnl_emoji} Closed position for {symbol} due to {reason}",
                     details={'symbol': symbol, 'pnl': f'{pnl:.2f}', 'reason': reason, 'close_price': close_price}
-                ))
+                ), asyncio.get_running_loop())
 
             return position
         except Exception as e:
@@ -138,44 +152,38 @@ class PositionManager:
         finally:
             session.close()
 
-    def manage_trailing_stop(self, pos: Position, current_price: float, rm_config: RiskManagementConfig) -> Position:
-        """
-        Checks and updates the trailing stop for a position based on the current price.
-        This method encapsulates the logic and database transaction.
-        """
+    async def manage_trailing_stop(self, pos: Position, current_price: float, rm_config: RiskManagementConfig) -> Position:
+        return await self._run_in_executor(self._manage_trailing_stop_sync, pos, current_price, rm_config)
+
+    def _manage_trailing_stop_sync(self, pos: Position, current_price: float, rm_config: RiskManagementConfig) -> Position:
         session = self.SessionLocal()
         try:
-            session.add(pos) # Re-attach the object to a new session
+            # Re-attach the object to the new session
+            pos = session.merge(pos)
             original_stop_loss = pos.stop_loss_price
 
             if pos.side == 'BUY':
-                # Activate TSL if price crosses activation threshold
                 if not pos.trailing_stop_active:
                     activation_price = pos.entry_price * (1 + rm_config.trailing_stop_activation_pct)
                     if current_price >= activation_price:
                         pos.trailing_stop_active = True
                         logger.info("Trailing stop activated for LONG", symbol=pos.symbol, price=current_price, activation_price=activation_price)
                 
-                # Update peak price reference
                 pos.trailing_ref_price = max(pos.trailing_ref_price, current_price)
 
-                # If TSL is active, calculate new stop loss and update if it's higher
                 if pos.trailing_stop_active:
                     new_stop_price = pos.trailing_ref_price * (1 - rm_config.trailing_stop_pct)
                     pos.stop_loss_price = max(pos.stop_loss_price, new_stop_price)
 
             elif pos.side == 'SELL':
-                # Activate TSL
                 if not pos.trailing_stop_active:
                     activation_price = pos.entry_price * (1 - rm_config.trailing_stop_activation_pct)
                     if current_price <= activation_price:
                         pos.trailing_stop_active = True
                         logger.info("Trailing stop activated for SHORT", symbol=pos.symbol, price=current_price, activation_price=activation_price)
 
-                # Update trough price reference
                 pos.trailing_ref_price = min(pos.trailing_ref_price, current_price)
 
-                # If TSL is active, calculate new stop loss and update if it's lower
                 if pos.trailing_stop_active:
                     new_stop_price = pos.trailing_ref_price * (1 + rm_config.trailing_stop_pct)
                     pos.stop_loss_price = min(pos.stop_loss_price, new_stop_price)
@@ -189,17 +197,14 @@ class PositionManager:
         except Exception as e:
             logger.error("Failed to manage trailing stop", symbol=pos.symbol, error=str(e))
             session.rollback()
-            return pos # Return original object on error
+            return pos
         finally:
             session.close()
 
     async def get_daily_realized_pnl(self) -> float:
-        """Calculates the realized PnL for the current UTC day."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._calculate_daily_pnl_sync)
+        return await self._run_in_executor(self._calculate_daily_pnl_sync)
 
     def _calculate_daily_pnl_sync(self) -> float:
-        """Synchronous method to query the database for today's PnL."""
         session = self.SessionLocal()
         try:
             today_utc = datetime.datetime.utcnow().date()
@@ -211,14 +216,20 @@ class PositionManager:
         finally:
             session.close()
 
-    def get_open_position(self, symbol: str) -> Optional[Position]:
+    async def get_open_position(self, symbol: str) -> Optional[Position]:
+        return await self._run_in_executor(self._get_open_position_sync, symbol)
+
+    def _get_open_position_sync(self, symbol: str) -> Optional[Position]:
         session = self.SessionLocal()
         try:
             return session.query(Position).filter(Position.symbol == symbol, Position.status == 'OPEN').first()
         finally:
             session.close()
 
-    def get_all_open_positions(self) -> List[Position]:
+    async def get_all_open_positions(self) -> List[Position]:
+        return await self._run_in_executor(self._get_all_open_positions_sync)
+
+    def _get_all_open_positions_sync(self) -> List[Position]:
         session = self.SessionLocal()
         try:
             return session.query(Position).filter(Position.status == 'OPEN').all()
@@ -227,6 +238,7 @@ class PositionManager:
 
     def get_portfolio_value(self, latest_prices: Dict[str, float], open_positions: List[Position]) -> float:
         """Calculates total portfolio equity using in-memory PnL and current market prices."""
+        # This method is CPU-bound and fast, safe to run in main loop as long as _realized_pnl is updated safely.
         unrealized_pnl = 0.0
         for pos in open_positions:
             current_price = latest_prices.get(pos.symbol, pos.entry_price)
