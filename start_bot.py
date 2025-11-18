@@ -9,7 +9,8 @@ from bot_core.config import BotConfig
 from bot_core.exchange_api import ExchangeAPI, MockExchangeAPI, CCXTExchangeAPI
 from bot_core.position_manager import PositionManager
 from bot_core.risk_manager import RiskManager
-from bot_core.strategy import TradingStrategy, SimpleMACrossoverStrategy, AIEnsembleStrategy
+from bot_core.strategy import TradingStrategy
+from bot_core import strategy as strategy_module
 from bot_core.bot import TradingBot
 from bot_core.telegram_bot import TelegramBot
 from bot_core.monitoring import HealthChecker, InfluxDBMetrics
@@ -83,14 +84,22 @@ def get_exchange_api(config: BotConfig) -> ExchangeAPI:
     return CCXTExchangeAPI(config.exchange)
 
 def get_strategy(config: BotConfig) -> TradingStrategy:
-    strategy_map = {
-        "SimpleMACrossoverStrategy": SimpleMACrossoverStrategy,
-        "AIEnsembleStrategy": AIEnsembleStrategy
-    }
-    strategy_class = strategy_map.get(config.strategy.name)
-    if not strategy_class:
-        raise ValueError(f"Unknown strategy: {config.strategy.name}")
-    return strategy_class(config.strategy)
+    """Dynamically loads and instantiates a strategy class by name."""
+    logger = get_logger(__name__)
+    strategy_name = config.strategy.name
+    try:
+        strategy_class = getattr(strategy_module, strategy_name)
+        if not issubclass(strategy_class, TradingStrategy):
+            raise TypeError(f"Strategy '{strategy_name}' is not a valid subclass of TradingStrategy.")
+        
+        logger.info(f"Loading strategy: {strategy_name}")
+        return strategy_class(config.strategy)
+    except AttributeError:
+        logger.critical(f"Strategy class '{strategy_name}' not found in bot_core/strategy.py.")
+        raise ValueError(f"Unknown strategy: {strategy_name}")
+    except TypeError as e:
+        logger.critical(f"Strategy class '{strategy_name}' is not a valid strategy.", error=str(e))
+        raise
 
 if __name__ == "__main__":
     try:
