@@ -107,8 +107,7 @@ class StrategyConfig(BaseModel):
     symbols: List[str]
     interval_seconds: int
     timeframe: str
-    ai_ensemble: AIStrategyConfig
-    simple_ma: SimpleMAConfig
+    params: Dict[str, Any] = Field(default_factory=dict)
 
 class RegimeRiskOverride(BaseModel):
     risk_per_trade_pct: Optional[float] = None
