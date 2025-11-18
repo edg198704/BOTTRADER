@@ -246,8 +246,8 @@ class CCXTExchangeAPI(ExchangeAPI):
             return {
                 "orderId": order.get('id'),
                 "status": order.get('status', 'unknown').upper(),
-                "executedQty": order.get('filled', 0.0),
-                "cummulativeQuoteQty": order.get('cost', 0.0)
+                "filled": order.get('filled', 0.0),
+                "cost": order.get('cost', 0.0)
             }
         except InsufficientFunds as e:
             logger.error("Insufficient funds to place order, not retrying.", symbol=symbol, error=str(e))
