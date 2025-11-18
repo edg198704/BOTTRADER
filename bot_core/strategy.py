@@ -1,6 +1,7 @@
 import abc
 import pandas as pd
 from typing import Dict, Any, Optional
+from datetime import datetime, timedelta
 
 from bot_core.logger import get_logger
 from bot_core.config import StrategyConfig
@@ -17,6 +18,16 @@ class TradingStrategy(abc.ABC):
     @abc.abstractmethod
     async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[Dict[str, Any]]:
         """Analyzes market data and returns a trading signal or None."""
+        pass
+
+    @abc.abstractmethod
+    async def retrain(self, symbol: str, df: pd.DataFrame):
+        """Triggers the retraining of the strategy's underlying models."""
+        pass
+
+    @abc.abstractmethod
+    def needs_retraining(self, symbol: str) -> bool:
+        """Checks if the strategy needs to be retrained."""
         pass
 
 class SimpleMACrossoverStrategy(TradingStrategy):
@@ -56,10 +67,18 @@ class SimpleMACrossoverStrategy(TradingStrategy):
 
         return None
 
+    async def retrain(self, symbol: str, df: pd.DataFrame):
+        # No models to retrain for this strategy
+        pass
+
+    def needs_retraining(self, symbol: str) -> bool:
+        return False
+
 class AIEnsembleStrategy(TradingStrategy):
     def __init__(self, config: StrategyConfig):
         super().__init__(config)
         self.ai_config = config.ai_ensemble
+        self.last_retrained_at: Dict[str, datetime] = {}
         try:
             self.ensemble_learner = EnsembleLearner(self.ai_config)
             self.regime_detector = MarketRegimeDetector(self.ai_config)
@@ -108,3 +127,26 @@ class AIEnsembleStrategy(TradingStrategy):
                 return {'action': 'SELL', 'symbol': symbol, 'confidence': confidence, 'regime': regime}
 
         return None
+
+    async def retrain(self, symbol: str, df: pd.DataFrame):
+        """Initiates the retraining process for the ensemble learner."""
+        if not hasattr(self, 'ensemble_learner'):
+            logger.warning("Ensemble learner not available, cannot retrain.")
+            return
+        
+        logger.info("Strategy is triggering model retraining.", symbol=symbol)
+        await self.ensemble_learner.train(symbol, df)
+        self.last_retrained_at[symbol] = datetime.utcnow()
+        logger.info("Model retraining process completed.", symbol=symbol)
+
+    def needs_retraining(self, symbol: str) -> bool:
+        """Checks if enough time has passed since the last retraining."""
+        if self.ai_config.retrain_interval_hours <= 0:
+            return False # Retraining is disabled
+        
+        last_retrained = self.last_retrained_at.get(symbol)
+        if not last_retrained:
+            return True # Never been trained, so it needs it
+        
+        time_since_retrain = datetime.utcnow() - last_retrained
+        return time_since_retrain >= timedelta(hours=self.ai_config.retrain_interval_hours)
