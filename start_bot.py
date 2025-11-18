@@ -19,31 +19,10 @@ from bot_core.order_sizer import OrderSizer
 from bot_core.position_monitor import PositionMonitor
 from bot_core.order_lifecycle_manager import OrderLifecycleManager
 from bot_core.trade_executor import TradeExecutor
+from bot_core.utils import generate_indicator_rename_map
 
 # Shared state for communication between components (e.g., Telegram and Bot)
 shared_bot_state: Dict[str, Any] = {}
-
-def _generate_indicator_column_name(indicator_config: Dict[str, Any]) -> str:
-    """Simulates the column name generation of pandas-ta for validation purposes."""
-    kind = indicator_config.get('kind', '').upper()
-    if kind == 'RSI':
-        return f"RSI_{indicator_config.get('length', 14)}"
-    if kind == 'MACD':
-        return f"MACD_{indicator_config.get('fast', 12)}_{indicator_config.get('slow', 26)}_{indicator_config.get('signal', 9)}"
-    if kind == 'BBANDS':
-        # bbands generates multiple columns, we check for the main ones
-        length = indicator_config.get('length', 20)
-        std = indicator_config.get('std', 2.0)
-        return [f"BBL_{length}_{std}", f"BBM_{length}_{std}", f"BBU_{length}_{std}"]
-    if kind == 'ATR':
-        return f"ATRr_{indicator_config.get('length', 14)}"
-    if kind == 'ADX':
-        return f"ADX_{indicator_config.get('length', 14)}"
-    if kind == 'SMA':
-        return f"SMA_{indicator_config.get('length')}"
-    # For MACD hist/signal, etc., this simple generator is not exhaustive,
-    # but it covers the main cases for feature validation.
-    return kind # Fallback
 
 def validate_config(config: BotConfig):
     """
@@ -58,24 +37,13 @@ def validate_config(config: BotConfig):
         
         base_columns = {'open', 'high', 'low', 'close', 'volume'}
         
-        # Dynamically generate the expected column names from the indicator config
-        generated_columns = set()
-        for ind_config in config.strategy.indicators:
-            names = _generate_indicator_column_name(ind_config)
-            if isinstance(names, list):
-                generated_columns.update(names)
-            else:
-                generated_columns.add(names)
-        
-        # pandas-ta also generates other columns for some indicators (e.g., MACD hist and signal)
-        # We add them here for more robust validation.
-        for ind_config in config.strategy.indicators:
-            if ind_config.get('kind') == 'macd':
-                fast = ind_config.get('fast', 12)
-                slow = ind_config.get('slow', 26)
-                signal = ind_config.get('signal', 9)
-                generated_columns.add(f"MACDh_{fast}_{slow}_{signal}")
-                generated_columns.add(f"MACDs_{fast}_{slow}_{signal}")
+        try:
+            rename_map = generate_indicator_rename_map(config.strategy.indicators)
+            generated_columns = set(rename_map.values())
+        except ValueError as e:
+            # If map generation fails (e.g., missing alias for SMA), it's a critical config error.
+            logger.critical(f"Configuration error in indicators: {e}")
+            raise e
 
         available_columns = base_columns.union(generated_columns)
         required_columns = set(config.strategy.params.feature_columns)
