@@ -3,7 +3,7 @@ import time
 import random
 from typing import Dict, Any, List, Optional
 import ccxt.async_support as ccxt
-from ccxt.base.errors import NetworkError, ExchangeError, InsufficientFunds, OrderNotFound
+from ccxt.base.errors import NetworkError, ExchangeError, InsufficientFunds, OrderNotFound, NotSupported
 
 from bot_core.logger import get_logger
 from bot_core.utils import async_retry
@@ -35,8 +35,18 @@ class ExchangeAPI(abc.ABC):
         pass
 
     @abc.abstractmethod
+    async def fetch_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        """Fetches all currently open orders for a symbol."""
+        pass
+
+    @abc.abstractmethod
     async def cancel_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
         """Cancels an open order."""
+        pass
+
+    @abc.abstractmethod
+    async def cancel_all_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        """Cancels all open orders for a symbol."""
         pass
 
     @abc.abstractmethod
@@ -68,8 +78,6 @@ class MockExchangeAPI(ExchangeAPI):
         logger.debug("Mock: Fetching market data", symbol=symbol, limit=limit)
         now = int(time.time() * 1000)
         
-        # Parse timeframe to milliseconds for accurate mock generation
-        # Assumes standard format like '1m', '5m', '1h', '1d'
         try:
             unit = timeframe[-1]
             value = int(timeframe[:-1])
@@ -133,7 +141,7 @@ class MockExchangeAPI(ExchangeAPI):
             elif order['type'] == 'LIMIT':
                 if order['side'] == 'BUY' and self.last_price <= order['price']:
                     can_fill_price = True
-                    fill_price = order['price'] # Assume no slippage for mock limit
+                    fill_price = order['price']
                 elif order['side'] == 'SELL' and self.last_price >= order['price']:
                     can_fill_price = True
                     fill_price = order['price']
@@ -162,6 +170,9 @@ class MockExchangeAPI(ExchangeAPI):
         
         return order
 
+    async def fetch_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        return [order for order in self.open_orders.values() if order['symbol'] == symbol and order['status'] == 'OPEN']
+
     async def cancel_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
         order = self.open_orders.get(order_id)
         if order and order['status'] == 'OPEN':
@@ -171,13 +182,21 @@ class MockExchangeAPI(ExchangeAPI):
         logger.warning("Mock: Order not found or not open for cancellation", order_id=order_id)
         return order
 
+    async def cancel_all_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        canceled_orders = []
+        for order_id, order in list(self.open_orders.items()):
+            if order['symbol'] == symbol and order['status'] == 'OPEN':
+                order['status'] = 'CANCELED'
+                canceled_orders.append(order)
+        logger.info("Mock: All orders canceled", symbol=symbol, count=len(canceled_orders))
+        return canceled_orders
+
     async def get_balance(self) -> Dict[str, Any]:
         logger.debug("Mock: Getting all balances")
         return {asset: {"free": amount, "total": amount} for asset, amount in self.balances.items()}
 
     async def fetch_market_details(self, symbol: str) -> Optional[Dict[str, Any]]:
         logger.debug("Mock: Fetching market details", symbol=symbol)
-        # Return mock details that are permissive but allow for testing
         return {
             'symbol': symbol,
             'precision': {'amount': 1e-5, 'price': 1e-2},
@@ -215,7 +234,6 @@ class CCXTExchangeAPI(ExchangeAPI):
         else:
             logger.info("CCXTExchangeAPI initialized in LIVE mode", exchange=config.name)
 
-        # Dynamically apply the configured retry decorator to instance methods
         retry_decorator = async_retry(
             max_attempts=config.retry.max_attempts,
             delay_seconds=config.retry.delay_seconds,
@@ -226,7 +244,9 @@ class CCXTExchangeAPI(ExchangeAPI):
         self.get_ticker_data = retry_decorator(self.get_ticker_data)
         self.place_order = retry_decorator(self.place_order)
         self.fetch_order = retry_decorator(self.fetch_order)
+        self.fetch_open_orders = retry_decorator(self.fetch_open_orders)
         self.cancel_order = retry_decorator(self.cancel_order)
+        self.cancel_all_orders = retry_decorator(self.cancel_all_orders)
         self.get_balance = retry_decorator(self.get_balance)
         self.fetch_market_details = retry_decorator(self.fetch_market_details)
 
@@ -246,54 +266,33 @@ class CCXTExchangeAPI(ExchangeAPI):
 
     async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[Any]]:
         try:
-            # Optimization: For small limits (live trading updates), use standard fetch
-            # to ensure we get the absolute latest data without clock skew risks.
             if limit <= 1000:
                 return await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
 
-            # Pagination Logic for Deep History (Training Data)
-            # Calculate duration of one candle in milliseconds
             duration = self.exchange.parse_timeframe(timeframe) * 1000
-            
-            # Calculate 'since' timestamp with a buffer to account for gaps/maintenance
             now = self.exchange.milliseconds()
-            # 1.1 buffer factor to ensure we cover enough time even with some gaps
             since = now - int(limit * duration * 1.1)
             
             all_ohlcv = []
-            
             while True:
                 remaining = limit - len(all_ohlcv)
-                if remaining <= 0:
-                    break
+                if remaining <= 0: break
                 
-                # Request a bit more than needed to handle gaps, but rely on exchange capping
                 request_limit = remaining + 50
-                
                 batch = await self.exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=request_limit)
+                if not batch: break
                 
-                if not batch:
-                    break
-                
-                # Filter out duplicates if 'since' overlaps
                 if all_ohlcv:
                     last_ts = all_ohlcv[-1][0]
                     batch = [candle for candle in batch if candle[0] > last_ts]
-                    if not batch:
-                        break
+                    if not batch: break
 
                 all_ohlcv.extend(batch)
-                
-                # Update 'since' for the next iteration
                 since = batch[-1][0] + 1
-                
-                if since >= now:
-                    break
+                if since >= now: break
 
-            # Return exactly the requested number of candles, taking the most recent ones
             if len(all_ohlcv) > limit:
                 return all_ohlcv[-limit:]
-            
             return all_ohlcv
 
         except (NetworkError, ExchangeError) as e:
@@ -336,11 +335,8 @@ class CCXTExchangeAPI(ExchangeAPI):
         try:
             order = await self.exchange.fetch_order(order_id, symbol)
             status_map = {
-                'open': 'OPEN',
-                'closed': 'FILLED',  # 'closed' in ccxt means fully filled
-                'canceled': 'CANCELED',
-                'rejected': 'REJECTED',
-                'expired': 'EXPIRED'
+                'open': 'OPEN', 'closed': 'FILLED', 'canceled': 'CANCELED',
+                'rejected': 'REJECTED', 'expired': 'EXPIRED'
             }
             return {
                 'id': order.get('id'),
@@ -359,18 +355,40 @@ class CCXTExchangeAPI(ExchangeAPI):
             logger.error("Final attempt failed for fetch_order", order_id=order_id, error=str(e))
             raise
 
+    async def fetch_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        try:
+            orders = await self.exchange.fetch_open_orders(symbol)
+            return orders
+        except (NetworkError, ExchangeError) as e:
+            logger.error("Final attempt failed for fetch_open_orders", symbol=symbol, error=str(e))
+            raise
+
     async def cancel_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
         try:
-            # ccxt's cancel_order returns the order structure
             await self.exchange.cancel_order(order_id, symbol)
-            # Fetch to get standardized status after cancellation
             return await self.fetch_order(order_id, symbol)
         except OrderNotFound:
-            logger.warning("Attempted to cancel an order that was not found (might be already filled or canceled).", order_id=order_id)
-            # Try to fetch it anyway to see its final state
+            logger.warning("Attempted to cancel an order that was not found.", order_id=order_id)
             return await self.fetch_order(order_id, symbol)
         except (NetworkError, ExchangeError) as e:
             logger.error("Final attempt failed for cancel_order", order_id=order_id, error=str(e))
+            raise
+
+    async def cancel_all_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        try:
+            # Try native method first if available
+            if self.exchange.has.get('cancelAllOrders'):
+                return await self.exchange.cancel_all_orders(symbol)
+            
+            # Fallback: fetch and cancel individually
+            open_orders = await self.fetch_open_orders(symbol)
+            results = []
+            for order in open_orders:
+                res = await self.cancel_order(order['id'], symbol)
+                results.append(res)
+            return results
+        except (NetworkError, ExchangeError) as e:
+            logger.error("Final attempt failed for cancel_all_orders", symbol=symbol, error=str(e))
             raise
 
     async def get_balance(self) -> Dict[str, Any]:
