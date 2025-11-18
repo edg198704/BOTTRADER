@@ -123,14 +123,17 @@ class TradingBot:
 
                 open_positions = self.position_manager.get_all_open_positions()
                 portfolio_value = self.position_manager.get_portfolio_value(self.latest_prices, open_positions)
-                await self.risk_manager.update_portfolio_risk(portfolio_value)
+                
+                daily_pnl = await self.position_manager.get_daily_realized_pnl()
+                await self.risk_manager.update_portfolio_risk(portfolio_value, daily_pnl)
 
                 # Update shared state for Telegram bot
                 self.shared_bot_state['portfolio_equity'] = portfolio_value
                 self.shared_bot_state['open_positions_count'] = len(open_positions)
+                self.shared_bot_state['daily_pnl'] = daily_pnl
 
                 if self.metrics_writer and self.metrics_writer.enabled:
-                    await self.metrics_writer.write_metric('portfolio', fields={'equity': portfolio_value})
+                    await self.metrics_writer.write_metric('portfolio', fields={'equity': portfolio_value, 'daily_pnl': daily_pnl})
 
             except asyncio.CancelledError:
                 logger.info("Monitoring loop cancelled.")
@@ -187,7 +190,7 @@ class TradingBot:
         logger.debug("Starting new trade check", symbol=symbol)
 
         if self.risk_manager.is_halted:
-            logger.warning("Trading is halted by RiskManager circuit breaker.")
+            logger.warning("Trading is halted by RiskManager.")
             return
 
         df_with_indicators = self.data_handler.get_market_data(symbol)
