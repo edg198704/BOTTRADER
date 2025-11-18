@@ -66,6 +66,8 @@ class RiskManagementConfig(BaseModel):
     max_open_positions: int = 5
     circuit_breaker_threshold: float = -0.10 # -10% portfolio drawdown
     use_trailing_stop: bool = True
+    trailing_stop_activation_pct: float = 0.02 # e.g., 2% profit before trailing
+    trailing_stop_pct: float = 0.015 # e.g., trail by 1.5%
     atr_stop_multiplier: float = 2.0
     stop_loss_fallback_pct: float = 0.05
     risk_per_trade_pct: float = 0.01 # Risk 1% of portfolio equity per trade
