@@ -7,18 +7,34 @@ from bot_core.position_manager import Position
 
 if TYPE_CHECKING:
     from bot_core.monitoring import AlertSystem
+    from bot_core.position_manager import PositionManager
 
 logger = get_logger(__name__)
 
 class RiskManager:
-    def __init__(self, config: RiskManagementConfig, alert_system: Optional['AlertSystem'] = None):
+    def __init__(self, config: RiskManagementConfig, position_manager: 'PositionManager', alert_system: Optional['AlertSystem'] = None):
         self.config = config
+        self.position_manager = position_manager
+        self.alert_system = alert_system
+        
         self.circuit_breaker_halted = False
         self.daily_loss_halted = False
-        self.initial_capital = None # Will be set on first update
+        self.initial_capital = None 
         self.peak_portfolio_value = None
-        self.alert_system = alert_system
+        
         logger.info("RiskManager initialized.")
+
+    async def initialize(self):
+        """Loads the initial capital and peak portfolio value from the persistent store."""
+        state = await self.position_manager.get_portfolio_state()
+        if state:
+            self.initial_capital = state['initial_capital']
+            self.peak_portfolio_value = state['peak_equity']
+            logger.info("RiskManager loaded persistent state.", 
+                        initial_capital=self.initial_capital, 
+                        peak_equity=self.peak_portfolio_value)
+        else:
+            logger.warning("RiskManager could not load persistent state. Will initialize on first update.")
 
     @property
     def is_halted(self) -> bool:
@@ -26,13 +42,17 @@ class RiskManager:
         return self.circuit_breaker_halted or self.daily_loss_halted
 
     async def update_portfolio_risk(self, portfolio_value: float, daily_realized_pnl: float):
+        # Initialize on first run if DB was empty or initialize wasn't called
+        if self.peak_portfolio_value is None:
+            self.peak_portfolio_value = portfolio_value
         if self.initial_capital is None:
             self.initial_capital = portfolio_value
-            self.peak_portfolio_value = portfolio_value
 
-        # 1. Check Circuit Breaker based on drawdown
+        # 1. Check Circuit Breaker based on drawdown from High Water Mark
         if portfolio_value > self.peak_portfolio_value:
             self.peak_portfolio_value = portfolio_value
+            # Persist the new high water mark
+            await self.position_manager.update_portfolio_high_water_mark(portfolio_value)
 
         drawdown = (portfolio_value - self.peak_portfolio_value) / self.peak_portfolio_value if self.peak_portfolio_value > 0 else 0
 
@@ -63,13 +83,11 @@ class RiskManager:
                 message = f"MAX DAILY LOSS REACHED! Trading halted for the day."
                 details = {
                     'daily_pnl': f"${daily_realized_pnl:.2f}",
-                    'limit': f"$-{self.config.max_daily_loss_usd:.2f}"
+                    'limit': f"-${self.config.max_daily_loss_usd:.2f}"
                 }
                 logger.critical(message, **details)
                 if self.alert_system:
                     await self.alert_system.send_alert(level='critical', message=message, details=details)
-        # Note: A daily loss halt typically lasts until the next day. This logic doesn't auto-reset.
-        # A more complex implementation would involve a daily reset task, but for now, this is a safe stop.
 
     def _get_regime_param(self, param_name: str, regime: Optional[str]) -> Any:
         """Gets a risk parameter, using a regime-specific value if available, otherwise the default."""
