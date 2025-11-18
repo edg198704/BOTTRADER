@@ -13,6 +13,7 @@ from bot_core.strategy import TradingStrategy, SimpleMACrossoverStrategy, AIEnse
 from bot_core.bot import TradingBot
 from bot_core.telegram_bot import TelegramBot
 from bot_core.monitoring import HealthChecker, InfluxDBMetrics
+from bot_core.data_handler import DataHandler
 
 # Shared state for communication between components (e.g., Telegram and Bot)
 shared_bot_state: Dict[str, Any] = {}
@@ -30,7 +31,26 @@ async def main():
     health_checker = HealthChecker()
     metrics_writer = InfluxDBMetrics(url=os.getenv('INFLUXDB_URL'), token=os.getenv('INFLUXDB_TOKEN'), org=os.getenv('INFLUXDB_ORG'), bucket=os.getenv('INFLUXDB_BUCKET'))
 
-    bot = TradingBot(config, exchange_api, strategy, position_manager, risk_manager, health_checker, metrics_writer, shared_bot_state)
+    # The bot owns the latest_prices dict, which is shared with the DataHandler
+    # for efficient updates without circular dependencies.
+    bot = TradingBot(
+        config=config,
+        exchange_api=exchange_api,
+        data_handler=None, # Will be set after DataHandler is created
+        strategy=strategy,
+        position_manager=position_manager,
+        risk_manager=risk_manager,
+        health_checker=health_checker,
+        metrics_writer=metrics_writer,
+        shared_bot_state=shared_bot_state
+    )
+
+    data_handler = DataHandler(
+        exchange_api=exchange_api,
+        config=config,
+        shared_latest_prices=bot.latest_prices
+    )
+    bot.data_handler = data_handler # Complete the dependency injection
 
     # --- Setup shared state and graceful shutdown ---
     shared_bot_state['stop_bot_callback'] = bot.stop
@@ -39,6 +59,7 @@ async def main():
         loop.add_signal_handler(sig, lambda: asyncio.create_task(bot.stop()))
 
     # --- Initialize and run components ---
+    await data_handler.initialize_data() # Load historical data before starting
     telegram_bot = TelegramBot(config.telegram, shared_bot_state)
     
     try:
