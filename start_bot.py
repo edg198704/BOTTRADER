@@ -82,8 +82,10 @@ async def main():
         config.initial_capital,
         alert_system=alert_system
     )
+    # RiskManager now requires position_manager to persist state
     risk_manager = RiskManager(
         config.risk_management,
+        position_manager=position_manager,
         alert_system=alert_system
     )
     strategy = get_strategy(config)
@@ -148,8 +150,13 @@ async def main():
         loop.add_signal_handler(sig, lambda: asyncio.create_task(bot.stop()))
 
     # --- Initialize and run components ---
-    await position_manager.initialize() # Load historical PnL before starting
-    await data_handler.initialize_data() # Load historical data before starting
+    # 1. Initialize PositionManager (loads PnL and ensures PortfolioState exists)
+    await position_manager.initialize()
+    # 2. Initialize RiskManager (loads persisted High Water Mark from PositionManager)
+    await risk_manager.initialize()
+    # 3. Initialize DataHandler (loads historical data)
+    await data_handler.initialize_data()
+    
     telegram_bot = TelegramBot(config.telegram, shared_bot_state)
     
     # Register Telegram as an alert handler if it's configured
