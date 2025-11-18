@@ -8,6 +8,10 @@ exchange:
   api_secret: null      # Loaded from BOT_EXCHANGE_API_SECRET environment variable
   testnet: true         # Use the exchange's testnet/sandbox environment
 
+data_handler:
+  history_limit: 200 # Number of historical candles to load at startup
+  update_interval_multiplier: 0.5 # Update data every (strategy.interval_seconds * 0.5) seconds
+
 strategy:
   name: "AIEnsembleStrategy" # Strategy to use ('AIEnsembleStrategy' or 'SimpleMACrossoverStrategy')
   symbols: ["BTC/USDT", "ETH/USDT"] # List of symbols to trade
