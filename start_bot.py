@@ -37,6 +37,12 @@ async def main():
     health_checker = HealthChecker()
     metrics_writer = InfluxDBMetrics(url=os.getenv('INFLUXDB_URL'), token=os.getenv('INFLUXDB_TOKEN'), org=os.getenv('INFLUXDB_ORG'), bucket=os.getenv('INFLUXDB_BUCKET'))
 
+    data_handler = DataHandler(
+        exchange_api=exchange_api,
+        config=config,
+        shared_latest_prices=latest_prices
+    )
+
     position_monitor = PositionMonitor(
         config=config,
         position_manager=position_manager,
@@ -46,7 +52,7 @@ async def main():
     bot = TradingBot(
         config=config,
         exchange_api=exchange_api,
-        data_handler=None, # Will be set after DataHandler is created
+        data_handler=data_handler,
         strategy=strategy,
         position_manager=position_manager,
         risk_manager=risk_manager,
@@ -57,13 +63,6 @@ async def main():
         metrics_writer=metrics_writer,
         shared_bot_state=shared_bot_state
     )
-
-    data_handler = DataHandler(
-        exchange_api=exchange_api,
-        config=config,
-        shared_latest_prices=latest_prices
-    )
-    bot.data_handler = data_handler # Complete the dependency injection
 
     # Set the callback after bot is created to avoid circular dependency on init
     position_monitor.set_close_position_callback(bot._close_position)
