@@ -60,7 +60,7 @@ class SimpleMAStrategyConfig(BaseModel):
 class StrategyConfig(BaseModel):
     name: str = "AIEnsembleStrategy"
     symbols: List[str] = Field(default_factory=lambda: ["BTC/USDT"])
-    interval_seconds: int = 60
+    cycle_interval_seconds: int = 10  # Time in seconds between each trading cycle check.
     timeframe: str = "1h"  # Timeframe for OHLCV data (e.g., '1m', '5m', '1h', '1d')
     ai_ensemble: AIStrategyConfig = Field(default_factory=AIStrategyConfig)
     simple_ma: SimpleMAStrategyConfig = Field(default_factory=SimpleMAStrategyConfig)
