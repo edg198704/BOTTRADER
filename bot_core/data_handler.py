@@ -122,6 +122,24 @@ class DataHandler:
         
         return df.copy() # Return a copy to prevent mutation
 
+    async def fetch_full_history_for_symbol(self, symbol: str, limit: int) -> Optional[pd.DataFrame]:
+        """Fetches a large batch of historical data for a symbol, intended for model training."""
+        logger.info("Fetching full historical data for training", symbol=symbol, limit=limit)
+        try:
+            ohlcv_data = await self.exchange_api.get_market_data(symbol, self.timeframe, limit)
+            if ohlcv_data:
+                df = create_dataframe(ohlcv_data)
+                if df is not None and not df.empty:
+                    # Calculate indicators on the full dataset
+                    full_df = calculate_technical_indicators(df)
+                    logger.info("Successfully fetched and processed training data", symbol=symbol, records=len(full_df))
+                    return full_df
+            logger.warning("Could not fetch sufficient training data.", symbol=symbol)
+            return None
+        except Exception as e:
+            logger.error("Failed to fetch full historical data", symbol=symbol, error=str(e))
+            return None
+
 def create_dataframe(ohlcv_data: list) -> pd.DataFrame | None:
     """Create DataFrame from OHLCV data with complete validation."""
     try:
