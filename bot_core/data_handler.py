@@ -2,6 +2,7 @@ import asyncio
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional
+import pandas_ta as ta
 
 from bot_core.logger import get_logger
 from bot_core.config import BotConfig
@@ -174,58 +175,47 @@ def create_dataframe(ohlcv_data: list) -> pd.DataFrame | None:
         return None
 
 def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate a comprehensive set of technical indicators."""
+    """Calculate a comprehensive set of technical indicators using pandas-ta."""
     if df is None or len(df) < 50:
         logger.debug("DataFrame has insufficient data for all indicators.", data_length=len(df) if df is not None else 0)
         return df
 
     df_out = df.copy()
 
-    # RSI
-    delta = df_out['close'].diff()
-    gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
-    loss = -delta.clip(upper=0).ewm(com=13, adjust=False).mean()
-    rs = gain / (loss + 1e-9)
-    df_out['rsi'] = 100 - (100 / (1 + rs))
+    # Define the strategy for pandas-ta
+    ta_strategy = ta.Strategy(
+        name="BotTrader Indicators",
+        description="A collection of standard indicators for the trading bot.",
+        ta=[
+            {"kind": "rsi", "length": 14},
+            {"kind": "macd", "fast": 12, "slow": 26, "signal": 9},
+            {"kind": "bbands", "length": 20, "std": 2},
+            {"kind": "atr", "length": 14},
+            {"kind": "adx", "length": 14},
+            {"kind": "sma", "length": 10},
+            {"kind": "sma", "length": 20},
+        ]
+    )
 
-    # MACD
-    ema12 = df_out['close'].ewm(span=12, adjust=False).mean()
-    ema26 = df_out['close'].ewm(span=26, adjust=False).mean()
-    df_out['macd'] = ema12 - ema26
-    df_out['macd_signal'] = df_out['macd'].ewm(span=9, adjust=False).mean()
-    df_out['macd_hist'] = df_out['macd'] - df_out['macd_signal']
+    # Apply the strategy
+    df_out.ta.strategy(ta_strategy)
 
-    # Bollinger Bands
-    sma_20 = df_out['close'].rolling(20).mean()
-    std_20 = df_out['close'].rolling(20).std()
-    df_out['bb_upper'] = sma_20 + (std_20 * 2)
-    df_out['bb_lower'] = sma_20 - (std_20 * 2)
-    df_out['bb_middle'] = sma_20
-
-    # ATR (for Risk Manager)
-    high_low = df_out['high'] - df_out['low']
-    high_close = abs(df_out['high'] - df_out['close'].shift())
-    low_close = abs(df_out['low'] - df_out['close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df_out['atr'] = tr.ewm(alpha=1/14, adjust=False).mean()
-
-    # ADX
-    plus_dm = df_out['high'].diff()
-    minus_dm = df_out['low'].diff().mul(-1)
-    plus_dm[plus_dm < 0] = 0
-    plus_dm[plus_dm < minus_dm] = 0
-    minus_dm[minus_dm < 0] = 0
-    minus_dm[minus_dm < plus_dm] = 0
-    tr14 = tr.rolling(14).sum()
-    plus_di = 100 * (plus_dm.rolling(14).sum() / tr14)
-    minus_di = 100 * (minus_dm.rolling(14).sum() / tr14)
-    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1e-9))
-    df_out['adx'] = dx.rolling(14).mean()
-
-    # SMAs for crossover strategy
-    df_out['sma_fast'] = df_out['close'].rolling(window=10).mean()
-    df_out['sma_slow'] = df_out['close'].rolling(window=20).mean()
+    # Rename columns to match application's expectations
+    rename_map = {
+        'RSI_14': 'rsi',
+        'MACD_12_26_9': 'macd',
+        'MACDh_12_26_9': 'macd_hist',
+        'MACDs_12_26_9': 'macd_signal',
+        'BBL_20_2.0': 'bb_lower',
+        'BBM_20_2.0': 'bb_middle',
+        'BBU_20_2.0': 'bb_upper',
+        'ATRr_14': 'atr',
+        'ADX_14': 'adx',
+        'SMA_10': 'sma_fast',
+        'SMA_20': 'sma_slow'
+    }
+    df_out.rename(columns=rename_map, inplace=True)
 
     df_out.dropna(inplace=True)
-    logger.debug("Technical indicators calculated", row_count=len(df_out))
+    logger.debug("Technical indicators calculated using pandas-ta", row_count=len(df_out))
     return df_out
