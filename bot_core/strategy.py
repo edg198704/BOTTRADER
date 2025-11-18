@@ -73,9 +73,10 @@ class AIEnsembleStrategy(TradingStrategy):
             logger.debug("AI models not trained yet, skipping analysis.", symbol=symbol)
             return None
 
+        regime_result = await self.regime_detector.detect_regime(symbol, df)
+        regime = regime_result.get('regime')
+
         if self.ai_config.use_regime_filter:
-            regime_result = await self.regime_detector.detect_regime(symbol, df)
-            regime = regime_result.get('regime')
             if regime in ['sideways', 'unknown']:
                 logger.debug("Market regime is sideways or unknown, holding position.", regime=regime, symbol=symbol)
                 return None
@@ -93,17 +94,17 @@ class AIEnsembleStrategy(TradingStrategy):
             # Have a position, look for close signals (opposing action)
             if position.side == 'BUY' and action == 'sell':
                 logger.info("AI Close Long signal detected", symbol=symbol, confidence=confidence)
-                return {'action': 'SELL', 'symbol': symbol, 'confidence': confidence}
+                return {'action': 'SELL', 'symbol': symbol, 'confidence': confidence, 'regime': regime}
             if position.side == 'SELL' and action == 'buy':
                 logger.info("AI Close Short signal detected", symbol=symbol, confidence=confidence)
-                return {'action': 'BUY', 'symbol': symbol, 'confidence': confidence}
+                return {'action': 'BUY', 'symbol': symbol, 'confidence': confidence, 'regime': regime}
         else:
             # No position, look for open signals
             if action == 'buy':
                 logger.info("AI Open Long signal detected", symbol=symbol, confidence=confidence)
-                return {'action': 'BUY', 'symbol': symbol, 'confidence': confidence}
+                return {'action': 'BUY', 'symbol': symbol, 'confidence': confidence, 'regime': regime}
             if action == 'sell':
                 logger.info("AI Open Short signal detected", symbol=symbol, confidence=confidence)
-                return {'action': 'SELL', 'symbol': symbol, 'confidence': confidence}
+                return {'action': 'SELL', 'symbol': symbol, 'confidence': confidence, 'regime': regime}
 
         return None
