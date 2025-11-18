@@ -18,6 +18,13 @@ class ExecutionConfig(BaseModel):
     limit_price_offset_pct: float = 0.0005  # 0.05% offset for limit orders
     order_fill_timeout_seconds: int = 45  # Time to wait for an order to fill before cancelling
 
+    # Order Chasing parameters for LIMIT orders
+    use_order_chasing: bool = True
+    chase_interval_seconds: int = 5 # Time to wait before checking if the order needs chasing
+    max_chase_attempts: int = 3 # Number of times to chase the order
+    chase_aggressiveness_pct: float = 0.0002 # 0.02% price improvement on each chase
+    execute_on_timeout: bool = False # If true, place a MARKET order after all chases fail
+
     @validator('default_order_type')
     def validate_order_type(cls, v):
         if v.upper() not in ['MARKET', 'LIMIT']:
