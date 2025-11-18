@@ -118,6 +118,9 @@ class StrategyConfig(BaseModel):
     symbols: List[str]
     interval_seconds: int
     timeframe: str
+    # This list of dictionaries will directly drive the pandas-ta indicator calculation.
+    # Each dict should be a valid input for pandas-ta, e.g., {"kind": "rsi", "length": 14}
+    indicators: List[Dict[str, Any]]
     params: Union[AIEnsembleStrategyParams, SimpleMACrossoverStrategyParams] = Field(..., discriminator='name')
 
 class RegimeRiskOverride(BaseModel):
