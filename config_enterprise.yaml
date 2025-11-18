@@ -1,24 +1,28 @@
-# Central configuration file for the modular trading bot
+# Main Configuration for the Enterprise Trading Bot
 
 initial_capital: 10000.0
 
 exchange:
-  name: "MockExchange" # Use "MockExchange" for testing or a ccxt-supported exchange like "binance"
-  api_key: "YOUR_API_KEY" # For live trading, use environment variables instead
-  api_secret: "YOUR_API_SECRET" # For live trading, use environment variables instead
-  testnet: true
+  name: "MockExchange"  # Exchange name (e.g., 'binance', 'bybit'). Use 'MockExchange' for testing.
+  api_key: null         # Loaded from BOT_EXCHANGE_API_KEY environment variable
+  api_secret: null      # Loaded from BOT_EXCHANGE_API_SECRET environment variable
+  testnet: true         # Use the exchange's testnet/sandbox environment
 
 strategy:
-  name: "AIEnsembleStrategy" # Can be "AIEnsembleStrategy" or "SimpleMACrossoverStrategy"
+  name: "AIEnsembleStrategy" # Strategy to use ('AIEnsembleStrategy' or 'SimpleMACrossoverStrategy')
   symbol: "BTC/USDT"
-  interval_seconds: 60
+  interval_seconds: 60      # Time in seconds between each trading cycle
+
+  # Settings for AIEnsembleStrategy
   ai_ensemble:
-    feature_columns: ['close', 'rsi', 'macd', 'volume']
-    confidence_threshold: 0.60
+    feature_columns: ['close', 'rsi', 'macd', 'volume', 'bb_upper', 'bb_lower']
+    confidence_threshold: 0.65
     model_path: "models/ensemble"
     use_regime_filter: true
     retrain_interval_hours: 24
     training_epochs: 10
+
+  # Settings for SimpleMACrossoverStrategy
   simple_ma:
     fast_ma_period: 10
     slow_ma_period: 20
@@ -26,8 +30,8 @@ strategy:
 risk_management:
   max_position_size_usd: 1000.0
   max_daily_loss_usd: 500.0
-  max_open_positions: 5
-  circuit_breaker_threshold: -0.10
+  max_open_positions: 1 # For simplicity in this example
+  circuit_breaker_threshold: -0.10 # Halt trading if portfolio drops 10%
   use_trailing_stop: true
   atr_stop_multiplier: 2.0
   stop_loss_fallback_pct: 0.05
@@ -37,10 +41,11 @@ database:
   path: "position_ledger.db"
 
 telegram:
-  bot_token: "YOUR_TELEGRAM_BOT_TOKEN" # Optional: For remote control. Use environment variables in production.
-  admin_chat_ids: [123456789] # Optional: Your Telegram chat ID
+  bot_token: null # Loaded from BOT_TELEGRAM_BOT_TOKEN environment variable
+  admin_chat_ids:
+    - 123456789 # Replace with your Telegram admin chat ID
 
 logging:
   level: "INFO"
   file_path: "logs/trading_bot.log"
-  use_json: true
+  use_json: false
