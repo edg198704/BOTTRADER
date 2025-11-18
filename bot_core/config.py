@@ -47,6 +47,18 @@ class AIAttentionConfig(BaseModel):
     nhead: int = 4
     dropout: float = Field(0.2, ge=0.0, lt=1.0)
 
+class AIFeatureEngineeringConfig(BaseModel):
+    sequence_length: int
+    labeling_horizon: int = 5
+    labeling_threshold: float = 0.005
+
+class AIHyperparameters(BaseModel):
+    xgboost: XGBoostConfig = XGBoostConfig()
+    random_forest: RandomForestConfig = RandomForestConfig()
+    logistic_regression: LogisticRegressionConfig = LogisticRegressionConfig()
+    lstm: AILSTMConfig = AILSTMConfig()
+    attention: AIAttentionConfig = AIAttentionConfig()
+
 # --- Strategy-Specific Parameter Models ---
 
 class StrategyParamsBase(BaseModel):
@@ -65,20 +77,14 @@ class AIEnsembleStrategyParams(StrategyParamsBase):
     model_path: str
     use_regime_filter: bool
     retrain_interval_hours: int
-    sequence_length: int
     training_data_limit: int = 5000
-    labeling_horizon: int = 5
-    labeling_threshold: float = 0.005
 
-    # Nested model configs
-    xgboost: XGBoostConfig = XGBoostConfig()
-    random_forest: RandomForestConfig = RandomForestConfig()
-    logistic_regression: LogisticRegressionConfig = LogisticRegressionConfig()
+    # Nested, structured configs
+    features: AIFeatureEngineeringConfig
+    training: AITrainingConfig = AITrainingConfig()
+    hyperparameters: AIHyperparameters = AIHyperparameters()
     ensemble_weights: EnsembleWeightsConfig = EnsembleWeightsConfig()
     market_regime: MarketRegimeConfig = MarketRegimeConfig()
-    training: AITrainingConfig = AITrainingConfig()
-    lstm: AILSTMConfig = AILSTMConfig()
-    attention: AIAttentionConfig = AIAttentionConfig()
 
 # --- Core Component Configs ---
 
