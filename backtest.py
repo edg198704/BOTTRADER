@@ -1,6 +1,7 @@
 import asyncio
 import pandas as pd
 import os
+import shutil
 from datetime import datetime, timedelta
 from typing import Dict, List, Any
 
@@ -20,6 +21,7 @@ from bot_core.order_lifecycle_manager import OrderLifecycleManager
 from bot_core.trade_executor import TradeExecutor
 from bot_core.utils import Clock
 from bot_core.reporting import PerformanceAnalyzer
+from bot_core.config import AIEnsembleStrategyParams
 
 logger = get_logger(__name__)
 
@@ -60,10 +62,20 @@ async def run_backtest():
     setup_logging("INFO", "logs/backtest.log", False)
     config = load_config('config_enterprise.yaml')
     
-    # Override DB path for backtest to avoid messing up live DB
+    # --- Backtest Configuration Overrides ---
+    # 1. Database: Use a separate DB for backtesting
     config.database.path = "backtest_ledger.db"
     if os.path.exists(config.database.path):
         os.remove(config.database.path)
+
+    # 2. AI Models: Use a separate directory for backtest models to avoid overwriting prod
+    if isinstance(config.strategy.params, AIEnsembleStrategyParams):
+        config.strategy.params.model_path = config.backtest.model_path
+        # Clean up previous backtest models
+        if os.path.exists(config.backtest.model_path):
+            shutil.rmtree(config.backtest.model_path)
+        os.makedirs(config.backtest.model_path, exist_ok=True)
+        logger.info(f"Using backtest model path: {config.backtest.model_path}")
 
     # 1. Load Data
     historical_data = await load_historical_data(config, None)
@@ -73,7 +85,6 @@ async def run_backtest():
 
     # 2. Initialize Backtest Exchange
     initial_balances = {"USDT": config.backtest.initial_balance}
-    # Pass the backtest config to the exchange API
     exchange_api = BacktestExchangeAPI(historical_data, initial_balances, config.backtest)
 
     # 3. Initialize Components
@@ -81,16 +92,14 @@ async def run_backtest():
     alert_system = AlertSystem()
     
     data_handler = DataHandler(exchange_api, config, shared_latest_prices)
-    # Pre-load data handler buffers manually since we won't run its loop
-    # We don't need to do anything yet, update_symbol_data will handle it
-
+    
     position_manager = PositionManager(config.database, config.backtest.initial_balance, alert_system)
     await position_manager.initialize()
 
     risk_manager = RiskManager(config.risk_management, position_manager, data_handler, alert_system)
     await risk_manager.initialize()
 
-    # Load Strategy
+    # Load Strategy (with the modified config)
     strategy_class = getattr(strategy_module, config.strategy.params.name)
     strategy = strategy_class(config.strategy.params)
 
@@ -112,17 +121,20 @@ async def run_backtest():
         health_checker, position_monitor, trade_executor, alert_system, shared_latest_prices
     )
     
-    # Set callback for position monitor
     position_monitor.set_close_position_callback(bot._close_position)
 
-    # 4. Run Setup (Loads market details, etc.)
+    # 4. Run Setup
     await bot.setup()
 
     # 5. Main Backtest Loop
-    # Determine start and end times based on data intersection
     start_times = [df.index[0] for df in historical_data.values()]
     end_times = [df.index[-1] for df in historical_data.values()]
-    start_time = max(start_times) + timedelta(hours=24) # Warmup period
+    
+    # Warmup period: Allow enough data for indicators and initial training
+    warmup_candles = max(config.data_handler.history_limit, 500)
+    # Estimate warmup time based on timeframe (approximate)
+    # We'll just start 24h in, assuming that's enough for 5m candles (288 candles)
+    start_time = max(start_times) + timedelta(hours=24) 
     end_time = min(end_times)
     
     current_time = start_time
@@ -130,36 +142,69 @@ async def run_backtest():
     
     logger.info(f"Starting backtest from {start_time} to {end_time}")
     
-    # Track equity curve for reporting
+    # --- Initial Training / Warmup ---
+    # Set the clock to start time so data handler fetches data up to this point
+    Clock.set_time(current_time)
+    
+    # Pre-load data into DataHandler buffers for the warmup period
+    for symbol in config.strategy.symbols:
+        await data_handler.update_symbol_data(symbol)
+
+    # If it's an AI strategy, perform initial training now
+    if isinstance(config.strategy.params, AIEnsembleStrategyParams):
+        logger.info("Performing initial AI model training (Walk-Forward Warmup)...")
+        for symbol in config.strategy.symbols:
+            training_limit = strategy.get_training_data_limit()
+            # Fetch full history available up to current_time
+            training_df = await data_handler.fetch_full_history_for_symbol(symbol, training_limit)
+            if training_df is not None and not training_df.empty:
+                # Use the bot's executor to train
+                await strategy.retrain(symbol, training_df, bot.process_executor)
+            else:
+                logger.warning(f"Insufficient data for initial training of {symbol}")
+
     equity_curve: List[Dict[str, Any]] = []
 
-    while current_time <= end_time:
-        Clock.set_time(current_time)
-        
-        # Update DataHandler for all symbols at this timestamp
-        for symbol in config.strategy.symbols:
-            await data_handler.update_symbol_data(symbol)
-        
-        # Run Bot Logic
-        for symbol in config.strategy.symbols:
-            await bot.process_symbol_tick(symbol)
+    try:
+        while current_time <= end_time:
+            Clock.set_time(current_time)
             
-        # Run Position Monitor (Check SL/TP)
-        # We manually trigger the check logic
-        open_positions = await position_manager.get_all_open_positions()
-        for pos in open_positions:
-            await position_monitor._check_position(pos)
+            # 1. Update Data
+            for symbol in config.strategy.symbols:
+                await data_handler.update_symbol_data(symbol)
             
-        # Record Equity
-        equity = position_manager.get_portfolio_value(shared_latest_prices, open_positions)
-        equity_curve.append({'timestamp': current_time, 'equity': equity})
+            # 2. Check for Retraining (Walk-Forward Analysis)
+            # We do this BEFORE processing ticks to ensure the model is up-to-date
+            for symbol in config.strategy.symbols:
+                if strategy.needs_retraining(symbol):
+                    logger.info(f"Retraining triggered for {symbol} at {current_time}")
+                    training_limit = strategy.get_training_data_limit()
+                    training_df = await data_handler.fetch_full_history_for_symbol(symbol, training_limit)
+                    if training_df is not None and not training_df.empty:
+                        await strategy.retrain(symbol, training_df, bot.process_executor)
 
-        # Advance Time
-        current_time += interval
-        
-        # Optional: Print progress every day
-        if current_time.hour == 0 and current_time.minute == 0 and current_time.second == 0:
-             logger.info(f"Progress: {current_time} | Equity: ${equity:.2f}")
+            # 3. Run Bot Logic
+            for symbol in config.strategy.symbols:
+                await bot.process_symbol_tick(symbol)
+                
+            # 4. Run Position Monitor
+            open_positions = await position_manager.get_all_open_positions()
+            for pos in open_positions:
+                await position_monitor._check_position(pos)
+                
+            # 5. Record Equity
+            equity = position_manager.get_portfolio_value(shared_latest_prices, open_positions)
+            equity_curve.append({'timestamp': current_time, 'equity': equity})
+
+            # 6. Advance Time
+            current_time += interval
+            
+            if current_time.hour == 0 and current_time.minute == 0 and current_time.second == 0:
+                 logger.info(f"Progress: {current_time} | Equity: ${equity:.2f}")
+
+    finally:
+        # Ensure we shut down the bot's executor to prevent hanging
+        await bot.stop()
 
     # 6. Final Report
     logger.info("Backtest Complete. Generating Report...")
