@@ -10,7 +10,7 @@ from bot_core.logger import get_logger
 
 from bot_core.config import BotConfig
 from bot_core.exchange_api import ExchangeAPI
-from bot_core.utils import generate_indicator_rename_map, parse_timeframe_to_seconds, Clock
+from bot_core.utils import generate_indicator_rename_map, parse_timeframe_to_seconds, Clock, calculate_min_history_depth
 
 logger = get_logger(__name__)
 
@@ -26,7 +26,16 @@ class DataHandler:
         self.config = config
         self.symbols = config.strategy.symbols
         self.timeframe = config.strategy.timeframe
-        self.history_limit = config.data_handler.history_limit
+        
+        # Dynamic History Limit Calculation
+        min_required = calculate_min_history_depth(config.strategy.indicators)
+        self.history_limit = max(config.data_handler.history_limit, min_required)
+        if self.history_limit > config.data_handler.history_limit:
+            logger.info("Adjusted history limit to satisfy indicator requirements.", 
+                        configured=config.data_handler.history_limit, 
+                        required=min_required, 
+                        final=self.history_limit)
+        
         self.update_interval = config.strategy.interval_seconds * config.data_handler.update_interval_multiplier
         self.indicators_config = config.strategy.indicators
         
@@ -58,7 +67,8 @@ class DataHandler:
         logger.info("DataHandler initialized.", 
                     cache_dir=self.cache_dir, 
                     analysis_window=self.analysis_window,
-                    max_training_buffer=self.max_training_buffer)
+                    max_training_buffer=self.max_training_buffer,
+                    history_limit=self.history_limit)
 
     async def initialize_data(self):
         """Fetches the initial batch of historical data for all symbols, utilizing local cache."""
