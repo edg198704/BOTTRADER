@@ -7,9 +7,10 @@ import pandas_ta as ta
 from concurrent.futures import ThreadPoolExecutor
 
 from bot_core.logger import get_logger
+
 from bot_core.config import BotConfig
 from bot_core.exchange_api import ExchangeAPI
-from bot_core.utils import generate_indicator_rename_map
+from bot_core.utils import generate_indicator_rename_map, parse_timeframe_to_seconds
 
 logger = get_logger(__name__)
 
@@ -132,12 +133,14 @@ class DataHandler:
 
     async def _update_symbol_data(self, symbol: str):
         try:
-            # Self-Healing Logic: Check if we have enough data
+            # Self-Healing Logic: Check if we have enough data and if it's up to date
             current_buffer = self._raw_buffers.get(symbol)
             required_history = self.history_limit
             
-            # If buffer is missing or significantly smaller than required history, 
-            # trigger a recovery fetch instead of an incremental update.
+            fetch_limit = 5 # Default small update
+            is_recovery = False
+
+            # 1. Check for empty or insufficient buffer
             if current_buffer is None or len(current_buffer) < (required_history * 0.9):
                 logger.warning("Insufficient data buffer detected. Attempting recovery fetch.", 
                                symbol=symbol, 
@@ -145,9 +148,29 @@ class DataHandler:
                                target_len=required_history)
                 fetch_limit = required_history
                 is_recovery = True
-            else:
-                fetch_limit = 5 # Standard incremental update
-                is_recovery = False
+            
+            # 2. Check for stale buffer (Gap Detection)
+            elif current_buffer is not None and not current_buffer.empty:
+                last_ts = current_buffer.index[-1]
+                # Ensure we compare apples to apples (UTC)
+                now = pd.Timestamp.utcnow().tz_localize(None)
+                if last_ts.tzinfo is not None:
+                    last_ts = last_ts.tz_convert(None)
+                
+                time_diff = (now - last_ts).total_seconds()
+                tf_seconds = parse_timeframe_to_seconds(self.timeframe)
+                
+                if tf_seconds > 0:
+                    missed_candles = int(time_diff / tf_seconds)
+                    # If we missed more than the default fetch, expand the limit
+                    if missed_candles > 5:
+                        fetch_limit = missed_candles + 5 # Add buffer
+                        logger.info("Data gap detected.", symbol=symbol, missed_candles=missed_candles, fetch_limit=fetch_limit)
+
+                # Safety cap: if gap is huge, treat as full recovery
+                if fetch_limit > required_history:
+                    fetch_limit = required_history
+                    is_recovery = True
 
             # Fetch data
             latest_ohlcv = await self.exchange_api.get_market_data(symbol, self.timeframe, fetch_limit)
@@ -181,7 +204,6 @@ class DataHandler:
                     
                     self._raw_buffers[symbol] = combined_df
                 else:
-                    # Should be covered by recovery logic, but fallback safe
                     self._raw_buffers[symbol] = latest_df
 
             # Process Indicators on Analysis Window
@@ -216,7 +238,7 @@ class DataHandler:
 
     async def _calculate_indicators_async(self, df: pd.DataFrame) -> pd.DataFrame:
         """Wrapper to run indicator calculation in thread pool."""
-        loop = asyncio.get_running_loop()
+        loop = asyncio.get_running_loop() 
         return await loop.run_in_executor(self._executor, self.calculate_technical_indicators, df)
 
     def _update_latest_price(self, symbol: str, df: pd.DataFrame):
