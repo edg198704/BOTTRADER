@@ -7,10 +7,12 @@ from typing import Dict, Any, Tuple, List, Optional
 import pandas as pd
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams
 from bot_core.ai.models import LSTMPredictor, AttentionNetwork
+from bot_core.ai.feature_processor.py import FeatureProcessor
 from bot_core.ai.feature_processor import FeatureProcessor
 
 # ML Imports with safe fallbacks
@@ -23,7 +25,6 @@ try:
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import precision_score, classification_report
     from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
-    from sklearn.utils.class_weight import compute_class_weight, compute_sample_weight
     from xgboost import XGBClassifier
     ML_AVAILABLE = True
 except ImportError:
@@ -37,8 +38,6 @@ except ImportError:
     class TimeSeriesSplit: pass
     def precision_score(*args, **kwargs): return 0.0
     def classification_report(*args, **kwargs): return ""
-    def compute_class_weight(*args, **kwargs): return []
-    def compute_sample_weight(*args, **kwargs): return []
     class nn:
         class Module: pass
     class optim: pass
@@ -58,9 +57,6 @@ def _create_fresh_models(config: AIEnsembleStrategyParams, device) -> Dict[str, 
     lr_config = hp.logistic_regression
     lstm_config = hp.lstm
     attn_config = hp.attention
-
-    # Determine class_weight setting for sklearn models
-    sklearn_class_weight = 'balanced' if config.training.use_class_weighting else None
 
     return {
         'lstm': LSTMPredictor(
@@ -82,28 +78,21 @@ def _create_fresh_models(config: AIEnsembleStrategyParams, device) -> Dict[str, 
                 n_estimators=rf_config.n_estimators,
                 max_depth=rf_config.max_depth,
                 min_samples_leaf=rf_config.min_samples_leaf,
-                random_state=42,
-                class_weight=sklearn_class_weight
+                random_state=42
             )),
             ('lr', LogisticRegression(
                 max_iter=lr_config.max_iter,
                 C=lr_config.C,
-                random_state=42,
-                class_weight=sklearn_class_weight
+                random_state=42
             ))
         ], voting='soft')
     }
 
-def _optimize_hyperparameters(model, X, y, param_dist, n_iter, logger_instance, symbol, sample_weight=None):
+def _optimize_hyperparameters(model, X, y, param_dist, n_iter, logger_instance, symbol):
     """Runs RandomizedSearchCV to find better hyperparameters."""
     try:
         # Use TimeSeriesSplit to prevent data leakage (future peeking)
         tscv = TimeSeriesSplit(n_splits=3)
-        
-        fit_params = {}
-        if sample_weight is not None:
-            fit_params['sample_weight'] = sample_weight
-
         search = RandomizedSearchCV(
             estimator=model,
             param_distributions=param_dist,
@@ -114,16 +103,14 @@ def _optimize_hyperparameters(model, X, y, param_dist, n_iter, logger_instance, 
             random_state=42,
             verbose=0
         )
-        search.fit(X, y, **fit_params)
+        search.fit(X, y)
         logger_instance.info("Hyperparameter optimization complete", symbol=symbol, best_params=search.best_params_)
         return search.best_estimator_
     except Exception as e:
         logger_instance.warning("Hyperparameter optimization failed, using default.", symbol=symbol, error=str(e))
         return model
 
-def _train_pytorch_model(model: nn.Module, X_train: torch.Tensor, y_train: torch.Tensor, 
-                         X_val: torch.Tensor, y_val: torch.Tensor, config: AIEnsembleStrategyParams,
-                         class_weights: Optional[torch.Tensor] = None):
+def _train_pytorch_model(model: nn.Module, X_train: torch.Tensor, y_train: torch.Tensor, X_val: torch.Tensor, y_val: torch.Tensor, config: AIEnsembleStrategyParams):
     train_cfg = config.training
     train_dataset = TensorDataset(X_train, y_train)
     train_loader = DataLoader(train_dataset, batch_size=train_cfg.batch_size, shuffle=True)
@@ -131,7 +118,7 @@ def _train_pytorch_model(model: nn.Module, X_train: torch.Tensor, y_train: torch
     val_loader = DataLoader(val_dataset, batch_size=train_cfg.batch_size)
 
     optimizer = optim.Adam(model.parameters(), lr=train_cfg.learning_rate)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss()
 
     best_val_loss = float('inf')
     patience_counter = 0
@@ -295,24 +282,6 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         X_val_flat = X_val_seq.reshape(X_val_seq.shape[0], -1)
         y_val_flat = y_val_seq
         
-        # --- Class Weighting Calculation ---
-        sample_weights_xgb = None
-        class_weights_tensor = None
-        
-        if config.training.use_class_weighting:
-            # For XGBoost (Sample Weights)
-            sample_weights_xgb = compute_sample_weight('balanced', y_train_flat)
-            
-            # For PyTorch (Class Weights Tensor)
-            classes = np.unique(y_train_flat)
-            cw = compute_class_weight('balanced', classes=classes, y=y_train_flat)
-            weight_map = dict(zip(classes, cw))
-            # Ensure we have weights for all 3 classes [0, 1, 2], default to 1.0 if missing
-            final_weights = [weight_map.get(i, 1.0) for i in range(3)]
-            class_weights_tensor = torch.FloatTensor(final_weights).to(device)
-            
-            worker_logger.info("Class weighting enabled", symbol=symbol, weights=final_weights)
-
         # 5. Create Models
         models = _create_fresh_models(config, device)
 
@@ -330,8 +299,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             }
             models['gb'] = _optimize_hyperparameters(
                 models['gb'], X_train_flat, y_train_flat, xgb_params, 
-                config.training.n_iter_search, worker_logger, symbol, 
-                sample_weight=sample_weights_xgb
+                config.training.n_iter_search, worker_logger, symbol
             )
 
             # Random Forest Optimization (Standalone first)
@@ -341,7 +309,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 'min_samples_leaf': [1, 2, 4, 10]
             }
             # Extract RF from VotingClassifier or create new
-            rf_base = RandomForestClassifier(random_state=42, class_weight='balanced' if config.training.use_class_weighting else None)
+            rf_base = RandomForestClassifier(random_state=42)
             optimized_rf = _optimize_hyperparameters(
                 rf_base, X_train_flat, y_train_flat, rf_params,
                 config.training.n_iter_search, worker_logger, symbol
@@ -356,12 +324,11 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
 
         # 6. Train Models
         worker_logger.info("Training scikit-learn models with flattened history...", symbol=symbol)
-        
-        # XGBoost fit with sample weights
+        # Note: If HPO ran, models['gb'] is already fitted on X_train_flat by RandomizedSearchCV (refit=True)
+        # But VotingClassifier needs to be fitted.
         if not config.training.auto_tune_models:
-            models['gb'].fit(X_train_flat, y_train_flat, sample_weight=sample_weights_xgb)
+            models['gb'].fit(X_train_flat, y_train_flat)
         
-        # VotingClassifier (RF/LR) handles class_weight internally via constructor params
         models['technical'].fit(X_train_flat, y_train_flat)
         
         worker_logger.info("Training PyTorch models...", symbol=symbol)
@@ -370,8 +337,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         X_val_tensor = torch.FloatTensor(X_val_seq).to(device)
         y_val_tensor = torch.LongTensor(y_val_seq).to(device)
         
-        _train_pytorch_model(models['lstm'], X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor, config, class_weights=class_weights_tensor)
-        _train_pytorch_model(models['attention'], X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor, config, class_weights=class_weights_tensor)
+        _train_pytorch_model(models['lstm'], X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor, config)
+        _train_pytorch_model(models['attention'], X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor, config)
 
         # 7. Auto-Tune Ensemble Weights (Auto-ML)
         weights_config = config.ensemble_weights
@@ -508,7 +475,7 @@ class EnsembleLearner:
         
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        # Stores models AND metadata: {symbol: {'models': {...}, 'meta': {...}}}
+        # Stores models AND metadata: {symbol: {'models': {...}, 'meta': {...}, 'timestamp': datetime}}
         self.symbol_models: Dict[str, Dict[str, Any]] = {}
         self.is_trained = False
         
@@ -562,6 +529,10 @@ class EnsembleLearner:
                 meta = json.load(f)
                 if meta.get('feature_columns') != self.config.feature_columns:
                     return None
+            
+            # Parse timestamp for logic checks
+            timestamp_str = meta.get('timestamp')
+            timestamp = pd.to_datetime(timestamp_str) if timestamp_str else None
 
             models = _create_fresh_models(self.config, self.device)
             models['gb'] = joblib.load(os.path.join(symbol_path, "gb_model.pkl"))
@@ -571,10 +542,18 @@ class EnsembleLearner:
             
             return {
                 'models': models,
-                'meta': meta
+                'meta': meta,
+                'timestamp': timestamp
             }
         except Exception:
             return None
+
+    def get_last_training_time(self, symbol: str) -> Optional[datetime]:
+        """Returns the timestamp of the currently loaded model for a symbol."""
+        entry = self.symbol_models.get(symbol)
+        if entry:
+            return entry.get('timestamp')
+        return None
 
     async def predict(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
         """Async wrapper for prediction logic."""
