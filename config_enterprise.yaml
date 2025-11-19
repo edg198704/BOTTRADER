@@ -118,6 +118,10 @@ strategy:
       early_stopping_patience: 5 # Stop training if validation loss doesn't improve for this many epochs
       validation_split: 0.15 # Percentage of training data to use for validation
       min_precision_threshold: 0.55 # Require at least 55% precision on validation set to accept new model
+      
+      # --- Feature Selection ---
+      auto_feature_selection: true
+      max_features: 20
 
     # --- Model Hyperparameters ---
     hyperparameters:
