@@ -74,6 +74,78 @@ class MarketRegimeDetector:
         values = {'regime_trend': 0.0, 'regime_volatility': 1.0, 'regime_efficiency': 0.5}
         return df.fillna(value=values)
 
+    def get_regime_series(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Vectorized calculation of market regimes for the entire DataFrame.
+        Returns a Series of regime strings.
+        """
+        if df is None or df.empty:
+            return pd.Series()
+
+        mr_config = self.config.market_regime
+        
+        # Ensure features exist
+        if not {'regime_trend', 'regime_volatility', 'regime_efficiency'}.issubset(df.columns):
+            df = self.add_regime_features(df)
+
+        # --- Thresholds ---
+        trend_thresh = mr_config.trend_strength_threshold
+        vol_thresh = mr_config.volatility_multiplier
+        eff_thresh = mr_config.efficiency_threshold
+
+        # Dynamic Thresholds
+        if mr_config.use_dynamic_thresholds:
+            window = mr_config.dynamic_window
+            # Calculate rolling quantiles
+            # Note: This is computationally expensive for very large DFs, but necessary for adaptive logic
+            dynamic_trend_thresh = df['regime_trend'].abs().rolling(window=window, min_periods=100).quantile(mr_config.trend_percentile)
+            dynamic_vol_thresh = df['regime_volatility'].rolling(window=window, min_periods=100).quantile(mr_config.volatility_percentile)
+            
+            # Use dynamic if available, else static fallback (handled by max/fillna logic implicitly via series ops)
+            # We'll use the series directly in the conditions below
+            trend_thresh_series = dynamic_trend_thresh.fillna(trend_thresh)
+            vol_thresh_series = dynamic_vol_thresh.fillna(vol_thresh)
+        else:
+            trend_thresh_series = pd.Series(trend_thresh, index=df.index)
+            vol_thresh_series = pd.Series(vol_thresh, index=df.index)
+
+        # --- Conditions ---
+        # Initialize as SIDEWAYS
+        regimes = pd.Series(MarketRegime.SIDEWAYS.value, index=df.index)
+
+        # 1. ADX Filter (Priority 1 - Forces Sideways)
+        adx_mask = pd.Series(False, index=df.index)
+        if mr_config.use_adx_filter and mr_config.adx_col in df.columns:
+            adx_mask = df[mr_config.adx_col] < mr_config.adx_threshold
+            # We don't need to set it here, as default is SIDEWAYS, but we use mask to prevent other assignments
+
+        # 2. Efficiency Filter (Priority 2)
+        # If efficiency < threshold, it's either SIDEWAYS or VOLATILE
+        inefficient_mask = df['regime_efficiency'] < eff_thresh
+        volatile_mask = df['regime_volatility'] > vol_thresh_series
+        
+        # 3. Trend/Vol Logic
+        bull_mask = df['regime_trend'] > trend_thresh_series
+        bear_mask = df['regime_trend'] < -trend_thresh_series
+        
+        # Apply Logic Hierarchy (Vectorized)
+        # Start with Trend
+        regimes[bull_mask] = MarketRegime.BULL.value
+        regimes[bear_mask] = MarketRegime.BEAR.value
+        
+        # Overwrite with Volatile
+        regimes[volatile_mask] = MarketRegime.VOLATILE.value
+        
+        # Overwrite with Inefficient Logic
+        # If inefficient, it's Volatile if vol is high, else Sideways
+        regimes[inefficient_mask & volatile_mask] = MarketRegime.VOLATILE.value
+        regimes[inefficient_mask & ~volatile_mask] = MarketRegime.SIDEWAYS.value
+        
+        # Overwrite with ADX (Forces Sideways)
+        regimes[adx_mask] = MarketRegime.SIDEWAYS.value
+        
+        return regimes
+
     async def detect_regime(self, symbol: str, df: pd.DataFrame) -> Dict[str, Any]:
         """
         Analyzes the provided DataFrame to determine the market regime.
