@@ -264,6 +264,19 @@ risk_management:
     max_hold_time_hours: 24
     threshold_pct: 0.005 # Close if PnL < 0.5% after 24 hours
 
+# --- Strategy Optimizer (New) ---
+# Automatically adjusts confidence thresholds based on realized performance per regime.
+optimizer:
+  enabled: true
+  interval_hours: 24 # Run optimization every 24 hours
+  lookback_trades: 100 # Analyze last 100 trades
+  min_trades_for_adjustment: 10 # Minimum trades in a regime to trigger adjustment
+  min_profit_factor: 1.0 # If PF < 1.0, increase threshold (stricter)
+  high_performance_pf: 1.5 # If PF > 1.5, decrease threshold (looser)
+  adjustment_step: 0.02 # Change threshold by 2% per run
+  max_threshold_cap: 0.90 # Never go above 90% confidence req
+  min_threshold_floor: 0.55 # Never go below 55% confidence req
+
 backtest:
   enabled: true
   initial_balance: 10000.0
