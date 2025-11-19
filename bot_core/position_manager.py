@@ -401,6 +401,75 @@ class PositionManager:
         finally:
             session.close()
 
+    async def reduce_position(self, symbol: str, quantity: float, price: float, reason: str) -> Optional[Position]:
+        """Reduces the quantity of an open position (partial close)."""
+        async with self._db_lock:
+            return await self._run_in_executor(self._reduce_position_sync, symbol, quantity, price, reason)
+
+    def _reduce_position_sync(self, symbol: str, quantity: float, price: float, reason: str) -> Optional[Position]:
+        session = self.SessionLocal()
+        try:
+            position = session.query(Position).filter(Position.symbol == symbol, Position.status == PositionStatus.OPEN).first()
+            if not position:
+                logger.warning("No open position found to reduce for symbol", symbol=symbol)
+                return None
+
+            # If reduction quantity covers the whole position (or more), close it fully
+            if quantity >= (position.quantity * 0.999):
+                logger.info("Reduction quantity covers entire position. Closing fully.", symbol=symbol, qty=quantity, pos_qty=position.quantity)
+                session.close() # Close session before calling internal sync method to avoid conflict
+                return self._close_position_sync(symbol, price, reason)
+
+            # Calculate PnL for the portion being closed
+            pnl = (price - position.entry_price) * quantity
+            if position.side == 'SELL':
+                pnl = -pnl
+
+            # Create a "child" record for the closed portion
+            closed_chunk = Position(
+                symbol=symbol,
+                side=position.side,
+                quantity=quantity,
+                entry_price=position.entry_price,
+                status=PositionStatus.CLOSED,
+                order_id=position.order_id, # Link to original entry order
+                stop_loss_price=position.stop_loss_price,
+                take_profit_price=position.take_profit_price,
+                open_timestamp=position.open_timestamp,
+                close_timestamp=Clock.now(),
+                close_price=price,
+                pnl=pnl,
+                trailing_ref_price=position.trailing_ref_price,
+                trailing_stop_active=position.trailing_stop_active,
+                strategy_metadata=position.strategy_metadata
+            )
+            session.add(closed_chunk)
+
+            # Update the remaining position
+            position.quantity -= quantity
+            
+            self._realized_pnl += pnl
+            session.commit()
+            session.refresh(position)
+            
+            logger.info("Reduced position", symbol=symbol, reduced_by=quantity, remaining=position.quantity, pnl=f"{pnl:.2f}", reason=reason)
+
+            if self.alert_system:
+                pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+                asyncio.run_coroutine_threadsafe(self.alert_system.send_alert(
+                    level='info',
+                    message=f"{pnl_emoji} Partially closed {symbol} ({reason})",
+                    details={'symbol': symbol, 'reduced_qty': quantity, 'remaining': position.quantity, 'pnl': f'{pnl:.2f}'}
+                ), asyncio.get_running_loop())
+
+            return position
+        except Exception as e:
+            logger.error("Failed to reduce position", symbol=symbol, error=str(e))
+            session.rollback()
+            return None
+        finally:
+            session.close()
+
     async def manage_trailing_stop(self, pos: Position, current_price: float, rm_config: RiskManagementConfig) -> Position:
         async with self._db_lock:
             return await self._run_in_executor(self._manage_trailing_stop_sync, pos, current_price, rm_config)
