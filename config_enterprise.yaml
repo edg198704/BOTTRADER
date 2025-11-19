@@ -126,6 +126,9 @@ strategy:
       early_stopping_patience: 5 # Stop training if validation loss doesn't improve for this many epochs
       validation_split: 0.15 # Percentage of training data to use for validation
       min_precision_threshold: 0.55 # Require at least 55% precision on validation set to accept new model
+      min_profit_factor: 1.05 # Require positive expectancy
+      min_sharpe_ratio: 0.05 # Require positive risk-adjusted return
+      min_improvement_pct: 0.02 # Require 2% improvement over previous model to replace it
 
     # --- Model Hyperparameters ---
     hyperparameters:
