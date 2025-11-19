@@ -47,7 +47,7 @@ logger = get_logger(__name__)
 # --- Standalone Helper Functions (Pickle-safe for Multiprocessing) ---
 
 def _create_fresh_models(config: AIEnsembleStrategyParams, num_features: int, device) -> Dict[str, Any]:
-    """Creates a fresh set of untrained model instances based on configuration."""
+    """Creates a fresh set of untrained model instances based on configuration and dynamic feature count."""
     hp = config.hyperparameters
     xgb_config = hp.xgboost
     rf_config = hp.random_forest
@@ -128,42 +128,21 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
 
     try:
         # 1. Prepare Data
-        # Normalize (using all candidate features defined in config)
-        df_norm = FeatureProcessor.normalize(df, config)
+        # Process (Lag generation + Normalization)
+        df_proc = FeatureProcessor.process_data(df, config)
+        num_features = df_proc.shape[1]
+        
         # Create Labels
         labels = FeatureProcessor.create_labels(df, config)
         
         # Align Data (drop NaNs from rolling windows and shifting)
-        common_index = df_norm.index.intersection(labels.index)
+        common_index = df_proc.index.intersection(labels.index)
         if len(common_index) < 100:
             worker_logger.warning("Insufficient data after alignment.")
             return False
             
-        X_full = df_norm.loc[common_index].values
+        X = df_proc.loc[common_index].values
         y = labels.loc[common_index].values.astype(int)
-        
-        # --- Feature Selection ---
-        selected_features = config.feature_columns
-        
-        if config.training.auto_feature_selection:
-            worker_logger.info("Performing automatic feature selection...")
-            # Train a temporary XGBoost model to determine feature importance
-            sel_model = XGBClassifier(n_estimators=50, max_depth=3, random_state=42, use_label_encoder=False, eval_metric='logloss')
-            sel_model.fit(X_full, y)
-            
-            importances = sel_model.feature_importances_
-            # Get indices of top N features
-            top_n = min(config.training.max_features, len(config.feature_columns))
-            top_indices = np.argsort(importances)[::-1][:top_n]
-            
-            # Filter features
-            selected_features = [config.feature_columns[i] for i in top_indices]
-            X = X_full[:, top_indices]
-            worker_logger.info(f"Selected {len(selected_features)} features: {selected_features}")
-        else:
-            X = X_full
-
-        num_features = len(selected_features)
 
         # Split Train/Val
         split_idx = int(len(X) * (1 - config.training.validation_split))
@@ -173,7 +152,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         # Setup Device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Create Models with correct input dimension
+        # Create Models with dynamic feature count
         models = _create_fresh_models(config, num_features, device)
         trained_models = {}
         metrics = {}
@@ -204,12 +183,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             
             # Feature Importance (if available)
             if hasattr(model, 'feature_importances_'):
-                # Map importance back to selected feature names
-                imps = model.feature_importances_.tolist()
-                if len(imps) == len(selected_features):
-                    feature_importance[name] = dict(zip(selected_features, imps))
-                else:
-                    feature_importance[name] = imps
+                feature_importance[name] = model.feature_importances_.tolist()
 
         # 3. Train PyTorch Models
         seq_len = config.features.sequence_length
@@ -363,7 +337,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             'timestamp': datetime.now().isoformat(),
             'metrics': metrics,
             'feature_importance': feature_importance,
-            'feature_columns': selected_features # Save the ACTUAL features used
+            'feature_columns': config.feature_columns,
+            'num_features': num_features # Save this to ensure correct loading
         }
         with open(os.path.join(save_dir, "metadata.json"), 'w') as f:
             json.dump(meta, f, indent=2)
@@ -429,22 +404,33 @@ class EnsembleLearner:
                 meta = json.load(f)
 
             # --- CONFIG CONSISTENCY CHECK ---
-            # The model might use a subset of features if auto_feature_selection was on.
-            # We must ensure that all features required by the model are available in the current config.
+            # Ensure the features used to train the model match the current config.
             saved_features = meta.get('feature_columns', [])
-            current_candidate_features = self.config.feature_columns
+            current_features = self.config.feature_columns
             
-            # Check if saved_features is a subset of current_candidate_features
-            if not set(saved_features).issubset(set(current_candidate_features)):
+            if saved_features != current_features:
                 logger.warning(
                     f"Feature mismatch for {symbol}. "
-                    f"Model requires features not present in current config. "
-                    f"Missing: {set(saved_features) - set(current_candidate_features)}. "
+                    f"Saved: {len(saved_features)} features, Current: {len(current_features)} features. "
                     "Model will be discarded to trigger retrain."
                 )
                 if symbol in self.symbol_models:
                     del self.symbol_models[symbol]
                 return
+            
+            # Calculate expected feature count (base + lags) to instantiate models correctly
+            expected_num_features = FeatureProcessor.get_expected_feature_count(self.config)
+            saved_num_features = meta.get('num_features', len(saved_features))
+            
+            if expected_num_features != saved_num_features:
+                 logger.warning(
+                    f"Feature count mismatch for {symbol}. "
+                    f"Saved: {saved_num_features}, Expected: {expected_num_features}. "
+                    "Model will be discarded to trigger retrain."
+                )
+                 if symbol in self.symbol_models:
+                    del self.symbol_models[symbol]
+                 return
             # --------------------------------
 
             models = {}
@@ -455,11 +441,10 @@ class EnsembleLearner:
                     models[name] = joblib.load(path)
 
             # Load PyTorch Models
-            num_features = len(saved_features)
             if 'lstm' in self.config.ensemble_weights.dict():
                 path = os.path.join(load_dir, "lstm.pth")
                 if os.path.exists(path):
-                    lstm = LSTMPredictor(num_features, self.config.hyperparameters.lstm.hidden_dim, 
+                    lstm = LSTMPredictor(expected_num_features, self.config.hyperparameters.lstm.hidden_dim, 
                                          self.config.hyperparameters.lstm.num_layers, 
                                          self.config.hyperparameters.lstm.dropout).to(self.device)
                     lstm.load_state_dict(torch.load(path, map_location=self.device))
@@ -469,7 +454,7 @@ class EnsembleLearner:
             if 'attention' in self.config.ensemble_weights.dict():
                 path = os.path.join(load_dir, "attention.pth")
                 if os.path.exists(path):
-                    attn = AttentionNetwork(num_features, self.config.hyperparameters.attention.hidden_dim,
+                    attn = AttentionNetwork(expected_num_features, self.config.hyperparameters.attention.hidden_dim,
                                             self.config.hyperparameters.attention.num_layers,
                                             self.config.hyperparameters.attention.nhead,
                                             self.config.hyperparameters.attention.dropout).to(self.device)
@@ -479,10 +464,9 @@ class EnsembleLearner:
 
             self.symbol_models[symbol] = {
                 'models': models,
-                'meta': meta,
-                'features': saved_features # Store the specific features this model uses
+                'meta': meta
             }
-            logger.info(f"Models reloaded successfully for {symbol}. Using {len(saved_features)} features.")
+            logger.info(f"Models reloaded successfully for {symbol}")
 
         except Exception as e:
             logger.error(f"Failed to reload models for {symbol}: {e}")
@@ -497,25 +481,15 @@ class EnsembleLearner:
 
         entry = self.symbol_models[symbol]
         models = entry['models']
-        required_features = entry['features']
         
-        # Prepare Data
-        # 1. Normalize using ALL candidate features (to maintain Z-score consistency with training)
-        df_norm = FeatureProcessor.normalize(df, self.config)
-        
-        # 2. Filter to only the features used by this specific model
-        try:
-            X_df = df_norm[required_features].iloc[-1:]
-            X = X_df.values
-        except KeyError as e:
-            logger.error(f"Missing required features for inference: {e}")
-            return {}
+        # Prepare Data (Process features including lags)
+        df_proc = FeatureProcessor.process_data(df, self.config)
+        X = df_proc.iloc[-1:].values # Last row for prediction
         
         # Prepare Sequences for NN
         seq_len = self.config.features.sequence_length
-        if len(df_norm) >= seq_len:
-            # Slice sequence and filter features
-            X_seq = df_norm[required_features].iloc[-seq_len:].values.reshape(1, seq_len, -1)
+        if len(df_proc) >= seq_len:
+            X_seq = df_proc.iloc[-seq_len:].values.reshape(1, seq_len, -1)
         else:
             X_seq = None
 
@@ -604,11 +578,22 @@ class EnsembleLearner:
         top_features = {}
         if 'gb' in models and hasattr(models['gb'], 'feature_importances_'):
             imps = models['gb'].feature_importances_
-            # Use the required_features list to map indices back to names
+            # We need to map these back to feature names (base + lags)
+            # Reconstruct feature names
+            cols = self.config.feature_columns.copy()
+            lags = self.config.features.lag_features
+            depth = self.config.features.lag_depth
+            if depth > 0 and lags:
+                for col in lags:
+                    if col in cols:
+                        for i in range(1, depth + 1):
+                            cols.append(f"{col}_lag_{i}")
+            
+            # Sort and take top 5
             indices = np.argsort(imps)[::-1][:5]
             for idx in indices:
-                if idx < len(required_features):
-                    top_features[required_features[idx]] = float(imps[idx])
+                if idx < len(cols):
+                    top_features[cols[idx]] = float(imps[idx])
 
         return {
             'action': best_action,
