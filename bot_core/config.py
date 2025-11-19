@@ -26,6 +26,8 @@ class EnsembleWeightsConfig(BaseModel):
     attention: float = 0.2
     auto_tune: bool = True
     use_stacking: bool = True
+    # Penalize confidence if models disagree (StdDev of probs * penalty)
+    disagreement_penalty: float = 0.5
 
 class MarketRegimeConfig(BaseModel):
     # Static Fallbacks
