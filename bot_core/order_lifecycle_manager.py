@@ -26,7 +26,8 @@ class OrderLifecycleManager:
                      quantity: float, 
                      initial_price: Optional[float], 
                      market_details: Optional[Dict[str, Any]] = None,
-                     on_order_replace: Optional[Callable[[str, str], Awaitable[None]]] = None) -> Optional[Dict[str, Any]]:
+                     on_order_replace: Optional[Callable[[str, str], Awaitable[None]]] = None,
+                     trade_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Main entry point to manage an order's lifecycle.
         """
@@ -41,7 +42,7 @@ class OrderLifecycleManager:
         if not is_chaseable:
             return await self._poll_order_until_filled_or_timeout(order_id, symbol)
 
-        return await self._chase_order_lifecycle(order_id, symbol, side, quantity, initial_price, market_details, on_order_replace)
+        return await self._chase_order_lifecycle(order_id, symbol, side, quantity, initial_price, market_details, on_order_replace, trade_id)
 
     async def _chase_order_lifecycle(self, 
                                      initial_order_id: str, 
@@ -50,7 +51,8 @@ class OrderLifecycleManager:
                                      total_quantity: float, 
                                      initial_price: Optional[float], 
                                      market_details: Optional[Dict[str, Any]],
-                                     on_order_replace: Optional[Callable[[str, str], Awaitable[None]]] = None) -> Optional[Dict[str, Any]]:
+                                     on_order_replace: Optional[Callable[[str, str], Awaitable[None]]] = None,
+                                     trade_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Handles the advanced order chasing logic for LIMIT orders, accounting for partial fills.
         """
@@ -180,7 +182,15 @@ class OrderLifecycleManager:
             new_price = market_price + price_improvement if side.upper() == 'BUY' else market_price - price_improvement
             
             try:
-                new_order_result = await self.exchange_api.place_order(symbol, side, 'LIMIT', remaining_qty, price=new_price)
+                # Construct deterministic clientOrderId if trade_id is available
+                extra_params = {}
+                if trade_id:
+                    extra_params['clientOrderId'] = f"{trade_id}_chase_{chase_attempts}"
+
+                new_order_result = await self.exchange_api.place_order(
+                    symbol, side, 'LIMIT', remaining_qty, price=new_price, extra_params=extra_params
+                )
+                
                 if new_order_result and new_order_result.get('orderId'):
                     new_order_id = new_order_result['orderId']
                     
