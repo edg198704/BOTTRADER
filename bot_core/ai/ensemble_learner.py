@@ -5,8 +5,10 @@ import logging
 import shutil
 import numpy as np
 import pandas as pd
+import asyncio
 from typing import Dict, Any, Tuple, Optional, List
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams
@@ -408,14 +410,6 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             champion_models = champion_data['models']
             champion_weights = champion_data['meta'].get('optimized_weights')
             
-            # Note: Champion might use different features. 
-            # _load_saved_models ensures we can generate them, but we need to extract them correctly here.
-            # However, for simplicity in this architecture, we re-evaluate the champion using ITS OWN feature set logic
-            # if we were doing strict versioning. 
-            # Current simplification: We only compare if the champion is compatible with current config superset.
-            # If feature selection changed drastically, the champion might be using features we just discarded.
-            # To handle this robustly, we would need to reconstruct the champion's X from df_proc using its meta.
-            
             champ_features = champion_data['meta'].get('active_feature_columns', champion_data['meta'].get('feature_columns'))
             
             # Reconstruct X for champion
@@ -602,12 +596,20 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
 class EnsembleLearner:
     """
     Manages the lifecycle of AI models: loading, inference, and state management.
+    Uses a ThreadPoolExecutor to prevent blocking the main asyncio loop during CPU-bound operations.
     """
     def __init__(self, config: AIEnsembleStrategyParams):
         self.config = config
         self.symbol_models: Dict[str, Dict[str, Any]] = {}
         self.device = torch.device("cuda" if ML_AVAILABLE and torch.cuda.is_available() else "cpu")
+        # Executor for inference and loading to avoid blocking main loop
+        self.executor = ThreadPoolExecutor(max_workers=4)
         logger.info(f"EnsembleLearner initialized. Device: {self.device}")
+
+    async def close(self):
+        """Shuts down the internal executor."""
+        self.executor.shutdown(wait=True)
+        logger.info("EnsembleLearner executor shut down.")
 
     @property
     def is_trained(self) -> bool:
@@ -634,7 +636,16 @@ class EnsembleLearner:
             return
 
         try:
-            loaded_data = _load_saved_models(symbol, self.config.model_path, self.config, self.device)
+            loop = asyncio.get_running_loop()
+            # Offload blocking I/O (joblib.load, torch.load) to thread
+            loaded_data = await loop.run_in_executor(
+                self.executor, 
+                _load_saved_models, 
+                symbol, 
+                self.config.model_path, 
+                self.config, 
+                self.device
+            )
             
             if loaded_data:
                 self.symbol_models[symbol] = loaded_data
@@ -648,14 +659,12 @@ class EnsembleLearner:
         except Exception as e:
             logger.error(f"Failed to reload models for {symbol}: {e}")
 
-    async def predict(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
-        """Runs inference using the ensemble of models."""
-        if symbol not in self.symbol_models:
-            await self.reload_models(symbol)
-            if symbol not in self.symbol_models:
-                return {}
+    def _predict_sync(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
+        """Synchronous inference logic to be run in executor."""
+        entry = self.symbol_models.get(symbol)
+        if not entry:
+            return {}
 
-        entry = self.symbol_models[symbol]
         models = entry['models']
         meta = entry['meta']
         
@@ -787,3 +796,14 @@ class EnsembleLearner:
             'metrics': meta.get('metrics', {}),
             'optimized_weights': optimized_weights if use_dynamic else None
         }
+
+    async def predict(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
+        """Runs inference using the ensemble of models."""
+        if symbol not in self.symbol_models:
+            await self.reload_models(symbol)
+            if symbol not in self.symbol_models:
+                return {}
+
+        loop = asyncio.get_running_loop()
+        # Offload CPU-bound inference to thread
+        return await loop.run_in_executor(self.executor, self._predict_sync, df, symbol)
