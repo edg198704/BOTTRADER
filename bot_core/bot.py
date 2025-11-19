@@ -45,6 +45,9 @@ class TradingBot:
         self.market_details: Dict[str, Dict[str, Any]] = {}
         self.tasks: list[asyncio.Task] = []
         
+        # Track processed candles to avoid redundant analysis on the same closed candle
+        self.processed_candles: Dict[str, pd.Timestamp] = {}
+        
         # Executor for CPU-intensive tasks like AI training
         self.process_executor = ProcessPoolExecutor(max_workers=2)
         
@@ -247,11 +250,18 @@ class TradingBot:
             logger.warning("Trading is halted by RiskManager.")
             return
 
-        df_with_indicators = self.data_handler.get_market_data(symbol)
-        if df_with_indicators is None:
+        # Request only CLOSED candles to prevent repainting
+        df_with_indicators = self.data_handler.get_market_data(symbol, include_forming=False)
+        if df_with_indicators is None or df_with_indicators.empty:
             logger.warning("Could not get market data from handler.", symbol=symbol)
             return
         
+        # Check if we have already processed this specific candle
+        last_candle_ts = df_with_indicators.index[-1]
+        if self.processed_candles.get(symbol) == last_candle_ts:
+            # We have already analyzed this closed candle. Wait for the next one.
+            return
+
         if symbol not in self.latest_prices:
             logger.warning("Latest price for symbol not available yet.", symbol=symbol)
             return
@@ -260,7 +270,11 @@ class TradingBot:
         position = await self.position_manager.get_open_position(symbol)
         signal = await self.strategy.analyze_market(symbol, df_with_indicators, position)
 
-        if signal: await self._handle_signal(signal, df_with_indicators, position)
+        if signal: 
+            await self._handle_signal(signal, df_with_indicators, position)
+        
+        # Mark this candle as processed so we don't re-analyze it in the next tick
+        self.processed_candles[symbol] = last_candle_ts
 
     async def _monitoring_loop(self):
         """Periodically runs health checks and portfolio monitoring."""
