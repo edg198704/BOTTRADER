@@ -58,6 +58,14 @@ class PositionMonitor:
         if not current_price:
             return
 
+        # --- Breakeven Stop Logic ---
+        if self.config.risk_management.breakeven.enabled:
+            # Check if we should move SL to breakeven
+            # PositionManager handles the logic and DB updates.
+            pos = await self.position_manager.manage_breakeven_stop(
+                pos, current_price, self.config.risk_management.breakeven
+            )
+
         # --- Trailing Stop Logic ---
         if self.config.risk_management.use_trailing_stop:
             # PositionManager handles the logic and DB updates.
