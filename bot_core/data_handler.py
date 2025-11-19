@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from bot_core.logger import get_logger
 
-from bot_core.config import BotConfig
+from bot_core.config import BotConfig, AIEnsembleStrategyParams
 from bot_core.exchange_api import ExchangeAPI
 from bot_core.utils import generate_indicator_rename_map, parse_timeframe_to_seconds, Clock, calculate_min_history_depth
 
@@ -58,8 +58,13 @@ class DataHandler:
         os.makedirs(self.cache_dir, exist_ok=True)
         self.auto_save_interval = 900 # Save every 15 minutes
         
-        # Buffer Limits
-        self.max_training_buffer = 10000 # Max rows to keep in raw buffer
+        # Dynamic Buffer Sizing for AI
+        self.max_training_buffer = 10000
+        if hasattr(config.strategy.params, 'training_data_limit'):
+             # Keep a buffer slightly larger than training limit to avoid edge cases
+             self.max_training_buffer = int(config.strategy.params.training_data_limit * 1.2)
+             logger.info(f"Adjusted max_training_buffer to {self.max_training_buffer} based on strategy config.")
+
         # Analysis window: Enough for indicators to converge (e.g. SMA 200 + warmup)
         self.analysis_window = max(self.history_limit * 2, 500)
         
