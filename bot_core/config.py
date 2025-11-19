@@ -28,6 +28,8 @@ class EnsembleWeightsConfig(BaseModel):
     use_stacking: bool = True
     # Penalize confidence if models disagree (StdDev of probs * penalty)
     disagreement_penalty: float = 0.5
+    # Optimize weights per regime (Bull, Bear, Sideways, Volatile)
+    use_regime_specific_weights: bool = False
 
 class MarketRegimeConfig(BaseModel):
     # Static Fallbacks
@@ -86,6 +88,8 @@ class AITrainingConfig(BaseModel):
     n_iter_search: int = 10
     # --- Data Handling ---
     use_class_weighting: bool = True
+    # Calibration method: 'isotonic', 'sigmoid', or 'none'
+    calibration_method: str = 'isotonic'
 
 class AILSTMConfig(BaseModel):
     hidden_dim: int = 64
