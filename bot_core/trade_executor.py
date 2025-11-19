@@ -3,7 +3,7 @@ from typing import Dict, Any, Optional
 
 from bot_core.logger import get_logger
 from bot_core.config import BotConfig
-from bot_core.exchange_api import ExchangeAPI
+from bot_core.exchange_api import ExchangeAPI, BotInsufficientFundsError, BotInvalidOrderError
 from bot_core.position_manager import PositionManager, Position
 from bot_core.risk_manager import RiskManager
 from bot_core.order_sizer import OrderSizer
@@ -112,7 +112,15 @@ class TradeExecutor:
             limit_price = current_price * (1 - offset) if side == 'BUY' else current_price * (1 + offset)
 
         # 1. Place Order
-        order_result = await self.exchange_api.place_order(symbol, side, order_type, final_quantity, price=limit_price)
+        try:
+            order_result = await self.exchange_api.place_order(symbol, side, order_type, final_quantity, price=limit_price)
+        except BotInvalidOrderError as e:
+            logger.error("Invalid order parameters for open.", error=str(e))
+            return
+        except Exception as e:
+            logger.error("Failed to place open order.", error=str(e))
+            return
+
         order_id = order_result.get('orderId')
         
         if not (order_result and order_id):
@@ -210,7 +218,19 @@ class TradeExecutor:
         else:
             order_type = 'MARKET'
 
-        order_result = await self.exchange_api.place_order(position.symbol, close_side, order_type, close_quantity, price=limit_price)
+        try:
+            order_result = await self.exchange_api.place_order(position.symbol, close_side, order_type, close_quantity, price=limit_price)
+        except BotInsufficientFundsError:
+            logger.warning("Insufficient funds to close position. Checking for phantom state.", symbol=position.symbol)
+            await self._handle_phantom_position(position)
+            return
+        except BotInvalidOrderError as e:
+            logger.error("Invalid order parameters for close.", error=str(e))
+            return
+        except Exception as e:
+            logger.error("Failed to place close order.", error=str(e))
+            return
+
         if not (order_result and order_result.get('orderId')):
             logger.error("Failed to place close order.", symbol=position.symbol)
             return
@@ -236,3 +256,48 @@ class TradeExecutor:
                 message=f"🔥 FAILED TO CLOSE position for {position.symbol}. Manual intervention may be required.",
                 details={'symbol': position.symbol, 'order_id': order_result.get('orderId'), 'reason': reason, 'final_status': final_status}
             )
+
+    async def _handle_phantom_position(self, position: Position):
+        """
+        Verifies if a position is truly missing from the exchange (phantom) and reconciles the DB.
+        """
+        try:
+            base_asset = position.symbol.split('/')[0]
+            balances = await self.exchange_api.get_balance()
+            asset_balance = balances.get(base_asset, {}).get('total', 0.0)
+            
+            # Check open orders that might be locking the balance
+            open_orders = await self.exchange_api.fetch_open_orders(position.symbol)
+            
+            # Logic: If we have significantly less than the position quantity AND no open orders locking it
+            # Then the position is likely already gone (sold externally or previous close update failed).
+            
+            # Tolerance for dust (e.g. 1% of position size)
+            if asset_balance < (position.quantity * 0.01) and not open_orders:
+                logger.info("Confirmed phantom position (DB open, Exchange closed). Reconciling.", 
+                            db_qty=position.quantity, exchange_bal=asset_balance)
+                
+                # Estimate close price (Current market price) for PnL tracking purposes
+                close_price = self.latest_prices.get(position.symbol, position.entry_price)
+                
+                await self.position_manager.close_position(
+                    position.symbol, 
+                    close_price, 
+                    reason="Phantom Reconciliation"
+                )
+                
+                await self.alert_system.send_alert(
+                    level='warning',
+                    message=f"⚠️ Auto-Reconciled Phantom Position for {position.symbol}",
+                    details={'db_qty': position.quantity, 'wallet_bal': asset_balance}
+                )
+            else:
+                logger.error("Insufficient funds error but wallet has balance or open orders. Manual check needed.",
+                             db_qty=position.quantity, exchange_bal=asset_balance, open_orders=len(open_orders))
+                await self.alert_system.send_alert(
+                    level='critical',
+                    message=f"🚨 Insufficient Funds to close {position.symbol} but state is ambiguous.",
+                    details={'db_qty': position.quantity, 'wallet_bal': asset_balance, 'open_orders': len(open_orders)}
+                )
+        except Exception as e:
+            logger.error("Error during phantom position reconciliation", error=str(e))
