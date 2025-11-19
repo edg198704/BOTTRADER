@@ -23,6 +23,7 @@ try:
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import precision_score, classification_report, log_loss
     from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
+    from sklearn.utils.class_weight import compute_class_weight, compute_sample_weight
     from xgboost import XGBClassifier
     ML_AVAILABLE = True
 except ImportError:
@@ -37,6 +38,8 @@ except ImportError:
     def precision_score(*args, **kwargs): return 0.0
     def log_loss(*args, **kwargs): return 0.0
     def classification_report(*args, **kwargs): return ""
+    def compute_class_weight(*args, **kwargs): return []
+    def compute_sample_weight(*args, **kwargs): return []
     class nn:
         class Module: pass
     class optim: pass
@@ -56,6 +59,9 @@ def _create_fresh_models(config: AIEnsembleStrategyParams, num_features: int, de
     lstm_config = hp.lstm
     attn_config = hp.attention
 
+    # Determine class weight setting for Sklearn models
+    cw_option = 'balanced' if config.training.use_class_weighting else None
+
     models = {
         'gb': XGBClassifier(
             n_estimators=xgb_config.n_estimators,
@@ -64,17 +70,20 @@ def _create_fresh_models(config: AIEnsembleStrategyParams, num_features: int, de
             subsample=xgb_config.subsample,
             colsample_bytree=xgb_config.colsample_bytree,
             random_state=42, use_label_encoder=False, eval_metric='logloss'
+            # XGBoost handles weights via fit(sample_weight=...), not init
         ),
         'technical': VotingClassifier(estimators=[
             ('rf', RandomForestClassifier(
                 n_estimators=rf_config.n_estimators,
                 max_depth=rf_config.max_depth,
                 min_samples_leaf=rf_config.min_samples_leaf,
+                class_weight=cw_option,
                 random_state=42
             )),
             ('lr', LogisticRegression(
                 max_iter=lr_config.max_iter,
                 C=lr_config.C,
+                class_weight=cw_option,
                 random_state=42
             ))
         ], voting='soft')
@@ -91,7 +100,7 @@ def _create_fresh_models(config: AIEnsembleStrategyParams, num_features: int, de
     
     return models
 
-def _optimize_hyperparameters(model, X, y, param_dist, n_iter, logger_instance):
+def _optimize_hyperparameters(model, X, y, param_dist, n_iter, logger_instance, fit_params=None):
     """Runs RandomizedSearchCV to find better hyperparameters."""
     try:
         # Use TimeSeriesSplit to prevent data leakage (future peeking)
@@ -106,12 +115,12 @@ def _optimize_hyperparameters(model, X, y, param_dist, n_iter, logger_instance):
             random_state=42,
             verbose=0
         )
-        search.fit(X, y)
+        search.fit(X, y, **(fit_params or {}))
         logger_instance.info(f"Hyperparameter optimization complete. Best score: {search.best_score_:.4f}")
         return search.best_estimator_
     except Exception as e:
         logger_instance.warning(f"Hyperparameter optimization failed: {e}. Using default parameters.")
-        model.fit(X, y)
+        model.fit(X, y, **(fit_params or {}))
         return model
 
 def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.ndarray, iterations: int = 1000) -> Dict[str, float]:
@@ -189,9 +198,26 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         X_train, X_val = X[:split_idx], X[split_idx:]
         y_train, y_val = y[:split_idx], y[split_idx:]
 
-        # Setup Device
+        # --- Class Weighting Calculation ---
+        sample_weights = None
+        torch_weights = None
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+
+        if config.training.use_class_weighting:
+            # For XGBoost (Sample Weights)
+            sample_weights = compute_sample_weight(class_weight='balanced', y=y_train)
+            
+            # For PyTorch (Class Weights Tensor)
+            unique_classes = np.unique(y_train)
+            class_weights = compute_class_weight(class_weight='balanced', classes=unique_classes, y=y_train)
+            
+            # Map to fixed size 3 array [Sell(0), Hold(1), Buy(2)] to handle missing classes in small datasets
+            weight_map = {c: w for c, w in zip(unique_classes, class_weights)}
+            final_weights = [weight_map.get(c, 1.0) for c in [0, 1, 2]]
+            torch_weights = torch.FloatTensor(final_weights).to(device)
+            
+            worker_logger.info(f"Using Class Weights: {final_weights}")
+
         # Create Models with dynamic feature count
         models = _create_fresh_models(config, num_features, device)
         trained_models = {}
@@ -203,6 +229,11 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             if name in ['lstm', 'attention']: continue
             
             worker_logger.info(f"Training {name}...")
+            
+            fit_params = {}
+            if name == 'gb' and sample_weights is not None:
+                fit_params['sample_weight'] = sample_weights
+
             if config.training.auto_tune_models and name == 'gb':
                 # Example param grid for XGBoost
                 param_dist = {
@@ -210,9 +241,9 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                     'max_depth': [3, 5, 7],
                     'learning_rate': [0.01, 0.1, 0.2]
                 }
-                model = _optimize_hyperparameters(model, X_train, y_train, param_dist, config.training.n_iter_search, worker_logger)
+                model = _optimize_hyperparameters(model, X_train, y_train, param_dist, config.training.n_iter_search, worker_logger, fit_params)
             else:
-                model.fit(X_train, y_train)
+                model.fit(X_train, y_train, **fit_params)
             
             trained_models[name] = model
             
@@ -239,7 +270,12 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 
                 model = models[name]
                 optimizer = optim.Adam(model.parameters(), lr=config.training.learning_rate)
-                criterion = nn.CrossEntropyLoss()
+                
+                # Apply weights to loss function if calculated
+                if torch_weights is not None:
+                    criterion = nn.CrossEntropyLoss(weight=torch_weights)
+                else:
+                    criterion = nn.CrossEntropyLoss()
                 
                 worker_logger.info(f"Training {name} (PyTorch)...")
                 model.train()
