@@ -102,6 +102,7 @@ async def main():
     position_monitor = PositionMonitor(
         config=config,
         position_manager=position_manager,
+        risk_manager=risk_manager,
         shared_latest_prices=latest_prices
     )
 
