@@ -4,6 +4,7 @@ from typing import Dict, Callable, Awaitable
 from bot_core.logger import get_logger
 from bot_core.config import BotConfig
 from bot_core.position_manager import PositionManager, Position
+from bot_core.risk_manager import RiskManager
 
 logger = get_logger(__name__)
 
@@ -12,9 +13,10 @@ class PositionMonitor:
     Monitors all open positions for stop-loss, take-profit, and trailing stop updates.
     This component is responsible for triggering the closure of positions based on risk parameters.
     """
-    def __init__(self, config: BotConfig, position_manager: PositionManager, shared_latest_prices: Dict[str, float]):
+    def __init__(self, config: BotConfig, position_manager: PositionManager, risk_manager: RiskManager, shared_latest_prices: Dict[str, float]):
         self.config = config
         self.position_manager = position_manager
+        self.risk_manager = risk_manager
         self.latest_prices = shared_latest_prices
         self.running = False
         self._task: asyncio.Task = None
@@ -51,7 +53,7 @@ class PositionMonitor:
             await asyncio.sleep(5) # Check positions frequently
 
     async def _check_position(self, pos: Position):
-        """Checks a single position for TSL, SL, and TP triggers."""
+        """Checks a single position for TSL, SL, TP, and Stagnation triggers."""
         current_price = self.latest_prices.get(pos.symbol)
         if not current_price:
             return
@@ -64,6 +66,13 @@ class PositionMonitor:
             pos = await self.position_manager.manage_trailing_stop(
                 pos, current_price, self.config.risk_management
             )
+
+        # --- Time-Based / Stagnation Exit ---
+        if self.config.risk_management.time_based_exit.enabled:
+             should_exit = self.risk_manager.check_time_based_exit(pos, current_price)
+             if should_exit:
+                 await self._close_position_callback(pos, "Time-Based Stagnation")
+                 return
 
         # --- SL/TP Execution ---
         if pos.side == 'BUY':
