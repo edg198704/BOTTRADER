@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from bot_core.logger import get_logger
 from bot_core.config import TelegramConfig
+from bot_core.strategy import AIEnsembleStrategy
 
 # Safe import for telegram
 try:
@@ -39,6 +40,7 @@ class TelegramBot:
         self.application.add_handler(CommandHandler("status", self.status_command))
         self.application.add_handler(CommandHandler("stop", self.stop_command))
         self.application.add_handler(CommandHandler("positions", self.positions_command))
+        self.application.add_handler(CommandHandler("ai", self.ai_command))
 
     async def _is_admin(self, update: Update) -> bool:
         user_id = update.effective_user.id
@@ -54,6 +56,7 @@ class TelegramBot:
             "Welcome to the Trading Bot!\n" 
             "/status - Get detailed bot status and equity.\n"
             "/positions - View all open positions with live PnL.\n"
+            "/ai <symbol> - View AI model details and top features.\n"
             "/stop - Send a shutdown signal to the bot."
         )
 
@@ -138,4 +141,59 @@ class TelegramBot:
             
             message += (
                 f"{side_emoji} *{symbol_md}* \({pos.side}\)\n"
-                f
+                f"Qty: `{pos.quantity}` | Entry: `{pos.entry_price}`\n"
+                f"Current: `{current_price}`\n"
+                f"PnL: {pnl_emoji} `${pnl:.2f}` \(`{pnl_pct:.2f}%`\)\n"
+                f"-------------------\n"
+            )
+
+        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN_V2)
+
+    async def ai_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._is_admin(update): return
+        
+        if not context.args:
+            await update.message.reply_text("Usage: /ai <symbol> (e.g., /ai BTC/USDT)")
+            return
+
+        symbol = context.args[0]
+        strategy = self.bot_state.get('strategy')
+        
+        if not strategy or not isinstance(strategy, AIEnsembleStrategy):
+            await update.message.reply_text("AI Strategy is not active.")
+            return
+
+        # Access the ensemble learner directly
+        learner = strategy.ensemble_learner
+        entry = learner.symbol_models.get(symbol)
+        
+        if not entry:
+            await update.message.reply_text(f"No trained models found for {symbol}.")
+            return
+
+        meta = entry.get('meta', {})
+        metrics = meta.get('metrics', {})
+        top_features = meta.get('top_features', {})
+        timestamp = meta.get('timestamp', 'N/A')
+
+        # Format Metrics
+        prec_buy = metrics.get('precision_buy', 0.0) * 100
+        prec_sell = metrics.get('precision_sell', 0.0) * 100
+        avg_prec = metrics.get('avg_action_precision', 0.0) * 100
+
+        # Format Features
+        features_str = ""
+        for feat, imp in top_features.items():
+            features_str += f"• `{feat}`: {imp:.4f}\n"
+
+        message = (
+            f"🧠 *AI Model Status: {symbol}*\n\n"
+            f"*Last Retrained*: `{timestamp}`\n"
+            f"*Avg Precision*: `{avg_prec:.1f}%`\n"
+            f"*Buy Precision*: `{prec_buy:.1f}%`\n"
+            f"*Sell Precision*: `{prec_sell:.1f}%`\n\n"
+            f"*Top Contributing Features*:\n"
+            f"{features_str}"
+        )
+        
+        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN_V2)
