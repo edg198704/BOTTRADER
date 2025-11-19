@@ -114,6 +114,45 @@ def _optimize_hyperparameters(model, X, y, param_dist, n_iter, logger_instance):
         model.fit(X, y)
         return model
 
+def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.ndarray, iterations: int = 1000) -> Dict[str, float]:
+    """
+    Finds optimal weights for the ensemble using Random Search to minimize Log Loss.
+    predictions: Dict of model_name -> prob_array (N, 3)
+    y_true: array (N,)
+    """
+    model_names = list(predictions.keys())
+    if not model_names:
+        return {}
+    
+    best_score = float('inf')
+    best_weights = {name: 1.0/len(model_names) for name in model_names}
+    
+    # Convert dict to list of arrays for fast vectorized math
+    # shape: (num_models, num_samples, num_classes)
+    pred_stack = np.array([predictions[name] for name in model_names])
+    
+    for _ in range(iterations):
+        # Generate random weights summing to 1
+        w = np.random.dirichlet(np.ones(len(model_names)))
+        
+        # Weighted average: sum(w[i] * pred_stack[i])
+        # w shape: (num_models,)
+        # pred_stack shape: (num_models, num_samples, num_classes)
+        # Result: (num_samples, num_classes)
+        ensemble_probs = np.tensordot(w, pred_stack, axes=([0],[0]))
+        
+        # Clip to avoid log(0)
+        ensemble_probs = np.clip(ensemble_probs, 1e-15, 1 - 1e-15)
+        
+        # Calculate Log Loss
+        score = log_loss(y_true, ensemble_probs)
+        
+        if score < best_score:
+            best_score = score
+            best_weights = {name: float(w[i]) for i, name in enumerate(model_names)}
+            
+    return best_weights
+
 def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrategyParams) -> bool:
     """
     Standalone function to train models in a separate process.
@@ -227,29 +266,78 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                     prec = precision_score(y_seq_val, predicted.cpu().numpy(), average=None, zero_division=0)
                     metrics[name] = {'precision': prec.tolist()}
 
-        # 4. Walk-Forward Validation (Profitability Check)
+        # 4. Dynamic Weight Optimization (Auto-Tune)
+        optimized_weights = {}
+        if config.ensemble_weights.auto_tune:
+            worker_logger.info("Optimizing ensemble weights on validation set...")
+            val_preds = {}
+            
+            # Collect predictions from flat models
+            if 'gb' in trained_models:
+                val_preds['gb'] = trained_models['gb'].predict_proba(X_val)
+            if 'technical' in trained_models:
+                val_preds['technical'] = trained_models['technical'].predict_proba(X_val)
+            
+            # Collect predictions from sequence models (aligned)
+            if len(X_seq_val) > 0:
+                # Sequence models lose (seq_len - 1) samples at the start
+                valid_indices = slice(seq_len - 1, None)
+                
+                # Truncate flat model preds to match sequence length
+                for k in list(val_preds.keys()):
+                    val_preds[k] = val_preds[k][valid_indices]
+                
+                y_val_opt = y_val[valid_indices]
+                
+                for name in ['lstm', 'attention']:
+                    if name in trained_models:
+                        model = trained_models[name]
+                        model.eval()
+                        with torch.no_grad():
+                            inputs = torch.FloatTensor(X_seq_val).to(device)
+                            probs = model(inputs).cpu().numpy()
+                            val_preds[name] = probs
+            else:
+                # If sequence data is too short, we can't use NNs in optimization properly
+                # or we just use flat models. For now, assume we use what we have.
+                y_val_opt = y_val
+            
+            # Run Optimization
+            if val_preds:
+                optimized_weights = _optimize_ensemble_weights(val_preds, y_val_opt)
+                worker_logger.info(f"Optimized Weights: {optimized_weights}")
+
+        # 5. Walk-Forward Validation (Profitability Check)
         worker_logger.info("Performing Walk-Forward Validation on Validation Set...")
         
-        # Aggregate Probabilities
+        # Aggregate Probabilities using Optimized Weights if available, else Config Weights
         num_val = len(y_val)
         ensemble_probs = np.zeros((num_val, 3))
-        weights = config.ensemble_weights
+        
+        # Helper to get weight
+        def get_weight(name, default_weight):
+            if optimized_weights:
+                return optimized_weights.get(name, 0.0)
+            return default_weight
+
+        config_weights = config.ensemble_weights
         
         # Sklearn Models
         if 'gb' in trained_models:
             probs = trained_models['gb'].predict_proba(X_val)
-            ensemble_probs += probs * weights.xgboost
+            w = get_weight('gb', config_weights.xgboost)
+            ensemble_probs += probs * w
             
         if 'technical' in trained_models:
             probs = trained_models['technical'].predict_proba(X_val)
-            ensemble_probs += probs * weights.technical_ensemble
+            w = get_weight('technical', config_weights.technical_ensemble)
+            ensemble_probs += probs * w
             
         # NN Models (Alignment required)
-        # X_seq_val corresponds to X_val[seq_len-1:]
         valid_nn_indices = slice(seq_len - 1, None)
         
         if len(X_seq_val) > 0:
-            def add_nn_probs(model_name, weight):
+            def add_nn_probs(model_name, default_weight):
                 if model_name in trained_models:
                     model = trained_models[model_name]
                     model.eval()
@@ -259,10 +347,11 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                         # Add to the slice of ensemble_probs
                         target_len = len(ensemble_probs[valid_nn_indices])
                         if len(probs) == target_len:
-                            ensemble_probs[valid_nn_indices] += probs * weight
+                            w = get_weight(model_name, default_weight)
+                            ensemble_probs[valid_nn_indices] += probs * w
             
-            add_nn_probs('lstm', weights.lstm)
-            add_nn_probs('attention', weights.attention)
+            add_nn_probs('lstm', config_weights.lstm)
+            add_nn_probs('attention', config_weights.attention)
 
         # Determine Final Predictions on the subset where all models could predict
         eval_probs = ensemble_probs[valid_nn_indices]
@@ -274,16 +363,13 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         signals[final_preds == 2] = 1
         
         # Get Market Returns for the validation period
-        # val_indices are the timestamps in df corresponding to X_val
         val_indices = common_index[split_idx:]
-        # Slice to match the NN valid indices
         eval_indices = val_indices[valid_nn_indices]
         
         if len(eval_indices) != len(signals):
             worker_logger.warning("Shape mismatch in validation. Skipping profitability check.")
         else:
-            # Calculate Next-Candle Returns: (Close[t+1] - Close[t]) / Close[t]
-            # We calculate this on the full df first to ensure continuity, then slice
+            # Calculate Next-Candle Returns
             full_returns = df['close'].pct_change().shift(-1)
             eval_returns = full_returns.loc[eval_indices].fillna(0.0).values
             
@@ -322,7 +408,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 worker_logger.warning(f"Model rejected: Sharpe {sharpe:.4f} < {config.training.min_sharpe_ratio}")
                 return False
 
-        # 5. Atomic Save Artifacts
+        # 6. Atomic Save Artifacts
         safe_symbol = symbol.replace('/', '_')
         final_dir = os.path.join(config.model_path, safe_symbol)
         temp_dir = os.path.join(config.model_path, f"{safe_symbol}_temp")
@@ -346,7 +432,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 'metrics': metrics,
                 'feature_importance': feature_importance,
                 'feature_columns': config.feature_columns,
-                'num_features': num_features # Save this to ensure correct loading
+                'num_features': num_features,
+                'optimized_weights': optimized_weights # Save the dynamic weights
             }
             with open(os.path.join(temp_dir, "metadata.json"), 'w') as f:
                 json.dump(meta, f, indent=2)
@@ -425,7 +512,6 @@ class EnsembleLearner:
                 meta = json.load(f)
 
             # --- CONFIG CONSISTENCY CHECK ---
-            # Ensure the features used to train the model match the current config.
             saved_features = meta.get('feature_columns', [])
             current_features = self.config.feature_columns
             
@@ -439,7 +525,6 @@ class EnsembleLearner:
                     del self.symbol_models[symbol]
                 return
             
-            # Calculate expected feature count (base + lags) to instantiate models correctly
             expected_num_features = FeatureProcessor.get_expected_feature_count(self.config)
             saved_num_features = meta.get('num_features', len(saved_features))
             
@@ -497,13 +582,13 @@ class EnsembleLearner:
         if symbol not in self.symbol_models:
             await self.reload_models(symbol)
             if symbol not in self.symbol_models:
-                # Still no model (e.g. mismatch or missing), return empty
                 return {}
 
         entry = self.symbol_models[symbol]
         models = entry['models']
+        meta = entry['meta']
         
-        # Prepare Data (Process features including lags)
+        # Prepare Data
         df_proc = FeatureProcessor.process_data(df, self.config)
         X = df_proc.iloc[-1:].values # Last row for prediction
         
@@ -515,10 +600,18 @@ class EnsembleLearner:
             X_seq = None
 
         votes = {'buy': 0.0, 'sell': 0.0, 'hold': 0.0}
-        weights = self.config.ensemble_weights
+        config_weights = self.config.ensemble_weights
         
+        # Determine Weights (Dynamic vs Static)
+        optimized_weights = meta.get('optimized_weights')
+        use_dynamic = config_weights.auto_tune and optimized_weights
+        
+        def get_weight(name, default_weight):
+            if use_dynamic:
+                return optimized_weights.get(name, 0.0)
+            return default_weight
+
         # Store individual predictions for variance calculation
-        # List of (weight, prob_array)
         model_predictions = []
         
         # Inference
@@ -526,18 +619,20 @@ class EnsembleLearner:
             # XGBoost
             if 'gb' in models:
                 probs = models['gb'].predict_proba(X)[0]
-                votes['sell'] += probs[0] * weights.xgboost
-                votes['hold'] += probs[1] * weights.xgboost
-                votes['buy'] += probs[2] * weights.xgboost
-                model_predictions.append((weights.xgboost, probs))
+                w = get_weight('gb', config_weights.xgboost)
+                votes['sell'] += probs[0] * w
+                votes['hold'] += probs[1] * w
+                votes['buy'] += probs[2] * w
+                model_predictions.append((w, probs))
 
             # Technical Ensemble
             if 'technical' in models:
                 probs = models['technical'].predict_proba(X)[0]
-                votes['sell'] += probs[0] * weights.technical_ensemble
-                votes['hold'] += probs[1] * weights.technical_ensemble
-                votes['buy'] += probs[2] * weights.technical_ensemble
-                model_predictions.append((weights.technical_ensemble, probs))
+                w = get_weight('technical', config_weights.technical_ensemble)
+                votes['sell'] += probs[0] * w
+                votes['hold'] += probs[1] * w
+                votes['buy'] += probs[2] * w
+                model_predictions.append((w, probs))
 
             # PyTorch Models
             if X_seq is not None:
@@ -546,17 +641,19 @@ class EnsembleLearner:
                     
                     if 'lstm' in models:
                         probs = models['lstm'](tensor_in).cpu().numpy()[0]
-                        votes['sell'] += probs[0] * weights.lstm
-                        votes['hold'] += probs[1] * weights.lstm
-                        votes['buy'] += probs[2] * weights.lstm
-                        model_predictions.append((weights.lstm, probs))
+                        w = get_weight('lstm', config_weights.lstm)
+                        votes['sell'] += probs[0] * w
+                        votes['hold'] += probs[1] * w
+                        votes['buy'] += probs[2] * w
+                        model_predictions.append((w, probs))
                         
                     if 'attention' in models:
                         probs = models['attention'](tensor_in).cpu().numpy()[0]
-                        votes['sell'] += probs[0] * weights.attention
-                        votes['hold'] += probs[1] * weights.attention
-                        votes['buy'] += probs[2] * weights.attention
-                        model_predictions.append((weights.attention, probs))
+                        w = get_weight('attention', config_weights.attention)
+                        votes['sell'] += probs[0] * w
+                        votes['hold'] += probs[1] * w
+                        votes['buy'] += probs[2] * w
+                        model_predictions.append((w, probs))
 
         except Exception as e:
             logger.error(f"Inference error for {symbol}: {e}")
@@ -569,40 +666,34 @@ class EnsembleLearner:
                 votes[k] /= total_weight
 
         # Determine Action
-        # 0: sell, 1: hold, 2: buy
         best_action = max(votes, key=votes.get)
         confidence = votes[best_action]
 
         # --- Disagreement Penalty ---
-        # If models disagree significantly on the best action, reduce confidence.
-        if model_predictions and weights.disagreement_penalty > 0:
+        if model_predictions and config_weights.disagreement_penalty > 0:
             action_map = {'sell': 0, 'hold': 1, 'buy': 2}
             best_action_idx = action_map[best_action]
             
-            # Extract the probability assigned to the BEST action by each model
-            # Only consider models that actually contributed (weight > 0)
+            # Only consider models that actually contributed
             relevant_probs = [p[best_action_idx] for w, p in model_predictions if w > 0]
             
             if len(relevant_probs) > 1:
                 std_dev = np.std(relevant_probs)
-                penalty = std_dev * weights.disagreement_penalty
+                penalty = std_dev * config_weights.disagreement_penalty
                 original_conf = confidence
                 confidence = max(0.0, confidence - penalty)
                 if penalty > 0.05:
                     logger.debug(f"Confidence penalized for {symbol}", 
                                  original=original_conf, 
                                  penalty=penalty, 
-                                 std_dev=std_dev,
+                                 std_dev=std_dev, 
                                  final=confidence)
 
         # Extract top features from XGBoost if available
         top_features = {}
         if 'gb' in models and hasattr(models['gb'], 'feature_importances_'):
             imps = models['gb'].feature_importances_
-            # Use the centralized feature name generator to ensure alignment
             cols = FeatureProcessor.get_feature_names(self.config)
-            
-            # Sort and take top 5
             indices = np.argsort(imps)[::-1][:5]
             for idx in indices:
                 if idx < len(cols):
@@ -611,8 +702,9 @@ class EnsembleLearner:
         return {
             'action': best_action,
             'confidence': round(confidence, 4),
-            'model_version': entry['meta']['timestamp'],
+            'model_version': meta['timestamp'],
             'active_weights': votes,
             'top_features': top_features,
-            'metrics': entry['meta'].get('metrics', {})
+            'metrics': meta.get('metrics', {}),
+            'optimized_weights': optimized_weights if use_dynamic else None
         }
