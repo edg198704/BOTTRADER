@@ -4,13 +4,29 @@ import random
 from typing import Dict, Any, List, Optional
 import pandas as pd
 import ccxt.async_support as ccxt
-from ccxt.base.errors import NetworkError, ExchangeError, InsufficientFunds, OrderNotFound, NotSupported
+from ccxt.base.errors import NetworkError, ExchangeError, InsufficientFunds, OrderNotFound, NotSupported, InvalidOrder
 
 from bot_core.logger import get_logger
 from bot_core.utils import async_retry, Clock
 from bot_core.config import ExchangeConfig, BacktestConfig
 
 logger = get_logger(__name__)
+
+# --- Custom Exchange Exceptions ---
+
+class BotExchangeError(Exception):
+    """Base exception for exchange interactions."""
+    pass
+
+class BotInsufficientFundsError(BotExchangeError):
+    """Raised when the exchange reports insufficient funds."""
+    pass
+
+class BotInvalidOrderError(BotExchangeError):
+    """Raised when the order parameters are invalid (e.g. size too small/large)."""
+    pass
+
+# ----------------------------------
 
 class ExchangeAPI(abc.ABC):
     """Abstract Base Class for interacting with a cryptocurrency exchange."""
@@ -488,8 +504,11 @@ class CCXTExchangeAPI(ExchangeAPI):
                 "cost": order.get('cost', 0.0)
             }
         except InsufficientFunds as e:
-            logger.error("Insufficient funds to place order, not retrying.", symbol=symbol, error=str(e))
-            raise
+            logger.error("Insufficient funds to place order.", symbol=symbol, error=str(e))
+            raise BotInsufficientFundsError(str(e)) from e
+        except InvalidOrder as e:
+            logger.error("Invalid order parameters.", symbol=symbol, error=str(e))
+            raise BotInvalidOrderError(str(e)) from e
         except (NetworkError, ExchangeError) as e:
             logger.error("Final attempt failed for place_order", symbol=symbol, error=str(e))
             raise
