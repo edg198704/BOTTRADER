@@ -150,6 +150,9 @@ strategy:
       technical_ensemble: 0.3
       lstm: 0.2
       attention: 0.2
+      # Penalize confidence if models disagree. 
+      # Formula: Confidence = WeightedAvg - (StdDev * disagreement_penalty)
+      disagreement_penalty: 0.5
 
     # --- Market Regime Detector ---
     market_regime:
