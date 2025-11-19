@@ -80,6 +80,8 @@ class AITrainingConfig(BaseModel):
     n_iter_search: int = 10
     # --- Data Handling ---
     use_class_weighting: bool = True
+    # --- Probability Calibration ---
+    calibration_method: str = "isotonic" # 'isotonic', 'sigmoid', or 'none'
 
 class AILSTMConfig(BaseModel):
     hidden_dim: int = 64
