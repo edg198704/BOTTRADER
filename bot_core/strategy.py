@@ -162,7 +162,12 @@ class AIEnsembleStrategy(TradingStrategy):
         if self.ai_config.performance.enabled:
             self._monitor_performance(symbol, df)
 
-        regime_result = await self.regime_detector.detect_regime(symbol, df)
+        # 2. Enrich Data with Regime Features
+        # This injects 'regime_trend' and 'regime_volatility' into the DF so the model can use them
+        df_enriched = self.regime_detector.add_regime_features(df)
+
+        # 3. Detect Regime (Optimized: uses the columns we just added)
+        regime_result = await self.regime_detector.detect_regime(symbol, df_enriched)
         regime = regime_result.get('regime')
 
         if self.ai_config.use_regime_filter:
@@ -177,7 +182,8 @@ class AIEnsembleStrategy(TradingStrategy):
             logger.debug("Signal ignored due to cooldown.", symbol=symbol)
             return None
 
-        prediction = await self.ensemble_learner.predict(df, symbol)
+        # 4. Predict using Enriched Data
+        prediction = await self.ensemble_learner.predict(df_enriched, symbol)
         action = prediction.get('action')
         confidence = prediction.get('confidence', 0.0)
         model_version = prediction.get('model_version')
@@ -321,12 +327,15 @@ class AIEnsembleStrategy(TradingStrategy):
         
         loop = asyncio.get_running_loop()
         try:
+            # Enrich Data with Regime Features before sending to worker
+            df_enriched = self.regime_detector.add_regime_features(df)
+
             # Offload the heavy training task to a separate process
             success = await loop.run_in_executor(
                 executor, 
                 train_ensemble_task, 
                 symbol, 
-                df, 
+                df_enriched, 
                 self.ai_config
             )
             
