@@ -110,3 +110,19 @@ def generate_indicator_rename_map(indicators_config: List[Dict[str, Any]]) -> Di
                 rename_map[ta_name] = alias
 
     return rename_map
+
+def parse_timeframe_to_seconds(timeframe: str) -> int:
+    """
+    Parses a timeframe string (e.g., '1m', '1h', '1d') into seconds.
+    """
+    if not timeframe:
+        return 60
+    
+    unit = timeframe[-1]
+    try:
+        value = int(timeframe[:-1])
+    except ValueError:
+        return 60
+
+    multipliers = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}
+    return value * multipliers.get(unit, 60)
