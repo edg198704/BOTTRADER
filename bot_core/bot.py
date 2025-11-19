@@ -169,19 +169,59 @@ class TradingBot:
                         logger.info("Pending position was terminal but partially filled. Recovering.", symbol=pos.symbol, status=status)
                         await confirm_from_order(order)
                     else:
-                        # ZOMBIE CHECK: Before voiding, check if there are any OTHER open orders 
+                        # ZOMBIE CHECK: Before voiding, check if there are any OTHER orders (Open OR Closed)
                         # that belong to this trade_id (e.g. chase orders placed before crash)
                         zombie_recovered = False
                         if pos.trade_id:
-                            logger.info("Checking for zombie chase orders...", symbol=pos.symbol, trade_id=pos.trade_id)
+                            logger.info("Checking for zombie chase orders (Open)...", symbol=pos.symbol, trade_id=pos.trade_id)
+                            # 1. Check Open Orders
                             open_orders = await self.exchange_api.fetch_open_orders(pos.symbol)
                             for o in open_orders:
                                 client_oid = o.get('clientOrderId', '')
                                 if client_oid and client_oid.startswith(pos.trade_id):
-                                    logger.info("Found zombie chase order! Recovering.", symbol=pos.symbol, new_order_id=o['id'])
+                                    logger.info("Found zombie chase order (OPEN)! Recovering.", symbol=pos.symbol, new_order_id=o['id'])
                                     await self.position_manager.update_pending_order_id(pos.symbol, pos.order_id, o['id'])
                                     zombie_recovered = True
+                                    # We found it, now we need to handle it (it's OPEN, so we likely want to cancel it or let it run)
+                                    # For safety, we update the ID and let the next loop/logic handle it, or handle it here.
+                                    # Since we are in the 'CANCELED' block of the *original* order, we must handle the new one.
+                                    # We'll cancel it to be safe and confirm any partials.
+                                    cancelled_order = await self.exchange_api.cancel_order(o['id'], pos.symbol)
+                                    if cancelled_order and cancelled_order.get('filled', 0.0) > 0:
+                                        await confirm_from_order(cancelled_order)
+                                    else:
+                                        await self.position_manager.void_position(pos.symbol, o['id'])
                                     break
+                            
+                            # 2. Check Recent History (Deep Scan) if not found in Open
+                            if not zombie_recovered:
+                                logger.info("Deep scan for zombie chase orders (History)...", symbol=pos.symbol, trade_id=pos.trade_id)
+                                try:
+                                    recent_orders = await self.exchange_api.fetch_recent_orders(pos.symbol, limit=20)
+                                    for o in recent_orders:
+                                        client_oid = o.get('clientOrderId', '')
+                                        if client_oid and client_oid.startswith(pos.trade_id):
+                                            # We found a related order in history.
+                                            status_hist = o.get('status')
+                                            if status_hist in ['FILLED', 'PARTIALLY_FILLED']:
+                                                logger.info("Found zombie chase order (FILLED) in history! Recovering.", symbol=pos.symbol, new_order_id=o['id'])
+                                                await self.position_manager.update_pending_order_id(pos.symbol, pos.order_id, o['id'])
+                                                await confirm_from_order(o)
+                                                zombie_recovered = True
+                                                break
+                                            elif status_hist == 'OPEN':
+                                                # Should have been caught by fetch_open_orders, but just in case
+                                                logger.info("Found zombie chase order (OPEN) in history! Recovering.", symbol=pos.symbol, new_order_id=o['id'])
+                                                await self.position_manager.update_pending_order_id(pos.symbol, pos.order_id, o['id'])
+                                                cancelled_order = await self.exchange_api.cancel_order(o['id'], pos.symbol)
+                                                if cancelled_order and cancelled_order.get('filled', 0.0) > 0:
+                                                    await confirm_from_order(cancelled_order)
+                                                else:
+                                                    await self.position_manager.void_position(pos.symbol, o['id'])
+                                                zombie_recovered = True
+                                                break
+                                except Exception as e:
+                                    logger.error("Failed deep zombie scan", error=str(e))
                         
                         if not zombie_recovered:
                             logger.info("Pending position order was terminal and empty. Voiding.", symbol=pos.symbol, status=status)
