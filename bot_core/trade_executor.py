@@ -302,6 +302,20 @@ class TradeExecutor:
             
             # If retry didn't produce an order, fall back to phantom handling
             if not order_result:
+                # Before assuming phantom, check for open orders locking funds
+                try:
+                    open_orders = await self.exchange_api.fetch_open_orders(position.symbol)
+                    if open_orders:
+                        logger.warning("Insufficient funds to close, but open orders exist. Skipping phantom check.", count=len(open_orders))
+                        await self.alert_system.send_alert(
+                            level='warning',
+                            message=f"⚠️ Cannot close {position.symbol}: Insufficient funds and {len(open_orders)} open orders detected.",
+                            details={'symbol': position.symbol, 'open_orders': len(open_orders)}
+                        )
+                        return
+                except Exception as e:
+                    logger.error("Failed to fetch open orders during insufficient funds check.", error=str(e))
+
                 await self._handle_phantom_position(position)
                 return
 
