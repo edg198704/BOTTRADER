@@ -1,5 +1,7 @@
 import asyncio
 import functools
+import numpy as np
+import pandas as pd
 from typing import Tuple, Type, List, Dict, Any, Optional
 from datetime import datetime, timezone
 
@@ -41,6 +43,76 @@ class Clock:
     def timestamp(cls) -> float:
         """Returns current timestamp as float."""
         return cls.now().timestamp()
+
+class PerformanceMetrics:
+    """Calculates advanced performance metrics for trading strategies."""
+    
+    @staticmethod
+    def calculate(trades: List[Dict[str, Any]], initial_capital: float) -> Dict[str, Any]:
+        if not trades:
+            return {
+                'total_trades': 0,
+                'win_rate': 0.0,
+                'profit_factor': 0.0,
+                'sharpe_ratio': 0.0,
+                'sortino_ratio': 0.0,
+                'max_drawdown': 0.0,
+                'total_return_pct': 0.0
+            }
+
+        df = pd.DataFrame(trades)
+        df['pnl'] = pd.to_numeric(df['pnl'])
+        df['close_timestamp'] = pd.to_datetime(df['close_timestamp'])
+        df.sort_values('close_timestamp', inplace=True)
+
+        # Basic Metrics
+        total_trades = len(df)
+        wins = df[df['pnl'] > 0]
+        losses = df[df['pnl'] <= 0]
+        win_rate = len(wins) / total_trades if total_trades > 0 else 0.0
+        
+        gross_profit = wins['pnl'].sum()
+        gross_loss = abs(losses['pnl'].sum())
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+        
+        total_pnl = df['pnl'].sum()
+        total_return_pct = (total_pnl / initial_capital) * 100
+
+        # Equity Curve & Drawdown
+        df['cumulative_pnl'] = df['pnl'].cumsum()
+        df['equity'] = initial_capital + df['cumulative_pnl']
+        df['peak_equity'] = df['equity'].cummax()
+        df['drawdown'] = (df['equity'] - df['peak_equity']) / df['peak_equity']
+        max_drawdown = abs(df['drawdown'].min())
+
+        # Risk-Adjusted Returns (Sharpe/Sortino)
+        # We approximate using per-trade returns. For more accuracy, daily returns are better.
+        returns = df['pnl'] / initial_capital
+        mean_return = returns.mean()
+        std_return = returns.std()
+        
+        sharpe_ratio = 0.0
+        if std_return > 0:
+            # Annualized Sharpe (assuming ~252 trading days, but here we just use trade frequency)
+            # A simple approximation: Mean / Std
+            sharpe_ratio = mean_return / std_return
+
+        downside_returns = returns[returns < 0]
+        downside_std = downside_returns.std()
+        sortino_ratio = 0.0
+        if downside_std > 0:
+            sortino_ratio = mean_return / downside_std
+
+        return {
+            'total_trades': total_trades,
+            'win_rate': round(win_rate * 100, 2),
+            'profit_factor': round(profit_factor, 2),
+            'sharpe_ratio': round(sharpe_ratio, 2),
+            'sortino_ratio': round(sortino_ratio, 2),
+            'max_drawdown': round(max_drawdown * 100, 2),
+            'total_return_pct': round(total_return_pct, 2),
+            'final_equity': round(initial_capital + total_pnl, 2)
+        }
 
 def async_retry(
     max_attempts: int = 3,
