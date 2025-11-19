@@ -110,6 +110,11 @@ strategy:
       triple_barrier_tp_multiplier: 2.0 # Target 2x ATR profit
       triple_barrier_sl_multiplier: 2.0 # Stop at 2x ATR loss
 
+      # --- Temporal Features (New) ---
+      # Automatically generate lagged versions of these features to capture rate-of-change
+      lag_features: ["log_return", "rsi"]
+      lag_depth: 3 # Generate lag_1, lag_2, lag_3 for each feature above
+
     # --- Model Training Parameters ---
     training:
       epochs: 50 # Max epochs to train for
@@ -118,10 +123,6 @@ strategy:
       early_stopping_patience: 5 # Stop training if validation loss doesn't improve for this many epochs
       validation_split: 0.15 # Percentage of training data to use for validation
       min_precision_threshold: 0.55 # Require at least 55% precision on validation set to accept new model
-      
-      # --- Feature Selection ---
-      auto_feature_selection: true
-      max_features: 20
 
     # --- Model Hyperparameters ---
     hyperparameters:
