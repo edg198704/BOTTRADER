@@ -10,6 +10,7 @@ from bot_core.config import AIEnsembleStrategyParams, SimpleMACrossoverStrategyP
 from bot_core.ai.ensemble_learner import EnsembleLearner, train_ensemble_task
 from bot_core.ai.regime_detector import MarketRegimeDetector
 from bot_core.position_manager import Position
+from bot_core.utils import Clock
 
 logger = get_logger(__name__)
 
@@ -164,7 +165,7 @@ class AIEnsembleStrategy(TradingStrategy):
             )
             
             if success:
-                self.last_retrained_at[symbol] = datetime.utcnow()
+                self.last_retrained_at[symbol] = Clock.now()
                 logger.info("Model training successful. Reloading models...", symbol=symbol)
                 await self.ensemble_learner.reload_models(symbol)
             else:
@@ -181,7 +182,7 @@ class AIEnsembleStrategy(TradingStrategy):
         if not last_retrained:
             return True
         
-        time_since_retrain = datetime.utcnow() - last_retrained
+        time_since_retrain = Clock.now() - last_retrained
         return time_since_retrain >= timedelta(hours=self.ai_config.retrain_interval_hours)
 
     def get_training_data_limit(self) -> int:
