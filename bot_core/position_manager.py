@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 
 from bot_core.logger import get_logger
 from bot_core.config import DatabaseConfig, RiskManagementConfig
+from bot_core.utils import Clock
 
 if TYPE_CHECKING:
     from bot_core.monitoring import AlertSystem
@@ -32,7 +33,8 @@ class Position(Base):
     order_id = Column(String, nullable=True) # Exchange Order ID for reconciliation
     stop_loss_price = Column(Float, nullable=True)
     take_profit_price = Column(Float, nullable=True)
-    open_timestamp = Column(DateTime, default=datetime.datetime.utcnow)
+    # Use Clock.now as the default callable for time abstraction
+    open_timestamp = Column(DateTime, default=Clock.now)
     close_timestamp = Column(DateTime, nullable=True)
     close_price = Column(Float, nullable=True)
     pnl = Column(Float, nullable=True)
@@ -47,7 +49,7 @@ class PortfolioState(Base):
     id = Column(Integer, primary_key=True) # Singleton row, always ID 1
     initial_capital = Column(Float, nullable=False)
     peak_equity = Column(Float, nullable=False)
-    last_update = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    last_update = Column(DateTime, default=Clock.now, onupdate=Clock.now)
 
 class PositionManager:
     def __init__(self, config: DatabaseConfig, initial_capital: float, alert_system: Optional['AlertSystem'] = None):
@@ -252,7 +254,7 @@ class PositionManager:
             position.stop_loss_price = stop_loss
             position.take_profit_price = take_profit
             position.trailing_ref_price = entry_price
-            position.open_timestamp = datetime.datetime.utcnow()
+            position.open_timestamp = Clock.now()
             
             session.commit()
             session.refresh(position)
@@ -333,7 +335,8 @@ class PositionManager:
                 take_profit_price=take_profit,
                 status=PositionStatus.OPEN,
                 trailing_ref_price=entry_price,
-                trailing_stop_active=False
+                trailing_stop_active=False,
+                open_timestamp=Clock.now()
             )
             session.add(new_position)
             session.commit()
@@ -368,7 +371,7 @@ class PositionManager:
 
             position.status = PositionStatus.CLOSED
             position.close_price = close_price
-            position.close_timestamp = datetime.datetime.utcnow()
+            position.close_timestamp = Clock.now()
             position.pnl = pnl
             session.commit()
             session.refresh(position)
@@ -446,7 +449,8 @@ class PositionManager:
     def _calculate_daily_pnl_sync(self) -> float:
         session = self.SessionLocal()
         try:
-            today_utc = datetime.datetime.utcnow().date()
+            # Use Clock.now() for consistency, though date() strips time
+            today_utc = Clock.now().date()
             daily_pnl = session.query(func.sum(Position.pnl)).filter(
                 Position.status == PositionStatus.CLOSED,
                 cast(Position.close_timestamp, Date) == today_utc
