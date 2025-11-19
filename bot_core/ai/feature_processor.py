@@ -14,23 +14,61 @@ class FeatureProcessor:
     """
 
     @staticmethod
-    def normalize(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> pd.DataFrame:
-        """Applies rolling Z-score normalization."""
-        window = config.features.normalization_window
+    def get_expected_feature_count(config: AIEnsembleStrategyParams) -> int:
+        """
+        Calculates the total number of features expected after processing,
+        including base features and generated lags.
+        """
+        base_count = len(config.feature_columns)
+        # Count how many lag columns will be generated
+        # Only lag columns that are actually in the feature_columns list
+        lag_targets = [c for c in config.features.lag_features if c in config.feature_columns]
+        lag_count = len(lag_targets) * config.features.lag_depth
+        return base_count + lag_count
+
+    @staticmethod
+    def process_data(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> pd.DataFrame:
+        """
+        Applies the full feature engineering pipeline:
+        1. Selects base feature columns.
+        2. Generates lagged features (if configured).
+        3. Drops NaNs introduced by lags.
+        4. Applies Z-score normalization.
+        """
+        # 1. Select Base Columns
         cols = config.feature_columns
-        
-        # Ensure we only select columns that exist
         valid_cols = [c for c in cols if c in df.columns]
+        
         if len(valid_cols) != len(cols):
             missing = set(cols) - set(valid_cols)
-            logger.warning("Missing columns during normalization", missing=missing)
+            logger.warning("Missing columns during processing", missing=missing)
         
         subset = df[valid_cols].copy()
+        
+        # 2. Generate Lags
+        lags = config.features.lag_features
+        depth = config.features.lag_depth
+        
+        if depth > 0 and lags:
+            for col in lags:
+                if col in subset.columns:
+                    for i in range(1, depth + 1):
+                        subset[f"{col}_lag_{i}"] = subset[col].shift(i)
+        
+        # 3. Drop NaNs (from lags and missing data)
+        subset.dropna(inplace=True)
+        
+        # 4. Normalize
+        window = config.features.normalization_window
         rolling_mean = subset.rolling(window=window).mean()
         rolling_std = subset.rolling(window=window).std()
         
         epsilon = 1e-8
         normalized = (subset - rolling_mean) / (rolling_std + epsilon)
+        
+        # Rolling normalization introduces NaNs at the start of the window
+        normalized.dropna(inplace=True)
+        
         return normalized
 
     @staticmethod
