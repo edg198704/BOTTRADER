@@ -59,6 +59,7 @@ class TradingBot:
         self.shared_bot_state['risk_manager'] = self.risk_manager
         self.shared_bot_state['latest_prices'] = self.latest_prices
         self.shared_bot_state['config'] = self.config
+        self.shared_bot_state['strategy'] = self.strategy
 
     async def setup(self):
         """Performs initial setup: loads market details and reconciles state. Separated for backtesting."""
