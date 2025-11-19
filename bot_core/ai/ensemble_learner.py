@@ -18,7 +18,6 @@ try:
     import torch.optim as optim
     from torch.utils.data import TensorDataset, DataLoader
     from sklearn.ensemble import VotingClassifier, RandomForestClassifier
-    from sklearn.model_selection import train_test_split
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import precision_score, classification_report
     from xgboost import XGBClassifier
@@ -35,19 +34,15 @@ except ImportError:
     class nn:
         class Module: pass
     class optim: pass
-    def train_test_split(*args, **kwargs): pass
     class TensorDataset: pass
     class DataLoader: pass
 
 logger = get_logger(__name__)
 
-# Increment this version when changing model architecture or input shapes
-MODEL_VERSION = "1.1"
-
 class EnsembleLearner:
     """
     Manages a suite of AI/ML models for generating trading predictions.
-    Implements atomic model updates and rolling Z-score normalization for stationarity.
+    Implements atomic model updates, sequential data splitting, and rolling Z-score normalization.
     """
 
     def __init__(self, config: AIEnsembleStrategyParams):
@@ -60,7 +55,7 @@ class EnsembleLearner:
         self.symbol_models: Dict[str, Dict[str, Any]] = {}
         self.is_trained = False
         
-        logger.info("EnsembleLearner initialized.", device=str(self.device), model_version=MODEL_VERSION)
+        logger.info("EnsembleLearner initialized.", device=str(self.device))
         
         # Attempt to load models in the background
         try:
@@ -125,16 +120,17 @@ class EnsembleLearner:
                     if os.path.exists(meta_path):
                         with open(meta_path, 'r') as f:
                             meta = json.load(f)
-                            # Check feature columns
+                            
+                            # Check Feature Columns
                             if meta.get('feature_columns') != self.config.feature_columns:
                                 logger.warning("Model feature mismatch. Skipping load to force retrain.", symbol=symbol)
                                 continue
-                            # Check model version
-                            if meta.get('model_version') != MODEL_VERSION:
-                                logger.warning("Model version mismatch. Skipping load to force retrain.", 
-                                               symbol=symbol, 
-                                               expected=MODEL_VERSION, 
-                                               found=meta.get('model_version'))
+                            
+                            # Check Hyperparameters (Critical for Neural Net shapes)
+                            saved_hp = meta.get('hyperparameters')
+                            current_hp = self.config.hyperparameters.dict()
+                            if saved_hp != current_hp:
+                                logger.warning("Model hyperparameters mismatch. Skipping load to force retrain.", symbol=symbol)
                                 continue
                     else:
                         logger.warning("No metadata found for model. Skipping load to be safe.", symbol=symbol)
@@ -208,13 +204,10 @@ class EnsembleLearner:
             features = np.nan_to_num(sequence_df.values, nan=0.0)
 
             # Prepare inputs
-            # Flatten the sequence for Tree/Linear models: (1, seq_len * num_features)
-            flat_features = features.reshape(1, -1)
-            
-            # Keep 3D shape for DL models: (1, seq_len, num_features)
+            last_step_features = features[-1, :].reshape(1, -1)
             sequence_tensor = torch.FloatTensor(features).unsqueeze(0).to(self.device)
 
-            ensemble_pred = self._get_ensemble_prediction(models, flat_features, sequence_tensor)
+            ensemble_pred = self._get_ensemble_prediction(models, last_step_features, sequence_tensor)
             
             action_idx = np.argmax(ensemble_pred)
             confidence = float(ensemble_pred[action_idx])
@@ -236,13 +229,13 @@ class EnsembleLearner:
             weights_config.attention
         ]
 
-        # Scikit-learn models (Input: Flattened Sequence)
+        # Scikit-learn models
         gb_pred = models['gb'].predict_proba(X_flat)
         predictions.append(gb_pred)
         tech_pred = models['technical'].predict_proba(X_flat)
         predictions.append(tech_pred)
 
-        # PyTorch models (Input: 3D Sequence)
+        # PyTorch models
         with torch.no_grad():
             models['lstm'].eval()
             models['attention'].eval()
@@ -278,9 +271,16 @@ class EnsembleLearner:
     def _create_sequences(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         seq_length = self.config.features.sequence_length
         X_seq, y_seq = [], []
+        # Ensure we have enough data
+        if len(X) <= seq_length:
+            return np.array([]), np.array([])
+            
         for i in range(len(X) - seq_length + 1):
             X_seq.append(X[i:i+seq_length])
+            # The label for the sequence ending at t is y[t+seq_length-1]
+            # because y is already aligned such that y[k] is the label for the candle at index k
             y_seq.append(y[i+seq_length-1])
+            
         return np.array(X_seq), np.array(y_seq)
 
     def train(self, symbol: str, df: pd.DataFrame) -> bool:
@@ -308,24 +308,31 @@ class EnsembleLearner:
                 logger.warning("Training data has fewer than 3 unique labels. Skipping training.", symbol=symbol, labels=np.unique(y))
                 return False
 
-            # 3. Split data
-            X_train, X_val, y_train, y_val = train_test_split(
-                X_normalized, y, test_size=self.config.training.validation_split, random_state=42, stratify=y
-            )
+            # 3. Create sequences from NORMALIZED data BEFORE splitting
+            # This ensures temporal continuity for sequence generation
+            X_seq, y_seq = self._create_sequences(X_normalized, y)
 
-            # 4. Create sequences from NORMALIZED data
-            X_train_seq, y_train_seq = self._create_sequences(X_train, y_train)
-            X_val_seq, y_val_seq = self._create_sequences(X_val, y_val)
-
-            if len(X_train_seq) == 0 or len(X_val_seq) == 0:
+            if len(X_seq) == 0:
                 logger.warning("Sequence generation resulted in empty datasets.", symbol=symbol)
                 return False
 
-            # 5. Prepare data for different model types
-            # Flatten sequences for Tree/Linear models: (N, seq_len * features)
-            X_train_flat = X_train_seq.reshape(X_train_seq.shape[0], -1)
+            # 4. Sequential Split (Time Series Split)
+            # We do NOT use random shuffle. We train on past, validate on recent future.
+            split_idx = int(len(X_seq) * (1 - self.config.training.validation_split))
+            
+            X_train_seq = X_seq[:split_idx]
+            y_train_seq = y_seq[:split_idx]
+            X_val_seq = X_seq[split_idx:]
+            y_val_seq = y_seq[split_idx:]
+
+            if len(X_train_seq) == 0 or len(X_val_seq) == 0:
+                logger.warning("Split resulted in empty train or validation set.", symbol=symbol)
+                return False
+
+            # 5. Prepare flat data for scikit-learn models (using the last step of the sequence)
+            X_train_flat = X_train_seq[:, -1, :]
             y_train_flat = y_train_seq
-            X_val_flat = X_val_seq.reshape(X_val_seq.shape[0], -1)
+            X_val_flat = X_val_seq[:, -1, :]
             y_val_flat = y_val_seq
             
             # 6. Create FRESH models for this training session
@@ -336,17 +343,17 @@ class EnsembleLearner:
             models['gb'].fit(X_train_flat, y_train_flat)
             models['technical'].fit(X_train_flat, y_train_flat)
             
-            # Log Feature Importance (Approximate for flattened features)
+            # Log Feature Importance
             try:
                 if hasattr(models['gb'], 'feature_importances_'):
                     importances = models['gb'].feature_importances_
-                    # Just log the top 5 indices since names are now flattened
                     indices = np.argsort(importances)[::-1][:5]
-                    logger.info("XGBoost Top 5 Feature Indices", symbol=symbol, indices=indices.tolist())
+                    top_features = {self.config.feature_columns[i]: float(importances[i]) for i in indices}
+                    logger.info("XGBoost Top 5 Features", symbol=symbol, features=top_features)
             except Exception as e:
                 logger.warning("Could not log feature importance", error=str(e))
 
-            # 8. Train PyTorch models (Use 3D sequences)
+            # 8. Train PyTorch models
             logger.info("Training PyTorch models...", symbol=symbol)
             X_train_tensor = torch.FloatTensor(X_train_seq).to(self.device)
             y_train_tensor = torch.LongTensor(y_train_seq).to(self.device)
@@ -400,7 +407,7 @@ class EnsembleLearner:
     def _train_pytorch_model(self, model: nn.Module, X_train: torch.Tensor, y_train: torch.Tensor, X_val: torch.Tensor, y_val: torch.Tensor):
         train_cfg = self.config.training
         train_dataset = TensorDataset(X_train, y_train)
-        train_loader = DataLoader(train_dataset, batch_size=train_cfg.batch_size, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=train_cfg.batch_size, shuffle=True) # Shuffle batches is fine, data is already sequenced
         val_dataset = TensorDataset(X_val, y_val)
         val_loader = DataLoader(val_dataset, batch_size=train_cfg.batch_size)
 
@@ -447,16 +454,15 @@ class EnsembleLearner:
         save_path = os.path.join(self.config.model_path, symbol_path_str)
         os.makedirs(save_path, exist_ok=True)
         
-        # Save Metadata
+        # Save Metadata including Hyperparameters
         metadata = {
             'feature_columns': self.config.feature_columns,
-            'model_version': MODEL_VERSION,
+            'hyperparameters': self.config.hyperparameters.dict(),
             'timestamp': str(pd.Timestamp.utcnow())
         }
         with open(os.path.join(save_path, "metadata.json"), 'w') as f:
             json.dump(metadata, f)
 
-        # Note: We no longer save a scaler because we use rolling Z-score normalization
         joblib.dump(models['gb'], os.path.join(save_path, "gb_model.pkl"))
         joblib.dump(models['technical'], os.path.join(save_path, "technical_model.pkl"))
         torch.save(models['lstm'].state_dict(), os.path.join(save_path, "lstm_model.pth"))
