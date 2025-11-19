@@ -191,7 +191,9 @@ class AIEnsembleStrategy(TradingStrategy):
             return None
 
         # 4. Predict using Enriched Data
-        prediction = await self.ensemble_learner.predict(df_enriched, symbol)
+        # PASS REGIME TO PREDICT FOR REGIME-SPECIFIC WEIGHTS
+        prediction = await self.ensemble_learner.predict(df_enriched, symbol, regime=regime)
+        
         action = prediction.get('action')
         confidence = prediction.get('confidence', 0.0)
         model_version = prediction.get('model_version')
