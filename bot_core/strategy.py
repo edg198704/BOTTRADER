@@ -41,6 +41,10 @@ class TradingStrategy(abc.ABC):
         """Returns the number of historical candles needed for training."""
         pass
 
+    async def close(self):
+        """Clean up strategy resources."""
+        pass
+
 class SimpleMACrossoverStrategy(TradingStrategy):
     def __init__(self, config: SimpleMACrossoverStrategyParams):
         super().__init__(config)
@@ -110,6 +114,10 @@ class AIEnsembleStrategy(TradingStrategy):
         except ImportError as e:
             logger.critical("Failed to initialize AIEnsembleStrategy due to missing ML libraries", error=str(e))
             raise
+
+    async def close(self):
+        """Shuts down the ensemble learner resources."""
+        await self.ensemble_learner.close()
 
     def _in_cooldown(self, symbol: str) -> bool:
         """Checks if the symbol is in a signal cooldown period."""
