@@ -247,17 +247,43 @@ class DataHandler:
         if df is not None and not df.empty:
             self._shared_latest_prices[symbol] = df['close'].iloc[-1]
 
-    def get_market_data(self, symbol: str) -> Optional[pd.DataFrame]:
+    def get_market_data(self, symbol: str, include_forming: bool = True) -> Optional[pd.DataFrame]:
         """
         Returns the latest DataFrame for a symbol with pre-calculated technical indicators.
-        Returns None if data is not available.
+        
+        Args:
+            symbol: The trading symbol.
+            include_forming: If True, returns the latest candle even if it's still forming (incomplete).
+                             If False, strips the last candle if it hasn't closed yet.
         """
         df = self._dataframes.get(symbol)
         if df is None or df.empty:
             logger.warning("No market data available for symbol", symbol=symbol)
             return None
         
-        return df.copy() # Return a copy to prevent mutation
+        df_copy = df.copy() # Return a copy to prevent mutation
+
+        if not include_forming:
+            # Logic to drop last row if it is still forming
+            last_ts = df_copy.index[-1]
+            tf_seconds = parse_timeframe_to_seconds(self.timeframe)
+            
+            # Handle timezone naivety/awareness consistency
+            now = pd.Timestamp(Clock.now()).tz_localize(None)
+            if last_ts.tzinfo is not None:
+                last_ts = last_ts.tz_convert(None)
+                
+            # Candle close time is start_time + timeframe
+            candle_end_time = last_ts + pd.Timedelta(seconds=tf_seconds)
+            
+            if now < candle_end_time:
+                # It is forming, drop it
+                df_copy = df_copy.iloc[:-1]
+        
+        if df_copy.empty:
+            return None
+            
+        return df_copy
 
     def get_correlation(self, symbol_a: str, symbol_b: str, lookback: int = 50) -> float:
         """
