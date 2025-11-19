@@ -14,6 +14,7 @@ from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams
 from bot_core.ai.models import LSTMPredictor, AttentionNetwork
 from bot_core.ai.feature_processor import FeatureProcessor
+from bot_core.ai.regime_detector import MarketRegimeDetector
 
 # ML Imports with safe fallbacks
 try:
@@ -524,6 +525,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
 
         # --- OPTIMIZE WEIGHTS & CALIBRATE (Using Calibration Set) ---
         optimized_weights = {}
+        regime_weights = {}
         calibrator = None
         
         # Generate predictions on Calibration Set
@@ -545,26 +547,61 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             y_calib_aligned = y_calib
 
         if calib_preds:
-            # 1. Optimize Weights
+            # 1. Global Weight Optimization
             if config.ensemble_weights.auto_tune:
                 optimized_weights = _optimize_ensemble_weights(calib_preds, y_calib_aligned)
             else:
-                # Use default weights
                 cw = config.ensemble_weights
                 optimized_weights = {
                     'gb': cw.xgboost, 'technical': cw.technical_ensemble,
                     'lstm': cw.lstm, 'attention': cw.attention
                 }
 
-            # 2. Fit Calibrator (on weighted ensemble output)
+            # 2. Regime-Specific Weight Optimization (New)
+            if config.ensemble_weights.use_regime_specific_weights:
+                worker_logger.info("Optimizing weights per regime...")
+                try:
+                    # Reconstruct regime labels for the calibration set
+                    # We need to slice the original DF using the same indices as X_calib
+                    # X_calib corresponds to df_proc.loc[common_index][calib_split_idx:]
+                    # But wait, X_temp was [:test_split_idx], then X_calib was X_temp[calib_split_idx:]
+                    # So X_calib is from index [calib_split_idx : test_split_idx]
+                    
+                    calib_start_idx = calib_split_idx
+                    calib_end_idx = test_split_idx
+                    
+                    # Get the subset of the dataframe corresponding to calibration
+                    df_calib_subset = df.loc[common_index].iloc[calib_start_idx:calib_end_idx]
+                    
+                    # If we used sequences, we lose the first seq_len-1 rows of predictions
+                    if len(X_seq_calib) > 0:
+                        df_calib_subset = df_calib_subset.iloc[seq_len - 1:]
+                    
+                    if len(df_calib_subset) == len(y_calib_aligned):
+                        regime_detector = MarketRegimeDetector(config)
+                        regime_series = regime_detector.get_regime_series(df_calib_subset)
+                        
+                        unique_regimes = regime_series.unique()
+                        for regime in unique_regimes:
+                            mask = (regime_series == regime).values
+                            if np.sum(mask) > 20: # Minimum samples to optimize
+                                regime_preds = {k: v[mask] for k, v in calib_preds.items()}
+                                regime_y = y_calib_aligned[mask]
+                                r_weights = _optimize_ensemble_weights(regime_preds, regime_y)
+                                regime_weights[regime] = r_weights
+                                worker_logger.info(f"Optimized weights for {regime}: {r_weights}")
+                    else:
+                        worker_logger.warning("Calibration DF length mismatch, skipping regime optimization.")
+                except Exception as e:
+                    worker_logger.error(f"Regime weight optimization failed: {e}")
+
+            # 3. Fit Calibrator (on weighted ensemble output using GLOBAL weights)
             if config.training.calibration_method != 'none':
                 worker_logger.info(f"Calibrating ensemble using {config.training.calibration_method}...")
-                # Calculate weighted ensemble probabilities on calibration set
                 model_names = list(calib_preds.keys())
                 pred_stack = np.array([calib_preds[name] for name in model_names])
                 weights = np.array([optimized_weights.get(name, 0.0) for name in model_names])
                 
-                # Normalize weights if they don't sum to 1 (safety)
                 if weights.sum() > 0: weights /= weights.sum()
                 
                 ensemble_probs_calib = np.tensordot(weights, pred_stack, axes=([0],[0]))
@@ -628,7 +665,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 'feature_columns': config.feature_columns,
                 'active_feature_columns': active_feature_names,
                 'num_features': num_features,
-                'optimized_weights': optimized_weights
+                'optimized_weights': optimized_weights,
+                'regime_weights': regime_weights
             }
             with open(os.path.join(temp_dir, "metadata.json"), 'w') as f:
                 json.dump(meta, f, indent=2)
@@ -709,7 +747,7 @@ class EnsembleLearner:
         except Exception as e:
             logger.error(f"Failed to reload models for {symbol}: {e}")
 
-    def _predict_sync(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
+    def _predict_sync(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None) -> Dict[str, Any]:
         entry = self.symbol_models.get(symbol)
         if not entry:
             return {}
@@ -738,12 +776,21 @@ class EnsembleLearner:
         votes = {'buy': 0.0, 'sell': 0.0, 'hold': 0.0}
         config_weights = self.config.ensemble_weights
         
+        # --- Weight Selection Logic ---
         optimized_weights = meta.get('optimized_weights')
+        regime_weights = meta.get('regime_weights', {})
+        
         use_dynamic = config_weights.auto_tune and optimized_weights
+        active_weight_map = optimized_weights if use_dynamic else {}
+        
+        # Override with regime specific weights if available
+        if config_weights.use_regime_specific_weights and regime and regime in regime_weights:
+            active_weight_map = regime_weights[regime]
+            # logger.debug(f"Using regime-specific weights for {regime}", weights=active_weight_map)
         
         def get_weight(name, default_weight):
-            if use_dynamic:
-                return optimized_weights.get(name, 0.0)
+            if active_weight_map:
+                return active_weight_map.get(name, 0.0)
             return default_weight
 
         model_predictions = []
@@ -811,9 +858,7 @@ class EnsembleLearner:
         best_action = max(votes, key=votes.get)
         confidence = votes[best_action]
 
-        # --- Disagreement Penalty (Only if not calibrated, or applied before calibration?) ---
-        # If calibrated, the probability should theoretically account for uncertainty.
-        # However, we keep it as a safety mechanism for model divergence.
+        # --- Disagreement Penalty ---
         if model_predictions and config_weights.disagreement_penalty > 0:
             action_map = {'sell': 0, 'hold': 1, 'buy': 2}
             best_action_idx = action_map[best_action]
@@ -839,14 +884,14 @@ class EnsembleLearner:
             'active_weights': votes,
             'top_features': top_features,
             'metrics': meta.get('metrics', {}),
-            'optimized_weights': optimized_weights if use_dynamic else None
+            'optimized_weights': active_weight_map if active_weight_map else None
         }
 
-    async def predict(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
+    async def predict(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None) -> Dict[str, Any]:
         if symbol not in self.symbol_models:
             await self.reload_models(symbol)
             if symbol not in self.symbol_models:
                 return {}
 
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self.executor, self._predict_sync, df, symbol)
+        return await loop.run_in_executor(self.executor, self._predict_sync, df, symbol, regime)
