@@ -51,6 +51,8 @@ class AITrainingConfig(BaseModel):
     # --- Hyperparameter Optimization ---
     auto_tune_models: bool = False
     n_iter_search: int = 10
+    # --- Data Handling ---
+    use_class_weighting: bool = True
 
 class AILSTMConfig(BaseModel):
     hidden_dim: int = 64
