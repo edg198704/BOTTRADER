@@ -132,6 +132,8 @@ class AIEnsembleStrategy(TradingStrategy):
         confidence = prediction.get('confidence', 0.0)
         model_version = prediction.get('model_version')
         active_weights = prediction.get('active_weights')
+        top_features = prediction.get('top_features')
+        metrics = prediction.get('metrics')
 
         # Log prediction for future evaluation
         if self.ai_config.performance.enabled and action:
@@ -155,7 +157,9 @@ class AIEnsembleStrategy(TradingStrategy):
             'regime': regime,
             'regime_confidence': regime_result.get('confidence'),
             'model_type': prediction.get('model_type'),
-            'active_weights': active_weights
+            'active_weights': active_weights,
+            'top_features': top_features,
+            'metrics': metrics
         }
 
         # NOTE: We explicitly pass 'regime' at the top level so RiskManager can see it.
