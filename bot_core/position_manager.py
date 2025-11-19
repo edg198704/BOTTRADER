@@ -180,6 +180,35 @@ class PositionManager:
         finally:
             session.close()
 
+    async def update_pending_order_id(self, symbol: str, old_order_id: str, new_order_id: str) -> bool:
+        """Updates the order ID of a pending position (e.g., during order chasing)."""
+        async with self._db_lock:
+            return await self._run_in_executor(self._update_pending_order_id_sync, symbol, old_order_id, new_order_id)
+
+    def _update_pending_order_id_sync(self, symbol: str, old_order_id: str, new_order_id: str) -> bool:
+        session = self.SessionLocal()
+        try:
+            position = session.query(Position).filter(
+                Position.symbol == symbol,
+                Position.order_id == old_order_id,
+                Position.status == PositionStatus.PENDING
+            ).first()
+            
+            if position:
+                position.order_id = new_order_id
+                session.commit()
+                logger.info("Updated PENDING position order ID", symbol=symbol, old_id=old_order_id, new_id=new_order_id)
+                return True
+            else:
+                logger.warning("Could not find PENDING position to update order ID", symbol=symbol, old_id=old_order_id)
+                return False
+        except Exception as e:
+            logger.error("Failed to update pending order ID", symbol=symbol, error=str(e))
+            session.rollback()
+            return False
+        finally:
+            session.close()
+
     async def confirm_position_open(self, symbol: str, order_id: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float) -> Optional[Position]:
         async with self._db_lock:
             return await self._run_in_executor(self._confirm_position_open_sync, symbol, order_id, quantity, entry_price, stop_loss, take_profit)
