@@ -31,6 +31,7 @@ class Position(Base):
     entry_price = Column(Float, nullable=False)
     status = Column(SQLAlchemyEnum(PositionStatus), default=PositionStatus.OPEN, nullable=False)
     order_id = Column(String, nullable=True) # Exchange Order ID for reconciliation
+    trade_id = Column(String, nullable=True) # Immutable Logical Trade ID (Client Order ID of first order)
     stop_loss_price = Column(Float, nullable=True)
     take_profit_price = Column(Float, nullable=True)
     # Use Clock.now as the default callable for time abstraction
@@ -78,10 +79,13 @@ class PositionManager:
             insp = inspect(self.engine)
             if insp.has_table('positions'):
                 columns = [c['name'] for c in insp.get_columns('positions')]
-                if 'strategy_metadata' not in columns:
-                    with self.engine.connect() as conn:
+                with self.engine.connect() as conn:
+                    if 'strategy_metadata' not in columns:
                         conn.execute(text("ALTER TABLE positions ADD COLUMN strategy_metadata TEXT"))
                         logger.info("Schema updated: Added strategy_metadata column to positions table.")
+                    if 'trade_id' not in columns:
+                        conn.execute(text("ALTER TABLE positions ADD COLUMN trade_id TEXT"))
+                        logger.info("Schema updated: Added trade_id column to positions table.")
         except Exception as e:
             logger.warning(f"Schema update check failed: {e}")
 
@@ -168,11 +172,11 @@ class PositionManager:
 
     # --- Pending Position Management (Two-Phase Commit) ---
 
-    async def create_pending_position(self, symbol: str, side: str, order_id: str, strategy_metadata: Optional[Dict[str, Any]] = None) -> Optional[Position]:
+    async def create_pending_position(self, symbol: str, side: str, order_id: str, trade_id: str, strategy_metadata: Optional[Dict[str, Any]] = None) -> Optional[Position]:
         async with self._db_lock:
-            return await self._run_in_executor(self._create_pending_position_sync, symbol, side, order_id, strategy_metadata)
+            return await self._run_in_executor(self._create_pending_position_sync, symbol, side, order_id, trade_id, strategy_metadata)
 
-    def _create_pending_position_sync(self, symbol: str, side: str, order_id: str, strategy_metadata: Optional[Dict[str, Any]]) -> Optional[Position]:
+    def _create_pending_position_sync(self, symbol: str, side: str, order_id: str, trade_id: str, strategy_metadata: Optional[Dict[str, Any]]) -> Optional[Position]:
         session = self.SessionLocal()
         try:
             # Check for existing open or pending positions to prevent duplicates
@@ -194,6 +198,7 @@ class PositionManager:
                 entry_price=0.0, # Placeholder until confirmed
                 status=PositionStatus.PENDING,
                 order_id=order_id,
+                trade_id=trade_id,
                 trailing_ref_price=0.0,
                 trailing_stop_active=False,
                 strategy_metadata=metadata_json
@@ -201,7 +206,7 @@ class PositionManager:
             session.add(new_position)
             session.commit()
             session.refresh(new_position)
-            logger.info("Created PENDING position", symbol=symbol, order_id=order_id)
+            logger.info("Created PENDING position", symbol=symbol, order_id=order_id, trade_id=trade_id)
             return new_position
         except Exception as e:
             logger.error("Failed to create pending position", symbol=symbol, error=str(e))
@@ -443,6 +448,7 @@ class PositionManager:
                 entry_price=position.entry_price,
                 status=PositionStatus.CLOSED,
                 order_id=position.order_id, # Link to original entry order
+                trade_id=position.trade_id, # Link to original trade
                 stop_loss_price=position.stop_loss_price,
                 take_profit_price=position.take_profit_price,
                 open_timestamp=position.open_timestamp,
