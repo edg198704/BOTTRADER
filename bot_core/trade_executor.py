@@ -56,7 +56,7 @@ class TradeExecutor:
         if not position:
             if action not in ['BUY', 'SELL']:
                 return  # Ignore other signals if no position is open
-            await self._execute_open_position(symbol, action, current_price, df_with_indicators, market_regime)
+            await self._execute_open_position(symbol, action, current_price, df_with_indicators, market_regime, signal)
         
         # --- Handle Closing an Existing Position ---
         elif position:
@@ -66,7 +66,7 @@ class TradeExecutor:
             if is_close_long_signal or is_close_short_signal:
                 await self.close_position(position, "Strategy Signal")
 
-    async def _execute_open_position(self, symbol: str, side: str, current_price: float, df: pd.DataFrame, regime: Optional[str]):
+    async def _execute_open_position(self, symbol: str, side: str, current_price: float, df: pd.DataFrame, regime: Optional[str], signal: Dict):
         # Await async DB call
         open_positions = await self.position_manager.get_all_open_positions()
         if not self.risk_manager.check_trade_allowed(symbol, open_positions):
@@ -112,7 +112,9 @@ class TradeExecutor:
             return
 
         # 2. Record PENDING Position (Two-Phase Commit Start)
-        await self.position_manager.create_pending_position(symbol, side, order_id)
+        # Extract metadata from signal to persist with position
+        strategy_metadata = signal.get('strategy_metadata')
+        await self.position_manager.create_pending_position(symbol, side, order_id, strategy_metadata=strategy_metadata)
 
         # Define callback to update DB if order is replaced during chase
         async def _on_order_replace(old_id: str, new_id: str):
