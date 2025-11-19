@@ -239,6 +239,11 @@ risk_management:
   confidence_rr_scaling_factor: 0.0 # Set to e.g. 3.0 to enable dynamic TP
   max_confidence_rr_multiplier: 1.5
 
+  # --- Kelly Criterion Sizing (New) ---
+  # Uses the AI model's validation metrics (Win Rate, Profit Factor) to calculate optimal risk.
+  use_kelly_criterion: false # Set to true to enable
+  kelly_fraction: 0.5 # Use Half-Kelly for safety
+
   regime_based_risk:
     # Override default risk parameters based on the detected market regime.
     # If a parameter is not set here, the default value above will be used.
