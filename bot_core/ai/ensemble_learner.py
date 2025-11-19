@@ -257,14 +257,39 @@ class EnsembleLearner:
 
     def _create_labels(self, df: pd.DataFrame) -> pd.Series:
         horizon = self.config.features.labeling_horizon
-        threshold = self.config.features.labeling_threshold
         
         future_price = df['close'].shift(-horizon)
         price_change_pct = (future_price - df['close']) / df['close']
 
-        labels = pd.Series(1, index=df.index)  # Default to 'hold'
-        labels[price_change_pct > threshold] = 2  # 'buy'
-        labels[price_change_pct < -threshold] = 0 # 'sell'
+        labels = pd.Series(1, index=df.index)  # Default to 'hold' (1)
+
+        # Determine threshold: Dynamic (ATR-based) or Static
+        if self.config.features.use_dynamic_labeling:
+            atr_col = self.config.market_regime.volatility_col
+            if atr_col in df.columns:
+                # Dynamic Threshold = (ATR * Multiplier) / Close
+                # This represents the expected volatility percentage
+                multiplier = self.config.features.labeling_atr_multiplier
+                dynamic_threshold = (df[atr_col] * multiplier) / df['close']
+                
+                # Apply dynamic threshold
+                labels[price_change_pct > dynamic_threshold] = 2  # 'buy'
+                labels[price_change_pct < -dynamic_threshold] = 0 # 'sell'
+                
+                logger.info("Using Dynamic ATR Labeling", 
+                            avg_threshold=dynamic_threshold.mean(), 
+                            multiplier=multiplier)
+            else:
+                logger.warning("Dynamic labeling enabled but ATR column not found. Falling back to static threshold.", 
+                               missing_col=atr_col)
+                threshold = self.config.features.labeling_threshold
+                labels[price_change_pct > threshold] = 2
+                labels[price_change_pct < -threshold] = 0
+        else:
+            # Static Threshold
+            threshold = self.config.features.labeling_threshold
+            labels[price_change_pct > threshold] = 2
+            labels[price_change_pct < -threshold] = 0
         
         return labels.iloc[:-horizon]
 
@@ -287,6 +312,7 @@ class EnsembleLearner:
         logger.info("Starting model training", symbol=symbol)
         try:
             # 1. Create labels using ORIGINAL data (prices needed for % change)
+            # Note: df here contains all indicators calculated by DataHandler
             labels = self._create_labels(df)
             
             # 2. Normalize features using Rolling Z-Score
@@ -392,48 +418,12 @@ class EnsembleLearner:
                                required=threshold)
                 return False
 
-            # --- PRODUCTION RETRAINING ---
-            logger.info("Validation passed. Retraining models on full dataset for production.", symbol=symbol)
-            
-            # 1. Prepare Full Dataset
-            X_full_seq = X_seq
-            y_full_seq = y_seq
-            X_full_flat = X_seq[:, -1, :]
-            y_full_flat = y_seq
-            
-            # 2. Create Fresh Production Models
-            prod_models = self._create_fresh_models()
-            
-            # 3. Train Sklearn Models on Full Data
-            prod_models['gb'].fit(X_full_flat, y_full_flat)
-            prod_models['technical'].fit(X_full_flat, y_full_flat)
-            
-            # 4. Train PyTorch Models on Full Data (with small internal split for early stopping)
-            # Use 10% of full data for early stopping to maximize training data while keeping safety
-            prod_split_idx = int(len(X_full_seq) * 0.90)
-            
-            X_prod_train = X_full_seq[:prod_split_idx]
-            y_prod_train = y_full_seq[:prod_split_idx]
-            X_prod_val = X_full_seq[prod_split_idx:]
-            y_prod_val = y_full_seq[prod_split_idx:]
-            
-            X_prod_train_tensor = torch.FloatTensor(X_prod_train).to(self.device)
-            y_prod_train_tensor = torch.LongTensor(y_prod_train).to(self.device)
-            X_prod_val_tensor = torch.FloatTensor(X_prod_val).to(self.device)
-            y_prod_val_tensor = torch.LongTensor(y_prod_val).to(self.device)
-            
-            self._train_pytorch_model(prod_models['lstm'], X_prod_train_tensor, y_prod_train_tensor, X_prod_val_tensor, y_prod_val_tensor)
-            self._train_pytorch_model(prod_models['attention'], X_prod_train_tensor, y_prod_train_tensor, X_prod_val_tensor, y_prod_val_tensor)
-            
-            # 5. Update Reference to the production models
-            models = prod_models
-
             # 10. Atomic Update & Save
             self.symbol_models[symbol] = models
             self.is_trained = True
             
             self._save_models(symbol, models)
-            logger.info("All models trained, validated, retrained on full history, and promoted to production.", symbol=symbol)
+            logger.info("All models trained, validated, and promoted to production.", symbol=symbol)
             return True
 
         except Exception as e:
