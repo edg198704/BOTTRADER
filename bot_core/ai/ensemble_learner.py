@@ -179,17 +179,19 @@ def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyP
             meta = json.load(f)
 
         # --- CONFIG CONSISTENCY CHECK ---
-        saved_features = meta.get('feature_columns', [])
-        current_features = config.feature_columns
+        # We check if the model's required features are available in the current config.
+        # The model might use a subset (due to feature selection), which is fine.
+        saved_active_features = meta.get('active_feature_columns', meta.get('feature_columns', []))
         
-        if saved_features != current_features:
+        # Get all currently available features from config
+        current_available_features = FeatureProcessor.get_feature_names(config)
+        
+        # Check if saved features are a subset of current available features
+        if not set(saved_active_features).issubset(set(current_available_features)):
             return None
         
-        expected_num_features = FeatureProcessor.get_expected_feature_count(config)
-        saved_num_features = meta.get('num_features', len(saved_features))
-        
-        if expected_num_features != saved_num_features:
-            return None
+        # The number of features the model expects
+        saved_num_features = meta.get('num_features', len(saved_active_features))
         # --------------------------------
 
         models = {}
@@ -203,7 +205,7 @@ def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyP
         if 'lstm' in config.ensemble_weights.dict():
             path = os.path.join(load_dir, "lstm.pth")
             if os.path.exists(path):
-                lstm = LSTMPredictor(expected_num_features, config.hyperparameters.lstm.hidden_dim, 
+                lstm = LSTMPredictor(saved_num_features, config.hyperparameters.lstm.hidden_dim, 
                                      config.hyperparameters.lstm.num_layers, 
                                      config.hyperparameters.lstm.dropout).to(device)
                 lstm.load_state_dict(torch.load(path, map_location=device))
@@ -213,7 +215,7 @@ def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyP
         if 'attention' in config.ensemble_weights.dict():
             path = os.path.join(load_dir, "attention.pth")
             if os.path.exists(path):
-                attn = AttentionNetwork(expected_num_features, config.hyperparameters.attention.hidden_dim,
+                attn = AttentionNetwork(saved_num_features, config.hyperparameters.attention.hidden_dim,
                                         config.hyperparameters.attention.num_layers,
                                         config.hyperparameters.attention.nhead,
                                         config.hyperparameters.attention.dropout).to(device)
@@ -341,7 +343,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
 
         # 1. Prepare Data
         df_proc = FeatureProcessor.process_data(df, config)
-        num_features = df_proc.shape[1]
+        all_feature_names = list(df_proc.columns)
         labels = FeatureProcessor.create_labels(df, config)
         
         # Align Data
@@ -350,8 +352,38 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             worker_logger.warning("Insufficient data after alignment.")
             return False
             
-        X = df_proc.loc[common_index].values
+        X_full = df_proc.loc[common_index].values
         y = labels.loc[common_index].values.astype(int)
+
+        # --- FEATURE SELECTION ---
+        selected_indices = list(range(X_full.shape[1])) # Default to all
+        active_feature_names = all_feature_names
+
+        if config.features.use_feature_selection:
+            worker_logger.info("Running Feature Selection...")
+            try:
+                # Use a lightweight Random Forest for selection
+                selector = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42, n_jobs=1)
+                selector.fit(X_full, y)
+                importances = selector.feature_importances_
+                
+                # Select top K features
+                k = min(config.features.max_active_features, len(all_feature_names))
+                top_k_indices = np.argsort(importances)[::-1][:k]
+                
+                # Sort indices to maintain relative order (important for time series structure if any)
+                selected_indices = sorted(top_k_indices)
+                active_feature_names = [all_feature_names[i] for i in selected_indices]
+                
+                worker_logger.info(f"Selected {len(active_feature_names)} features out of {len(all_feature_names)}.")
+                worker_logger.debug(f"Active features: {active_feature_names}")
+                
+            except Exception as e:
+                worker_logger.error(f"Feature selection failed: {e}. Using all features.")
+
+        # Subset X to selected features
+        X = X_full[:, selected_indices]
+        num_features = X.shape[1]
 
         # Calculate Market Returns for Evaluation (Next candle return)
         full_returns = df['close'].pct_change().shift(-1)
@@ -376,11 +408,31 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             champion_models = champion_data['models']
             champion_weights = champion_data['meta'].get('optimized_weights')
             
-            champion_metrics = _evaluate_ensemble(
-                champion_models, X_val, y_val, X_seq_val, y_seq_val, 
-                config, device, returns_val, weights_override=champion_weights
-            )
-            worker_logger.info(f"Champion Metrics: PF={champion_metrics.get('profit_factor', 0):.2f}, Sharpe={champion_metrics.get('sharpe', 0):.4f}")
+            # Note: Champion might use different features. 
+            # _load_saved_models ensures we can generate them, but we need to extract them correctly here.
+            # However, for simplicity in this architecture, we re-evaluate the champion using ITS OWN feature set logic
+            # if we were doing strict versioning. 
+            # Current simplification: We only compare if the champion is compatible with current config superset.
+            # If feature selection changed drastically, the champion might be using features we just discarded.
+            # To handle this robustly, we would need to reconstruct the champion's X from df_proc using its meta.
+            
+            champ_features = champion_data['meta'].get('active_feature_columns', champion_data['meta'].get('feature_columns'))
+            
+            # Reconstruct X for champion
+            try:
+                champ_indices = [all_feature_names.index(f) for f in champ_features if f in all_feature_names]
+                if len(champ_indices) == len(champ_features):
+                    X_champ_full = X_full[:, champ_indices]
+                    X_champ_val = X_champ_full[split_idx:]
+                    X_champ_seq_val, y_champ_seq_val = FeatureProcessor.create_sequences(X_champ_val, y_val, seq_len)
+                    
+                    champion_metrics = _evaluate_ensemble(
+                        champion_models, X_champ_val, y_val, X_champ_seq_val, y_champ_seq_val, 
+                        config, device, returns_val, weights_override=champion_weights
+                    )
+                    worker_logger.info(f"Champion Metrics: PF={champion_metrics.get('profit_factor', 0):.2f}, Sharpe={champion_metrics.get('sharpe', 0):.4f}")
+            except Exception as e:
+                worker_logger.warning(f"Could not evaluate champion due to feature mismatch: {e}")
 
         # --- CHALLENGER TRAINING ---
         # Class Weighting
@@ -415,7 +467,10 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             
             trained_models[name] = model
             if hasattr(model, 'feature_importances_'):
-                feature_importance[name] = model.feature_importances_.tolist()
+                # Map importances back to active feature names
+                imps = model.feature_importances_.tolist()
+                if len(imps) == len(active_feature_names):
+                    feature_importance[name] = dict(zip(active_feature_names, imps))
 
         # Train PyTorch
         X_seq_train, y_seq_train = FeatureProcessor.create_sequences(X_train, y_train, seq_len)
@@ -486,15 +541,11 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         # 2. Champion vs Challenger
         if champion_metrics:
             champ_sharpe = champion_metrics.get('sharpe', 0)
-            # Ensure we don't divide by zero or handle negative sharpe weirdly
-            # Logic: New Sharpe must be > Old Sharpe * (1 + threshold)
-            # If Old Sharpe is negative, any positive Sharpe is an improvement.
-            
             improvement_needed = config.training.min_improvement_pct
             
             is_better = False
             if champ_sharpe <= 0:
-                if sharpe > champ_sharpe + 0.05: # Arbitrary small bump to escape negative
+                if sharpe > champ_sharpe + 0.05: 
                     is_better = True
             else:
                 if sharpe > champ_sharpe * (1 + improvement_needed):
@@ -525,7 +576,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 'timestamp': datetime.now().isoformat(),
                 'metrics': {'ensemble': challenger_metrics},
                 'feature_importance': feature_importance,
-                'feature_columns': config.feature_columns,
+                'feature_columns': config.feature_columns, # Full list from config
+                'active_feature_columns': active_feature_names, # Actual subset used
                 'num_features': num_features,
                 'optimized_weights': optimized_weights
             }
@@ -609,6 +661,20 @@ class EnsembleLearner:
         
         # Prepare Data
         df_proc = FeatureProcessor.process_data(df, self.config)
+        
+        # --- FILTER FEATURES ---
+        # The model might use a subset of features defined in metadata
+        active_features = meta.get('active_feature_columns', meta.get('feature_columns'))
+        
+        # Ensure we have all required columns
+        if not set(active_features).issubset(set(df_proc.columns)):
+            logger.error(f"Inference failed: Missing features for {symbol}. Model expects {active_features}")
+            return {}
+            
+        # Subset to active features in correct order
+        df_proc = df_proc[active_features]
+        # -----------------------
+
         X = df_proc.iloc[-1:].values # Last row for prediction
         
         # Prepare Sequences for NN
@@ -704,8 +770,9 @@ class EnsembleLearner:
         # Extract top features from XGBoost if available
         top_features = {}
         if 'gb' in models and hasattr(models['gb'], 'feature_importances_'):
+            # Need to map back to names since we subsetted
             imps = models['gb'].feature_importances_
-            cols = FeatureProcessor.get_feature_names(self.config)
+            cols = active_features
             indices = np.argsort(imps)[::-1][:5]
             for idx in indices:
                 if idx < len(cols):
