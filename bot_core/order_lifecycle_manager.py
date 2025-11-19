@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Callable, Awaitable
 
 from bot_core.logger import get_logger
 from bot_core.config import ExecutionConfig
@@ -19,7 +19,14 @@ class OrderLifecycleManager:
         self.latest_prices = shared_latest_prices
         logger.info("OrderLifecycleManager initialized.")
 
-    async def manage(self, initial_order: Dict[str, Any], symbol: str, side: str, quantity: float, initial_price: Optional[float], market_details: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    async def manage(self, 
+                     initial_order: Dict[str, Any], 
+                     symbol: str, 
+                     side: str, 
+                     quantity: float, 
+                     initial_price: Optional[float], 
+                     market_details: Optional[Dict[str, Any]] = None,
+                     on_order_replace: Optional[Callable[[str, str], Awaitable[None]]] = None) -> Optional[Dict[str, Any]]:
         """
         Main entry point to manage an order's lifecycle.
         """
@@ -34,9 +41,16 @@ class OrderLifecycleManager:
         if not is_chaseable:
             return await self._poll_order_until_filled_or_timeout(order_id, symbol)
 
-        return await self._chase_order_lifecycle(order_id, symbol, side, quantity, initial_price, market_details)
+        return await self._chase_order_lifecycle(order_id, symbol, side, quantity, initial_price, market_details, on_order_replace)
 
-    async def _chase_order_lifecycle(self, initial_order_id: str, symbol: str, side: str, total_quantity: float, initial_price: Optional[float], market_details: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    async def _chase_order_lifecycle(self, 
+                                     initial_order_id: str, 
+                                     symbol: str, 
+                                     side: str, 
+                                     total_quantity: float, 
+                                     initial_price: Optional[float], 
+                                     market_details: Optional[Dict[str, Any]],
+                                     on_order_replace: Optional[Callable[[str, str], Awaitable[None]]] = None) -> Optional[Dict[str, Any]]:
         """
         Handles the advanced order chasing logic for LIMIT orders, accounting for partial fills.
         """
@@ -45,6 +59,9 @@ class OrderLifecycleManager:
         current_order_id = initial_order_id
         current_order_price = initial_price
         chase_attempts = 0
+
+        # Track the ID currently stored in the persistence layer to ensure updates are linked correctly
+        last_persisted_order_id = initial_order_id
 
         # Get min amount from market details to avoid dust errors
         min_amount = 0.0
@@ -140,7 +157,17 @@ class OrderLifecycleManager:
             try:
                 new_order_result = await self.exchange_api.place_order(symbol, side, 'LIMIT', remaining_qty, price=new_price)
                 if new_order_result and new_order_result.get('orderId'):
-                    current_order_id = new_order_result['orderId']
+                    new_order_id = new_order_result['orderId']
+                    
+                    # Trigger callback to persist the new order ID
+                    if on_order_replace:
+                        try:
+                            await on_order_replace(last_persisted_order_id, new_order_id)
+                            last_persisted_order_id = new_order_id
+                        except Exception as e:
+                            logger.error("Error in on_order_replace callback", error=str(e))
+
+                    current_order_id = new_order_id
                     current_order_price = new_price
                     logger.info("Placed new chase order.", new_order_id=current_order_id, price=new_price, qty=remaining_qty)
                 else:
