@@ -103,11 +103,18 @@ class TradeExecutor:
             offset = self.config.execution.limit_price_offset_pct
             limit_price = current_price * (1 - offset) if side == 'BUY' else current_price * (1 + offset)
 
+        # 1. Place Order
         order_result = await self.exchange_api.place_order(symbol, side, order_type, final_quantity, price=limit_price)
-        if not (order_result and order_result.get('orderId')):
+        order_id = order_result.get('orderId')
+        
+        if not (order_result and order_id):
             logger.error("Order placement failed, no order ID returned.", symbol=symbol)
             return
 
+        # 2. Record PENDING Position (Two-Phase Commit Start)
+        await self.position_manager.create_pending_position(symbol, side, order_id)
+
+        # 3. Manage Order Lifecycle
         final_order_state = await self.order_lifecycle_manager.manage(
             initial_order=order_result, 
             symbol=symbol, 
@@ -118,25 +125,29 @@ class TradeExecutor:
         )
         
         fill_quantity = final_order_state.get('filled', 0.0) if final_order_state else 0.0
+        
+        # 4. Confirm or Void Position (Two-Phase Commit End)
         if fill_quantity > 0:
             fill_price = final_order_state.get('average')
             if not fill_price or fill_price <= 0:
-                logger.critical("Order filled but average price is invalid. Cannot open position.", order_id=order_result.get('orderId'), final_state=final_order_state)
+                logger.critical("Order filled but average price is invalid. Cannot confirm position.", order_id=order_id, final_state=final_order_state)
+                # We leave it as PENDING so it can be reconciled manually or on restart, rather than deleting a filled trade.
                 return
 
-            logger.info("Order to open position was filled (fully or partially).", order_id=order_result.get('orderId'), filled_qty=fill_quantity, fill_price=fill_price)
+            logger.info("Order to open position was filled.", order_id=order_id, filled_qty=fill_quantity, fill_price=fill_price)
             final_stop_loss = self.risk_manager.calculate_stop_loss(side, fill_price, df, market_regime=regime)
             final_take_profit = self.risk_manager.calculate_take_profit(side, fill_price, final_stop_loss, market_regime=regime)
             
-            # Await async DB call
-            await self.position_manager.open_position(symbol, side, fill_quantity, fill_price, final_stop_loss, final_take_profit)
+            await self.position_manager.confirm_position_open(symbol, order_id, fill_quantity, fill_price, final_stop_loss, final_take_profit)
         else:
             final_status = final_order_state.get('status') if final_order_state else 'UNKNOWN'
-            logger.error("Order to open position did not fill.", order_id=order_result.get('orderId'), final_status=final_status)
+            logger.error("Order to open position did not fill. Voiding pending position.", order_id=order_id, final_status=final_status)
+            await self.position_manager.void_position(symbol, order_id)
+            
             await self.alert_system.send_alert(
                 level='error',
                 message=f"🔴 Failed to open position for {symbol}. Order did not fill.",
-                details={'symbol': symbol, 'order_id': order_result.get('orderId'), 'final_status': final_status}
+                details={'symbol': symbol, 'order_id': order_id, 'final_status': final_status}
             )
 
     async def close_position(self, position: Position, reason: str):
