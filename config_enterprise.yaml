@@ -166,6 +166,7 @@ risk_management:
   max_daily_loss_usd: 500.0
   max_open_positions: 5 # Increased to allow for multi-symbol trading
   circuit_breaker_threshold: -0.10 # Halt trading if portfolio drops 10%
+  close_positions_on_halt: true # Liquidate all positions if circuit breaker or max daily loss is hit
   use_trailing_stop: true
   atr_stop_multiplier: 2.0
   stop_loss_fallback_pct: 0.05
