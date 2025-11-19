@@ -42,7 +42,7 @@ class ExchangeAPI(abc.ABC):
         pass
 
     @abc.abstractmethod
-    async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None) -> Dict[str, Any]:
+    async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]:
         """Places an order on the exchange."""
         pass
     
@@ -123,7 +123,7 @@ class MockExchangeAPI(ExchangeAPI):
         self.last_price += random.uniform(-100, 100)
         return {"symbol": symbol, "lastPrice": str(self.last_price)}
 
-    async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None) -> Dict[str, Any]:
+    async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]:
         self.order_id_counter += 1
         order_id = f"mock_order_{self.order_id_counter}"
         
@@ -138,6 +138,10 @@ class MockExchangeAPI(ExchangeAPI):
             'filled': 0.0,
             'average': 0.0
         }
+        
+        if extra_params and 'clientOrderId' in extra_params:
+            order['clientOrderId'] = extra_params['clientOrderId']
+
         self.open_orders[order_id] = order
         logger.info("Mock: Order placed", **order)
 
@@ -279,7 +283,7 @@ class BacktestExchangeAPI(ExchangeAPI):
         price = candle['close'] if candle is not None else 0.0
         return {"symbol": symbol, "lastPrice": str(price)}
 
-    async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None) -> Dict[str, Any]:
+    async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]:
         self.order_id_counter += 1
         order_id = f"bt_order_{self.order_id_counter}"
         
@@ -295,6 +299,9 @@ class BacktestExchangeAPI(ExchangeAPI):
             'average': 0.0,
             'timestamp': Clock.now()
         }
+        if extra_params and 'clientOrderId' in extra_params:
+            order['clientOrderId'] = extra_params['clientOrderId']
+            
         self.open_orders[order_id] = order
         return {"orderId": order_id, "status": "OPEN"}
 
@@ -486,14 +493,15 @@ class CCXTExchangeAPI(ExchangeAPI):
             logger.error("Final attempt failed for get_ticker_data", symbol=symbol, error=str(e))
             raise
 
-    async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None) -> Dict[str, Any]:
+    async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]:
         try:
+            params = extra_params or {}
             if order_type.upper() == 'MARKET':
-                order = await self.exchange.create_market_order(symbol, side.lower(), quantity)
+                order = await self.exchange.create_market_order(symbol, side.lower(), quantity, params=params)
             elif order_type.upper() == 'LIMIT':
                 if price is None:
                     raise ValueError("Price is required for a LIMIT order.")
-                order = await self.exchange.create_limit_order(symbol, side.lower(), quantity, price)
+                order = await self.exchange.create_limit_order(symbol, side.lower(), quantity, price, params=params)
             else:
                 raise ValueError(f"Unsupported order type: {order_type}")
             
@@ -528,7 +536,8 @@ class CCXTExchangeAPI(ExchangeAPI):
                 'symbol': order.get('symbol'),
                 'price': order.get('price', 0.0),
                 'side': order.get('side'),
-                'type': order.get('type')
+                'type': order.get('type'),
+                'clientOrderId': order.get('clientOrderId')
             }
         except OrderNotFound:
             logger.warning("Order not found on exchange, not retrying.", order_id=order_id, symbol=symbol)
