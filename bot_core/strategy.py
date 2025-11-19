@@ -335,10 +335,17 @@ class AIEnsembleStrategy(TradingStrategy):
         if self.ai_config.retrain_interval_hours <= 0:
             return False
         
-        last_retrained = self.last_retrained_at.get(symbol)
-        if not last_retrained:
-            return True
+        # Sync with learner state if local state is empty (e.g. after restart)
+        if symbol not in self.last_retrained_at:
+            last_train_time = self.ensemble_learner.get_last_training_time(symbol)
+            if last_train_time:
+                self.last_retrained_at[symbol] = last_train_time
+                logger.info("Synced last training time from loaded model.", symbol=symbol, timestamp=last_train_time)
+            else:
+                # If learner has no record, we must train.
+                return True
         
+        last_retrained = self.last_retrained_at.get(symbol)
         time_since_retrain = Clock.now() - last_retrained
         return time_since_retrain >= timedelta(hours=self.ai_config.retrain_interval_hours)
 
