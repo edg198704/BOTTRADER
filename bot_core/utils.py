@@ -1,12 +1,46 @@
 import asyncio
 import functools
-from typing import Tuple, Type, List, Dict, Any
+from typing import Tuple, Type, List, Dict, Any, Optional
+from datetime import datetime, timezone
 
 from bot_core.logger import get_logger
 
 # Note: The logger is fetched at the module level.
 # When used inside the decorator, it will correctly reference the decorated function's module.
 logger = get_logger(__name__)
+
+class Clock:
+    """
+    Centralized time provider to enable deterministic testing and backtesting.
+    In LIVE mode, returns system time.
+    In SIMULATION mode, returns the injected mock time.
+    """
+    _mock_time: Optional[datetime] = None
+
+    @classmethod
+    def now(cls) -> datetime:
+        """Returns the current time (UTC)."""
+        if cls._mock_time:
+            return cls._mock_time
+        return datetime.now(timezone.utc)
+
+    @classmethod
+    def set_time(cls, dt: datetime):
+        """Sets the mock time for simulation."""
+        if dt.tzinfo is None:
+            # Assume UTC if no timezone provided during simulation set
+            dt = dt.replace(tzinfo=timezone.utc)
+        cls._mock_time = dt
+
+    @classmethod
+    def reset(cls):
+        """Resets to system time."""
+        cls._mock_time = None
+
+    @classmethod
+    def timestamp(cls) -> float:
+        """Returns current timestamp as float."""
+        return cls.now().timestamp()
 
 def async_retry(
     max_attempts: int = 3,
