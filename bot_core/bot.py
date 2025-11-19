@@ -99,13 +99,12 @@ class TradingBot:
                         continue
 
                     status = order.get('status')
-                    if status == 'FILLED':
-                        # Recover the position
-                        filled_qty = order.get('filled', 0.0)
-                        avg_price = order.get('average', 0.0)
-                        
+                    
+                    # Helper to confirm position from order data
+                    async def confirm_from_order(order_data):
+                        filled_qty = order_data.get('filled', 0.0)
+                        avg_price = order_data.get('average', 0.0)
                         # Fallback SL/TP since we might not have market data yet
-                        # Default to 5% risk if we can't calculate it
                         sl_pct = 0.05
                         tp_pct = 0.05
                         if pos.side == 'BUY':
@@ -114,18 +113,34 @@ class TradingBot:
                         else:
                             sl = avg_price * (1 + sl_pct)
                             tp = avg_price * (1 - tp_pct)
-
-                        logger.info("Recovered FILLED order for pending position.", symbol=pos.symbol, order_id=pos.order_id)
+                        
+                        logger.info("Recovered position from order.", symbol=pos.symbol, order_id=pos.order_id, filled=filled_qty)
                         await self.position_manager.confirm_position_open(pos.symbol, pos.order_id, filled_qty, avg_price, sl, tp)
+
+                    if status == 'FILLED':
+                        await confirm_from_order(order)
                     
                     elif status in ['CANCELED', 'REJECTED', 'EXPIRED']:
-                        logger.info("Pending position order was terminal but not filled. Voiding.", symbol=pos.symbol, status=status)
-                        await self.position_manager.void_position(pos.symbol, pos.order_id)
+                        # Check for partial fills even in terminal states
+                        filled = order.get('filled', 0.0)
+                        if filled > 0:
+                            logger.info("Pending position was terminal but partially filled. Recovering.", symbol=pos.symbol, status=status)
+                            await confirm_from_order(order)
+                        else:
+                            logger.info("Pending position order was terminal and empty. Voiding.", symbol=pos.symbol, status=status)
+                            await self.position_manager.void_position(pos.symbol, pos.order_id)
                     
                     elif status == 'OPEN':
-                        logger.info("Pending position order is still OPEN. Cancelling and voiding to ensure clean state.", symbol=pos.symbol)
-                        await self.exchange_api.cancel_order(pos.order_id, pos.symbol)
-                        await self.position_manager.void_position(pos.symbol, pos.order_id)
+                        logger.info("Pending position order is still OPEN. Cancelling...", symbol=pos.symbol)
+                        # Cancel returns the updated order object (or fetches it)
+                        cancelled_order = await self.exchange_api.cancel_order(pos.order_id, pos.symbol)
+                        
+                        if cancelled_order and cancelled_order.get('filled', 0.0) > 0:
+                             logger.info("Cancelled order had partial fills. Confirming position.", symbol=pos.symbol)
+                             await confirm_from_order(cancelled_order)
+                        else:
+                             logger.info("Cancelled order was empty. Voiding position.", symbol=pos.symbol)
+                             await self.position_manager.void_position(pos.symbol, pos.order_id)
 
                 except Exception as e:
                     logger.error("Error reconciling pending position", symbol=pos.symbol, error=str(e))
