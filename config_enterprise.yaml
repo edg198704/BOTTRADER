@@ -157,23 +157,6 @@ strategy:
       window_size: 50 # Evaluate last 50 predictions
       min_accuracy: 0.45 # Trigger retrain if accuracy drops below 45%
 
-# --- Example for SimpleMACrossoverStrategy (for reference) ---
-# strategy:
-#   symbols: ["BTC/USDT"]
-#   interval_seconds: 60
-#   timeframe: "1h"
-#   indicators:
-#     - kind: "sma"
-#       length: 10
-#       alias: "sma_fast"
-#     - kind: "sma"
-#       length: 20
-#       alias: "sma_slow"
-#   params:
-#     name: "SimpleMACrossoverStrategy"
-#     fast_ma_period: 10
-#     slow_ma_period: 20
-
 risk_management:
   max_position_size_usd: 1000.0
   max_daily_loss_usd: 500.0
@@ -213,6 +196,13 @@ risk_management:
     enabled: false
     max_hold_time_hours: 24
     threshold_pct: 0.005 # Close if PnL < 0.5% after 24 hours
+
+backtest:
+  enabled: true
+  initial_balance: 10000.0
+  maker_fee_pct: 0.001 # 0.1%
+  taker_fee_pct: 0.001 # 0.1%
+  slippage_pct: 0.0005 # 0.05%
 
 database:
   path: "position_ledger.db"
