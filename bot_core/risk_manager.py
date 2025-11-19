@@ -5,6 +5,7 @@ from datetime import datetime
 from bot_core.config import RiskManagementConfig
 from bot_core.logger import get_logger
 from bot_core.position_manager import Position
+from bot_core.utils import Clock
 
 if TYPE_CHECKING:
     from bot_core.monitoring import AlertSystem
@@ -254,7 +255,8 @@ class RiskManager:
         cfg = self.config.time_based_exit
         if not cfg.enabled: return False
         
-        now = datetime.utcnow()
+        # Use Clock.now() for time abstraction
+        now = Clock.now()
         duration = now - position.open_timestamp
         if duration.total_seconds() > (cfg.max_hold_time_hours * 3600):
             # Calculate PnL %
