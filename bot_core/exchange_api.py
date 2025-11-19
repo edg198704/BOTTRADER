@@ -57,6 +57,11 @@ class ExchangeAPI(abc.ABC):
         pass
 
     @abc.abstractmethod
+    async def fetch_recent_orders(self, symbol: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Fetches the most recent orders (open or closed) for a symbol."""
+        pass
+
+    @abc.abstractmethod
     async def cancel_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
         """Cancels an open order."""
         pass
@@ -136,7 +141,8 @@ class MockExchangeAPI(ExchangeAPI):
             'quantity': quantity,
             'status': 'OPEN',
             'filled': 0.0,
-            'average': 0.0
+            'average': 0.0,
+            'timestamp': int(time.time() * 1000)
         }
         
         if extra_params and 'clientOrderId' in extra_params:
@@ -180,7 +186,7 @@ class MockExchangeAPI(ExchangeAPI):
                     if order['side'] == "BUY":
                         self.balances[quote_asset] -= (cost + fee_cost)
                         self.balances[base_asset] = self.balances.get(base_asset, 0) + order['quantity']
-                    else: # SELL
+                    else:
                         self.balances[base_asset] -= order['quantity']
                         self.balances[quote_asset] = self.balances.get(quote_asset, 0) + (cost - fee_cost)
                     
@@ -197,6 +203,12 @@ class MockExchangeAPI(ExchangeAPI):
 
     async def fetch_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
         return [order for order in self.open_orders.values() if order['symbol'] == symbol and order['status'] == 'OPEN']
+
+    async def fetch_recent_orders(self, symbol: str, limit: int = 10) -> List[Dict[str, Any]]:
+        # Filter by symbol and sort by timestamp descending
+        orders = [o for o in self.open_orders.values() if o['symbol'] == symbol]
+        orders.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
+        return orders[:limit]
 
     async def cancel_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
         order = self.open_orders.get(order_id)
@@ -374,6 +386,13 @@ class BacktestExchangeAPI(ExchangeAPI):
     async def fetch_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
         return [o for o in self.open_orders.values() if o['symbol'] == symbol and o['status'] == 'OPEN']
 
+    async def fetch_recent_orders(self, symbol: str, limit: int = 10) -> List[Dict[str, Any]]:
+        # Backtest API stores all orders in open_orders dict (even closed ones)
+        orders = [o for o in self.open_orders.values() if o['symbol'] == symbol]
+        # Sort by timestamp (Clock.now() returns datetime, so it's comparable)
+        orders.sort(key=lambda x: x.get('timestamp'), reverse=True)
+        return orders[:limit]
+
     async def cancel_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
         order = self.open_orders.get(order_id)
         if order and order['status'] == 'OPEN':
@@ -437,6 +456,7 @@ class CCXTExchangeAPI(ExchangeAPI):
         self.place_order = retry_decorator(self.place_order)
         self.fetch_order = retry_decorator(self.fetch_order)
         self.fetch_open_orders = retry_decorator(self.fetch_open_orders)
+        self.fetch_recent_orders = retry_decorator(self.fetch_recent_orders)
         self.cancel_order = retry_decorator(self.cancel_order)
         self.cancel_all_orders = retry_decorator(self.cancel_all_orders)
         self.get_balance = retry_decorator(self.get_balance)
@@ -559,6 +579,17 @@ class CCXTExchangeAPI(ExchangeAPI):
             return orders
         except (NetworkError, ExchangeError) as e:
             logger.error("Final attempt failed for fetch_open_orders", symbol=symbol, error=str(e))
+            raise
+
+    async def fetch_recent_orders(self, symbol: str, limit: int = 10) -> List[Dict[str, Any]]:
+        try:
+            if self.exchange.has.get('fetchOrders'):
+                return await self.exchange.fetch_orders(symbol, limit=limit)
+            else:
+                logger.warning("Exchange does not support fetchOrders. Deep zombie scan unavailable.", symbol=symbol)
+                return []
+        except (NetworkError, ExchangeError) as e:
+            logger.error("Final attempt failed for fetch_recent_orders", symbol=symbol, error=str(e))
             raise
 
     async def cancel_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
