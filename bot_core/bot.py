@@ -60,6 +60,13 @@ class TradingBot:
         self.shared_bot_state['latest_prices'] = self.latest_prices
         self.shared_bot_state['config'] = self.config
 
+    async def setup(self):
+        """Performs initial setup: loads market details and reconciles state. Separated for backtesting."""
+        logger.info("Setting up TradingBot components...")
+        await self._load_market_details()
+        await self._reconcile_start_state()
+        logger.info("TradingBot setup complete.")
+
     async def _load_market_details(self):
         """Fetches and caches exchange trading rules for all configured symbols."""
         logger.info("Loading market details for all symbols...")
@@ -184,8 +191,7 @@ class TradingBot:
         self.shared_bot_state['status'] = 'running'
         logger.info("Starting TradingBot...", symbols=self.config.strategy.symbols)
         
-        await self._load_market_details()
-        await self._reconcile_start_state()
+        await self.setup()
 
         # Start shared loops
         self.tasks.append(asyncio.create_task(self.data_handler.run()))
@@ -205,7 +211,7 @@ class TradingBot:
         while self.running:
             set_correlation_id()
             try:
-                await self._run_single_trade_check(symbol)
+                await self.process_symbol_tick(symbol)
             except asyncio.CancelledError:
                 logger.info("Trading loop cancelled for symbol", symbol=symbol)
                 break
@@ -213,6 +219,27 @@ class TradingBot:
                 logger.critical("Unhandled exception in trading cycle", symbol=symbol, error=str(e), exc_info=True)
             
             await asyncio.sleep(self.config.strategy.interval_seconds)
+
+    async def process_symbol_tick(self, symbol: str):
+        """Executes a single trading logic iteration for a symbol. Public for backtesting."""
+        if self.risk_manager.is_halted:
+            logger.warning("Trading is halted by RiskManager.")
+            return
+
+        df_with_indicators = self.data_handler.get_market_data(symbol)
+        if df_with_indicators is None:
+            logger.warning("Could not get market data from handler.", symbol=symbol)
+            return
+        
+        if symbol not in self.latest_prices:
+            logger.warning("Latest price for symbol not available yet.", symbol=symbol)
+            return
+
+        # Await the async DB call
+        position = await self.position_manager.get_open_position(symbol)
+        signal = await self.strategy.analyze_market(symbol, df_with_indicators, position)
+
+        if signal: await self._handle_signal(signal, df_with_indicators, position)
 
     async def _monitoring_loop(self):
         """Periodically runs health checks and portfolio monitoring."""
@@ -314,28 +341,6 @@ class TradingBot:
             except Exception as e:
                 logger.error("Error in retraining loop", error=str(e), exc_info=True)
                 await asyncio.sleep(3600) # Wait before retrying on error
-
-    async def _run_single_trade_check(self, symbol: str):
-        logger.debug("Starting new trade check", symbol=symbol)
-
-        if self.risk_manager.is_halted:
-            logger.warning("Trading is halted by RiskManager.")
-            return
-
-        df_with_indicators = self.data_handler.get_market_data(symbol)
-        if df_with_indicators is None:
-            logger.warning("Could not get market data from handler.", symbol=symbol)
-            return
-        
-        if symbol not in self.latest_prices:
-            logger.warning("Latest price for symbol not available yet.", symbol=symbol)
-            return
-
-        # Await the async DB call
-        position = await self.position_manager.get_open_position(symbol)
-        signal = await self.strategy.analyze_market(symbol, df_with_indicators, position)
-
-        if signal: await self._handle_signal(signal, df_with_indicators, position)
 
     async def _handle_signal(self, signal: Dict, df_with_indicators: pd.DataFrame, position: Optional[Position]):
         """Delegates signal handling to the TradeExecutor."""
