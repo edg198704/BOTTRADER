@@ -392,12 +392,48 @@ class EnsembleLearner:
                                required=threshold)
                 return False
 
+            # --- PRODUCTION RETRAINING ---
+            logger.info("Validation passed. Retraining models on full dataset for production.", symbol=symbol)
+            
+            # 1. Prepare Full Dataset
+            X_full_seq = X_seq
+            y_full_seq = y_seq
+            X_full_flat = X_seq[:, -1, :]
+            y_full_flat = y_seq
+            
+            # 2. Create Fresh Production Models
+            prod_models = self._create_fresh_models()
+            
+            # 3. Train Sklearn Models on Full Data
+            prod_models['gb'].fit(X_full_flat, y_full_flat)
+            prod_models['technical'].fit(X_full_flat, y_full_flat)
+            
+            # 4. Train PyTorch Models on Full Data (with small internal split for early stopping)
+            # Use 10% of full data for early stopping to maximize training data while keeping safety
+            prod_split_idx = int(len(X_full_seq) * 0.90)
+            
+            X_prod_train = X_full_seq[:prod_split_idx]
+            y_prod_train = y_full_seq[:prod_split_idx]
+            X_prod_val = X_full_seq[prod_split_idx:]
+            y_prod_val = y_full_seq[prod_split_idx:]
+            
+            X_prod_train_tensor = torch.FloatTensor(X_prod_train).to(self.device)
+            y_prod_train_tensor = torch.LongTensor(y_prod_train).to(self.device)
+            X_prod_val_tensor = torch.FloatTensor(X_prod_val).to(self.device)
+            y_prod_val_tensor = torch.LongTensor(y_prod_val).to(self.device)
+            
+            self._train_pytorch_model(prod_models['lstm'], X_prod_train_tensor, y_prod_train_tensor, X_prod_val_tensor, y_prod_val_tensor)
+            self._train_pytorch_model(prod_models['attention'], X_prod_train_tensor, y_prod_train_tensor, X_prod_val_tensor, y_prod_val_tensor)
+            
+            # 5. Update Reference to the production models
+            models = prod_models
+
             # 10. Atomic Update & Save
             self.symbol_models[symbol] = models
             self.is_trained = True
             
             self._save_models(symbol, models)
-            logger.info("All models trained, validated, and promoted to production.", symbol=symbol)
+            logger.info("All models trained, validated, retrained on full history, and promoted to production.", symbol=symbol)
             return True
 
         except Exception as e:
