@@ -160,6 +160,7 @@ class RiskManagementConfig(BaseModel):
     max_daily_loss_usd: float
     max_open_positions: int
     circuit_breaker_threshold: float
+    close_positions_on_halt: bool = True
     use_trailing_stop: bool
     atr_stop_multiplier: float
     stop_loss_fallback_pct: float
