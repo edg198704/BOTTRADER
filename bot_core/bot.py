@@ -68,7 +68,7 @@ class TradingBot:
         """Performs initial setup: loads market details and reconciles state. Separated for backtesting."""
         logger.info("Setting up TradingBot components...")
         await self._load_market_details()
-        await self._reconcile_start_state()
+        await self.reconcile_pending_positions()
         logger.info("TradingBot setup complete.")
 
     async def _load_market_details(self):
@@ -88,126 +88,101 @@ class TradingBot:
         self.trade_executor.market_details = self.market_details
         logger.info("Market details loading complete and passed to TradeExecutor.")
 
-    async def _reconcile_start_state(self):
-        """Performs safety checks and state reconciliation on startup."""
-        logger.info("Performing startup state reconciliation...")
+    async def reconcile_pending_positions(self):
+        """Performs safety checks and state reconciliation for PENDING positions."""
+        logger.info("Reconciling PENDING positions...")
         
         # 1. Reconcile PENDING positions (Two-Phase Commit Recovery)
         pending_positions = await self.position_manager.get_pending_positions()
-        if pending_positions:
-            logger.info("Found PENDING positions from previous session. Reconciling...", count=len(pending_positions))
-            for pos in pending_positions:
-                if not pos.order_id:
-                    logger.warning("Pending position has no Order ID. Voiding.", symbol=pos.symbol)
+        if not pending_positions:
+            return
+
+        logger.info("Found PENDING positions. Reconciling...", count=len(pending_positions))
+        for pos in pending_positions:
+            if not pos.order_id:
+                logger.warning("Pending position has no Order ID. Voiding.", symbol=pos.symbol)
+                await self.position_manager.void_position(pos.symbol, pos.order_id)
+                continue
+
+            try:
+                # Try to fetch by ID first
+                try:
+                    order = await self.exchange_api.fetch_order(pos.order_id, pos.symbol)
+                except Exception:
+                    order = None
+                
+                # If not found, it might be a Client Order ID that the exchange doesn't index directly.
+                # Scan open orders to find a match.
+                if not order:
+                    logger.info("Order not found by ID, scanning open orders for Client ID match...", symbol=pos.symbol, id=pos.order_id)
+                    open_orders = await self.exchange_api.fetch_open_orders(pos.symbol)
+                    for o in open_orders:
+                        # Check standard CCXT field 'clientOrderId'
+                        if o.get('clientOrderId') == pos.order_id:
+                            order = o
+                            logger.info("Found match in open orders via Client ID.", symbol=pos.symbol, exchange_id=o['id'])
+                            # Update DB with real ID
+                            await self.position_manager.update_pending_order_id(pos.symbol, pos.order_id, o['id'])
+                            pos.order_id = o['id'] # Update local obj for subsequent logic
+                            break
+
+                if not order:
+                    logger.warning("Order not found on exchange (ID or ClientID). Voiding pending position.", symbol=pos.symbol, order_id=pos.order_id)
                     await self.position_manager.void_position(pos.symbol, pos.order_id)
                     continue
 
-                try:
-                    # Try to fetch by ID first
-                    try:
-                        order = await self.exchange_api.fetch_order(pos.order_id, pos.symbol)
-                    except Exception:
-                        order = None
+                status = order.get('status')
+                
+                # Helper to confirm position from order data
+                async def confirm_from_order(order_data):
+                    filled_qty = order_data.get('filled', 0.0)
+                    avg_price = order_data.get('average', 0.0)
+                    # Fallback SL/TP since we might not have market data yet
+                    sl_pct = 0.05
+                    tp_pct = 0.05
+                    if pos.side == 'BUY':
+                        sl = avg_price * (1 - sl_pct)
+                        tp = avg_price * (1 + tp_pct)
+                    else:
+                        sl = avg_price * (1 + sl_pct)
+                        tp = avg_price * (1 - tp_pct)
                     
-                    # If not found, it might be a Client Order ID that the exchange doesn't index directly.
-                    # Scan open orders to find a match.
-                    if not order:
-                        logger.info("Order not found by ID, scanning open orders for Client ID match...", symbol=pos.symbol, id=pos.order_id)
-                        open_orders = await self.exchange_api.fetch_open_orders(pos.symbol)
-                        for o in open_orders:
-                            # Check standard CCXT field 'clientOrderId'
-                            if o.get('clientOrderId') == pos.order_id:
-                                order = o
-                                logger.info("Found match in open orders via Client ID.", symbol=pos.symbol, exchange_id=o['id'])
-                                # Update DB with real ID
-                                await self.position_manager.update_pending_order_id(pos.symbol, pos.order_id, o['id'])
-                                pos.order_id = o['id'] # Update local obj for subsequent logic
-                                break
+                    logger.info("Recovered position from order.", symbol=pos.symbol, order_id=pos.order_id, filled=filled_qty)
+                    await self.position_manager.confirm_position_open(pos.symbol, pos.order_id, filled_qty, avg_price, sl, tp)
 
-                    if not order:
-                        logger.warning("Order not found on exchange (ID or ClientID). Voiding pending position.", symbol=pos.symbol, order_id=pos.order_id)
-                        await self.position_manager.void_position(pos.symbol, pos.order_id)
-                        continue
-
-                    status = order.get('status')
-                    
-                    # Helper to confirm position from order data
-                    async def confirm_from_order(order_data):
-                        filled_qty = order_data.get('filled', 0.0)
-                        avg_price = order_data.get('average', 0.0)
-                        # Fallback SL/TP since we might not have market data yet
-                        sl_pct = 0.05
-                        tp_pct = 0.05
-                        if pos.side == 'BUY':
-                            sl = avg_price * (1 - sl_pct)
-                            tp = avg_price * (1 + tp_pct)
-                        else:
-                            sl = avg_price * (1 + sl_pct)
-                            tp = avg_price * (1 - tp_pct)
-                        
-                        logger.info("Recovered position from order.", symbol=pos.symbol, order_id=pos.order_id, filled=filled_qty)
-                        await self.position_manager.confirm_position_open(pos.symbol, pos.order_id, filled_qty, avg_price, sl, tp)
-
-                    if status == 'FILLED':
+                if status == 'FILLED':
+                    await confirm_from_order(order)
+                
+                elif status in ['CANCELED', 'REJECTED', 'EXPIRED']:
+                    # Check for partial fills even in terminal states
+                    filled = order.get('filled', 0.0)
+                    if filled > 0:
+                        logger.info("Pending position was terminal but partially filled. Recovering.", symbol=pos.symbol, status=status)
                         await confirm_from_order(order)
+                    else:
+                        logger.info("Pending position order was terminal and empty. Voiding.", symbol=pos.symbol, status=status)
+                        await self.position_manager.void_position(pos.symbol, pos.order_id)
+                
+                elif status == 'OPEN':
+                    logger.info("Pending position order is still OPEN. Cancelling...", symbol=pos.symbol)
+                    # Cancel returns the updated order object (or fetches it)
+                    cancelled_order = await self.exchange_api.cancel_order(pos.order_id, pos.symbol)
                     
-                    elif status in ['CANCELED', 'REJECTED', 'EXPIRED']:
-                        # Check for partial fills even in terminal states
-                        filled = order.get('filled', 0.0)
-                        if filled > 0:
-                            logger.info("Pending position was terminal but partially filled. Recovering.", symbol=pos.symbol, status=status)
-                            await confirm_from_order(order)
-                        else:
-                            logger.info("Pending position order was terminal and empty. Voiding.", symbol=pos.symbol, status=status)
+                    if cancelled_order and cancelled_order.get('filled', 0.0) > 0:
+                            logger.info("Cancelled order had partial fills. Confirming position.", symbol=pos.symbol)
+                            await confirm_from_order(cancelled_order)
+                    else:
+                            logger.info("Cancelled order was empty. Voiding position.", symbol=pos.symbol)
                             await self.position_manager.void_position(pos.symbol, pos.order_id)
-                    
-                    elif status == 'OPEN':
-                        logger.info("Pending position order is still OPEN. Cancelling...", symbol=pos.symbol)
-                        # Cancel returns the updated order object (or fetches it)
-                        cancelled_order = await self.exchange_api.cancel_order(pos.order_id, pos.symbol)
-                        
-                        if cancelled_order and cancelled_order.get('filled', 0.0) > 0:
-                             logger.info("Cancelled order had partial fills. Confirming position.", symbol=pos.symbol)
-                             await confirm_from_order(cancelled_order)
-                        else:
-                             logger.info("Cancelled order was empty. Voiding position.", symbol=pos.symbol)
-                             await self.position_manager.void_position(pos.symbol, pos.order_id)
 
-                except Exception as e:
-                    logger.error("Error reconciling pending position", symbol=pos.symbol, error=str(e))
+            except Exception as e:
+                logger.error("Error reconciling pending position", symbol=pos.symbol, error=str(e))
 
         # 2. Cancel all open orders to ensure clean slate (remove orphans)
-        for symbol in self.config.strategy.symbols:
-            try:
-                cancelled = await self.exchange_api.cancel_all_orders(symbol)
-                if cancelled:
-                    logger.info("Cancelled orphaned orders on startup", symbol=symbol, count=len(cancelled))
-            except Exception as e:
-                logger.error("Failed to cancel orders on startup", symbol=symbol, error=str(e))
-
-        # 3. Verify Balances vs Positions
-        try:
-            balances = await self.exchange_api.get_balance()
-            expected_positions = await self.position_manager.get_aggregated_open_positions()
-            
-            for symbol, expected_qty in expected_positions.items():
-                base_asset = symbol.split('/')[0]
-                # Check 'total' because we just cancelled orders, so 'used' should be 0
-                actual_qty = balances.get(base_asset, {}).get('total', 0.0)
-                
-                # Allow for small dust difference (e.g. fees)
-                if actual_qty < (expected_qty * 0.98): 
-                    logger.critical("CRITICAL: Balance mismatch detected!", 
-                                    symbol=symbol, 
-                                    expected_db=expected_qty, 
-                                    actual_wallet=actual_qty)
-                    await self.alert_system.send_alert(
-                        level='critical',
-                        message=f"🚨 Balance Mismatch for {symbol}",
-                        details={'expected_db': expected_qty, 'actual_wallet': actual_qty}
-                    )
-        except Exception as e:
-            logger.error("Error during balance reconciliation", error=str(e))
+        # Note: We only do this on startup or explicit reconciliation, not every loop.
+        # But for safety, we skip this in the periodic loop if not explicitly requested.
+        # For now, we assume this method is safe to run periodically as it only targets PENDING positions.
+        # Orphan cleanup is separate.
 
     async def run(self):
         """Main entry point to start all bot activities."""
@@ -285,7 +260,8 @@ class TradingBot:
         self.processed_candles[symbol] = last_candle_ts
 
     async def _monitoring_loop(self):
-        """Periodically runs health checks and portfolio monitoring."""
+        """Periodically runs health checks, portfolio monitoring, and state reconciliation."""
+        reconcile_counter = 0
         while self.running:
             try:
                 health_status = self.health_checker.get_health_status()
@@ -293,6 +269,12 @@ class TradingBot:
                 if self.metrics_writer and self.metrics_writer.enabled:
                     await self.metrics_writer.write_metric('health', fields=health_status)
                 
+                # --- Periodic Reconciliation (Every 2 minutes) ---
+                reconcile_counter += 1
+                if reconcile_counter >= 2:
+                    await self.reconcile_pending_positions()
+                    reconcile_counter = 0
+
                 if not self.latest_prices:
                     await asyncio.sleep(5)
                     continue
