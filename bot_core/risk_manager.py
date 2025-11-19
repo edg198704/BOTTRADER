@@ -9,13 +9,15 @@ from bot_core.position_manager import Position
 if TYPE_CHECKING:
     from bot_core.monitoring import AlertSystem
     from bot_core.position_manager import PositionManager
+    from bot_core.data_handler import DataHandler
 
 logger = get_logger(__name__)
 
 class RiskManager:
-    def __init__(self, config: RiskManagementConfig, position_manager: 'PositionManager', alert_system: Optional['AlertSystem'] = None):
+    def __init__(self, config: RiskManagementConfig, position_manager: 'PositionManager', data_handler: 'DataHandler', alert_system: Optional['AlertSystem'] = None):
         self.config = config
         self.position_manager = position_manager
+        self.data_handler = data_handler
         self.alert_system = alert_system
         
         self.circuit_breaker_halted = False
@@ -104,8 +106,8 @@ class RiskManager:
                     return override_value
         return default_value
 
-    def calculate_position_size(self, portfolio_equity: float, entry_price: float, stop_loss_price: float, market_regime: Optional[str] = None) -> float:
-        """Calculates position size in asset quantity based on risk."""
+    def calculate_position_size(self, symbol: str, portfolio_equity: float, entry_price: float, stop_loss_price: float, open_positions: List[Position], market_regime: Optional[str] = None) -> float:
+        """Calculates position size in asset quantity based on risk and correlation."""
         if entry_price <= 0 or stop_loss_price <= 0:
             logger.warning("Cannot calculate position size with zero or negative prices.", entry=entry_price, sl=stop_loss_price)
             return 0.0
@@ -119,11 +121,7 @@ class RiskManager:
         
         # --- Drawdown Scaling ---
         # Reduce risk as drawdown increases to preserve capital.
-        # Scaling factor: 1.0 at 0% drawdown, reducing linearly.
-        # We clamp the scaling to not go below 0.2 (20% of original risk) to allow for recovery.
-        # Example: 10% drawdown -> 0.9 factor.
         drawdown_scaling = max(0.2, 1.0 + self.current_drawdown)
-        
         adjusted_risk_pct = risk_pct * drawdown_scaling
         
         if drawdown_scaling < 1.0:
@@ -132,7 +130,32 @@ class RiskManager:
                         original_risk=risk_pct, 
                         adjusted_risk=adjusted_risk_pct)
 
-        risk_amount_usd = portfolio_equity * adjusted_risk_pct
+        # --- Correlation Scaling ---
+        correlation_scaling = 1.0
+        if self.config.correlation.enabled:
+            max_corr = 0.0
+            correlated_symbol = None
+            for pos in open_positions:
+                if pos.symbol == symbol:
+                    continue # Should not happen for new trades, but safe check
+                
+                corr = self.data_handler.get_correlation(symbol, pos.symbol, self.config.correlation.lookback_periods)
+                if corr > max_corr:
+                    max_corr = corr
+                    correlated_symbol = pos.symbol
+            
+            if max_corr > self.config.correlation.max_correlation:
+                correlation_scaling = self.config.correlation.penalty_factor
+                logger.info("High correlation detected. Applying penalty to position size.", 
+                            symbol=symbol, 
+                            correlated_with=correlated_symbol, 
+                            correlation=f"{max_corr:.2f}", 
+                            penalty=correlation_scaling)
+
+        # Apply all scalings
+        final_risk_pct = adjusted_risk_pct * correlation_scaling
+
+        risk_amount_usd = portfolio_equity * final_risk_pct
         quantity = risk_amount_usd / risk_per_unit
         
         # Cap the position size based on the max USD value allowed
