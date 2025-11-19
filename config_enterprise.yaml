@@ -27,6 +27,9 @@ execution:
   max_chase_attempts: 3
   # How much more aggressive to make the price on each chase (e.g., 0.0002 is 0.02%).
   chase_aggressiveness_pct: 0.0002
+  # Maximum percentage the price can deviate from the initial order price during chasing before giving up.
+  # Prevents buying at the top of a spike or selling at the bottom of a crash.
+  max_chase_slippage_pct: 0.01 # 1%
   # If the order is still not filled after all chase attempts, place a MARKET order to guarantee execution.
   # WARNING: This can lead to significant slippage. Use with caution.
   execute_on_timeout: false
