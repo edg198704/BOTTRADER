@@ -85,6 +85,7 @@ strategy:
       sequence_length: 30 # Lookback window for sequential models like LSTM/Attention
       labeling_horizon: 5 # How many candles into the future to look for labeling
       labeling_threshold: 0.005 # % price change to define a buy/sell label
+      normalization_window: 100 # Rolling window for Z-score normalization
 
     # --- Model Training Parameters ---
     training:
