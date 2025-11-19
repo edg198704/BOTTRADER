@@ -174,17 +174,21 @@ class MockExchangeAPI(ExchangeAPI):
                                    (order['side'] == "SELL" and self.balances.get(base_asset, 0) >= order['quantity'])
 
                 if can_fill_balance:
+                    # Simple fee simulation for Mock
+                    fee_cost = cost * 0.001
+                    
                     if order['side'] == "BUY":
-                        self.balances[quote_asset] -= cost
+                        self.balances[quote_asset] -= (cost + fee_cost)
                         self.balances[base_asset] = self.balances.get(base_asset, 0) + order['quantity']
                     else: # SELL
                         self.balances[base_asset] -= order['quantity']
-                        self.balances[quote_asset] = self.balances.get(quote_asset, 0) + cost
+                        self.balances[quote_asset] = self.balances.get(quote_asset, 0) + (cost - fee_cost)
                     
                     order['status'] = 'FILLED'
                     order['filled'] = order['quantity']
                     order['average'] = fill_price
-                    logger.info("Mock: Order filled on fetch", order_id=order_id, fill_price=fill_price)
+                    order['fee'] = {'cost': fee_cost, 'currency': quote_asset}
+                    logger.info("Mock: Order filled on fetch", order_id=order_id, fill_price=fill_price, fee=fee_cost)
                 else:
                     order['status'] = 'REJECTED'
                     logger.warning("Mock: Insufficient balance for order", order_id=order_id)
@@ -354,6 +358,7 @@ class BacktestExchangeAPI(ExchangeAPI):
                             order['status'] = 'FILLED'
                             order['filled'] = order['quantity']
                             order['average'] = fill_price
+                            order['fee'] = {'cost': fee, 'currency': quote}
                     else: # SELL
                         if self.balances.get(base, 0) >= order['quantity']:
                             self.balances[base] -= order['quantity']
@@ -362,6 +367,7 @@ class BacktestExchangeAPI(ExchangeAPI):
                             order['status'] = 'FILLED'
                             order['filled'] = order['quantity']
                             order['average'] = fill_price
+                            order['fee'] = {'cost': fee, 'currency': quote}
 
         return order
 
@@ -537,7 +543,8 @@ class CCXTExchangeAPI(ExchangeAPI):
                 'price': order.get('price', 0.0),
                 'side': order.get('side'),
                 'type': order.get('type'),
-                'clientOrderId': order.get('clientOrderId')
+                'clientOrderId': order.get('clientOrderId'),
+                'fee': order.get('fee') # Pass through fee info if available
             }
         except OrderNotFound:
             logger.warning("Order not found on exchange, not retrying.", order_id=order_id, symbol=symbol)
