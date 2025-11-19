@@ -124,8 +124,16 @@ class RiskManager:
                     return override_value
         return default_value
 
-    def calculate_position_size(self, symbol: str, portfolio_equity: float, entry_price: float, stop_loss_price: float, open_positions: List[Position], market_regime: Optional[str] = None) -> float:
-        """Calculates position size in asset quantity based on risk and correlation."""
+    def calculate_position_size(self, 
+                                symbol: str, 
+                                portfolio_equity: float, 
+                                entry_price: float, 
+                                stop_loss_price: float, 
+                                open_positions: List[Position], 
+                                market_regime: Optional[str] = None,
+                                confidence: Optional[float] = None,
+                                confidence_threshold: Optional[float] = None) -> float:
+        """Calculates position size in asset quantity based on risk, correlation, and confidence."""
         if entry_price <= 0 or stop_loss_price <= 0:
             logger.warning("Cannot calculate position size with zero or negative prices.", entry=entry_price, sl=stop_loss_price)
             return 0.0
@@ -170,8 +178,22 @@ class RiskManager:
                             correlation=f"{max_corr:.2f}", 
                             penalty=correlation_scaling)
 
+        # --- Confidence Scaling ---
+        confidence_scaling = 1.0
+        if (self.config.confidence_scaling_factor > 0 and 
+            confidence is not None and 
+            confidence_threshold is not None and 
+            confidence > confidence_threshold):
+            
+            surplus = confidence - confidence_threshold
+            # e.g., surplus 0.10 (75% vs 65%), factor 5.0 -> +0.5 -> 1.5x risk
+            raw_scaling = 1.0 + (surplus * self.config.confidence_scaling_factor)
+            confidence_scaling = min(raw_scaling, self.config.max_confidence_risk_multiplier)
+            
+            logger.info("Risk scaled by confidence", symbol=symbol, confidence=confidence, scaling=confidence_scaling)
+
         # Apply all scalings
-        final_risk_pct = adjusted_risk_pct * correlation_scaling
+        final_risk_pct = adjusted_risk_pct * correlation_scaling * confidence_scaling
 
         risk_amount_usd = portfolio_equity * final_risk_pct
         quantity = risk_amount_usd / risk_per_unit
