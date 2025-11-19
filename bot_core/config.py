@@ -31,7 +31,7 @@ class MarketRegimeConfig(BaseModel):
     volatility_multiplier: float = 1.5
     # Column aliases to use for detection (must match aliases in strategy.indicators)
     trend_fast_ma_col: str = "sma_fast"
-    trend_slow_ma_col: "sma_slow"
+    trend_slow_ma_col: str = "sma_slow"
     volatility_col: str = "atr"
     rsi_col: str = "rsi"
 
@@ -173,6 +173,11 @@ class RiskManagementConfig(BaseModel):
     reward_to_risk_ratio: float
     trailing_stop_activation_pct: float
     trailing_stop_pct: float
+    
+    # Confidence-Based Sizing
+    confidence_scaling_factor: float = 0.0 # Multiplier for the surplus confidence. 0.0 = disabled.
+    max_confidence_risk_multiplier: float = 1.0 # Hard cap on the risk multiplier (e.g., 1.5x)
+
     regime_based_risk: RegimeBasedRiskConfig
     time_based_exit: TimeBasedExitConfig = TimeBasedExitConfig()
     correlation: CorrelationConfig = CorrelationConfig()
