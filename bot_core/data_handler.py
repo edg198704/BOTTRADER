@@ -10,7 +10,7 @@ from bot_core.logger import get_logger
 
 from bot_core.config import BotConfig
 from bot_core.exchange_api import ExchangeAPI
-from bot_core.utils import generate_indicator_rename_map, parse_timeframe_to_seconds
+from bot_core.utils import generate_indicator_rename_map, parse_timeframe_to_seconds, Clock
 
 logger = get_logger(__name__)
 
@@ -153,7 +153,8 @@ class DataHandler:
             elif current_buffer is not None and not current_buffer.empty:
                 last_ts = current_buffer.index[-1]
                 # Ensure we compare apples to apples (UTC)
-                now = pd.Timestamp.utcnow().tz_localize(None)
+                # Use Clock.now() for time abstraction
+                now = pd.Timestamp(Clock.now()).tz_localize(None)
                 if last_ts.tzinfo is not None:
                     last_ts = last_ts.tz_convert(None)
                 
