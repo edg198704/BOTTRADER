@@ -1,11 +1,13 @@
 import abc
+import asyncio
 import pandas as pd
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
+from concurrent.futures import Executor
 
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams, SimpleMACrossoverStrategyParams, StrategyParamsBase
-from bot_core.ai.ensemble_learner import EnsembleLearner
+from bot_core.ai.ensemble_learner import EnsembleLearner, train_ensemble_task
 from bot_core.ai.regime_detector import MarketRegimeDetector
 from bot_core.position_manager import Position
 
@@ -21,7 +23,7 @@ class TradingStrategy(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def retrain(self, symbol: str, df: pd.DataFrame):
+    async def retrain(self, symbol: str, df: pd.DataFrame, executor: Executor):
         """Triggers the retraining of the strategy's underlying models."""
         pass
 
@@ -40,7 +42,6 @@ class SimpleMACrossoverStrategy(TradingStrategy):
         super().__init__(config)
         self.fast_ma_period = config.fast_ma_period
         self.slow_ma_period = config.slow_ma_period
-        # Dynamically generate column names from config
         self.fast_ma_col = f"SMA_{self.fast_ma_period}"
         self.slow_ma_col = f"SMA_{self.slow_ma_period}"
         logger.info("SimpleMACrossoverStrategy initialized", fast_ma=self.fast_ma_period, slow_ma=self.slow_ma_period)
@@ -58,7 +59,6 @@ class SimpleMACrossoverStrategy(TradingStrategy):
         is_bearish_cross = last_row[self.fast_ma_col] < last_row[self.slow_ma_col] and prev_row[self.fast_ma_col] >= prev_row[self.slow_ma_col]
 
         if position:
-            # Logic to close existing position with an opposing signal
             if position.side == 'BUY' and is_bearish_cross:
                 logger.info("Close Long signal detected (MA Crossover)", symbol=symbol)
                 return {'action': 'SELL', 'symbol': symbol}
@@ -66,7 +66,6 @@ class SimpleMACrossoverStrategy(TradingStrategy):
                 logger.info("Close Short signal detected (MA Crossover)", symbol=symbol)
                 return {'action': 'BUY', 'symbol': symbol}
         else:
-            # Logic to open new position
             if is_bullish_cross:
                 logger.info("Open Long signal detected (MA Crossover)", symbol=symbol)
                 return {'action': 'BUY', 'symbol': symbol}
@@ -76,20 +75,19 @@ class SimpleMACrossoverStrategy(TradingStrategy):
 
         return None
 
-    def retrain(self, symbol: str, df: pd.DataFrame):
-        # No models to retrain for this strategy
+    async def retrain(self, symbol: str, df: pd.DataFrame, executor: Executor):
         pass
 
     def needs_retraining(self, symbol: str) -> bool:
         return False
 
     def get_training_data_limit(self) -> int:
-        return 0 # This strategy does not require training data.
+        return 0
 
 class AIEnsembleStrategy(TradingStrategy):
     def __init__(self, config: AIEnsembleStrategyParams):
         super().__init__(config)
-        self.ai_config = config # The config is already the specific AI config
+        self.ai_config = config
         self.last_retrained_at: Dict[str, datetime] = {}
         try:
             self.ensemble_learner = EnsembleLearner(self.ai_config)
@@ -122,7 +120,6 @@ class AIEnsembleStrategy(TradingStrategy):
             return None
 
         if position:
-            # Have a position, look for close signals (opposing action)
             if position.side == 'BUY' and action == 'sell':
                 logger.info("AI Close Long signal detected", symbol=symbol, confidence=confidence)
                 return {'action': 'SELL', 'symbol': symbol, 'confidence': confidence, 'regime': regime}
@@ -130,7 +127,6 @@ class AIEnsembleStrategy(TradingStrategy):
                 logger.info("AI Close Short signal detected", symbol=symbol, confidence=confidence)
                 return {'action': 'BUY', 'symbol': symbol, 'confidence': confidence, 'regime': regime}
         else:
-            # No position, look for open signals
             if action == 'buy':
                 logger.info("AI Open Long signal detected", symbol=symbol, confidence=confidence)
                 return {'action': 'BUY', 'symbol': symbol, 'confidence': confidence, 'regime': regime}
@@ -140,33 +136,41 @@ class AIEnsembleStrategy(TradingStrategy):
 
         return None
 
-    def retrain(self, symbol: str, df: pd.DataFrame):
-        """Initiates the retraining process for the ensemble learner."""
-        if not hasattr(self, 'ensemble_learner'):
-            logger.warning("Ensemble learner not available, cannot retrain.")
-            return
+    async def retrain(self, symbol: str, df: pd.DataFrame, executor: Executor):
+        """Initiates the retraining process using the provided executor."""
+        logger.info("Strategy is triggering model retraining via ProcessPool.", symbol=symbol)
         
-        logger.info("Strategy is triggering model retraining.", symbol=symbol)
-        success = self.ensemble_learner.train(symbol, df)
-        
-        if success:
-            self.last_retrained_at[symbol] = datetime.utcnow()
-            logger.info("Model retraining process completed and accepted.", symbol=symbol)
-        else:
-            logger.warning("Model retraining completed but rejected due to poor performance.", symbol=symbol)
+        loop = asyncio.get_running_loop()
+        try:
+            # Offload the heavy training task to a separate process
+            success = await loop.run_in_executor(
+                executor, 
+                train_ensemble_task, 
+                symbol, 
+                df, 
+                self.ai_config
+            )
+            
+            if success:
+                self.last_retrained_at[symbol] = datetime.utcnow()
+                logger.info("Model training successful. Reloading models...", symbol=symbol)
+                await self.ensemble_learner.reload_models(symbol)
+            else:
+                logger.warning("Model training failed or rejected.", symbol=symbol)
+                
+        except Exception as e:
+            logger.error("Error during async model retraining", symbol=symbol, error=str(e))
 
     def needs_retraining(self, symbol: str) -> bool:
-        """Checks if enough time has passed since the last retraining."""
         if self.ai_config.retrain_interval_hours <= 0:
-            return False # Retraining is disabled
+            return False
         
         last_retrained = self.last_retrained_at.get(symbol)
         if not last_retrained:
-            return True # Never been trained, so it needs it
+            return True
         
         time_since_retrain = datetime.utcnow() - last_retrained
         return time_since_retrain >= timedelta(hours=self.ai_config.retrain_interval_hours)
 
     def get_training_data_limit(self) -> int:
-        """Returns the number of candles required for retraining the AI models."""
         return self.ai_config.training_data_limit
