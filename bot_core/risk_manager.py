@@ -1,4 +1,4 @@
-from typing import List, Optional, Any, TYPE_CHECKING
+from typing import List, Optional, Any, Dict, TYPE_CHECKING
 import pandas as pd
 from datetime import datetime
 
@@ -133,8 +133,9 @@ class RiskManager:
                                 open_positions: List[Position], 
                                 market_regime: Optional[str] = None,
                                 confidence: Optional[float] = None,
-                                confidence_threshold: Optional[float] = None) -> float:
-        """Calculates position size in asset quantity based on risk, correlation, and confidence."""
+                                confidence_threshold: Optional[float] = None,
+                                model_metrics: Optional[Dict[str, Any]] = None) -> float:
+        """Calculates position size in asset quantity based on risk, correlation, confidence, and optionally Kelly Criterion."""
         if entry_price <= 0 or stop_loss_price <= 0:
             logger.warning("Cannot calculate position size with zero or negative prices.", entry=entry_price, sl=stop_loss_price)
             return 0.0
@@ -144,8 +145,56 @@ class RiskManager:
             logger.warning("Risk per unit is zero, cannot calculate position size. Check stop-loss logic.")
             return 0.0
 
-        risk_pct = self._get_regime_param('risk_per_trade_pct', market_regime)
+        # --- Base Risk Calculation ---
+        base_risk_pct = self._get_regime_param('risk_per_trade_pct', market_regime)
         
+        # --- Kelly Criterion Logic ---
+        kelly_risk_pct = None
+        if self.config.use_kelly_criterion and model_metrics:
+            # Extract metrics from the model's validation performance
+            # Note: 'ensemble' key is used in ensemble_learner.py
+            ensemble_metrics = model_metrics.get('ensemble', model_metrics)
+            
+            win_rate = ensemble_metrics.get('win_rate')
+            profit_factor = ensemble_metrics.get('profit_factor')
+            
+            if win_rate is not None and profit_factor is not None and win_rate > 0:
+                # Calculate Win/Loss Ratio (R) from Profit Factor
+                # PF = (WinRate * AvgWin) / ((1-WinRate) * AvgLoss)
+                # R = AvgWin/AvgLoss = PF * (1-WinRate) / WinRate
+                if win_rate < 1.0:
+                    r_ratio = profit_factor * (1.0 - win_rate) / win_rate
+                else:
+                    r_ratio = 999.0 # Infinite R if 100% win rate
+                
+                if r_ratio > 0:
+                    # Kelly Formula: f* = W - (1-W)/R
+                    raw_kelly = win_rate - (1.0 - win_rate) / r_ratio
+                    
+                    # Apply Fraction (Safety)
+                    kelly_risk_pct = raw_kelly * self.config.kelly_fraction
+                    
+                    # Ensure non-negative
+                    kelly_risk_pct = max(0.0, kelly_risk_pct)
+                    
+                    logger.info("Kelly Criterion calculated", 
+                                symbol=symbol, 
+                                win_rate=win_rate, 
+                                profit_factor=profit_factor, 
+                                raw_kelly=raw_kelly, 
+                                final_kelly_risk=kelly_risk_pct)
+        
+        # Determine starting risk percentage
+        if kelly_risk_pct is not None:
+            # Use Kelly, but cap it at a hard safety limit (e.g. 5x base risk or a fixed 5%)
+            # Here we use a hard cap of 0.05 (5%) or the user's base risk, whichever is higher, to allow scaling up
+            # but preventing catastrophic bets.
+            safety_cap = max(0.05, base_risk_pct * 5.0)
+            risk_pct = min(kelly_risk_pct, safety_cap)
+            logger.info("Using Kelly-based risk", symbol=symbol, kelly=kelly_risk_pct, capped=risk_pct)
+        else:
+            risk_pct = base_risk_pct
+
         # --- Drawdown Scaling ---
         # Reduce risk as drawdown increases to preserve capital.
         drawdown_scaling = max(0.2, 1.0 + self.current_drawdown)
@@ -180,8 +229,9 @@ class RiskManager:
                             penalty=correlation_scaling)
 
         # --- Confidence Scaling ---
+        # Only apply confidence scaling if we are NOT using Kelly (Kelly already accounts for edge)
         confidence_scaling = 1.0
-        if (self.config.confidence_scaling_factor > 0 and 
+        if kelly_risk_pct is None and (self.config.confidence_scaling_factor > 0 and 
             confidence is not None and 
             confidence_threshold is not None and 
             confidence > confidence_threshold):
