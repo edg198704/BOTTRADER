@@ -24,12 +24,11 @@ class EnsembleWeightsConfig(BaseModel):
     technical_ensemble: float = 0.3
     lstm: float = 0.2
     attention: float = 0.2
-    auto_tune: bool = True  # If True, weights are learned from validation performance
+    auto_tune: bool = True
 
 class MarketRegimeConfig(BaseModel):
     trend_strength_threshold: float = 0.015
     volatility_multiplier: float = 1.5
-    # Column aliases to use for detection (must match aliases in strategy.indicators)
     trend_fast_ma_col: str = "sma_fast"
     trend_slow_ma_col: str = "sma_slow"
     volatility_col: str = "atr"
@@ -41,7 +40,7 @@ class AITrainingConfig(BaseModel):
     learning_rate: float = 0.001
     early_stopping_patience: int = 5
     validation_split: float = Field(0.15, ge=0.0, lt=1.0)
-    min_precision_threshold: float = Field(0.5, ge=0.0, le=1.0, description="Minimum precision required on validation set to accept a new model.")
+    min_precision_threshold: float = Field(0.5, ge=0.0, le=1.0)
 
 class AILSTMConfig(BaseModel):
     hidden_dim: int = 64
@@ -59,18 +58,16 @@ class AIFeatureEngineeringConfig(BaseModel):
     labeling_horizon: int = 5
     labeling_threshold: float = 0.005
     normalization_window: int = 100
-    # Dynamic Labeling Parameters (Legacy/Simple)
     use_dynamic_labeling: bool = False
     labeling_atr_multiplier: float = 1.0
-    # Triple Barrier Labeling Parameters (Advanced)
     use_triple_barrier: bool = False
     triple_barrier_tp_multiplier: float = 2.0
     triple_barrier_sl_multiplier: float = 2.0
 
 class AIPerformanceConfig(BaseModel):
     enabled: bool = True
-    window_size: int = 50 # Number of past predictions to evaluate
-    min_accuracy: float = 0.45 # Trigger retrain if accuracy drops below this
+    window_size: int = 50
+    min_accuracy: float = 0.45
 
 class AIHyperparameters(BaseModel):
     xgboost: XGBoostConfig = XGBoostConfig()
@@ -79,10 +76,7 @@ class AIHyperparameters(BaseModel):
     lstm: AILSTMConfig = AILSTMConfig()
     attention: AIAttentionConfig = AIAttentionConfig()
 
-# --- Strategy-Specific Parameter Models ---
-
 class StrategyParamsBase(BaseModel):
-    """Base model for strategy-specific parameters."""
     name: str
 
 class SimpleMACrossoverStrategyParams(StrategyParamsBase):
@@ -98,8 +92,6 @@ class AIEnsembleStrategyParams(StrategyParamsBase):
     use_regime_filter: bool
     retrain_interval_hours: int
     training_data_limit: int = 5000
-
-    # Nested, structured configs
     features: AIFeatureEngineeringConfig
     training: AITrainingConfig = AITrainingConfig()
     hyperparameters: AIHyperparameters = AIHyperparameters()
@@ -139,8 +131,6 @@ class StrategyConfig(BaseModel):
     symbols: List[str]
     interval_seconds: int
     timeframe: str
-    # This list of dictionaries will directly drive the pandas-ta indicator calculation.
-    # Each dict should be a valid input for pandas-ta, e.g., {"kind": "rsi", "length": 14}
     indicators: List[Dict[str, Any]]
     params: Union[AIEnsembleStrategyParams, SimpleMACrossoverStrategyParams] = Field(..., discriminator='name')
 
@@ -158,12 +148,12 @@ class RegimeBasedRiskConfig(BaseModel):
 class TimeBasedExitConfig(BaseModel):
     enabled: bool = False
     max_hold_time_hours: int = 24
-    threshold_pct: float = 0.005 # If PnL % is below this after max time, close.
+    threshold_pct: float = 0.005
 
 class CorrelationConfig(BaseModel):
     enabled: bool = True
     max_correlation: float = 0.8
-    penalty_factor: float = 0.5 # Multiply position size by this if correlated
+    penalty_factor: float = 0.5
     lookback_periods: int = 50
 
 class RiskManagementConfig(BaseModel):
@@ -179,11 +169,8 @@ class RiskManagementConfig(BaseModel):
     reward_to_risk_ratio: float
     trailing_stop_activation_pct: float
     trailing_stop_pct: float
-    
-    # Confidence-Based Sizing
-    confidence_scaling_factor: float = 0.0 # Multiplier for the surplus confidence. 0.0 = disabled.
-    max_confidence_risk_multiplier: float = 1.0 # Hard cap on the risk multiplier (e.g., 1.5x)
-
+    confidence_scaling_factor: float = 0.0
+    max_confidence_risk_multiplier: float = 1.0
     regime_based_risk: RegimeBasedRiskConfig
     time_based_exit: TimeBasedExitConfig = TimeBasedExitConfig()
     correlation: CorrelationConfig = CorrelationConfig()
@@ -200,6 +187,13 @@ class LoggingConfig(BaseModel):
     file_path: str
     use_json: bool
 
+class BacktestConfig(BaseModel):
+    enabled: bool = False
+    initial_balance: float = 10000.0
+    maker_fee_pct: float = 0.001 # 0.1%
+    taker_fee_pct: float = 0.001 # 0.1%
+    slippage_pct: float = 0.0005 # 0.05%
+
 # --- Top-Level Bot Config ---
 
 class BotConfig(BaseModel):
@@ -212,3 +206,4 @@ class BotConfig(BaseModel):
     database: DatabaseConfig
     telegram: TelegramConfig
     logging: LoggingConfig
+    backtest: BacktestConfig = BacktestConfig()
