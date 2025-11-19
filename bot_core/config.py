@@ -261,6 +261,17 @@ class BacktestConfig(BaseModel):
     slippage_pct: float = 0.0005 # 0.05% 
     model_path: str = "backtest_models"
 
+class OptimizerConfig(BaseModel):
+    enabled: bool = False
+    interval_hours: int = 24
+    lookback_trades: int = 100
+    min_trades_for_adjustment: int = 10
+    min_profit_factor: float = 1.0
+    high_performance_pf: float = 1.5
+    adjustment_step: float = 0.02
+    max_threshold_cap: float = 0.90
+    min_threshold_floor: float = 0.55
+
 # --- Top-Level Bot Config ---
 
 class BotConfig(BaseModel):
@@ -274,3 +285,4 @@ class BotConfig(BaseModel):
     telegram: TelegramConfig
     logging: LoggingConfig
     backtest: BacktestConfig = BacktestConfig()
+    optimizer: OptimizerConfig = OptimizerConfig()
