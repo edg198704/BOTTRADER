@@ -15,6 +15,7 @@ from bot_core.data_handler import DataHandler
 from bot_core.monitoring import HealthChecker, InfluxDBMetrics, AlertSystem
 from bot_core.position_monitor import PositionMonitor
 from bot_core.trade_executor import TradeExecutor
+from bot_core.optimizer import StrategyOptimizer
 
 logger = get_logger(__name__)
 
@@ -38,6 +39,9 @@ class TradingBot:
         self.alert_system = alert_system
         self.metrics_writer = metrics_writer
         self.shared_bot_state = shared_bot_state if shared_bot_state is not None else {}
+        
+        # Initialize Optimizer
+        self.optimizer = StrategyOptimizer(config, position_manager)
         
         self.running = False
         self.start_time = datetime.now(timezone.utc)
@@ -217,6 +221,7 @@ class TradingBot:
         self.tasks.append(asyncio.create_task(self._monitoring_loop()))
         self.tasks.append(asyncio.create_task(self.position_monitor.run()))
         self.tasks.append(asyncio.create_task(self._retraining_loop()))
+        self.tasks.append(asyncio.create_task(self.optimizer.run()))
 
         # Start a trading cycle for each symbol
         for symbol in self.config.strategy.symbols:
@@ -402,6 +407,7 @@ class TradingBot:
         
         await self.data_handler.stop()
         await self.position_monitor.stop()
+        await self.optimizer.stop()
         
         # Clean up strategy resources
         await self.strategy.close()
