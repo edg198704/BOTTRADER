@@ -233,12 +233,50 @@ class TradeExecutor:
         else:
             order_type = 'MARKET'
 
+        order_result = None
+        used_quantity = close_quantity
+
         try:
             order_result = await self.exchange_api.place_order(position.symbol, close_side, order_type, close_quantity, price=limit_price)
         except BotInsufficientFundsError:
-            logger.warning("Insufficient funds to close position. Checking for phantom state.", symbol=position.symbol)
-            await self._handle_phantom_position(position)
-            return
+            # --- Smart Retry Logic for Dust/Fees ---
+            logger.warning("Insufficient funds to close position. Attempting smart retry with actual wallet balance.", symbol=position.symbol)
+            try:
+                # 1. Fetch actual available balance
+                base_asset = position.symbol.split('/')[0]
+                balances = await self.exchange_api.get_balance()
+                available_balance = balances.get(base_asset, {}).get('free', 0.0)
+                
+                # 2. Check if balance is within tolerance (e.g., > 98% of tracked qty)
+                # This implies the discrepancy is likely due to fees or dust.
+                tolerance_threshold = position.quantity * 0.98
+                
+                if available_balance >= tolerance_threshold and available_balance < position.quantity:
+                    logger.info("Available balance is within tolerance. Retrying close with wallet balance.", 
+                                tracked=position.quantity, available=available_balance)
+                    
+                    # Adjust quantity to what we actually have
+                    used_quantity = self.order_sizer.adjust_order_quantity(
+                        position.symbol, available_balance, current_price or 0.0, market_details
+                    )
+                    
+                    if used_quantity > 0:
+                        order_result = await self.exchange_api.place_order(
+                            position.symbol, close_side, order_type, used_quantity, price=limit_price
+                        )
+                    else:
+                        logger.error("Adjusted wallet balance is too small to trade.", symbol=position.symbol)
+                else:
+                    logger.warning("Balance discrepancy too large or balance > qty. Proceeding to phantom check.", 
+                                   tracked=position.quantity, available=available_balance)
+            except Exception as retry_ex:
+                logger.error("Smart retry failed.", error=str(retry_ex))
+            
+            # If retry didn't produce an order, fall back to phantom handling
+            if not order_result:
+                await self._handle_phantom_position(position)
+                return
+
         except BotInvalidOrderError as e:
             logger.error("Invalid order parameters for close.", error=str(e))
             return
@@ -254,7 +292,7 @@ class TradeExecutor:
             initial_order=order_result, 
             symbol=position.symbol, 
             side=close_side, 
-            quantity=close_quantity, 
+            quantity=used_quantity,
             initial_price=limit_price,
             market_details=market_details
         )
@@ -266,8 +304,14 @@ class TradeExecutor:
             close_price = final_order_state['average']
             
             # Check if full close (with tolerance for float precision)
-            if fill_quantity >= (position.quantity * 0.999):
-                await self.position_manager.close_position(position.symbol, close_price, reason)
+            # OR if we used the 'Smart Retry' quantity (meaning we sold everything we had)
+            is_full_close = fill_quantity >= (position.quantity * 0.999)
+            is_smart_retry_close = (used_quantity < position.quantity) and (fill_quantity >= (used_quantity * 0.999))
+
+            if is_full_close or is_smart_retry_close:
+                # We pass the actual filled quantity to ensure PnL is calculated on what was sold,
+                # but the position record is closed fully, effectively discarding any dust discrepancy.
+                await self.position_manager.close_position(position.symbol, close_price, reason, actual_filled_qty=fill_quantity)
             else:
                 # Partial fill handling
                 await self.position_manager.reduce_position(position.symbol, fill_quantity, close_price, reason)
