@@ -39,6 +39,10 @@ class DataHandler:
         self._running = False
         self._update_task: Optional[asyncio.Task] = None
         
+        # Event system for new candle notification
+        self._new_candle_events: Dict[str, asyncio.Event] = {s: asyncio.Event() for s in self.symbols}
+        self._last_emitted_candle_ts: Dict[str, pd.Timestamp] = {}
+        
         # Persistence settings
         self.cache_dir = "market_data_cache"
         os.makedirs(self.cache_dir, exist_ok=True)
@@ -220,6 +224,7 @@ class DataHandler:
         """
         Slices the raw buffer to the analysis window size, calculates indicators,
         and updates the shared _dataframes dictionary.
+        Triggers an event if a new closed candle is detected.
         """
         raw_df = self._raw_buffers.get(symbol)
         if raw_df is None or raw_df.empty:
@@ -237,6 +242,36 @@ class DataHandler:
         # Atomic update of the consumption dataframe
         self._dataframes[symbol] = processed_df
         self._update_latest_price(symbol, processed_df)
+
+        # Check for new closed candle to trigger event
+        # We use the same logic as get_market_data(include_forming=False) to determine the closed candle
+        closed_df = self.get_market_data(symbol, include_forming=False)
+        if closed_df is not None and not closed_df.empty:
+            last_closed_ts = closed_df.index[-1]
+            
+            last_emitted = self._last_emitted_candle_ts.get(symbol)
+            if last_emitted is None or last_closed_ts > last_emitted:
+                self._last_emitted_candle_ts[symbol] = last_closed_ts
+                if symbol in self._new_candle_events:
+                    self._new_candle_events[symbol].set()
+
+    async def wait_for_new_candle(self, symbol: str, timeout: float = 60.0):
+        """
+        Waits until a new closed candle is available for the symbol.
+        Uses asyncio.Event to avoid busy waiting.
+        """
+        event = self._new_candle_events.get(symbol)
+        if not event:
+            # Fallback if symbol not initialized correctly
+            await asyncio.sleep(timeout)
+            return
+        
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass # Just return to allow loop to check status/stop flags
+        finally:
+            event.clear() # Reset for next time
 
     async def _calculate_indicators_async(self, df: pd.DataFrame) -> pd.DataFrame:
         """Wrapper to run indicator calculation in thread pool."""
