@@ -189,6 +189,11 @@ risk_management:
       # No overrides, will use default risk parameters.
       # Could also set risk_per_trade_pct to 0 to avoid trading.
 
+  time_based_exit:
+    enabled: false
+    max_hold_time_hours: 24
+    threshold_pct: 0.005 # Close if PnL < 0.5% after 24 hours
+
 database:
   path: "position_ledger.db"
 
