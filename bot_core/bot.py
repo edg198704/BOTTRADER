@@ -160,8 +160,23 @@ class TradingBot:
                         logger.info("Pending position was terminal but partially filled. Recovering.", symbol=pos.symbol, status=status)
                         await confirm_from_order(order)
                     else:
-                        logger.info("Pending position order was terminal and empty. Voiding.", symbol=pos.symbol, status=status)
-                        await self.position_manager.void_position(pos.symbol, pos.order_id)
+                        # ZOMBIE CHECK: Before voiding, check if there are any OTHER open orders 
+                        # that belong to this trade_id (e.g. chase orders placed before crash)
+                        zombie_recovered = False
+                        if pos.trade_id:
+                            logger.info("Checking for zombie chase orders...", symbol=pos.symbol, trade_id=pos.trade_id)
+                            open_orders = await self.exchange_api.fetch_open_orders(pos.symbol)
+                            for o in open_orders:
+                                client_oid = o.get('clientOrderId', '')
+                                if client_oid and client_oid.startswith(pos.trade_id):
+                                    logger.info("Found zombie chase order! Recovering.", symbol=pos.symbol, new_order_id=o['id'])
+                                    await self.position_manager.update_pending_order_id(pos.symbol, pos.order_id, o['id'])
+                                    zombie_recovered = True
+                                    break
+                        
+                        if not zombie_recovered:
+                            logger.info("Pending position order was terminal and empty. Voiding.", symbol=pos.symbol, status=status)
+                            await self.position_manager.void_position(pos.symbol, pos.order_id)
                 
                 elif status == 'OPEN':
                     logger.info("Pending position order is still OPEN. Cancelling...", symbol=pos.symbol)
