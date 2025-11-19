@@ -41,6 +41,9 @@ except ImportError:
 
 logger = get_logger(__name__)
 
+# Increment this version when changing model architecture or input shapes
+MODEL_VERSION = "1.1"
+
 class EnsembleLearner:
     """
     Manages a suite of AI/ML models for generating trading predictions.
@@ -57,7 +60,7 @@ class EnsembleLearner:
         self.symbol_models: Dict[str, Dict[str, Any]] = {}
         self.is_trained = False
         
-        logger.info("EnsembleLearner initialized.", device=str(self.device))
+        logger.info("EnsembleLearner initialized.", device=str(self.device), model_version=MODEL_VERSION)
         
         # Attempt to load models in the background
         try:
@@ -122,8 +125,16 @@ class EnsembleLearner:
                     if os.path.exists(meta_path):
                         with open(meta_path, 'r') as f:
                             meta = json.load(f)
+                            # Check feature columns
                             if meta.get('feature_columns') != self.config.feature_columns:
                                 logger.warning("Model feature mismatch. Skipping load to force retrain.", symbol=symbol)
+                                continue
+                            # Check model version
+                            if meta.get('model_version') != MODEL_VERSION:
+                                logger.warning("Model version mismatch. Skipping load to force retrain.", 
+                                               symbol=symbol, 
+                                               expected=MODEL_VERSION, 
+                                               found=meta.get('model_version'))
                                 continue
                     else:
                         logger.warning("No metadata found for model. Skipping load to be safe.", symbol=symbol)
@@ -197,10 +208,13 @@ class EnsembleLearner:
             features = np.nan_to_num(sequence_df.values, nan=0.0)
 
             # Prepare inputs
-            last_step_features = features[-1, :].reshape(1, -1)
+            # Flatten the sequence for Tree/Linear models: (1, seq_len * num_features)
+            flat_features = features.reshape(1, -1)
+            
+            # Keep 3D shape for DL models: (1, seq_len, num_features)
             sequence_tensor = torch.FloatTensor(features).unsqueeze(0).to(self.device)
 
-            ensemble_pred = self._get_ensemble_prediction(models, last_step_features, sequence_tensor)
+            ensemble_pred = self._get_ensemble_prediction(models, flat_features, sequence_tensor)
             
             action_idx = np.argmax(ensemble_pred)
             confidence = float(ensemble_pred[action_idx])
@@ -222,13 +236,13 @@ class EnsembleLearner:
             weights_config.attention
         ]
 
-        # Scikit-learn models
+        # Scikit-learn models (Input: Flattened Sequence)
         gb_pred = models['gb'].predict_proba(X_flat)
         predictions.append(gb_pred)
         tech_pred = models['technical'].predict_proba(X_flat)
         predictions.append(tech_pred)
 
-        # PyTorch models
+        # PyTorch models (Input: 3D Sequence)
         with torch.no_grad():
             models['lstm'].eval()
             models['attention'].eval()
@@ -307,10 +321,11 @@ class EnsembleLearner:
                 logger.warning("Sequence generation resulted in empty datasets.", symbol=symbol)
                 return False
 
-            # 5. Prepare flat data for scikit-learn models
-            X_train_flat = X_train_seq[:, -1, :]
+            # 5. Prepare data for different model types
+            # Flatten sequences for Tree/Linear models: (N, seq_len * features)
+            X_train_flat = X_train_seq.reshape(X_train_seq.shape[0], -1)
             y_train_flat = y_train_seq
-            X_val_flat = X_val_seq[:, -1, :]
+            X_val_flat = X_val_seq.reshape(X_val_seq.shape[0], -1)
             y_val_flat = y_val_seq
             
             # 6. Create FRESH models for this training session
@@ -321,17 +336,17 @@ class EnsembleLearner:
             models['gb'].fit(X_train_flat, y_train_flat)
             models['technical'].fit(X_train_flat, y_train_flat)
             
-            # Log Feature Importance
+            # Log Feature Importance (Approximate for flattened features)
             try:
                 if hasattr(models['gb'], 'feature_importances_'):
                     importances = models['gb'].feature_importances_
+                    # Just log the top 5 indices since names are now flattened
                     indices = np.argsort(importances)[::-1][:5]
-                    top_features = {self.config.feature_columns[i]: float(importances[i]) for i in indices}
-                    logger.info("XGBoost Top 5 Features", symbol=symbol, features=top_features)
+                    logger.info("XGBoost Top 5 Feature Indices", symbol=symbol, indices=indices.tolist())
             except Exception as e:
                 logger.warning("Could not log feature importance", error=str(e))
 
-            # 8. Train PyTorch models
+            # 8. Train PyTorch models (Use 3D sequences)
             logger.info("Training PyTorch models...", symbol=symbol)
             X_train_tensor = torch.FloatTensor(X_train_seq).to(self.device)
             y_train_tensor = torch.LongTensor(y_train_seq).to(self.device)
@@ -435,6 +450,7 @@ class EnsembleLearner:
         # Save Metadata
         metadata = {
             'feature_columns': self.config.feature_columns,
+            'model_version': MODEL_VERSION,
             'timestamp': str(pd.Timestamp.utcnow())
         }
         with open(os.path.join(save_path, "metadata.json"), 'w') as f:
