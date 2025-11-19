@@ -6,6 +6,7 @@ import json
 from typing import Dict, Any, Tuple, List, Optional
 import pandas as pd
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams
@@ -396,6 +397,7 @@ class EnsembleLearner:
     """
     Manages AI/ML models for inference. 
     Delegates training to `train_ensemble_task` via external executor.
+    Performs inference in a ThreadPoolExecutor to avoid blocking the asyncio loop.
     """
 
     def __init__(self, config: AIEnsembleStrategyParams):
@@ -408,7 +410,10 @@ class EnsembleLearner:
         self.symbol_models: Dict[str, Dict[str, Any]] = {}
         self.is_trained = False
         
-        logger.info("EnsembleLearner initialized.", device=str(self.device))
+        # Executor for inference to prevent blocking the main loop
+        self.inference_executor = ThreadPoolExecutor(max_workers=config.inference_workers)
+        
+        logger.info("EnsembleLearner initialized.", device=str(self.device), inference_workers=config.inference_workers)
         
         try:
             loop = asyncio.get_running_loop()
@@ -434,7 +439,7 @@ class EnsembleLearner:
             return
 
         try:
-            # Run IO-bound load in thread pool
+            # Run IO-bound load in thread pool (using default executor for IO)
             loop = asyncio.get_running_loop()
             loaded_data = await loop.run_in_executor(None, self._load_models_sync, symbol_path)
             
@@ -470,6 +475,21 @@ class EnsembleLearner:
             return None
 
     async def predict(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
+        """Async wrapper for prediction logic."""
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(
+                self.inference_executor, 
+                self._predict_sync, 
+                df, 
+                symbol
+            )
+        except Exception as e:
+            logger.error("Error during async prediction", symbol=symbol, error=str(e))
+            return {'action': 'hold', 'confidence': 0.0}
+
+    def _predict_sync(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
+        """Synchronous prediction logic to be run in a thread."""
         entry = self.symbol_models.get(symbol)
         if not entry:
             return {'action': 'hold', 'confidence': 0.0}
@@ -528,5 +548,9 @@ class EnsembleLearner:
                 'metrics': meta.get('metrics', {})
             }
         except Exception as e:
-            logger.error("Error during prediction", symbol=symbol, error=str(e))
+            logger.error("Error during sync prediction", symbol=symbol, error=str(e))
             return {'action': 'hold', 'confidence': 0.0}
+
+    def shutdown(self):
+        """Shuts down the inference executor."""
+        self.inference_executor.shutdown(wait=False)
