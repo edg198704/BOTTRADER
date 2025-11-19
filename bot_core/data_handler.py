@@ -460,13 +460,76 @@ class DataHandler:
             logger.error("Failed to load cache", symbol=symbol, error=str(e))
             return None
 
+    def _enforce_data_continuity(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Ensures the DataFrame has a continuous DatetimeIndex based on the timeframe.
+        Gaps are filled: Prices -> Forward Fill, Volume -> 0.
+        """
+        if df is None or df.empty:
+            return df
+
+        try:
+            # Ensure sorted
+            if not df.index.is_monotonic_increasing:
+                df = df.sort_index()
+
+            # Determine expected frequency in seconds
+            tf_seconds = parse_timeframe_to_seconds(self.timeframe)
+            if tf_seconds <= 0:
+                return df
+
+            # Create a complete index from start to end
+            start = df.index[0]
+            end = df.index[-1]
+            
+            # Generate expected timestamps using 's' (seconds) as frequency
+            full_index = pd.date_range(start=start, end=end, freq=f"{tf_seconds}s")
+            
+            if len(full_index) == len(df.index):
+                return df # No gaps
+
+            # Reindex
+            df_continuous = df.reindex(full_index)
+            
+            # Forward fill prices (Open, High, Low, Close)
+            # If a gap exists, price stays at the last known close
+            cols_to_ffill = ['open', 'high', 'low', 'close']
+            # Only fill columns that exist
+            cols_to_ffill = [c for c in cols_to_ffill if c in df_continuous.columns]
+            df_continuous[cols_to_ffill] = df_continuous[cols_to_ffill].ffill()
+            
+            # Fill Volume with 0 (no activity during gap)
+            if 'volume' in df_continuous.columns:
+                df_continuous['volume'] = df_continuous['volume'].fillna(0)
+            
+            # Handle any remaining NaNs (e.g. at the very start if not covered)
+            df_continuous.dropna(inplace=True)
+            
+            # Restore index name
+            df_continuous.index.name = 'timestamp'
+            
+            gap_count = len(full_index) - len(df)
+            if gap_count > 0:
+                # Log only if significant to avoid spam
+                if gap_count > 5:
+                    logger.warning(f"Enforced data continuity. Filled {gap_count} gaps.", timeframe=self.timeframe)
+            
+            return df_continuous
+
+        except Exception as e:
+            logger.error("Error enforcing data continuity", error=str(e))
+            return df
+
     def calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculate technical indicators dynamically based on the strategy configuration."""
         if df is None or len(df) < 50:
             logger.debug("DataFrame has insufficient data for indicators.", data_length=len(df) if df is not None else 0)
             return df
 
-        df_out = df.copy()
+        # Enforce continuity before calculation to ensure rolling windows are valid
+        df_continuous = self._enforce_data_continuity(df)
+        
+        df_out = df_continuous.copy()
 
         # Create a pandas-ta strategy from the configuration
         ta_strategy = ta.Strategy(
