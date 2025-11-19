@@ -26,6 +26,10 @@ class RiskManager:
         self.peak_portfolio_value = None
         self.current_drawdown = 0.0 # Track current drawdown state
         
+        # Flags for emergency liquidation
+        self.liquidation_needed = False
+        self.liquidation_triggered = False
+        
         logger.info("RiskManager initialized.")
 
     async def initialize(self):
@@ -74,10 +78,18 @@ class RiskManager:
                 logger.critical(message, **details)
                 if self.alert_system:
                     await self.alert_system.send_alert(level='critical', message=message, details=details)
+                
+                # Trigger Liquidation if configured
+                if self.config.close_positions_on_halt and not self.liquidation_triggered:
+                    self.liquidation_needed = True
+                    self.liquidation_triggered = True
+                    logger.warning("Emergency liquidation triggered by Circuit Breaker.")
+
         else:
             if self.circuit_breaker_halted:
                 # Note: A manual resume process is safer. This is a simple auto-resume for now.
                 self.circuit_breaker_halted = False
+                self.liquidation_triggered = False # Reset trigger so it can fire again if needed
                 logger.info("Trading resumed as portfolio recovered from drawdown.")
 
         # 2. Check Max Daily Loss
@@ -93,6 +105,12 @@ class RiskManager:
                 logger.critical(message, **details)
                 if self.alert_system:
                     await self.alert_system.send_alert(level='critical', message=message, details=details)
+                
+                # Trigger Liquidation if configured
+                if self.config.close_positions_on_halt and not self.liquidation_triggered:
+                    self.liquidation_needed = True
+                    self.liquidation_triggered = True
+                    logger.warning("Emergency liquidation triggered by Max Daily Loss.")
 
     def _get_regime_param(self, param_name: str, regime: Optional[str]) -> Any:
         """Gets a risk parameter, using a regime-specific value if available, otherwise the default."""
