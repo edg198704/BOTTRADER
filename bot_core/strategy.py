@@ -114,6 +114,7 @@ class AIEnsembleStrategy(TradingStrategy):
         action = prediction.get('action')
         confidence = prediction.get('confidence', 0.0)
         model_version = prediction.get('model_version')
+        active_weights = prediction.get('active_weights')
 
         logger.debug("AI prediction received", symbol=symbol, **prediction)
 
@@ -126,7 +127,8 @@ class AIEnsembleStrategy(TradingStrategy):
             'confidence': confidence,
             'regime': regime,
             'regime_confidence': regime_result.get('confidence'),
-            'model_type': prediction.get('model_type')
+            'model_type': prediction.get('model_type'),
+            'active_weights': active_weights
         }
 
         if position:
