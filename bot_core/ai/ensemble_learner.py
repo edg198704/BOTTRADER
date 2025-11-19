@@ -2,10 +2,12 @@ import os
 import joblib
 import json
 import logging
+import asyncio
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, Tuple, Optional, List
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams
@@ -351,12 +353,20 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
 class EnsembleLearner:
     """
     Manages the lifecycle of AI models: loading, inference, and state management.
+    Uses a ThreadPoolExecutor to offload blocking I/O (loading) and CPU (inference) tasks.
     """
     def __init__(self, config: AIEnsembleStrategyParams):
         self.config = config
         self.symbol_models: Dict[str, Dict[str, Any]] = {}
         self.device = torch.device("cuda" if ML_AVAILABLE and torch.cuda.is_available() else "cpu")
+        # Executor for inference and loading to prevent blocking the main loop
+        self.executor = ThreadPoolExecutor(max_workers=4)
         logger.info(f"EnsembleLearner initialized. Device: {self.device}")
+
+    def close(self):
+        """Shuts down the internal executor."""
+        self.executor.shutdown(wait=False)
+        logger.info("EnsembleLearner executor shut down.")
 
     @property
     def is_trained(self) -> bool:
@@ -375,8 +385,20 @@ class EnsembleLearner:
             pass
         return None
 
+    async def warmup_models(self, symbols: List[str]):
+        """Preloads models for all symbols concurrently."""
+        logger.info("Warming up models...", symbols=symbols)
+        tasks = [self.reload_models(symbol) for symbol in symbols]
+        await asyncio.gather(*tasks)
+        logger.info("Model warmup complete.")
+
     async def reload_models(self, symbol: str):
-        """Loads trained models from disk into memory."""
+        """Async wrapper to load models from disk in a thread."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self.executor, self._reload_models_sync, symbol)
+
+    def _reload_models_sync(self, symbol: str):
+        """Synchronous implementation of model loading (I/O bound)."""
         if not ML_AVAILABLE:
             return
 
@@ -432,13 +454,21 @@ class EnsembleLearner:
             logger.error(f"Failed to reload models for {symbol}: {e}")
 
     async def predict(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
-        """Runs inference using the ensemble of models."""
+        """Async wrapper to run inference in a thread."""
         if symbol not in self.symbol_models:
             await self.reload_models(symbol)
             if symbol not in self.symbol_models:
                 return {}
 
+        # Extract the specific model entry to pass to the thread
+        # This avoids race conditions if self.symbol_models[symbol] is updated elsewhere
         entry = self.symbol_models[symbol]
+        
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self.executor, self._predict_sync, df, entry)
+
+    def _predict_sync(self, df: pd.DataFrame, entry: Dict[str, Any]) -> Dict[str, Any]:
+        """Synchronous implementation of inference (CPU bound)."""
         models = entry['models']
         
         # Prepare Data
@@ -489,7 +519,7 @@ class EnsembleLearner:
                         votes['buy'] += probs[2] * weights.attention
 
         except Exception as e:
-            logger.error(f"Inference error for {symbol}: {e}")
+            logger.error(f"Inference error: {e}")
             return {}
 
         # Normalize votes
