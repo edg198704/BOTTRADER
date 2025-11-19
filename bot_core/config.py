@@ -146,6 +146,9 @@ class ExchangeConfig(BaseModel):
     retry: RetryConfig
     api_key: Optional[SecretStr] = Field(None, env="BOT_EXCHANGE_API_KEY")
     api_secret: Optional[SecretStr] = Field(None, env="BOT_EXCHANGE_API_SECRET")
+    # Fees for estimation if not returned by exchange
+    maker_fee_pct: float = 0.001 # 0.1%
+    taker_fee_pct: float = 0.001 # 0.1%
 
 class ExecutionConfig(BaseModel):
     default_order_type: str
@@ -233,8 +236,8 @@ class BacktestConfig(BaseModel):
     initial_balance: float = 10000.0
     maker_fee_pct: float = 0.001 # 0.1%
     taker_fee_pct: float = 0.001 # 0.1%
-    slippage_pct: float = 0.0005 # 0.05%
-    model_path: str = "backtest_models" # Directory to store temporary backtest models
+    slippage_pct: float = 0.0005 # 0.05% 
+    model_path: str = "backtest_models"
 
 # --- Top-Level Bot Config ---
 
