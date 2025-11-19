@@ -1,14 +1,17 @@
 import abc
 import asyncio
 import pandas as pd
-from typing import Dict, Any, Optional
+import numpy as np
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timedelta
 from concurrent.futures import Executor
+from collections import deque
 
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams, SimpleMACrossoverStrategyParams, StrategyParamsBase
 from bot_core.ai.ensemble_learner import EnsembleLearner, train_ensemble_task
 from bot_core.ai.regime_detector import MarketRegimeDetector
+from bot_core.ai.feature_processor import FeatureProcessor
 from bot_core.position_manager import Position
 from bot_core.utils import Clock
 
@@ -90,6 +93,15 @@ class AIEnsembleStrategy(TradingStrategy):
         super().__init__(config)
         self.ai_config = config
         self.last_retrained_at: Dict[str, datetime] = {}
+        
+        # Performance Monitoring State
+        # Map: symbol -> list of (timestamp, predicted_label_int)
+        self.prediction_logs: Dict[str, List[Tuple[datetime, int]]] = {}
+        # Map: symbol -> deque of recent accuracy (1 for correct, 0 for incorrect)
+        self.accuracy_history: Dict[str, deque] = {}
+        # Map: symbol -> bool
+        self.force_retrain_flags: Dict[str, bool] = {}
+
         try:
             self.ensemble_learner = EnsembleLearner(self.ai_config)
             self.regime_detector = MarketRegimeDetector(self.ai_config)
@@ -102,6 +114,10 @@ class AIEnsembleStrategy(TradingStrategy):
         if not self.ensemble_learner.is_trained:
             logger.debug("AI models not trained yet, skipping analysis.", symbol=symbol)
             return None
+
+        # 1. Monitor Performance of past predictions
+        if self.ai_config.performance.enabled:
+            self._monitor_performance(symbol, df)
 
         regime_result = await self.regime_detector.detect_regime(symbol, df)
         regime = regime_result.get('regime')
@@ -116,6 +132,16 @@ class AIEnsembleStrategy(TradingStrategy):
         confidence = prediction.get('confidence', 0.0)
         model_version = prediction.get('model_version')
         active_weights = prediction.get('active_weights')
+
+        # Log prediction for future evaluation
+        if self.ai_config.performance.enabled and action:
+            action_map = {'sell': 0, 'hold': 1, 'buy': 2}
+            pred_int = action_map.get(action, 1)
+            current_time = df.index[-1]
+            
+            if symbol not in self.prediction_logs:
+                self.prediction_logs[symbol] = []
+            self.prediction_logs[symbol].append((current_time, pred_int))
 
         logger.debug("AI prediction received", symbol=symbol, **prediction)
 
@@ -149,6 +175,63 @@ class AIEnsembleStrategy(TradingStrategy):
 
         return None
 
+    def _monitor_performance(self, symbol: str, df: pd.DataFrame):
+        """Evaluates past predictions against realized market moves."""
+        logs = self.prediction_logs.get(symbol, [])
+        if not logs:
+            return
+
+        # We only need to evaluate predictions that are older than the labeling horizon
+        horizon = self.ai_config.features.labeling_horizon
+        
+        # Use FeatureProcessor to generate ground truth labels for the recent history
+        # We take a slice large enough to cover the oldest unevaluated prediction + horizon
+        # But for efficiency, we just take the last 200 rows
+        eval_df = df.tail(200)
+        if len(eval_df) < horizon + 1:
+            return
+
+        try:
+            # Generate actual labels (0, 1, 2) based on future price movement
+            actual_labels = FeatureProcessor.create_labels(eval_df, self.ai_config)
+        except Exception as e:
+            logger.error("Failed to generate labels for performance monitoring", error=str(e))
+            return
+
+        if symbol not in self.accuracy_history:
+            self.accuracy_history[symbol] = deque(maxlen=self.ai_config.performance.window_size)
+
+        remaining_logs = []
+        evaluated_count = 0
+
+        for ts, pred_int in logs:
+            if ts in actual_labels.index:
+                actual = actual_labels.loc[ts]
+                # Check if actual is valid (not NaN due to horizon)
+                if not np.isnan(actual):
+                    is_correct = 1 if int(actual) == pred_int else 0
+                    self.accuracy_history[symbol].append(is_correct)
+                    evaluated_count += 1
+                else:
+                    # Horizon not reached yet
+                    remaining_logs.append((ts, pred_int))
+            else:
+                # Timestamp fell out of the evaluation window or mismatch
+                # If it's very old, discard. If recent, keep.
+                if ts > df.index[0]:
+                    remaining_logs.append((ts, pred_int))
+        
+        self.prediction_logs[symbol] = remaining_logs
+
+        # Check accuracy threshold
+        if len(self.accuracy_history[symbol]) >= 10: # Minimum samples to judge
+            accuracy = sum(self.accuracy_history[symbol]) / len(self.accuracy_history[symbol])
+            if accuracy < self.ai_config.performance.min_accuracy:
+                if not self.force_retrain_flags.get(symbol, False):
+                    logger.warning("Model accuracy dropped below threshold. Forcing retrain.", 
+                                   symbol=symbol, accuracy=f"{accuracy:.2%}", threshold=self.ai_config.performance.min_accuracy)
+                    self.force_retrain_flags[symbol] = True
+
     async def retrain(self, symbol: str, df: pd.DataFrame, executor: Executor):
         """Initiates the retraining process using the provided executor."""
         logger.info("Strategy is triggering model retraining via ProcessPool.", symbol=symbol)
@@ -166,7 +249,13 @@ class AIEnsembleStrategy(TradingStrategy):
             
             if success:
                 self.last_retrained_at[symbol] = Clock.now()
-                logger.info("Model training successful. Reloading models...", symbol=symbol)
+                # Reset performance metrics for the new model
+                self.force_retrain_flags[symbol] = False
+                self.prediction_logs[symbol] = []
+                if symbol in self.accuracy_history:
+                    self.accuracy_history[symbol].clear()
+                
+                logger.info("Model training successful. Reloading models and resetting performance stats.", symbol=symbol)
                 await self.ensemble_learner.reload_models(symbol)
             else:
                 logger.warning("Model training failed or rejected.", symbol=symbol)
@@ -175,6 +264,11 @@ class AIEnsembleStrategy(TradingStrategy):
             logger.error("Error during async model retraining", symbol=symbol, error=str(e))
 
     def needs_retraining(self, symbol: str) -> bool:
+        # 1. Check forced retrain flag (Performance based)
+        if self.force_retrain_flags.get(symbol, False):
+            return True
+
+        # 2. Check scheduled retrain
         if self.ai_config.retrain_interval_hours <= 0:
             return False
         
