@@ -21,7 +21,8 @@ class MarketRegimeDetector:
         self.config = config
         logger.info("MarketRegimeDetector initialized.", 
                     trend_fast=config.market_regime.trend_fast_ma_col,
-                    trend_slow=config.market_regime.trend_slow_ma_col)
+                    trend_slow=config.market_regime.trend_slow_ma_col,
+                    use_adx=config.market_regime.use_adx_filter)
 
     def add_regime_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -119,27 +120,44 @@ class MarketRegimeDetector:
                     vol_thresh = vol_series.quantile(mr_config.volatility_percentile)
 
             # --- Regime Classification ---
-            is_volatile = vol_ratio > vol_thresh
+            regime = MarketRegime.SIDEWAYS
+            confidence = 0.0
             
-            if is_volatile:
-                regime = MarketRegime.VOLATILE
-            elif trend_strength > trend_thresh:
-                regime = MarketRegime.BULL
-            elif trend_strength < -trend_thresh:
-                regime = MarketRegime.BEAR
-            else:
-                regime = MarketRegime.SIDEWAYS
+            # 1. ADX Check (Priority)
+            adx_forced_sideways = False
+            if mr_config.use_adx_filter and mr_config.adx_col in df.columns:
+                adx_val = df[mr_config.adx_col].iloc[-1]
+                if adx_val < mr_config.adx_threshold:
+                    regime = MarketRegime.SIDEWAYS
+                    adx_forced_sideways = True
+                    # Confidence is higher if ADX is significantly below threshold
+                    # e.g. Thresh 25, ADX 10 -> (25-10)/25 = 0.6 base confidence
+                    confidence = min(1.0, (mr_config.adx_threshold - adx_val) / mr_config.adx_threshold)
+                    # Boost confidence for sideways
+                    confidence = 0.5 + (confidence * 0.5)
 
-            # --- Confidence Calculation ---
-            # RSI (Momentum) Check
-            rsi_val = df[rsi_col].iloc[-1] if rsi_col in df.columns else 50
-            
-            # Normalize trend confidence relative to the threshold used
-            # If trend is 2x the threshold, confidence is high.
-            trend_conf = min(1.0, abs(trend_strength) / (trend_thresh * 2)) if trend_thresh > 0 else 0.0
-            rsi_conf = abs(rsi_val - 50) / 50
-            
-            confidence = (trend_conf * 0.7) + (rsi_conf * 0.3)
+            # 2. Standard Logic (if not forced by ADX)
+            if not adx_forced_sideways:
+                is_volatile = vol_ratio > vol_thresh
+                
+                if is_volatile:
+                    regime = MarketRegime.VOLATILE
+                elif trend_strength > trend_thresh:
+                    regime = MarketRegime.BULL
+                elif trend_strength < -trend_thresh:
+                    regime = MarketRegime.BEAR
+                else:
+                    regime = MarketRegime.SIDEWAYS
+
+                # --- Confidence Calculation ---
+                # RSI (Momentum) Check
+                rsi_val = df[rsi_col].iloc[-1] if rsi_col in df.columns else 50
+                
+                # Normalize trend confidence relative to the threshold used
+                trend_conf = min(1.0, abs(trend_strength) / (trend_thresh * 2)) if trend_thresh > 0 else 0.0
+                rsi_conf = abs(rsi_val - 50) / 50
+                
+                confidence = (trend_conf * 0.7) + (rsi_conf * 0.3)
             
             result = {
                 'regime': regime.value, 
