@@ -240,10 +240,35 @@ class RiskManager:
         else: # SELL
             return entry_price + stop_loss_offset
 
-    def calculate_take_profit(self, side: str, entry_price: float, stop_loss_price: float, market_regime: Optional[str] = None) -> float:
+    def calculate_take_profit(self, 
+                              side: str, 
+                              entry_price: float, 
+                              stop_loss_price: float, 
+                              market_regime: Optional[str] = None,
+                              confidence: Optional[float] = None,
+                              confidence_threshold: Optional[float] = None) -> float:
         risk_per_unit = abs(entry_price - stop_loss_price)
-        rr_ratio = self._get_regime_param('reward_to_risk_ratio', market_regime)
-        profit_target = risk_per_unit * rr_ratio
+        base_rr_ratio = self._get_regime_param('reward_to_risk_ratio', market_regime)
+        
+        # Confidence Scaling for Reward
+        rr_multiplier = 1.0
+        if (self.config.confidence_rr_scaling_factor > 0 and 
+            confidence is not None and 
+            confidence_threshold is not None and 
+            confidence > confidence_threshold):
+            
+            surplus = confidence - confidence_threshold
+            # e.g. surplus 0.1, factor 5.0 -> +0.5 -> 1.5x RR
+            raw_scaling = 1.0 + (surplus * self.config.confidence_rr_scaling_factor)
+            rr_multiplier = min(raw_scaling, self.config.max_confidence_rr_multiplier)
+            
+            logger.info("Reward-to-Risk scaled by confidence", 
+                        base_rr=base_rr_ratio, 
+                        confidence=confidence, 
+                        multiplier=rr_multiplier)
+
+        final_rr_ratio = base_rr_ratio * rr_multiplier
+        profit_target = risk_per_unit * final_rr_ratio
 
         if side == 'BUY':
             return entry_price + profit_target
