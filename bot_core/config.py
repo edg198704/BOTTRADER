@@ -24,13 +24,14 @@ class EnsembleWeightsConfig(BaseModel):
     technical_ensemble: float = 0.3
     lstm: float = 0.2
     attention: float = 0.2
+    auto_tune: bool = True  # If True, weights are learned from validation performance
 
 class MarketRegimeConfig(BaseModel):
     trend_strength_threshold: float = 0.015
     volatility_multiplier: float = 1.5
     # Column aliases to use for detection (must match aliases in strategy.indicators)
     trend_fast_ma_col: str = "sma_fast"
-    trend_slow_ma_col: str = "sma_slow"
+    trend_slow_ma_col: "sma_slow"
     volatility_col: str = "atr"
     rsi_col: str = "rsi"
 
