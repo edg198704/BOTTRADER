@@ -228,9 +228,13 @@ class RiskManagementConfig(BaseModel):
     confidence_scaling_factor: float = 0.0
     max_confidence_risk_multiplier: float = 1.0
     
-    # --- Confidence-Based Reward Targeting (New) ---
+    # --- Confidence-Based Reward Targeting ---
     confidence_rr_scaling_factor: float = 0.0
     max_confidence_rr_multiplier: float = 1.5
+
+    # --- Kelly Criterion Sizing (New) ---
+    use_kelly_criterion: bool = False
+    kelly_fraction: float = 0.5 # Half-Kelly by default for safety
 
     regime_based_risk: RegimeBasedRiskConfig
     time_based_exit: TimeBasedExitConfig = TimeBasedExitConfig()
