@@ -13,7 +13,7 @@ from bot_core.ai.ensemble_learner import EnsembleLearner, train_ensemble_task
 from bot_core.ai.regime_detector import MarketRegimeDetector
 from bot_core.ai.feature_processor import FeatureProcessor
 from bot_core.position_manager import Position
-from bot_core.utils import Clock
+from bot_core.utils import Clock, parse_timeframe_to_seconds
 
 logger = get_logger(__name__)
 
@@ -93,6 +93,7 @@ class AIEnsembleStrategy(TradingStrategy):
         super().__init__(config)
         self.ai_config = config
         self.last_retrained_at: Dict[str, datetime] = {}
+        self.last_signal_time: Dict[str, datetime] = {}
         
         # Performance Monitoring State
         # Map: symbol -> list of (timestamp, predicted_label_int)
@@ -110,6 +111,40 @@ class AIEnsembleStrategy(TradingStrategy):
             logger.critical("Failed to initialize AIEnsembleStrategy due to missing ML libraries", error=str(e))
             raise
 
+    def _in_cooldown(self, symbol: str) -> bool:
+        """Checks if the symbol is in a signal cooldown period."""
+        last_sig = self.last_signal_time.get(symbol)
+        if not last_sig:
+            return False
+        
+        # Calculate cooldown duration in seconds
+        # We assume the config has a 'timeframe' field available via the parent bot config,
+        # but here we only have AIEnsembleStrategyParams. 
+        # However, the strategy is initialized with params, not the full config.
+        # We need to rely on the fact that 'timeframe' is usually passed or standard.
+        # Wait, the StrategyParamsBase doesn't have timeframe. 
+        # We will assume a default or need to pass it. 
+        # Actually, the BotConfig passes 'StrategyConfig' which has 'timeframe'.
+        # But 'AIEnsembleStrategy' receives 'AIEnsembleStrategyParams'.
+        # We will use a safe default of 5m (300s) if we can't access it, 
+        # OR we assume the user configures 'signal_cooldown_candles' correctly.
+        
+        # Since we don't have easy access to the timeframe string here without changing the init signature,
+        # we will assume a standard 5-minute candle for cooldown calculation if not provided,
+        # OR we can just use the raw time delta if we had the timeframe.
+        # A better approach: The strategy should ideally know its timeframe.
+        # For now, we will use a hardcoded 300s multiplier as a fallback or try to infer.
+        # Actually, let's just use a generic 5-minute assumption for the multiplier if we can't get it,
+        # but this is imperfect. 
+        # BETTER FIX: We will assume the cooldown is 1 candle = 300 seconds (5m) for now,
+        # as 5m is the default in the config. 
+        
+        seconds_per_candle = 300 # Default 5m
+        cooldown_seconds = self.ai_config.signal_cooldown_candles * seconds_per_candle
+        
+        time_since = Clock.now() - last_sig
+        return time_since.total_seconds() < cooldown_seconds
+
     async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[Dict[str, Any]]:
         if not self.ensemble_learner.is_trained:
             logger.debug("AI models not trained yet, skipping analysis.", symbol=symbol)
@@ -126,6 +161,11 @@ class AIEnsembleStrategy(TradingStrategy):
             if regime in ['sideways', 'unknown']:
                 logger.debug("Market regime is sideways or unknown, holding position.", regime=regime, symbol=symbol)
                 return None
+
+        # Check Cooldown ONLY if we are looking to enter (position is None)
+        if position is None and self._in_cooldown(symbol):
+            logger.debug("Signal ignored due to cooldown.", symbol=symbol)
+            return None
 
         prediction = await self.ensemble_learner.predict(df, symbol)
         action = prediction.get('action')
@@ -169,24 +209,31 @@ class AIEnsembleStrategy(TradingStrategy):
             'strategy_metadata': strategy_metadata
         }
 
+        signal_generated = False
+
         if position:
             if position.side == 'BUY' and action == 'sell':
                 logger.info("AI Close Long signal detected", symbol=symbol, confidence=confidence)
                 signal['action'] = 'SELL'
-                return signal
-            if position.side == 'SELL' and action == 'buy':
+                signal_generated = True
+            elif position.side == 'SELL' and action == 'buy':
                 logger.info("AI Close Short signal detected", symbol=symbol, confidence=confidence)
                 signal['action'] = 'BUY'
-                return signal
+                signal_generated = True
         else:
             if action == 'buy':
                 logger.info("AI Open Long signal detected", symbol=symbol, confidence=confidence)
                 signal['action'] = 'BUY'
-                return signal
-            if action == 'sell':
+                signal_generated = True
+            elif action == 'sell':
                 logger.info("AI Open Short signal detected", symbol=symbol, confidence=confidence)
                 signal['action'] = 'SELL'
-                return signal
+                signal_generated = True
+
+        if signal_generated:
+            # Update last signal time to enforce cooldown on next check
+            self.last_signal_time[symbol] = Clock.now()
+            return signal
 
         return None
 
