@@ -225,7 +225,102 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                     prec = precision_score(y_seq_val, predicted.cpu().numpy(), average=None, zero_division=0)
                     metrics[name] = {'precision': prec.tolist()}
 
-        # 4. Save Artifacts
+        # 4. Walk-Forward Validation (Profitability Check)
+        worker_logger.info("Performing Walk-Forward Validation on Validation Set...")
+        
+        # Aggregate Probabilities
+        num_val = len(y_val)
+        ensemble_probs = np.zeros((num_val, 3))
+        weights = config.ensemble_weights
+        
+        # Sklearn Models
+        if 'gb' in trained_models:
+            probs = trained_models['gb'].predict_proba(X_val)
+            ensemble_probs += probs * weights.xgboost
+            
+        if 'technical' in trained_models:
+            probs = trained_models['technical'].predict_proba(X_val)
+            ensemble_probs += probs * weights.technical_ensemble
+            
+        # NN Models (Alignment required)
+        # X_seq_val corresponds to X_val[seq_len-1:]
+        valid_nn_indices = slice(seq_len - 1, None)
+        
+        if len(X_seq_val) > 0:
+            def add_nn_probs(model_name, weight):
+                if model_name in trained_models:
+                    model = trained_models[model_name]
+                    model.eval()
+                    with torch.no_grad():
+                        inputs = torch.FloatTensor(X_seq_val).to(device)
+                        probs = model(inputs).cpu().numpy()
+                        # Add to the slice of ensemble_probs
+                        target_len = len(ensemble_probs[valid_nn_indices])
+                        if len(probs) == target_len:
+                            ensemble_probs[valid_nn_indices] += probs * weight
+            
+            add_nn_probs('lstm', weights.lstm)
+            add_nn_probs('attention', weights.attention)
+
+        # Determine Final Predictions on the subset where all models could predict
+        eval_probs = ensemble_probs[valid_nn_indices]
+        final_preds = np.argmax(eval_probs, axis=1) # 0, 1, 2
+        
+        # Map to Signal: 0->-1 (Short), 1->0 (Hold), 2->1 (Long)
+        signals = np.zeros_like(final_preds)
+        signals[final_preds == 0] = -1
+        signals[final_preds == 2] = 1
+        
+        # Get Market Returns for the validation period
+        # val_indices are the timestamps in df corresponding to X_val
+        val_indices = common_index[split_idx:]
+        # Slice to match the NN valid indices
+        eval_indices = val_indices[valid_nn_indices]
+        
+        if len(eval_indices) != len(signals):
+            worker_logger.warning("Shape mismatch in validation. Skipping profitability check.")
+        else:
+            # Calculate Next-Candle Returns: (Close[t+1] - Close[t]) / Close[t]
+            # We calculate this on the full df first to ensure continuity, then slice
+            full_returns = df['close'].pct_change().shift(-1)
+            eval_returns = full_returns.loc[eval_indices].fillna(0.0).values
+            
+            # Strategy Returns
+            strategy_returns = signals * eval_returns
+            
+            # Metrics
+            total_return = np.sum(strategy_returns)
+            winning_returns = strategy_returns[strategy_returns > 0]
+            losing_returns = strategy_returns[strategy_returns < 0]
+            
+            gross_profit = np.sum(winning_returns)
+            gross_loss = np.abs(np.sum(losing_returns))
+            
+            profit_factor = gross_profit / gross_loss if gross_loss > 0 else 999.0
+            
+            mean_ret = np.mean(strategy_returns)
+            std_ret = np.std(strategy_returns)
+            sharpe = mean_ret / std_ret if std_ret > 0 else 0.0
+            
+            metrics['ensemble'] = {
+                'profit_factor': float(profit_factor),
+                'sharpe': float(sharpe),
+                'total_return': float(total_return),
+                'win_rate': float(len(winning_returns) / len(strategy_returns)) if len(strategy_returns) > 0 else 0.0
+            }
+            
+            worker_logger.info(f"Validation Results: PF={profit_factor:.2f}, Sharpe={sharpe:.4f}, Ret={total_return:.4f}")
+            
+            # Check Thresholds
+            if profit_factor < config.training.min_profit_factor:
+                worker_logger.warning(f"Model rejected: Profit Factor {profit_factor:.2f} < {config.training.min_profit_factor}")
+                return False
+                
+            if sharpe < config.training.min_sharpe_ratio:
+                worker_logger.warning(f"Model rejected: Sharpe {sharpe:.4f} < {config.training.min_sharpe_ratio}")
+                return False
+
+        # 5. Save Artifacts
         save_dir = os.path.join(config.model_path, symbol.replace('/', '_'))
         os.makedirs(save_dir, exist_ok=True)
         
