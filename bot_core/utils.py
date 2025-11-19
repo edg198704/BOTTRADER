@@ -208,6 +208,9 @@ def generate_indicator_rename_map(indicators_config: List[Dict[str, Any]]) -> Di
                 raise ValueError(f"Indicator 'sma' with length {conf.get('length')} must have an 'alias' in the configuration to avoid ambiguity.")
             length = conf.get("length")
             rename_map[f"SMA_{length}"] = alias
+        elif kind == "log_return":
+            length = conf.get("length", 1)
+            rename_map[f"LOGRET_{length}"] = alias or "log_return"
         else:
             # Handle generic case with alias
             if alias:
