@@ -1,5 +1,6 @@
 import datetime
 import asyncio
+import enum
 from typing import List, Optional, Dict, TYPE_CHECKING
 
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLAlchemyEnum, func, Boolean, cast, Date
@@ -14,7 +15,8 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 Base = declarative_base()
 
-class PositionStatus(SQLAlchemyEnum):
+class PositionStatus(enum.Enum):
+    PENDING = 'PENDING'
     OPEN = 'OPEN'
     CLOSED = 'CLOSED'
 
@@ -25,7 +27,8 @@ class Position(Base):
     side = Column(String, nullable=False) # 'BUY' or 'SELL'
     quantity = Column(Float, nullable=False)
     entry_price = Column(Float, nullable=False)
-    status = Column(String, default='OPEN', nullable=False)
+    status = Column(SQLAlchemyEnum(PositionStatus), default=PositionStatus.OPEN, nullable=False)
+    order_id = Column(String, nullable=True) # Exchange Order ID for reconciliation
     stop_loss_price = Column(Float, nullable=True)
     take_profit_price = Column(Float, nullable=True)
     open_timestamp = Column(DateTime, default=datetime.datetime.utcnow)
@@ -68,7 +71,7 @@ class PositionManager:
         """Synchronous method to query the database for historical PnL."""
         session = self.SessionLocal()
         try:
-            realized_pnl = session.query(func.sum(Position.pnl)).filter(Position.status == 'CLOSED').scalar()
+            realized_pnl = session.query(func.sum(Position.pnl)).filter(Position.status == PositionStatus.CLOSED).scalar()
             return realized_pnl or 0.0
         finally:
             session.close()
@@ -122,7 +125,6 @@ class PositionManager:
                     session.commit()
                     logger.info("Updated Portfolio High Water Mark", old_peak=old_peak, new_peak=new_peak)
             else:
-                # Should not happen if initialized correctly
                 state = PortfolioState(id=1, initial_capital=self._initial_capital, peak_equity=new_peak)
                 session.add(state)
                 session.commit()
@@ -132,7 +134,126 @@ class PositionManager:
         finally:
             session.close()
 
+    # --- Pending Position Management (Two-Phase Commit) ---
+
+    async def create_pending_position(self, symbol: str, side: str, order_id: str) -> Optional[Position]:
+        return await self._run_in_executor(self._create_pending_position_sync, symbol, side, order_id)
+
+    def _create_pending_position_sync(self, symbol: str, side: str, order_id: str) -> Optional[Position]:
+        session = self.SessionLocal()
+        try:
+            # Check for existing open or pending positions to prevent duplicates
+            existing = session.query(Position).filter(
+                Position.symbol == symbol, 
+                Position.status.in_([PositionStatus.OPEN, PositionStatus.PENDING])
+            ).first()
+            
+            if existing:
+                logger.warning("Cannot create pending position: Active position already exists.", symbol=symbol, status=existing.status)
+                return None
+
+            new_position = Position(
+                symbol=symbol,
+                side=side,
+                quantity=0.0, # Placeholder until confirmed
+                entry_price=0.0, # Placeholder until confirmed
+                status=PositionStatus.PENDING,
+                order_id=order_id,
+                trailing_ref_price=0.0,
+                trailing_stop_active=False
+            )
+            session.add(new_position)
+            session.commit()
+            session.refresh(new_position)
+            logger.info("Created PENDING position", symbol=symbol, order_id=order_id)
+            return new_position
+        except Exception as e:
+            logger.error("Failed to create pending position", symbol=symbol, error=str(e))
+            session.rollback()
+            return None
+        finally:
+            session.close()
+
+    async def confirm_position_open(self, symbol: str, order_id: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float) -> Optional[Position]:
+        return await self._run_in_executor(self._confirm_position_open_sync, symbol, order_id, quantity, entry_price, stop_loss, take_profit)
+
+    def _confirm_position_open_sync(self, symbol: str, order_id: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float) -> Optional[Position]:
+        session = self.SessionLocal()
+        try:
+            position = session.query(Position).filter(
+                Position.symbol == symbol, 
+                Position.order_id == order_id,
+                Position.status == PositionStatus.PENDING
+            ).first()
+
+            if not position:
+                logger.error("Cannot confirm position: No PENDING position found with matching Order ID.", symbol=symbol, order_id=order_id)
+                return None
+
+            position.status = PositionStatus.OPEN
+            position.quantity = quantity
+            position.entry_price = entry_price
+            position.stop_loss_price = stop_loss
+            position.take_profit_price = take_profit
+            position.trailing_ref_price = entry_price
+            position.open_timestamp = datetime.datetime.utcnow()
+            
+            session.commit()
+            session.refresh(position)
+            logger.info("Confirmed position as OPEN", symbol=symbol, order_id=order_id, quantity=quantity, price=entry_price)
+            
+            if self.alert_system:
+                asyncio.run_coroutine_threadsafe(self.alert_system.send_alert(
+                    level='info',
+                    message=f"🟢 Opened {position.side} position for {symbol}",
+                    details={'symbol': symbol, 'side': position.side, 'quantity': quantity, 'entry_price': entry_price}
+                ), asyncio.get_running_loop())
+
+            return position
+        except Exception as e:
+            logger.error("Failed to confirm position open", symbol=symbol, error=str(e))
+            session.rollback()
+            return None
+        finally:
+            session.close()
+
+    async def void_position(self, symbol: str, order_id: str):
+        """Deletes a PENDING position if the order failed or was cancelled."""
+        await self._run_in_executor(self._void_position_sync, symbol, order_id)
+
+    def _void_position_sync(self, symbol: str, order_id: str):
+        session = self.SessionLocal()
+        try:
+            position = session.query(Position).filter(
+                Position.symbol == symbol, 
+                Position.order_id == order_id,
+                Position.status == PositionStatus.PENDING
+            ).first()
+            
+            if position:
+                session.delete(position)
+                session.commit()
+                logger.info("Voided PENDING position", symbol=symbol, order_id=order_id)
+        except Exception as e:
+            logger.error("Failed to void position", symbol=symbol, error=str(e))
+            session.rollback()
+        finally:
+            session.close()
+
+    async def get_pending_positions(self) -> List[Position]:
+        return await self._run_in_executor(self._get_pending_positions_sync)
+
+    def _get_pending_positions_sync(self) -> List[Position]:
+        session = self.SessionLocal()
+        try:
+            return session.query(Position).filter(Position.status == PositionStatus.PENDING).all()
+        finally:
+            session.close()
+
+    # --- Standard Position Management ---
+
     async def open_position(self, symbol: str, side: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float) -> Optional[Position]:
+        """Legacy method for direct opening, kept for compatibility or manual overrides."""
         return await self._run_in_executor(
             self._open_position_sync, symbol, side, quantity, entry_price, stop_loss, take_profit
         )
@@ -140,7 +261,7 @@ class PositionManager:
     def _open_position_sync(self, symbol: str, side: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float) -> Optional[Position]:
         session = self.SessionLocal()
         try:
-            if session.query(Position).filter(Position.symbol == symbol, Position.status == 'OPEN').first():
+            if session.query(Position).filter(Position.symbol == symbol, Position.status == PositionStatus.OPEN).first():
                 logger.warning("Attempted to open a position for a symbol that already has one.", symbol=symbol)
                 return None
 
@@ -151,23 +272,14 @@ class PositionManager:
                 entry_price=entry_price,
                 stop_loss_price=stop_loss,
                 take_profit_price=take_profit,
-                status='OPEN',
+                status=PositionStatus.OPEN,
                 trailing_ref_price=entry_price,
                 trailing_stop_active=False
             )
             session.add(new_position)
             session.commit()
             session.refresh(new_position)
-            logger.info("Opened new position", symbol=symbol, side=side, quantity=quantity, entry_price=entry_price, sl=stop_loss, tp=take_profit)
-            
-            if self.alert_system:
-                # Fire and forget alert
-                asyncio.run_coroutine_threadsafe(self.alert_system.send_alert(
-                    level='info',
-                    message=f"🟢 Opened {side} position for {symbol}",
-                    details={'symbol': symbol, 'side': side, 'quantity': quantity, 'entry_price': entry_price}
-                ), asyncio.get_running_loop())
-
+            logger.info("Opened new position", symbol=symbol, side=side, quantity=quantity, entry_price=entry_price)
             return new_position
         except Exception as e:
             logger.error("Failed to open position", symbol=symbol, error=str(e))
@@ -179,14 +291,13 @@ class PositionManager:
     async def close_position(self, symbol: str, close_price: float, reason: str = "Unknown") -> Optional[Position]:
         position = await self._run_in_executor(self._close_position_sync, symbol, close_price, reason)
         if position:
-            # Update realized PnL in the main thread to ensure thread safety
             self._realized_pnl += position.pnl
         return position
 
     def _close_position_sync(self, symbol: str, close_price: float, reason: str) -> Optional[Position]:
         session = self.SessionLocal()
         try:
-            position = session.query(Position).filter(Position.symbol == symbol, Position.status == 'OPEN').first()
+            position = session.query(Position).filter(Position.symbol == symbol, Position.status == PositionStatus.OPEN).first()
             if not position:
                 logger.warning("No open position found to close for symbol", symbol=symbol)
                 return None
@@ -195,7 +306,7 @@ class PositionManager:
             if position.side == 'SELL':
                 pnl = -pnl
 
-            position.status = 'CLOSED'
+            position.status = PositionStatus.CLOSED
             position.close_price = close_price
             position.close_timestamp = datetime.datetime.utcnow()
             position.pnl = pnl
@@ -225,7 +336,6 @@ class PositionManager:
     def _manage_trailing_stop_sync(self, pos: Position, current_price: float, rm_config: RiskManagementConfig) -> Position:
         session = self.SessionLocal()
         try:
-            # Re-attach the object to the new session
             pos = session.merge(pos)
             original_stop_loss = pos.stop_loss_price
 
@@ -234,7 +344,7 @@ class PositionManager:
                     activation_price = pos.entry_price * (1 + rm_config.trailing_stop_activation_pct)
                     if current_price >= activation_price:
                         pos.trailing_stop_active = True
-                        logger.info("Trailing stop activated for LONG", symbol=pos.symbol, price=current_price, activation_price=activation_price)
+                        logger.info("Trailing stop activated for LONG", symbol=pos.symbol, price=current_price)
                 
                 pos.trailing_ref_price = max(pos.trailing_ref_price, current_price)
 
@@ -247,7 +357,7 @@ class PositionManager:
                     activation_price = pos.entry_price * (1 - rm_config.trailing_stop_activation_pct)
                     if current_price <= activation_price:
                         pos.trailing_stop_active = True
-                        logger.info("Trailing stop activated for SHORT", symbol=pos.symbol, price=current_price, activation_price=activation_price)
+                        logger.info("Trailing stop activated for SHORT", symbol=pos.symbol, price=current_price)
 
                 pos.trailing_ref_price = min(pos.trailing_ref_price, current_price)
 
@@ -256,7 +366,7 @@ class PositionManager:
                     pos.stop_loss_price = min(pos.stop_loss_price, new_stop_price)
 
             if session.is_modified(pos):
-                logger.debug("Updating trailing stop for position", symbol=pos.symbol, new_sl=pos.stop_loss_price, old_sl=original_stop_loss)
+                logger.debug("Updating trailing stop", symbol=pos.symbol, new_sl=pos.stop_loss_price)
                 session.commit()
                 session.refresh(pos)
             
@@ -276,7 +386,7 @@ class PositionManager:
         try:
             today_utc = datetime.datetime.utcnow().date()
             daily_pnl = session.query(func.sum(Position.pnl)).filter(
-                Position.status == 'CLOSED',
+                Position.status == PositionStatus.CLOSED,
                 cast(Position.close_timestamp, Date) == today_utc
             ).scalar()
             return daily_pnl or 0.0
@@ -289,7 +399,7 @@ class PositionManager:
     def _get_open_position_sync(self, symbol: str) -> Optional[Position]:
         session = self.SessionLocal()
         try:
-            return session.query(Position).filter(Position.symbol == symbol, Position.status == 'OPEN').first()
+            return session.query(Position).filter(Position.symbol == symbol, Position.status == PositionStatus.OPEN).first()
         finally:
             session.close()
 
@@ -299,26 +409,24 @@ class PositionManager:
     def _get_all_open_positions_sync(self) -> List[Position]:
         session = self.SessionLocal()
         try:
-            return session.query(Position).filter(Position.status == 'OPEN').all()
+            return session.query(Position).filter(Position.status == PositionStatus.OPEN).all()
         finally:
             session.close()
 
     async def get_aggregated_open_positions(self) -> Dict[str, float]:
-        """Returns a dictionary of {symbol: total_quantity} for all OPEN positions."""
         return await self._run_in_executor(self._get_aggregated_open_positions_sync)
 
     def _get_aggregated_open_positions_sync(self) -> Dict[str, float]:
         session = self.SessionLocal()
         try:
             results = session.query(Position.symbol, func.sum(Position.quantity))\
-                .filter(Position.status == 'OPEN')\
+                .filter(Position.status == PositionStatus.OPEN)\
                 .group_by(Position.symbol).all()
             return {r[0]: r[1] for r in results}
         finally:
             session.close()
 
     def get_portfolio_value(self, latest_prices: Dict[str, float], open_positions: List[Position]) -> float:
-        """Calculates total portfolio equity using in-memory PnL and current market prices."""
         unrealized_pnl = 0.0
         for pos in open_positions:
             current_price = latest_prices.get(pos.symbol, pos.entry_price)
