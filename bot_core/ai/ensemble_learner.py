@@ -483,6 +483,10 @@ class EnsembleLearner:
         votes = {'buy': 0.0, 'sell': 0.0, 'hold': 0.0}
         weights = self.config.ensemble_weights
         
+        # Store individual predictions for variance calculation
+        # List of (weight, prob_array)
+        model_predictions = []
+        
         # Inference
         try:
             # XGBoost
@@ -491,6 +495,7 @@ class EnsembleLearner:
                 votes['sell'] += probs[0] * weights.xgboost
                 votes['hold'] += probs[1] * weights.xgboost
                 votes['buy'] += probs[2] * weights.xgboost
+                model_predictions.append((weights.xgboost, probs))
 
             # Technical Ensemble
             if 'technical' in models:
@@ -498,6 +503,7 @@ class EnsembleLearner:
                 votes['sell'] += probs[0] * weights.technical_ensemble
                 votes['hold'] += probs[1] * weights.technical_ensemble
                 votes['buy'] += probs[2] * weights.technical_ensemble
+                model_predictions.append((weights.technical_ensemble, probs))
 
             # PyTorch Models
             if X_seq is not None:
@@ -509,12 +515,14 @@ class EnsembleLearner:
                         votes['sell'] += probs[0] * weights.lstm
                         votes['hold'] += probs[1] * weights.lstm
                         votes['buy'] += probs[2] * weights.lstm
+                        model_predictions.append((weights.lstm, probs))
                         
                     if 'attention' in models:
                         probs = models['attention'](tensor_in).cpu().numpy()[0]
                         votes['sell'] += probs[0] * weights.attention
                         votes['hold'] += probs[1] * weights.attention
                         votes['buy'] += probs[2] * weights.attention
+                        model_predictions.append((weights.attention, probs))
 
         except Exception as e:
             logger.error(f"Inference error for {symbol}: {e}")
@@ -530,6 +538,28 @@ class EnsembleLearner:
         # 0: sell, 1: hold, 2: buy
         best_action = max(votes, key=votes.get)
         confidence = votes[best_action]
+
+        # --- Disagreement Penalty ---
+        # If models disagree significantly on the best action, reduce confidence.
+        if model_predictions and weights.disagreement_penalty > 0:
+            action_map = {'sell': 0, 'hold': 1, 'buy': 2}
+            best_action_idx = action_map[best_action]
+            
+            # Extract the probability assigned to the BEST action by each model
+            # Only consider models that actually contributed (weight > 0)
+            relevant_probs = [p[best_action_idx] for w, p in model_predictions if w > 0]
+            
+            if len(relevant_probs) > 1:
+                std_dev = np.std(relevant_probs)
+                penalty = std_dev * weights.disagreement_penalty
+                original_conf = confidence
+                confidence = max(0.0, confidence - penalty)
+                if penalty > 0.05:
+                    logger.debug(f"Confidence penalized for {symbol}", 
+                                 original=original_conf, 
+                                 penalty=penalty, 
+                                 std_dev=std_dev,
+                                 final=confidence)
 
         # Extract top features from XGBoost if available
         top_features = {}
