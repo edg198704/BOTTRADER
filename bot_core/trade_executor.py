@@ -114,6 +114,10 @@ class TradeExecutor:
         # 2. Record PENDING Position (Two-Phase Commit Start)
         await self.position_manager.create_pending_position(symbol, side, order_id)
 
+        # Define callback to update DB if order is replaced during chase
+        async def _on_order_replace(old_id: str, new_id: str):
+            await self.position_manager.update_pending_order_id(symbol, old_id, new_id)
+
         # 3. Manage Order Lifecycle
         final_order_state = await self.order_lifecycle_manager.manage(
             initial_order=order_result, 
@@ -121,7 +125,8 @@ class TradeExecutor:
             side=side, 
             quantity=final_quantity, 
             initial_price=limit_price,
-            market_details=market_details
+            market_details=market_details,
+            on_order_replace=_on_order_replace
         )
         
         fill_quantity = final_order_state.get('filled', 0.0) if final_order_state else 0.0
