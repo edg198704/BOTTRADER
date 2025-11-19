@@ -165,6 +165,11 @@ strategy:
       trend_strength_threshold: 0.015 # e.g., 1.5% difference between SMAs
       volatility_multiplier: 1.5 # How much higher current volatility must be than average to be 'volatile'
       
+      # --- ADX Filter (New) ---
+      use_adx_filter: true
+      adx_col: "adx"
+      adx_threshold: 25.0
+
       # --- Adaptive Regime Settings (New) ---
       # If enabled, thresholds are calculated dynamically based on recent history.
       use_dynamic_thresholds: true
