@@ -138,33 +138,56 @@ class TradeExecutor:
         # We persist the intent BEFORE the network call to handle crashes gracefully.
         await self.position_manager.create_pending_position(symbol, side, trade_id, trade_id, strategy_metadata=strategy_metadata)
 
-        # 3. Place Order
+        # 3. Place Order (With Smart Retry)
+        order_result = None
         try:
             # Use trade_id as the initial clientOrderId
             order_result = await self.exchange_api.place_order(
                 symbol, side, order_type, final_quantity, price=limit_price, 
                 extra_params={'clientOrderId': trade_id}
             )
-        except (BotInvalidOrderError, BotInsufficientFundsError) as e:
-            # These are deterministic errors; the order definitely failed.
+        except BotInsufficientFundsError:
+            # --- Smart Retry for Entry ---
+            logger.warning("Insufficient funds for entry. Attempting one-time retry with reduced size.", symbol=symbol)
+            try:
+                # Reduce quantity by 1% to account for fees/slippage
+                reduced_qty = final_quantity * 0.99
+                # Re-adjust for precision
+                reduced_qty = self.order_sizer.adjust_order_quantity(symbol, reduced_qty, current_price, market_details)
+                
+                if reduced_qty > 0:
+                    order_result = await self.exchange_api.place_order(
+                        symbol, side, order_type, reduced_qty, price=limit_price, 
+                        extra_params={'clientOrderId': trade_id}
+                    )
+                    final_quantity = reduced_qty # Update for lifecycle manager
+                    logger.info("Retry successful with reduced quantity.", original=final_quantity, new=reduced_qty)
+                else:
+                    logger.error("Reduced quantity too small to trade.")
+                    await self.position_manager.void_position(symbol, trade_id)
+                    return
+            except Exception as retry_e:
+                logger.error("Retry failed for entry order.", error=str(retry_e))
+                await self.position_manager.void_position(symbol, trade_id)
+                return
+
+        except BotInvalidOrderError as e:
             logger.error("Order rejected by exchange logic. Voiding pending position.", error=str(e))
             await self.position_manager.void_position(symbol, trade_id)
             return
         except Exception as e:
-            # Network timeout or unknown error. 
-            # The order MIGHT have gone through. We leave the PENDING position.
-            # The bot's reconciliation logic on restart (or OrderLifecycleManager if we continued) 
-            # would handle it. But here we stop execution flow to be safe.
             logger.error("Critical error during order placement. Leaving PENDING position for reconciliation.", error=str(e))
             return
 
+        if not order_result:
+            # Should be handled by except blocks, but safety check
+            return
+
         # 4. Update Order ID if Exchange returns a different one
-        # Some exchanges return their own ID. We update our DB to match.
         exchange_order_id = order_result.get('orderId')
         if exchange_order_id and exchange_order_id != trade_id:
             logger.info("Updating PENDING position with Exchange Order ID", client_id=trade_id, exchange_id=exchange_order_id)
             await self.position_manager.update_pending_order_id(symbol, trade_id, exchange_order_id)
-            # Use the exchange ID for lifecycle management
             current_order_id = exchange_order_id
         else:
             current_order_id = trade_id
