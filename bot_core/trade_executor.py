@@ -1,9 +1,10 @@
 import pandas as pd
+import uuid
 from typing import Dict, Any, Optional
 
 from bot_core.logger import get_logger
 from bot_core.config import BotConfig
-from bot_core.exchange_api import ExchangeAPI, BotInsufficientFundsError, BotInvalidOrderError
+from bot_core.exchange_api import ExchangeAPI, BotInsufficientFundsError, BotInvalidOrderError, BotExchangeError
 from bot_core.position_manager import PositionManager, Position
 from bot_core.risk_manager import RiskManager
 from bot_core.order_sizer import OrderSizer
@@ -111,32 +112,48 @@ class TradeExecutor:
             offset = self.config.execution.limit_price_offset_pct
             limit_price = current_price * (1 - offset) if side == 'BUY' else current_price * (1 + offset)
 
-        # 1. Place Order
+        # 1. Generate Client Order ID (Idempotency Key)
+        client_order_id = str(uuid.uuid4())
+
+        # 2. Record PENDING Position (Pre-Commit)
+        # We persist the intent BEFORE the network call to handle crashes gracefully.
+        await self.position_manager.create_pending_position(symbol, side, client_order_id, strategy_metadata=strategy_metadata)
+
+        # 3. Place Order
         try:
-            order_result = await self.exchange_api.place_order(symbol, side, order_type, final_quantity, price=limit_price)
-        except BotInvalidOrderError as e:
-            logger.error("Invalid order parameters for open.", error=str(e))
+            order_result = await self.exchange_api.place_order(
+                symbol, side, order_type, final_quantity, price=limit_price, 
+                extra_params={'clientOrderId': client_order_id}
+            )
+        except (BotInvalidOrderError, BotInsufficientFundsError) as e:
+            # These are deterministic errors; the order definitely failed.
+            logger.error("Order rejected by exchange logic. Voiding pending position.", error=str(e))
+            await self.position_manager.void_position(symbol, client_order_id)
             return
         except Exception as e:
-            logger.error("Failed to place open order.", error=str(e))
+            # Network timeout or unknown error. 
+            # The order MIGHT have gone through. We leave the PENDING position.
+            # The bot's reconciliation logic on restart (or OrderLifecycleManager if we continued) 
+            # would handle it. But here we stop execution flow to be safe.
+            logger.error("Critical error during order placement. Leaving PENDING position for reconciliation.", error=str(e))
             return
 
-        order_id = order_result.get('orderId')
-        
-        if not (order_result and order_id):
-            logger.error("Order placement failed, no order ID returned.", symbol=symbol)
-            return
-
-        # 2. Record PENDING Position (Two-Phase Commit Start)
-        # Extract metadata from signal to persist with position
-        strategy_metadata = signal.get('strategy_metadata')
-        await self.position_manager.create_pending_position(symbol, side, order_id, strategy_metadata=strategy_metadata)
+        # 4. Update Order ID if Exchange returns a different one
+        # Some exchanges return their own ID. We update our DB to match.
+        exchange_order_id = order_result.get('orderId')
+        if exchange_order_id and exchange_order_id != client_order_id:
+            logger.info("Updating PENDING position with Exchange Order ID", client_id=client_order_id, exchange_id=exchange_order_id)
+            await self.position_manager.update_pending_order_id(symbol, client_order_id, exchange_order_id)
+            # Use the exchange ID for lifecycle management
+            current_order_id = exchange_order_id
+        else:
+            current_order_id = client_order_id
 
         # Define callback to update DB if order is replaced during chase
         async def _on_order_replace(old_id: str, new_id: str):
             await self.position_manager.update_pending_order_id(symbol, old_id, new_id)
 
-        # 3. Manage Order Lifecycle
+        # 5. Manage Order Lifecycle
         final_order_state = await self.order_lifecycle_manager.manage(
             initial_order=order_result, 
             symbol=symbol, 
@@ -150,41 +167,39 @@ class TradeExecutor:
         fill_quantity = final_order_state.get('filled', 0.0) if final_order_state else 0.0
         final_status = final_order_state.get('status') if final_order_state else 'UNKNOWN'
         
-        # 4. Confirm or Void Position (Two-Phase Commit End)
+        # 6. Confirm or Void Position (Two-Phase Commit End)
         if fill_quantity > 0:
             fill_price = final_order_state.get('average')
             if not fill_price or fill_price <= 0:
-                logger.critical("Order filled but average price is invalid. Cannot confirm position.", order_id=order_id, final_state=final_order_state)
-                # We leave it as PENDING so it can be reconciled manually or on restart, rather than deleting a filled trade.
+                logger.critical("Order filled but average price is invalid. Cannot confirm position.", order_id=current_order_id, final_state=final_order_state)
+                # We leave it as PENDING so it can be reconciled manually or on restart.
                 return
 
-            logger.info("Order to open position was filled.", order_id=order_id, filled_qty=fill_quantity, fill_price=fill_price)
+            logger.info("Order to open position was filled.", order_id=current_order_id, filled_qty=fill_quantity, fill_price=fill_price)
             final_stop_loss = self.risk_manager.calculate_stop_loss(side, fill_price, df, market_regime=regime)
             final_take_profit = self.risk_manager.calculate_take_profit(side, fill_price, final_stop_loss, market_regime=regime)
             
-            await self.position_manager.confirm_position_open(symbol, order_id, fill_quantity, fill_price, final_stop_loss, final_take_profit)
+            await self.position_manager.confirm_position_open(symbol, current_order_id, fill_quantity, fill_price, final_stop_loss, final_take_profit)
         
         elif final_status == 'OPEN':
             # CRITICAL: The order is still OPEN on the exchange (cancellation failed), but we stopped chasing.
-            # We MUST NOT void the position, or we lose track of a live order (Zombie Order).
             logger.critical("Order is stuck in OPEN state after lifecycle management. Leaving position as PENDING.", 
-                            symbol=symbol, order_id=order_id)
+                            symbol=symbol, order_id=current_order_id)
             await self.alert_system.send_alert(
                 level='critical',
-                message=f"🚨 ZOMBIE ORDER RISK: Order {order_id} for {symbol} is stuck OPEN. Manual intervention required.",
-                details={'symbol': symbol, 'order_id': order_id, 'status': 'OPEN'}
+                message=f"🚨 ZOMBIE ORDER RISK: Order {current_order_id} for {symbol} is stuck OPEN. Manual intervention required.",
+                details={'symbol': symbol, 'order_id': current_order_id, 'status': 'OPEN'}
             )
-            # Do NOT void.
             
         else:
             # Order is definitively dead (CANCELED, REJECTED, EXPIRED) and empty.
-            logger.error("Order to open position did not fill. Voiding pending position.", order_id=order_id, final_status=final_status)
-            await self.position_manager.void_position(symbol, order_id)
+            logger.error("Order to open position did not fill. Voiding pending position.", order_id=current_order_id, final_status=final_status)
+            await self.position_manager.void_position(symbol, current_order_id)
             
             await self.alert_system.send_alert(
                 level='error',
                 message=f"🔴 Failed to open position for {symbol}. Order did not fill.",
-                details={'symbol': symbol, 'order_id': order_id, 'final_status': final_status}
+                details={'symbol': symbol, 'order_id': current_order_id, 'final_status': final_status}
             )
 
     async def close_position(self, position: Position, reason: str):
