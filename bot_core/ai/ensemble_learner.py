@@ -12,7 +12,6 @@ from datetime import datetime
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams
 from bot_core.ai.models import LSTMPredictor, AttentionNetwork
-from bot_core.ai.feature_processor.py import FeatureProcessor
 from bot_core.ai.feature_processor import FeatureProcessor
 
 # ML Imports with safe fallbacks
