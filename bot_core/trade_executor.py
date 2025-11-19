@@ -92,9 +92,11 @@ class TradeExecutor:
         portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, active_positions)
         stop_loss = self.risk_manager.calculate_stop_loss(side, current_price, df, market_regime=regime)
         
-        # Extract confidence data for risk scaling
+        # Extract confidence and metrics data for risk scaling
         strategy_metadata = signal.get('strategy_metadata', {})
         confidence = strategy_metadata.get('confidence')
+        metrics = strategy_metadata.get('metrics') # Extract validation metrics for Kelly Criterion
+        
         # Try to get threshold from config if it exists for the current strategy
         confidence_threshold = getattr(self.config.strategy.params, 'confidence_threshold', None)
 
@@ -107,7 +109,8 @@ class TradeExecutor:
             open_positions=active_positions,
             market_regime=regime,
             confidence=confidence,
-            confidence_threshold=confidence_threshold
+            confidence_threshold=confidence_threshold,
+            model_metrics=metrics # Pass metrics to RiskManager
         )
         
         market_details = self.market_details.get(symbol)
