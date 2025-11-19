@@ -234,6 +234,14 @@ class TradingBot:
         logger.info("Starting trading cycle for symbol", symbol=symbol)
         while self.running:
             set_correlation_id()
+            
+            # Wait for new data event instead of sleeping
+            # We use a timeout slightly larger than the interval to ensure we don't hang forever if data stops
+            timeout = self.config.strategy.interval_seconds * 2
+            await self.data_handler.wait_for_new_candle(symbol, timeout=timeout)
+            
+            if not self.running: break
+
             try:
                 await self.process_symbol_tick(symbol)
             except asyncio.CancelledError:
@@ -242,7 +250,7 @@ class TradingBot:
             except Exception as e:
                 logger.critical("Unhandled exception in trading cycle", symbol=symbol, error=str(e), exc_info=True)
             
-            await asyncio.sleep(self.config.strategy.interval_seconds)
+            # No sleep needed here, wait_for_new_candle handles the timing
 
     async def process_symbol_tick(self, symbol: str):
         """Executes a single trading logic iteration for a symbol. Public for backtesting."""
