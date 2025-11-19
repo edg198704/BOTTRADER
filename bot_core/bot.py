@@ -69,6 +69,11 @@ class TradingBot:
         logger.info("Setting up TradingBot components...")
         await self._load_market_details()
         await self.reconcile_pending_positions()
+        
+        # Warmup strategy (preload models, etc.)
+        logger.info("Warming up strategy...")
+        await self.strategy.warmup(self.config.strategy.symbols)
+        
         logger.info("TradingBot setup complete.")
 
     async def _load_market_details(self):
@@ -397,6 +402,9 @@ class TradingBot:
         
         await self.data_handler.stop()
         await self.position_monitor.stop()
+        
+        # Clean up strategy resources
+        await self.strategy.close()
 
         for task in self.tasks:
             if not task.done():
