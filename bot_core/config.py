@@ -144,6 +144,11 @@ class RegimeBasedRiskConfig(BaseModel):
     volatile: RegimeRiskOverride = RegimeRiskOverride()
     sideways: RegimeRiskOverride = RegimeRiskOverride()
 
+class TimeBasedExitConfig(BaseModel):
+    enabled: bool = False
+    max_hold_time_hours: int = 24
+    threshold_pct: float = 0.005 # If PnL % is below this after max time, close.
+
 class RiskManagementConfig(BaseModel):
     max_position_size_usd: float
     max_daily_loss_usd: float
@@ -157,6 +162,7 @@ class RiskManagementConfig(BaseModel):
     trailing_stop_activation_pct: float
     trailing_stop_pct: float
     regime_based_risk: RegimeBasedRiskConfig
+    time_based_exit: TimeBasedExitConfig = TimeBasedExitConfig()
 
 class DatabaseConfig(BaseModel):
     path: str
