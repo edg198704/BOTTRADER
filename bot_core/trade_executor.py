@@ -75,6 +75,12 @@ class TradeExecutor:
         portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, open_positions)
         stop_loss = self.risk_manager.calculate_stop_loss(side, current_price, df, market_regime=regime)
         
+        # Extract confidence data for risk scaling
+        strategy_metadata = signal.get('strategy_metadata', {})
+        confidence = strategy_metadata.get('confidence')
+        # Try to get threshold from config if it exists for the current strategy
+        confidence_threshold = getattr(self.config.strategy.params, 'confidence_threshold', None)
+
         # Pass symbol and open_positions for correlation check
         ideal_quantity = self.risk_manager.calculate_position_size(
             symbol=symbol,
@@ -82,7 +88,9 @@ class TradeExecutor:
             entry_price=current_price, 
             stop_loss_price=stop_loss, 
             open_positions=open_positions,
-            market_regime=regime
+            market_regime=regime,
+            confidence=confidence,
+            confidence_threshold=confidence_threshold
         )
         
         market_details = self.market_details.get(symbol)
