@@ -63,6 +63,10 @@ class AITrainingConfig(BaseModel):
     early_stopping_patience: int = 5
     validation_split: float = Field(0.15, ge=0.0, lt=1.0)
     min_precision_threshold: float = Field(0.5, ge=0.0, le=1.0)
+    # --- Profitability Gates (New) ---
+    min_profit_factor: float = 1.05 # Require positive expectancy (Gross Profit / Gross Loss)
+    min_sharpe_ratio: float = 0.05 # Require slightly positive risk-adjusted return
+    
     # --- Hyperparameter Optimization ---
     auto_tune_models: bool = False
     n_iter_search: int = 10
