@@ -175,7 +175,7 @@ def _atomic_save(obj: Any, path: str, method: str = 'joblib'):
             os.remove(temp_path)
         raise e
 
-def _save_models_to_disk(symbol: str, models: Dict[str, Any], config: AIEnsembleStrategyParams, learned_weights: Optional[List[float]] = None):
+def _save_models_to_disk(symbol: str, models: Dict[str, Any], config: AIEnsembleStrategyParams, learned_weights: Optional[List[float]] = None, extra_meta: Dict[str, Any] = None):
     symbol_path_str = symbol.replace('/', '_')
     save_path = os.path.join(config.model_path, symbol_path_str)
     os.makedirs(save_path, exist_ok=True)
@@ -186,6 +186,8 @@ def _save_models_to_disk(symbol: str, models: Dict[str, Any], config: AIEnsemble
         'timestamp': str(pd.Timestamp.utcnow()),
         'learned_weights': learned_weights
     }
+    if extra_meta:
+        metadata.update(extra_meta)
     
     # Use atomic saves to prevent corruption if read occurs during write
     _atomic_save(metadata, os.path.join(save_path, "metadata.json"), method='json')
@@ -307,7 +309,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 model_scores.append(score)
             
             # Calculate weights: Square the score to punish weak models, then normalize
-            total_score_sq = sum(s**2 for s in model_scores)
+            total_score_sq = sum(s**2 for s in model_scores) 
             if total_score_sq > 0:
                 final_weights = [(s**2)/total_score_sq for s in model_scores]
                 worker_logger.info("Learned optimal weights", symbol=symbol, weights=final_weights, scores=model_scores)
@@ -319,6 +321,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         ensemble_probs = _get_ensemble_prediction_static(models, X_val_flat, X_val_tensor, final_weights)
         y_pred = np.argmax(ensemble_probs, axis=1)
         
+        # Detailed Metrics
         precision = precision_score(y_val_flat, y_pred, average=None, labels=[0, 1, 2], zero_division=0)
         avg_action_precision = (precision[0] + precision[2]) / 2
         
@@ -329,8 +332,57 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             worker_logger.warning("Model failed validation threshold.", symbol=symbol)
             return False
 
-        # 8. Save Models & Weights
-        _save_models_to_disk(symbol, models, config, learned_weights=final_weights)
+        # 8. Feature Importance Extraction
+        # We aggregate importance across the sequence length for each feature
+        feature_importance_map = {}
+        try:
+            # XGBoost Importance
+            gb_imp = models['gb'].feature_importances_
+            # RandomForest Importance (inside VotingClassifier)
+            rf_model = None
+            if hasattr(models['technical'], 'named_estimators_'):
+                rf_model = models['technical'].named_estimators_.get('rf')
+            elif hasattr(models['technical'], 'estimators_'):
+                # Fallback for older sklearn or if named_estimators_ is not populated yet
+                rf_model = models['technical'].estimators_[0]
+            
+            rf_imp = rf_model.feature_importances_ if rf_model else np.zeros_like(gb_imp)
+            
+            # Average the two tree models
+            avg_imp = (gb_imp + rf_imp) / 2.0
+            
+            # Reshape to (seq_len, num_features) and sum across time
+            num_feats = len(config.feature_columns)
+            seq_len = config.features.sequence_length
+            
+            if len(avg_imp) == seq_len * num_feats:
+                reshaped_imp = avg_imp.reshape(seq_len, num_feats)
+                total_imp = reshaped_imp.sum(axis=0)
+                
+                # Map to feature names
+                for i, col in enumerate(config.feature_columns):
+                    feature_importance_map[col] = float(total_imp[i])
+            
+            # Sort and keep top 5
+            sorted_feats = sorted(feature_importance_map.items(), key=lambda x: x[1], reverse=True)[:5]
+            feature_importance_map = dict(sorted_feats)
+            
+        except Exception as e:
+            worker_logger.warning("Could not extract feature importance", error=str(e))
+
+        # Prepare extra metadata
+        extra_meta = {
+            'metrics': {
+                'precision_sell': float(precision[0]),
+                'precision_hold': float(precision[1]),
+                'precision_buy': float(precision[2]),
+                'avg_action_precision': float(avg_action_precision)
+            },
+            'top_features': feature_importance_map
+        }
+
+        # 9. Save Models & Weights
+        _save_models_to_disk(symbol, models, config, learned_weights=final_weights, extra_meta=extra_meta)
         worker_logger.info("Models saved successfully.", symbol=symbol)
         return True
 
@@ -471,7 +523,9 @@ class EnsembleLearner:
                 'confidence': confidence,
                 'model_version': meta.get('timestamp'),
                 'model_type': 'ensemble',
-                'active_weights': weights
+                'active_weights': weights,
+                'top_features': meta.get('top_features', {}),
+                'metrics': meta.get('metrics', {})
             }
         except Exception as e:
             logger.error("Error during prediction", symbol=symbol, error=str(e))
