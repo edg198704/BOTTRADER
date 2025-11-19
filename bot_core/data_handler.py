@@ -121,7 +121,7 @@ class DataHandler:
     async def _update_loop(self):
         while self._running:
             try:
-                tasks = [self._update_symbol_data(symbol) for symbol in self.symbols]
+                tasks = [self.update_symbol_data(symbol) for symbol in self.symbols]
                 await asyncio.gather(*tasks)
             except asyncio.CancelledError:
                 logger.info("Data update loop cancelled.")
@@ -131,7 +131,8 @@ class DataHandler:
             
             await asyncio.sleep(self.update_interval)
 
-    async def _update_symbol_data(self, symbol: str):
+    async def update_symbol_data(self, symbol: str):
+        """Fetches latest data for a symbol and updates internal buffers. Public for backtesting."""
         try:
             # Self-Healing Logic: Check if we have enough data and if it's up to date
             current_buffer = self._raw_buffers.get(symbol)
@@ -391,7 +392,7 @@ class DataHandler:
             df_out.ta.strategy(ta_strategy)
         except Exception as e:
             logger.error("Pandas-TA strategy execution failed", error=str(e))
-            return df
+            return df_out
 
         # Rename columns to a consistent, simplified format using the utility function
         try:
