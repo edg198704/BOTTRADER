@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import pandas as pd
 from typing import List, Dict, Any
 from bot_core.logger import get_logger
@@ -12,13 +13,73 @@ class StrategyOptimizer:
     """
     Periodically analyzes trade history to optimize strategy parameters (specifically confidence thresholds)
     based on realized performance in different market regimes.
+    Persists learned parameters to disk to ensure adaptation survives restarts.
     """
     def __init__(self, config: BotConfig, position_manager: PositionManager):
         self.config = config
         self.opt_config = config.optimizer
         self.position_manager = position_manager
         self.running = False
+        
+        # Load saved state on init to restore learned thresholds
+        self._load_state()
+        
         logger.info("StrategyOptimizer initialized.")
+
+    def _get_state_path(self) -> str:
+        return self.opt_config.state_file_path
+
+    def _load_state(self):
+        """Loads optimized thresholds from the state file and applies them to the config."""
+        path = self._get_state_path()
+        if not os.path.exists(path):
+            return
+
+        try:
+            with open(path, 'r') as f:
+                state = json.load(f)
+            
+            # We modify the config object in-place. Since it's passed by reference,
+            # the Strategy component (which holds a reference to the same config object)
+            # will see these updates immediately.
+            mr_config = self.config.strategy.params.market_regime
+            updates = 0
+            
+            for regime, threshold in state.get('regime_thresholds', {}).items():
+                attr_name = f"{regime}_confidence_threshold"
+                if hasattr(mr_config, attr_name):
+                    setattr(mr_config, attr_name, threshold)
+                    updates += 1
+            
+            if updates > 0:
+                logger.info(f"Restored {updates} optimized thresholds from state file.", path=path)
+                
+        except Exception as e:
+            logger.error("Failed to load optimizer state", error=str(e))
+
+    def _save_state(self):
+        """Saves the current optimized thresholds to the state file."""
+        path = self._get_state_path()
+        mr_config = self.config.strategy.params.market_regime
+        
+        state = {
+            'last_updated': str(pd.Timestamp.now()),
+            'regime_thresholds': {}
+        }
+        
+        for regime in ['bull', 'bear', 'volatile', 'sideways']:
+            attr_name = f"{regime}_confidence_threshold"
+            if hasattr(mr_config, attr_name):
+                val = getattr(mr_config, attr_name)
+                if val is not None:
+                    state['regime_thresholds'][regime] = val
+        
+        try:
+            with open(path, 'w') as f:
+                json.dump(state, f, indent=2)
+            logger.debug("Optimizer state saved.", path=path)
+        except Exception as e:
+            logger.error("Failed to save optimizer state", error=str(e))
 
     async def run(self):
         if not self.opt_config.enabled:
@@ -76,13 +137,12 @@ class StrategyOptimizer:
                 continue
 
         # Analyze and Adjust
-        # We access the strategy params directly. Since config is passed by reference,
-        # updates here will be seen by the Strategy component.
         if not hasattr(self.config.strategy.params, 'market_regime'):
             logger.warning("Strategy does not have market_regime configuration. Skipping optimization.")
             return
             
         mr_config = self.config.strategy.params.market_regime
+        any_changes = False
         
         for regime, trades in regime_stats.items():
             if len(trades) < 5: # Minimum sample per regime to be statistically relevant
@@ -123,7 +183,11 @@ class StrategyOptimizer:
 
             if new_thresh != current_thresh:
                 setattr(mr_config, attr_name, new_thresh)
+                any_changes = True
                 logger.info(f"Optimizer {action} {regime} threshold.", old=current_thresh, new=new_thresh, reason=f"PF={profit_factor:.2f}")
+
+        if any_changes:
+            self._save_state()
 
     async def stop(self):
         self.running = False
