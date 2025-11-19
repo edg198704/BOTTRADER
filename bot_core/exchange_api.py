@@ -2,11 +2,12 @@ import abc
 import time
 import random
 from typing import Dict, Any, List, Optional
+import pandas as pd
 import ccxt.async_support as ccxt
 from ccxt.base.errors import NetworkError, ExchangeError, InsufficientFunds, OrderNotFound, NotSupported
 
 from bot_core.logger import get_logger
-from bot_core.utils import async_retry
+from bot_core.utils import async_retry, Clock
 from bot_core.config import ExchangeConfig
 
 logger = get_logger(__name__)
@@ -209,6 +210,166 @@ class MockExchangeAPI(ExchangeAPI):
 
     async def close(self):
         logger.info("MockExchangeAPI connection closed.")
+
+class BacktestExchangeAPI(ExchangeAPI):
+    """
+    A simulated exchange that replays historical data for backtesting.
+    It uses the centralized Clock to determine the 'current' time and data availability.
+    """
+    def __init__(self, data_source: Dict[str, pd.DataFrame], initial_balances: Dict[str, float]):
+        self.data = data_source
+        self.balances = initial_balances
+        self.open_orders: Dict[str, Dict[str, Any]] = {}
+        self.order_id_counter = 0
+        logger.info("BacktestExchangeAPI initialized.")
+
+    def _get_current_candle(self, symbol: str) -> Optional[pd.Series]:
+        df = self.data.get(symbol)
+        if df is None or df.empty:
+            return None
+        
+        # Find the row closest to but not after Clock.now()
+        # Assuming df is indexed by timestamp
+        current_time = pd.Timestamp(Clock.now()).tz_localize(None)
+        
+        # Efficiently find the index
+        # Note: This assumes data is sorted. 
+        # For backtesting speed, we might optimize this, but asof is decent.
+        try:
+            idx = df.index.get_indexer([current_time], method='pad')[0]
+            if idx == -1:
+                return None
+            return df.iloc[idx]
+        except Exception:
+            return None
+
+    async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[Any]]:
+        # Return data up to Clock.now()
+        df = self.data.get(symbol)
+        if df is None:
+            return []
+        
+        current_time = pd.Timestamp(Clock.now()).tz_localize(None)
+        # Slice data up to current time
+        mask = df.index <= current_time
+        sliced = df.loc[mask].tail(limit)
+        
+        # Convert to list of lists [timestamp_ms, open, high, low, close, volume]
+        ohlcv = []
+        for ts, row in sliced.iterrows():
+            ts_ms = int(ts.timestamp() * 1000)
+            ohlcv.append([ts_ms, row['open'], row['high'], row['low'], row['close'], row['volume']])
+        
+        return ohlcv
+
+    async def get_ticker_data(self, symbol: str) -> Dict[str, Any]:
+        candle = self._get_current_candle(symbol)
+        price = candle['close'] if candle is not None else 0.0
+        return {"symbol": symbol, "lastPrice": str(price)}
+
+    async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None) -> Dict[str, Any]:
+        self.order_id_counter += 1
+        order_id = f"bt_order_{self.order_id_counter}"
+        
+        order = {
+            'id': order_id,
+            'symbol': symbol,
+            'side': side.upper(),
+            'type': order_type.upper(),
+            'price': price,
+            'quantity': quantity,
+            'status': 'OPEN',
+            'filled': 0.0,
+            'average': 0.0,
+            'timestamp': Clock.now()
+        }
+        self.open_orders[order_id] = order
+        return {"orderId": order_id, "status": "OPEN"}
+
+    async def fetch_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
+        order = self.open_orders.get(order_id)
+        if not order:
+            return None
+        
+        if order['status'] == 'OPEN':
+            candle = self._get_current_candle(symbol)
+            if candle is not None:
+                # Check for fill
+                should_fill = False
+                fill_price = candle['close'] # Default to close for MARKET
+                
+                if order['type'] == 'MARKET':
+                    should_fill = True
+                    # Slippage simulation could go here
+                    fill_price = candle['close']
+                elif order['type'] == 'LIMIT':
+                    limit_price = order['price']
+                    if order['side'] == 'BUY':
+                        # Buy if Low <= Limit
+                        if candle['low'] <= limit_price:
+                            should_fill = True
+                            # Optimistic fill at limit, or realistic at Open if Open < Limit?
+                            # Simple assumption: fill at limit price if within range
+                            fill_price = limit_price
+                    else: # SELL
+                        # Sell if High >= Limit
+                        if candle['high'] >= limit_price:
+                            should_fill = True
+                            fill_price = limit_price
+                
+                if should_fill:
+                    # Update Balances
+                    base, quote = symbol.split('/')
+                    cost = order['quantity'] * fill_price
+                    
+                    # Simple balance check (can be expanded)
+                    if order['side'] == 'BUY':
+                        if self.balances.get(quote, 0) >= cost:
+                            self.balances[quote] -= cost
+                            self.balances[base] = self.balances.get(base, 0) + order['quantity']
+                            order['status'] = 'FILLED'
+                            order['filled'] = order['quantity']
+                            order['average'] = fill_price
+                    else:
+                        if self.balances.get(base, 0) >= order['quantity']:
+                            self.balances[base] -= order['quantity']
+                            self.balances[quote] = self.balances.get(quote, 0) + cost
+                            order['status'] = 'FILLED'
+                            order['filled'] = order['quantity']
+                            order['average'] = fill_price
+
+        return order
+
+    async def fetch_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        return [o for o in self.open_orders.values() if o['symbol'] == symbol and o['status'] == 'OPEN']
+
+    async def cancel_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
+        order = self.open_orders.get(order_id)
+        if order and order['status'] == 'OPEN':
+            order['status'] = 'CANCELED'
+            return order
+        return order
+
+    async def cancel_all_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        cancelled = []
+        for oid, order in self.open_orders.items():
+            if order['symbol'] == symbol and order['status'] == 'OPEN':
+                order['status'] = 'CANCELED'
+                cancelled.append(order)
+        return cancelled
+
+    async def get_balance(self) -> Dict[str, Any]:
+        return {k: {'free': v, 'total': v} for k, v in self.balances.items()}
+
+    async def fetch_market_details(self, symbol: str) -> Optional[Dict[str, Any]]:
+        return {
+            'symbol': symbol,
+            'precision': {'amount': 1e-5, 'price': 1e-2},
+            'limits': {'amount': {'min': 1e-5, 'max': 10000}, 'cost': {'min': 1, 'max': None}}
+        }
+
+    async def close(self):
+        pass
 
 class CCXTExchangeAPI(ExchangeAPI):
     """Concrete implementation for a real exchange using ccxt."""
