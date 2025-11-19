@@ -258,11 +258,20 @@ class TradeExecutor:
             initial_price=limit_price,
             market_details=market_details
         )
-        if final_order_state and final_order_state.get('filled', 0.0) > 0:
+        
+        fill_quantity = final_order_state.get('filled', 0.0) if final_order_state else 0.0
+        
+        if fill_quantity > 0:
             # Use the aggregated average price for PnL calculation
             close_price = final_order_state['average']
-            # Await async DB call
-            await self.position_manager.close_position(position.symbol, close_price, reason)
+            
+            # Check if full close (with tolerance for float precision)
+            if fill_quantity >= (position.quantity * 0.999):
+                await self.position_manager.close_position(position.symbol, close_price, reason)
+            else:
+                # Partial fill handling
+                await self.position_manager.reduce_position(position.symbol, fill_quantity, close_price, reason)
+                
         else:
             final_status = final_order_state.get('status') if final_order_state else 'UNKNOWN'
             logger.error("Failed to confirm close order fill. Position remains open.", order_id=order_result.get('orderId'), symbol=position.symbol, final_status=final_status)
