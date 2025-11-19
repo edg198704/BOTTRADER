@@ -139,8 +139,33 @@ class OrderLifecycleManager:
                         cumulative_cost += (final_cancel_filled * final_cancel_avg)
                         logger.info("Cancelled order for chase.", filled_so_far=cumulative_filled)
                 except Exception as e:
-                    logger.error("Failed to cancel order during chase. Aborting chase.", error=str(e))
-                    break
+                    logger.error("Failed to cancel order during chase. Checking status.", error=str(e))
+                    # Critical Safety Check: If we failed to cancel, we must verify if it's still OPEN.
+                    # If it is OPEN, we cannot proceed with placing a new order (double exposure risk).
+                    try:
+                        check_status = await self.exchange_api.fetch_order(current_order_id, symbol)
+                        if check_status and check_status.get('status') == 'OPEN':
+                            logger.critical("Order is stuck OPEN and cannot be cancelled. Aborting chase to prevent double execution.", order_id=current_order_id)
+                            # Return the current state with OPEN status so the executor knows it's stuck
+                            return {
+                                'orderId': current_order_id,
+                                'status': 'OPEN',
+                                'filled': cumulative_filled,
+                                'average': cumulative_cost / cumulative_filled if cumulative_filled > 0 else 0.0,
+                                'symbol': symbol,
+                                'side': side
+                            }
+                    except Exception as ex:
+                        logger.critical("Failed to verify order status after cancel failure. Assuming stuck.", error=str(ex))
+                        return {
+                            'orderId': current_order_id,
+                            'status': 'OPEN', # Assume worst case
+                            'filled': cumulative_filled,
+                            'average': 0.0,
+                            'symbol': symbol,
+                            'side': side
+                        }
+                    # If it wasn't OPEN (e.g. filled in between), the loop will handle it in next iteration or fall through
             
             # 3. Calculate remaining quantity
             remaining_qty = total_quantity - cumulative_filled
@@ -229,4 +254,9 @@ class OrderLifecycleManager:
             return final_status
         except Exception as e:
             logger.critical("Failed to cancel timed-out order", order_id=order_id, error=str(e))
-            return {'id': order_id, 'status': 'UNKNOWN'}
+            # If we failed to cancel, we must check if it is still OPEN
+            try:
+                check = await self.exchange_api.fetch_order(order_id, symbol)
+                return check
+            except Exception:
+                return {'id': order_id, 'status': 'UNKNOWN'}
