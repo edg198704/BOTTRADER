@@ -481,6 +481,20 @@ class PositionManager:
         finally:
             session.close()
 
+    async def get_all_active_positions(self) -> List[Position]:
+        """Returns both OPEN and PENDING positions for risk calculations."""
+        async with self._db_lock:
+            return await self._run_in_executor(self._get_all_active_positions_sync)
+
+    def _get_all_active_positions_sync(self) -> List[Position]:
+        session = self.SessionLocal()
+        try:
+            return session.query(Position).filter(
+                Position.status.in_([PositionStatus.OPEN, PositionStatus.PENDING])
+            ).all()
+        finally:
+            session.close()
+
     async def get_all_closed_positions(self) -> List[Position]:
         async with self._db_lock:
             return await self._run_in_executor(self._get_all_closed_positions_sync)
