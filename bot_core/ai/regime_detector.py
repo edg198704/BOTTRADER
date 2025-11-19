@@ -26,8 +26,11 @@ class MarketRegimeDetector:
     def add_regime_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Calculates continuous regime metrics and adds them as columns to the DataFrame.
-        These features (regime_trend, regime_volatility) can be used by the AI model.
+        These features (regime_trend, regime_volatility) are injected into the AI model's feature set.
         """
+        if df is None or df.empty:
+            return df
+            
         df = df.copy()
         mr_config = self.config.market_regime
         
@@ -41,19 +44,23 @@ class MarketRegimeDetector:
             slow_ma = df[slow_ma_col].replace(0, np.nan)
             df['regime_trend'] = (df[fast_ma_col] - slow_ma) / slow_ma
         else:
+            # Fallback if columns missing (e.g. during warmup)
             df['regime_trend'] = 0.0
             
         # 2. Volatility Feature: Current / Avg(50)
         # > 1.0 means volatility is expanding, < 1.0 means contracting
         if vol_col in df.columns:
-            avg_vol = df[vol_col].rolling(50).mean()
+            # Use a rolling mean for average volatility baseline
+            avg_vol = df[vol_col].rolling(window=50, min_periods=1).mean()
             avg_vol = avg_vol.replace(0, np.nan)
             df['regime_volatility'] = df[vol_col] / avg_vol
         else:
             df['regime_volatility'] = 1.0
             
         # Fill NaNs that might result from rolling windows or division
-        return df.fillna(0.0)
+        # We use 0.0 for trend (neutral) and 1.0 for volatility (average)
+        values = {'regime_trend': 0.0, 'regime_volatility': 1.0}
+        return df.fillna(value=values)
 
     async def detect_regime(self, symbol: str, df: pd.DataFrame) -> Dict[str, Any]:
         """
