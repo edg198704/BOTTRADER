@@ -82,6 +82,10 @@ strategy:
     use_regime_filter: true
     retrain_interval_hours: 24
     training_data_limit: 5000 # How many candles to fetch for retraining
+    
+    # --- New Stability Parameters ---
+    signal_cooldown_candles: 1 # Wait 1 candle after a signal before allowing another entry
+    inference_workers: 2 # Number of threads for parallel AI inference
 
     # --- Feature Engineering Parameters ---
     features:
