@@ -1,8 +1,10 @@
 import asyncio
 import pandas as pd
 import os
+import shutil
 from datetime import datetime, timedelta
 from typing import Dict
+from concurrent.futures import ProcessPoolExecutor
 
 from config_loader import load_config
 from bot_core.logger import setup_logging, get_logger
@@ -18,7 +20,7 @@ from bot_core.order_sizer import OrderSizer
 from bot_core.position_monitor import PositionMonitor
 from bot_core.order_lifecycle_manager import OrderLifecycleManager
 from bot_core.trade_executor import TradeExecutor
-from bot_core.utils import Clock
+from bot_core.utils import Clock, PerformanceMetrics
 
 logger = get_logger(__name__)
 
@@ -59,10 +61,20 @@ async def run_backtest():
     setup_logging("INFO", "logs/backtest.log", False)
     config = load_config('config_enterprise.yaml')
     
-    # Override DB path for backtest to avoid messing up live DB
+    # --- Backtest Configuration Overrides ---
     config.database.path = "backtest_ledger.db"
     if os.path.exists(config.database.path):
         os.remove(config.database.path)
+
+    # Use a temporary directory for backtest models to avoid overwriting production models
+    backtest_model_path = "backtest_models"
+    if os.path.exists(backtest_model_path):
+        shutil.rmtree(backtest_model_path)
+    os.makedirs(backtest_model_path, exist_ok=True)
+    
+    # Inject the temp path into the strategy params
+    if hasattr(config.strategy.params, 'model_path'):
+        config.strategy.params.model_path = backtest_model_path
 
     # 1. Load Data
     historical_data = await load_historical_data(config, None)
@@ -72,7 +84,6 @@ async def run_backtest():
 
     # 2. Initialize Backtest Exchange
     initial_balances = {"USDT": config.backtest.initial_balance}
-    # Pass the backtest config to the exchange API
     exchange_api = BacktestExchangeAPI(historical_data, initial_balances, config.backtest)
 
     # 3. Initialize Components
@@ -80,9 +91,7 @@ async def run_backtest():
     alert_system = AlertSystem()
     
     data_handler = DataHandler(exchange_api, config, shared_latest_prices)
-    # Pre-load data handler buffers manually since we won't run its loop
-    # We don't need to do anything yet, update_symbol_data will handle it
-
+    
     position_manager = PositionManager(config.database, config.backtest.initial_balance, alert_system)
     await position_manager.initialize()
 
@@ -111,14 +120,12 @@ async def run_backtest():
         health_checker, position_monitor, trade_executor, alert_system, shared_latest_prices
     )
     
-    # Set callback for position monitor
     position_monitor.set_close_position_callback(bot._close_position)
 
-    # 4. Run Setup (Loads market details, etc.)
+    # 4. Run Setup
     await bot.setup()
 
     # 5. Main Backtest Loop
-    # Determine start and end times based on data intersection
     start_times = [df.index[0] for df in historical_data.values()]
     end_times = [df.index[-1] for df in historical_data.values()]
     start_time = max(start_times) + timedelta(hours=24) # Warmup period
@@ -129,37 +136,87 @@ async def run_backtest():
     
     logger.info(f"Starting backtest from {start_time} to {end_time}")
     
-    while current_time <= end_time:
-        Clock.set_time(current_time)
-        
-        # Update DataHandler for all symbols at this timestamp
-        for symbol in config.strategy.symbols:
-            await data_handler.update_symbol_data(symbol)
-        
-        # Run Bot Logic
-        for symbol in config.strategy.symbols:
-            await bot.process_symbol_tick(symbol)
+    # Executor for AI training simulation
+    process_executor = ProcessPoolExecutor(max_workers=2)
+
+    try:
+        while current_time <= end_time:
+            Clock.set_time(current_time)
             
-        # Run Position Monitor (Check SL/TP)
-        # We manually trigger the check logic
-        open_positions = await position_manager.get_all_open_positions()
-        for pos in open_positions:
-            await position_monitor._check_position(pos)
+            # Update DataHandler (Simulates receiving new candles)
+            for symbol in config.strategy.symbols:
+                await data_handler.update_symbol_data(symbol)
             
-        # Advance Time
-        current_time += interval
-        
-        # Optional: Print progress every day
-        if current_time.hour == 0 and current_time.minute == 0 and current_time.second == 0:
-             equity = position_manager.get_portfolio_value(shared_latest_prices, open_positions)
-             logger.info(f"Progress: {current_time} | Equity: ${equity:.2f}")
+            # --- AI Retraining Simulation ---
+            # Check if strategy needs retraining based on the simulated time
+            for symbol in config.strategy.symbols:
+                if strategy.needs_retraining(symbol):
+                    logger.info(f"[Backtest] Retraining model for {symbol} at {current_time}")
+                    limit = strategy.get_training_data_limit()
+                    if limit > 0:
+                        # Fetch data available UP TO current_time
+                        training_df = await data_handler.fetch_full_history_for_symbol(symbol, limit)
+                        if training_df is not None and not training_df.empty:
+                            await strategy.retrain(symbol, training_df, process_executor)
+
+            # Run Bot Logic
+            for symbol in config.strategy.symbols:
+                await bot.process_symbol_tick(symbol)
+                
+            # Run Position Monitor (Check SL/TP)
+            open_positions = await position_manager.get_all_open_positions()
+            for pos in open_positions:
+                await position_monitor._check_position(pos)
+                
+            # Advance Time
+            current_time += interval
+            
+            # Progress Log
+            if current_time.minute == 0 and current_time.second == 0:
+                 equity = position_manager.get_portfolio_value(shared_latest_prices, open_positions)
+                 print(f"\rProgress: {current_time} | Equity: ${equity:.2f}", end="")
+
+    finally:
+        process_executor.shutdown()
+        print("\n")
 
     # 6. Final Report
-    final_equity = position_manager.get_portfolio_value(shared_latest_prices, await position_manager.get_all_open_positions())
-    logger.info("Backtest Complete.")
-    logger.info(f"Initial Capital: ${config.backtest.initial_balance}")
-    logger.info(f"Final Equity: ${final_equity:.2f}")
-    logger.info(f"Return: {((final_equity - config.backtest.initial_balance) / config.backtest.initial_balance) * 100:.2f}%")
+    logger.info("Backtest Complete. Generating Report...")
+    
+    closed_positions = await position_manager.get_all_closed_positions()
+    trades_data = []
+    for pos in closed_positions:
+        trades_data.append({
+            'symbol': pos.symbol,
+            'side': pos.side,
+            'entry_price': pos.entry_price,
+            'close_price': pos.close_price,
+            'quantity': pos.quantity,
+            'pnl': pos.pnl,
+            'open_timestamp': pos.open_timestamp,
+            'close_timestamp': pos.close_timestamp
+        })
+
+    metrics = PerformanceMetrics.calculate(trades_data, config.backtest.initial_balance)
+    
+    print("="*40)
+    print("       BACKTEST PERFORMANCE REPORT       ")
+    print("="*40)
+    print(f"Initial Capital:   ${config.backtest.initial_balance:,.2f}")
+    print(f"Final Equity:      ${metrics['final_equity']:,.2f}")
+    print(f"Total Return:      {metrics['total_return_pct']}%")
+    print(f"Total Trades:      {metrics['total_trades']}")
+    print(f"Win Rate:          {metrics['win_rate']}%")
+    print(f"Profit Factor:     {metrics['profit_factor']}")
+    print(f"Sharpe Ratio:      {metrics['sharpe_ratio']}")
+    print(f"Sortino Ratio:     {metrics['sortino_ratio']}")
+    print(f"Max Drawdown:      {metrics['max_drawdown']}%")
+    print("="*40)
+
+    # Cleanup
+    if os.path.exists(backtest_model_path):
+        shutil.rmtree(backtest_model_path)
+        logger.info("Cleaned up backtest models.")
 
 if __name__ == "__main__":
     asyncio.run(run_backtest())
