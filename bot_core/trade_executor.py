@@ -112,23 +112,24 @@ class TradeExecutor:
             offset = self.config.execution.limit_price_offset_pct
             limit_price = current_price * (1 - offset) if side == 'BUY' else current_price * (1 + offset)
 
-        # 1. Generate Client Order ID (Idempotency Key)
-        client_order_id = str(uuid.uuid4())
+        # 1. Generate Trade ID (Idempotency Key & Group ID)
+        trade_id = str(uuid.uuid4())
 
         # 2. Record PENDING Position (Pre-Commit)
         # We persist the intent BEFORE the network call to handle crashes gracefully.
-        await self.position_manager.create_pending_position(symbol, side, client_order_id, strategy_metadata=strategy_metadata)
+        await self.position_manager.create_pending_position(symbol, side, trade_id, trade_id, strategy_metadata=strategy_metadata)
 
         # 3. Place Order
         try:
+            # Use trade_id as the initial clientOrderId
             order_result = await self.exchange_api.place_order(
                 symbol, side, order_type, final_quantity, price=limit_price, 
-                extra_params={'clientOrderId': client_order_id}
+                extra_params={'clientOrderId': trade_id}
             )
         except (BotInvalidOrderError, BotInsufficientFundsError) as e:
             # These are deterministic errors; the order definitely failed.
             logger.error("Order rejected by exchange logic. Voiding pending position.", error=str(e))
-            await self.position_manager.void_position(symbol, client_order_id)
+            await self.position_manager.void_position(symbol, trade_id)
             return
         except Exception as e:
             # Network timeout or unknown error. 
@@ -141,13 +142,13 @@ class TradeExecutor:
         # 4. Update Order ID if Exchange returns a different one
         # Some exchanges return their own ID. We update our DB to match.
         exchange_order_id = order_result.get('orderId')
-        if exchange_order_id and exchange_order_id != client_order_id:
-            logger.info("Updating PENDING position with Exchange Order ID", client_id=client_order_id, exchange_id=exchange_order_id)
-            await self.position_manager.update_pending_order_id(symbol, client_order_id, exchange_order_id)
+        if exchange_order_id and exchange_order_id != trade_id:
+            logger.info("Updating PENDING position with Exchange Order ID", client_id=trade_id, exchange_id=exchange_order_id)
+            await self.position_manager.update_pending_order_id(symbol, trade_id, exchange_order_id)
             # Use the exchange ID for lifecycle management
             current_order_id = exchange_order_id
         else:
-            current_order_id = client_order_id
+            current_order_id = trade_id
 
         # Define callback to update DB if order is replaced during chase
         async def _on_order_replace(old_id: str, new_id: str):
@@ -161,7 +162,8 @@ class TradeExecutor:
             quantity=final_quantity, 
             initial_price=limit_price,
             market_details=market_details,
-            on_order_replace=_on_order_replace
+            on_order_replace=_on_order_replace,
+            trade_id=trade_id # Pass trade_id for chase order generation
         )
         
         fill_quantity = final_order_state.get('filled', 0.0) if final_order_state else 0.0
