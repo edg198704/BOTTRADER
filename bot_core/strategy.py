@@ -117,33 +117,28 @@ class AIEnsembleStrategy(TradingStrategy):
         if not last_sig:
             return False
         
-        # Calculate cooldown duration in seconds
-        # We assume the config has a 'timeframe' field available via the parent bot config,
-        # but here we only have AIEnsembleStrategyParams. 
-        # However, the strategy is initialized with params, not the full config.
-        # We need to rely on the fact that 'timeframe' is usually passed or standard.
-        # Wait, the StrategyParamsBase doesn't have timeframe. 
-        # We will assume a default or need to pass it. 
-        # Actually, the BotConfig passes 'StrategyConfig' which has 'timeframe'.
-        # But 'AIEnsembleStrategy' receives 'AIEnsembleStrategyParams'.
-        # We will use a safe default of 5m (300s) if we can't access it, 
-        # OR we assume the user configures 'signal_cooldown_candles' correctly.
-        
-        # Since we don't have easy access to the timeframe string here without changing the init signature,
-        # we will assume a standard 5-minute candle for cooldown calculation if not provided,
-        # OR we can just use the raw time delta if we had the timeframe.
-        # A better approach: The strategy should ideally know its timeframe.
-        # For now, we will use a hardcoded 300s multiplier as a fallback or try to infer.
-        # Actually, let's just use a generic 5-minute assumption for the multiplier if we can't get it,
-        # but this is imperfect. 
-        # BETTER FIX: We will assume the cooldown is 1 candle = 300 seconds (5m) for now,
-        # as 5m is the default in the config. 
-        
-        seconds_per_candle = 300 # Default 5m
+        # Assume 5m candles (300s) for cooldown calculation if timeframe not explicitly available
+        seconds_per_candle = 300 
         cooldown_seconds = self.ai_config.signal_cooldown_candles * seconds_per_candle
         
         time_since = Clock.now() - last_sig
         return time_since.total_seconds() < cooldown_seconds
+
+    def _get_confidence_threshold(self, regime: str) -> float:
+        """Determines the confidence threshold based on the current market regime."""
+        base_threshold = self.ai_config.confidence_threshold
+        regime_config = self.ai_config.market_regime
+        
+        if regime == 'bull' and regime_config.bull_confidence_threshold is not None:
+            return regime_config.bull_confidence_threshold
+        elif regime == 'bear' and regime_config.bear_confidence_threshold is not None:
+            return regime_config.bear_confidence_threshold
+        elif regime == 'volatile' and regime_config.volatile_confidence_threshold is not None:
+            return regime_config.volatile_confidence_threshold
+        elif regime == 'sideways' and regime_config.sideways_confidence_threshold is not None:
+            return regime_config.sideways_confidence_threshold
+            
+        return base_threshold
 
     async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[Dict[str, Any]]:
         if not self.ensemble_learner.is_trained:
@@ -159,8 +154,10 @@ class AIEnsembleStrategy(TradingStrategy):
 
         if self.ai_config.use_regime_filter:
             if regime in ['sideways', 'unknown']:
-                logger.debug("Market regime is sideways or unknown, holding position.", regime=regime, symbol=symbol)
-                return None
+                # Check if we have a specific threshold for sideways to allow trading
+                if not (regime == 'sideways' and self.ai_config.market_regime.sideways_confidence_threshold is not None):
+                    logger.debug("Market regime is sideways or unknown, holding position.", regime=regime, symbol=symbol)
+                    return None
 
         # Check Cooldown ONLY if we are looking to enter (position is None)
         if position is None and self._in_cooldown(symbol):
@@ -187,7 +184,11 @@ class AIEnsembleStrategy(TradingStrategy):
 
         logger.debug("AI prediction received", symbol=symbol, **prediction)
 
-        if confidence < self.ai_config.confidence_threshold:
+        # --- Dynamic Threshold Check ---
+        required_threshold = self._get_confidence_threshold(regime)
+        
+        if confidence < required_threshold:
+            logger.debug("Confidence below threshold", symbol=symbol, confidence=confidence, required=required_threshold, regime=regime)
             return None
 
         # Construct metadata for the signal
