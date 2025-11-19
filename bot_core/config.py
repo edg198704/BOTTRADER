@@ -36,7 +36,7 @@ class MarketRegimeConfig(BaseModel):
     
     # Column Mappings
     trend_fast_ma_col: str = "sma_fast"
-    trend_slow_ma_col: "sma_slow"
+    trend_slow_ma_col: str = "sma_slow"
     volatility_col: str = "atr"
     rsi_col: str = "rsi"
     
@@ -65,12 +65,7 @@ class AITrainingConfig(BaseModel):
     early_stopping_patience: int = 5
     validation_split: float = Field(0.15, ge=0.0, lt=1.0)
     min_precision_threshold: float = Field(0.5, ge=0.0, le=1.0)
-    
-    # --- Feature Selection (New) ---
-    auto_feature_selection: bool = False
-    max_features: int = 20
-
-    # --- Profitability Gates ---
+    # --- Profitability Gates (New) ---
     min_profit_factor: float = 1.05 # Require positive expectancy (Gross Profit / Gross Loss)
     min_sharpe_ratio: float = 0.05 # Require slightly positive risk-adjusted return
     
@@ -101,6 +96,10 @@ class AIFeatureEngineeringConfig(BaseModel):
     use_triple_barrier: bool = False
     triple_barrier_tp_multiplier: float = 2.0
     triple_barrier_sl_multiplier: float = 2.0
+    
+    # --- Temporal Features ---
+    lag_features: List[str] = [] # List of column names to generate lags for
+    lag_depth: int = 0 # Number of past periods to include as features
 
 class AIPerformanceConfig(BaseModel):
     enabled: bool = True
