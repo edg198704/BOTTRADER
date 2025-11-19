@@ -100,9 +100,29 @@ class TradingBot:
                     continue
 
                 try:
-                    order = await self.exchange_api.fetch_order(pos.order_id, pos.symbol)
+                    # Try to fetch by ID first
+                    try:
+                        order = await self.exchange_api.fetch_order(pos.order_id, pos.symbol)
+                    except Exception:
+                        order = None
+                    
+                    # If not found, it might be a Client Order ID that the exchange doesn't index directly.
+                    # Scan open orders to find a match.
                     if not order:
-                        logger.warning("Order not found on exchange. Voiding pending position.", symbol=pos.symbol, order_id=pos.order_id)
+                        logger.info("Order not found by ID, scanning open orders for Client ID match...", symbol=pos.symbol, id=pos.order_id)
+                        open_orders = await self.exchange_api.fetch_open_orders(pos.symbol)
+                        for o in open_orders:
+                            # Check standard CCXT field 'clientOrderId'
+                            if o.get('clientOrderId') == pos.order_id:
+                                order = o
+                                logger.info("Found match in open orders via Client ID.", symbol=pos.symbol, exchange_id=o['id'])
+                                # Update DB with real ID
+                                await self.position_manager.update_pending_order_id(pos.symbol, pos.order_id, o['id'])
+                                pos.order_id = o['id'] # Update local obj for subsequent logic
+                                break
+
+                    if not order:
+                        logger.warning("Order not found on exchange (ID or ClientID). Voiding pending position.", symbol=pos.symbol, order_id=pos.order_id)
                         await self.position_manager.void_position(pos.symbol, pos.order_id)
                         continue
 
