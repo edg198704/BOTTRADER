@@ -21,6 +21,7 @@ class RiskManager:
         self.daily_loss_halted = False
         self.initial_capital = None 
         self.peak_portfolio_value = None
+        self.current_drawdown = 0.0 # Track current drawdown state
         
         logger.info("RiskManager initialized.")
 
@@ -54,14 +55,15 @@ class RiskManager:
             # Persist the new high water mark
             await self.position_manager.update_portfolio_high_water_mark(portfolio_value)
 
-        drawdown = (portfolio_value - self.peak_portfolio_value) / self.peak_portfolio_value if self.peak_portfolio_value > 0 else 0
+        # Calculate Drawdown (Negative Float, e.g., -0.05)
+        self.current_drawdown = (portfolio_value - self.peak_portfolio_value) / self.peak_portfolio_value if self.peak_portfolio_value > 0 else 0.0
 
-        if drawdown < self.config.circuit_breaker_threshold:
+        if self.current_drawdown < self.config.circuit_breaker_threshold:
             if not self.circuit_breaker_halted:
                 self.circuit_breaker_halted = True
                 message = f"CIRCUIT BREAKER TRIPPED! Trading halted due to excessive drawdown."
                 details = {
-                    'drawdown': f"{drawdown:.2%}", 
+                    'drawdown': f"{self.current_drawdown:.2%}", 
                     'threshold': f"{self.config.circuit_breaker_threshold:.2%}",
                     'portfolio_value': portfolio_value,
                     'peak_portfolio_value': self.peak_portfolio_value
@@ -113,7 +115,23 @@ class RiskManager:
             return 0.0
 
         risk_pct = self._get_regime_param('risk_per_trade_pct', market_regime)
-        risk_amount_usd = portfolio_equity * risk_pct
+        
+        # --- Drawdown Scaling ---
+        # Reduce risk as drawdown increases to preserve capital.
+        # Scaling factor: 1.0 at 0% drawdown, reducing linearly.
+        # We clamp the scaling to not go below 0.2 (20% of original risk) to allow for recovery.
+        # Example: 10% drawdown -> 0.9 factor.
+        drawdown_scaling = max(0.2, 1.0 + self.current_drawdown)
+        
+        adjusted_risk_pct = risk_pct * drawdown_scaling
+        
+        if drawdown_scaling < 1.0:
+            logger.info("Risk scaled down due to drawdown", 
+                        drawdown=f"{self.current_drawdown:.2%}", 
+                        original_risk=risk_pct, 
+                        adjusted_risk=adjusted_risk_pct)
+
+        risk_amount_usd = portfolio_equity * adjusted_risk_pct
         quantity = risk_amount_usd / risk_per_unit
         
         # Cap the position size based on the max USD value allowed
