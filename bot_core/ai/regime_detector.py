@@ -66,6 +66,7 @@ class MarketRegimeDetector:
         """
         Analyzes the provided DataFrame to determine the market regime.
         Uses pre-calculated regime features if available, otherwise calculates on the fly.
+        Supports adaptive thresholds based on historical distribution.
         """
         if len(df) < 50:
             return {'regime': MarketRegime.UNKNOWN.value, 'confidence': 0.0}
@@ -95,12 +96,30 @@ class MarketRegimeDetector:
                     if avg_vol > 0:
                         vol_ratio = current_vol / avg_vol
 
-            # 3. RSI (Momentum) Check
-            rsi_val = df[rsi_col].iloc[-1] if rsi_col in df.columns else 50
-
-            # Determine Regime
+            # --- Determine Thresholds (Adaptive vs Static) ---
             trend_thresh = mr_config.trend_strength_threshold
-            is_volatile = vol_ratio > mr_config.volatility_multiplier
+            vol_thresh = mr_config.volatility_multiplier
+
+            if mr_config.use_dynamic_thresholds and len(df) >= mr_config.dynamic_window:
+                # Calculate dynamic thresholds based on historical distribution
+                window = df.iloc[-mr_config.dynamic_window:]
+                
+                # Trend Strength: We care about magnitude (abs value)
+                if 'regime_trend' in window.columns:
+                    trend_series = window['regime_trend'].abs()
+                    # e.g., 75th percentile of absolute trend strength
+                    calc_trend_thresh = trend_series.quantile(mr_config.trend_percentile)
+                    # Ensure we don't get a near-zero threshold in flat markets
+                    trend_thresh = max(calc_trend_thresh, 0.001)
+                
+                # Volatility Ratio
+                if 'regime_volatility' in window.columns:
+                    vol_series = window['regime_volatility']
+                    # e.g., 80th percentile of volatility ratio
+                    vol_thresh = vol_series.quantile(mr_config.volatility_percentile)
+
+            # --- Regime Classification ---
+            is_volatile = vol_ratio > vol_thresh
             
             if is_volatile:
                 regime = MarketRegime.VOLATILE
@@ -111,12 +130,22 @@ class MarketRegimeDetector:
             else:
                 regime = MarketRegime.SIDEWAYS
 
-            # Calculate Confidence
-            trend_conf = min(1.0, abs(trend_strength) * 20)
+            # --- Confidence Calculation ---
+            # RSI (Momentum) Check
+            rsi_val = df[rsi_col].iloc[-1] if rsi_col in df.columns else 50
+            
+            # Normalize trend confidence relative to the threshold used
+            # If trend is 2x the threshold, confidence is high.
+            trend_conf = min(1.0, abs(trend_strength) / (trend_thresh * 2)) if trend_thresh > 0 else 0.0
             rsi_conf = abs(rsi_val - 50) / 50
+            
             confidence = (trend_conf * 0.7) + (rsi_conf * 0.3)
             
-            result = {'regime': regime.value, 'confidence': round(confidence, 2)}
+            result = {
+                'regime': regime.value, 
+                'confidence': round(confidence, 2),
+                'thresholds': {'trend': round(trend_thresh, 5), 'vol': round(vol_thresh, 3)}
+            }
             logger.debug("Market regime detected", symbol=symbol, result=result)
             return result
             
