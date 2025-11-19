@@ -20,7 +20,6 @@ try:
     from sklearn.ensemble import VotingClassifier, RandomForestClassifier
     from sklearn.model_selection import train_test_split
     from sklearn.linear_model import LogisticRegression
-    from sklearn.preprocessing import MinMaxScaler
     from sklearn.metrics import precision_score, classification_report
     from xgboost import XGBClassifier
     ML_AVAILABLE = True
@@ -31,7 +30,6 @@ except ImportError:
     class RandomForestClassifier: pass
     class LogisticRegression: pass
     class XGBClassifier: pass
-    class MinMaxScaler: pass
     def precision_score(*args, **kwargs): return 0.0
     def classification_report(*args, **kwargs): return ""
     class nn:
@@ -46,7 +44,7 @@ logger = get_logger(__name__)
 class EnsembleLearner:
     """
     Manages a suite of AI/ML models for generating trading predictions.
-    Implements atomic model updates to ensure thread safety during retraining.
+    Implements atomic model updates and rolling Z-score normalization for stationarity.
     """
 
     def __init__(self, config: AIEnsembleStrategyParams):
@@ -57,7 +55,6 @@ class EnsembleLearner:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         # symbol_models maps symbol -> Dict of model objects
         self.symbol_models: Dict[str, Dict[str, Any]] = {}
-        self.symbol_scalers: Dict[str, MinMaxScaler] = {}
         self.is_trained = False
         
         logger.info("EnsembleLearner initialized.", device=str(self.device))
@@ -134,7 +131,6 @@ class EnsembleLearner:
 
                     # 2. Load Models into fresh instances
                     models = self._create_fresh_models()
-                    scaler = joblib.load(os.path.join(symbol_path, "scaler.pkl"))
                     
                     models['gb'] = joblib.load(os.path.join(symbol_path, "gb_model.pkl"))
                     models['technical'] = joblib.load(os.path.join(symbol_path, "technical_model.pkl"))
@@ -143,34 +139,66 @@ class EnsembleLearner:
                     
                     # Atomic update
                     self.symbol_models[symbol] = models
-                    self.symbol_scalers[symbol] = scaler
                     self.is_trained = True
-                    logger.info("Loaded models and scaler for symbol", symbol=symbol)
+                    logger.info("Loaded models for symbol", symbol=symbol)
                 except Exception as e:
                     logger.warning("Could not load models for symbol", symbol=symbol, error=str(e))
+
+    def _normalize(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Applies rolling Z-score normalization to make features stationary and scale-invariant.
+        (x - rolling_mean) / rolling_std
+        """
+        window = self.config.features.normalization_window
+        cols = self.config.feature_columns
+        
+        # Use a copy to avoid SettingWithCopy warnings
+        subset = df[cols].copy()
+        
+        # Calculate rolling stats
+        rolling_mean = subset.rolling(window=window).mean()
+        rolling_std = subset.rolling(window=window).std()
+        
+        # Add epsilon to avoid division by zero
+        epsilon = 1e-8
+        normalized = (subset - rolling_mean) / (rolling_std + epsilon)
+        
+        return normalized
 
     async def predict(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
         # Thread-safe retrieval of the model dict reference
         models = self.symbol_models.get(symbol)
-        scaler = self.symbol_scalers.get(symbol)
 
-        if not models or not scaler:
+        if not models:
             logger.debug("Predict called but models are not loaded for symbol.", symbol=symbol)
             return {'action': 'hold', 'confidence': 0.0}
         
         seq_len = self.config.features.sequence_length
-        if len(df) < seq_len:
-            logger.warning("Not enough data for a full sequence prediction.", symbol=symbol, data_len=len(df), required=seq_len)
+        norm_window = self.config.features.normalization_window
+        required_len = seq_len + norm_window
+
+        if len(df) < required_len:
+            logger.warning("Not enough data for rolling normalization and prediction.", 
+                           symbol=symbol, data_len=len(df), required=required_len)
             return {'action': 'hold', 'confidence': 0.0}
 
         try:
-            sequence_df = df.tail(seq_len)
-            features = np.nan_to_num(sequence_df[self.config.feature_columns].values, nan=0.0)
-            features_scaled = scaler.transform(features)
+            # 1. Normalize the FULL dataframe first to get correct rolling values
+            normalized_df = self._normalize(df)
+            
+            # 2. Extract the sequence from the normalized data
+            sequence_df = normalized_df.tail(seq_len)
+            
+            # Check for NaNs (which might happen if window is too large relative to data)
+            if sequence_df.isnull().values.any():
+                logger.warning("NaNs detected in normalized sequence. Skipping prediction.", symbol=symbol)
+                return {'action': 'hold', 'confidence': 0.0}
+
+            features = np.nan_to_num(sequence_df.values, nan=0.0)
 
             # Prepare inputs
-            last_step_features = features_scaled[-1, :].reshape(1, -1)
-            sequence_tensor = torch.FloatTensor(features_scaled).unsqueeze(0).to(self.device)
+            last_step_features = features[-1, :].reshape(1, -1)
+            sequence_tensor = torch.FloatTensor(features).unsqueeze(0).to(self.device)
 
             ensemble_pred = self._get_ensemble_prediction(models, last_step_features, sequence_tensor)
             
@@ -244,45 +272,54 @@ class EnsembleLearner:
     def train(self, symbol: str, df: pd.DataFrame) -> bool:
         logger.info("Starting model training", symbol=symbol)
         try:
-            # 1. Create features and labels
+            # 1. Create labels using ORIGINAL data (prices needed for % change)
             labels = self._create_labels(df)
-            features_df = df[self.config.feature_columns].loc[labels.index]
             
-            X = np.nan_to_num(features_df.values, nan=0.0)
-            y = labels.values
+            # 2. Normalize features using Rolling Z-Score
+            # We normalize the whole DF first, then align with labels
+            normalized_df = self._normalize(df)
+            
+            # Align features and labels (drop rows where we don't have labels or valid normalization)
+            # The normalization window introduces NaNs at the start
+            valid_indices = normalized_df.dropna().index.intersection(labels.index)
+            
+            if len(valid_indices) < 100:
+                logger.warning("Insufficient data after normalization and labeling.", symbol=symbol)
+                return False
+
+            X_normalized = normalized_df.loc[valid_indices].values
+            y = labels.loc[valid_indices].values
 
             if len(np.unique(y)) < 3:
                 logger.warning("Training data has fewer than 3 unique labels. Skipping training.", symbol=symbol, labels=np.unique(y))
                 return False
 
-            # 2. Split data BEFORE scaling to prevent data leakage
+            # 3. Split data
             X_train, X_val, y_train, y_val = train_test_split(
-                X, y, test_size=self.config.training.validation_split, random_state=42, stratify=y
+                X_normalized, y, test_size=self.config.training.validation_split, random_state=42, stratify=y
             )
 
-            # 3. Fit scaler on training data and transform both sets
-            scaler = MinMaxScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-            X_val_scaled = scaler.transform(X_val)
-            
-            # 4. Create sequences from SCALED data
-            X_train_seq, y_train_seq = self._create_sequences(X_train_scaled, y_train)
-            X_val_seq, y_val_seq = self._create_sequences(X_val_scaled, y_val)
+            # 4. Create sequences from NORMALIZED data
+            X_train_seq, y_train_seq = self._create_sequences(X_train, y_train)
+            X_val_seq, y_val_seq = self._create_sequences(X_val, y_val)
+
+            if len(X_train_seq) == 0 or len(X_val_seq) == 0:
+                logger.warning("Sequence generation resulted in empty datasets.", symbol=symbol)
+                return False
 
             # 5. Prepare flat data for scikit-learn models
-            X_train_flat_scaled = X_train_seq[:, -1, :]
+            X_train_flat = X_train_seq[:, -1, :]
             y_train_flat = y_train_seq
-            X_val_flat_scaled = X_val_seq[:, -1, :]
+            X_val_flat = X_val_seq[:, -1, :]
             y_val_flat = y_val_seq
             
             # 6. Create FRESH models for this training session
-            # This ensures we don't corrupt the live models if training fails or is poor
             models = self._create_fresh_models()
 
             # 7. Train scikit-learn models
             logger.info("Training scikit-learn models...", symbol=symbol)
-            models['gb'].fit(X_train_flat_scaled, y_train_flat)
-            models['technical'].fit(X_train_flat_scaled, y_train_flat)
+            models['gb'].fit(X_train_flat, y_train_flat)
+            models['technical'].fit(X_train_flat, y_train_flat)
             
             # Log Feature Importance
             try:
@@ -307,7 +344,7 @@ class EnsembleLearner:
             # 9. EVALUATION & VALIDATION
             logger.info("Evaluating new models on validation set...", symbol=symbol)
             
-            ensemble_probs = self._get_ensemble_prediction(models, X_val_flat_scaled, X_val_tensor)
+            ensemble_probs = self._get_ensemble_prediction(models, X_val_flat, X_val_tensor)
             y_pred = np.argmax(ensemble_probs, axis=1)
             
             precision = precision_score(y_val_flat, y_pred, average=None, labels=[0, 1, 2], zero_division=0)
@@ -334,12 +371,10 @@ class EnsembleLearner:
                 return False
 
             # 10. Atomic Update & Save
-            # Only now do we update the live models
             self.symbol_models[symbol] = models
-            self.symbol_scalers[symbol] = scaler
             self.is_trained = True
             
-            self._save_models(symbol, models, scaler)
+            self._save_models(symbol, models)
             logger.info("All models trained, validated, and promoted to production.", symbol=symbol)
             return True
 
@@ -392,7 +427,7 @@ class EnsembleLearner:
         if best_model_state:
             model.load_state_dict(best_model_state)
 
-    def _save_models(self, symbol: str, models: Dict[str, Any], scaler: Any):
+    def _save_models(self, symbol: str, models: Dict[str, Any]):
         symbol_path_str = symbol.replace('/', '_')
         save_path = os.path.join(self.config.model_path, symbol_path_str)
         os.makedirs(save_path, exist_ok=True)
@@ -405,9 +440,9 @@ class EnsembleLearner:
         with open(os.path.join(save_path, "metadata.json"), 'w') as f:
             json.dump(metadata, f)
 
-        joblib.dump(scaler, os.path.join(save_path, "scaler.pkl"))
+        # Note: We no longer save a scaler because we use rolling Z-score normalization
         joblib.dump(models['gb'], os.path.join(save_path, "gb_model.pkl"))
         joblib.dump(models['technical'], os.path.join(save_path, "technical_model.pkl"))
         torch.save(models['lstm'].state_dict(), os.path.join(save_path, "lstm_model.pth"))
         torch.save(models['attention'].state_dict(), os.path.join(save_path, "attention_model.pth"))
-        logger.info("Saved models, scaler, and metadata to disk", path=save_path)
+        logger.info("Saved models and metadata to disk", path=save_path)
