@@ -195,6 +195,7 @@ class BacktestConfig(BaseModel):
     maker_fee_pct: float = 0.001 # 0.1%
     taker_fee_pct: float = 0.001 # 0.1%
     slippage_pct: float = 0.0005 # 0.05%
+    model_path: str = "backtest_models" # Directory to store temporary backtest models
 
 # --- Top-Level Bot Config ---
 
