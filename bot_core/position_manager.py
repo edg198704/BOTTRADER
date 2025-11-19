@@ -4,7 +4,7 @@ import enum
 import json
 from typing import List, Optional, Dict, Any, TYPE_CHECKING
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLAlchemyEnum, func, Boolean, cast, Date, text, inspect
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLAlchemyEnum, func, Boolean, cast, Date, text, inspect, event
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 from bot_core.logger import get_logger
@@ -54,6 +54,14 @@ class PortfolioState(Base):
 class PositionManager:
     def __init__(self, config: DatabaseConfig, initial_capital: float, alert_system: Optional['AlertSystem'] = None):
         self.engine = create_engine(f'sqlite:///{config.path}')
+        
+        # Enable Write-Ahead Logging (WAL) for better concurrency
+        @event.listens_for(self.engine, "connect")
+        def set_sqlite_pragma(dbapi_connection, connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.close()
+
         Base.metadata.create_all(self.engine)
         self._ensure_schema_updates()
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
@@ -62,7 +70,7 @@ class PositionManager:
         self.alert_system = alert_system
         # Lock to serialize DB access across async tasks to prevent SQLite locking errors
         self._db_lock = asyncio.Lock()
-        logger.info("PositionManager initialized and database table created.")
+        logger.info("PositionManager initialized and database table created (WAL mode enabled).")
 
     def _ensure_schema_updates(self):
         """Checks for missing columns and updates schema if necessary (SQLite migration)."""
