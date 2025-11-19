@@ -248,21 +248,15 @@ def _train_pytorch_model(model: nn.Module, X_train: torch.Tensor, y_train: torch
     if best_model_state:
         model.load_state_dict(best_model_state)
 
-def _get_ensemble_prediction_static(models: Dict[str, Any], X_flat: np.ndarray, X_seq: torch.Tensor, config: AIEnsembleStrategyParams) -> np.ndarray:
+def _get_ensemble_prediction_static(models: Dict[str, Any], X_flat: np.ndarray, X_seq: torch.Tensor, weights: List[float]) -> np.ndarray:
     """
     Static version of prediction logic for validation during training.
     X_flat: Flattened sequence history for tree models (N, seq_len * features)
     X_seq: 3D Tensor for deep learning models (N, seq_len, features)
+    weights: List of weights [xgboost, technical, lstm, attention]
     """
     predictions = []
-    weights_config = config.ensemble_weights
-    weights = [
-        weights_config.xgboost,
-        weights_config.technical_ensemble,
-        weights_config.lstm,
-        weights_config.attention
-    ]
-
+    
     # Tree models now receive the full flattened history
     gb_pred = models['gb'].predict_proba(X_flat)
     predictions.append(gb_pred)
@@ -283,7 +277,7 @@ def _get_ensemble_prediction_static(models: Dict[str, Any], X_flat: np.ndarray, 
     ensemble_pred = np.average(stacked_preds, weights=weights, axis=0)
     return ensemble_pred
 
-def _save_models_to_disk(symbol: str, models: Dict[str, Any], config: AIEnsembleStrategyParams):
+def _save_models_to_disk(symbol: str, models: Dict[str, Any], config: AIEnsembleStrategyParams, learned_weights: Optional[List[float]] = None):
     symbol_path_str = symbol.replace('/', '_')
     save_path = os.path.join(config.model_path, symbol_path_str)
     os.makedirs(save_path, exist_ok=True)
@@ -291,7 +285,8 @@ def _save_models_to_disk(symbol: str, models: Dict[str, Any], config: AIEnsemble
     metadata = {
         'feature_columns': config.feature_columns,
         'hyperparameters': config.hyperparameters.dict(),
-        'timestamp': str(pd.Timestamp.utcnow())
+        'timestamp': str(pd.Timestamp.utcnow()),
+        'learned_weights': learned_weights
     }
     with open(os.path.join(save_path, "metadata.json"), 'w') as f:
         json.dump(metadata, f)
@@ -375,9 +370,55 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         _train_pytorch_model(models['lstm'], X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor, config)
         _train_pytorch_model(models['attention'], X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor, config)
 
-        # 6. Evaluation
-        worker_logger.info("Evaluating models...", symbol=symbol)
-        ensemble_probs = _get_ensemble_prediction_static(models, X_val_flat, X_val_tensor, config)
+        # 6. Auto-Tune Ensemble Weights (Auto-ML)
+        weights_config = config.ensemble_weights
+        default_weights = [
+            weights_config.xgboost,
+            weights_config.technical_ensemble,
+            weights_config.lstm,
+            weights_config.attention
+        ]
+        
+        final_weights = default_weights
+        
+        if weights_config.auto_tune:
+            worker_logger.info("Auto-tuning ensemble weights based on validation performance...", symbol=symbol)
+            
+            # Get individual predictions on validation set
+            preds_map = {}
+            preds_map['gb'] = models['gb'].predict_proba(X_val_flat)
+            preds_map['technical'] = models['technical'].predict_proba(X_val_flat)
+            
+            with torch.no_grad():
+                models['lstm'].eval()
+                models['attention'].eval()
+                preds_map['lstm'] = models['lstm'](X_val_tensor).cpu().numpy()
+                preds_map['attention'] = models['attention'](X_val_tensor).cpu().numpy()
+            
+            # Calculate score for each model (Average Precision of Buy/Sell classes)
+            model_scores = []
+            model_order = ['gb', 'technical', 'lstm', 'attention']
+            
+            for name in model_order:
+                probs = preds_map[name]
+                y_pred_cls = np.argmax(probs, axis=1)
+                # Calculate precision for each class
+                prec = precision_score(y_val_flat, y_pred_cls, average=None, labels=[0, 1, 2], zero_division=0)
+                # Score is average of Sell(0) and Buy(2) precision. We care less about Hold(1).
+                score = (prec[0] + prec[2]) / 2
+                model_scores.append(score)
+            
+            # Calculate weights: Square the score to punish weak models, then normalize
+            total_score_sq = sum(s**2 for s in model_scores)
+            if total_score_sq > 0:
+                final_weights = [(s**2)/total_score_sq for s in model_scores]
+                worker_logger.info("Learned optimal weights", symbol=symbol, weights=final_weights, scores=model_scores)
+            else:
+                worker_logger.warning("Validation scores too low, reverting to default weights.", symbol=symbol)
+
+        # 7. Evaluation with Final Weights
+        worker_logger.info("Evaluating ensemble...", symbol=symbol)
+        ensemble_probs = _get_ensemble_prediction_static(models, X_val_flat, X_val_tensor, final_weights)
         y_pred = np.argmax(ensemble_probs, axis=1)
         
         precision = precision_score(y_val_flat, y_pred, average=None, labels=[0, 1, 2], zero_division=0)
@@ -390,8 +431,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             worker_logger.warning("Model failed validation threshold.", symbol=symbol)
             return False
 
-        # 7. Save Models
-        _save_models_to_disk(symbol, models, config)
+        # 8. Save Models & Weights
+        _save_models_to_disk(symbol, models, config, learned_weights=final_weights)
         worker_logger.info("Models saved successfully.", symbol=symbol)
         return True
 
@@ -486,6 +527,17 @@ class EnsembleLearner:
         models = entry['models']
         meta = entry['meta']
         
+        # Determine weights to use: Learned or Config
+        weights = meta.get('learned_weights')
+        if not weights:
+            weights_config = self.config.ensemble_weights
+            weights = [
+                weights_config.xgboost,
+                weights_config.technical_ensemble,
+                weights_config.lstm,
+                weights_config.attention
+            ]
+
         seq_len = self.config.features.sequence_length
         norm_window = self.config.features.normalization_window
         required_len = seq_len + norm_window
@@ -509,8 +561,8 @@ class EnsembleLearner:
             # Tensor for Deep Learning models: (1, seq_len, features)
             sequence_tensor = torch.FloatTensor(features).unsqueeze(0).to(self.device)
 
-            # Use the static prediction logic
-            ensemble_pred = _get_ensemble_prediction_static(models, flattened_features, sequence_tensor, self.config)
+            # Use the static prediction logic with explicit weights
+            ensemble_pred = _get_ensemble_prediction_static(models, flattened_features, sequence_tensor, weights)
             
             action_idx = np.argmax(ensemble_pred)
             confidence = float(ensemble_pred[action_idx])
@@ -520,7 +572,8 @@ class EnsembleLearner:
                 'action': action_map.get(action_idx, 'hold'), 
                 'confidence': confidence,
                 'model_version': meta.get('timestamp'),
-                'model_type': 'ensemble'
+                'model_type': 'ensemble',
+                'active_weights': weights
             }
         except Exception as e:
             logger.error("Error during prediction", symbol=symbol, error=str(e))
