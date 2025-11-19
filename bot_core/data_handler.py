@@ -235,6 +235,38 @@ class DataHandler:
         
         return df.copy() # Return a copy to prevent mutation
 
+    def get_correlation(self, symbol_a: str, symbol_b: str, lookback: int = 50) -> float:
+        """
+        Calculates the correlation between the returns of two symbols.
+        Uses the 'close' price from the analysis dataframes.
+        """
+        df_a = self._dataframes.get(symbol_a)
+        df_b = self._dataframes.get(symbol_b)
+        
+        if df_a is None or df_b is None or df_a.empty or df_b.empty:
+            return 0.0
+        
+        # Align data by index (timestamp) and calculate returns
+        # We use the tail(lookback) to focus on recent correlation
+        try:
+            # Ensure we have enough data
+            if len(df_a) < lookback or len(df_b) < lookback:
+                return 0.0
+
+            series_a = df_a['close'].pct_change().tail(lookback)
+            series_b = df_b['close'].pct_change().tail(lookback)
+            
+            # Pandas corr() automatically aligns indices
+            correlation = series_a.corr(series_b)
+            
+            if np.isnan(correlation):
+                return 0.0
+                
+            return float(correlation)
+        except Exception as e:
+            logger.error("Error calculating correlation", symbol_a=symbol_a, symbol_b=symbol_b, error=str(e))
+            return 0.0
+
     async def fetch_full_history_for_symbol(self, symbol: str, limit: int) -> Optional[pd.DataFrame]:
         """
         Fetches a large batch of historical data for a symbol, intended for model training.
