@@ -77,7 +77,56 @@ class TradingBot:
         """Performs safety checks and state reconciliation on startup."""
         logger.info("Performing startup state reconciliation...")
         
-        # 1. Cancel all open orders to ensure clean slate (remove orphans)
+        # 1. Reconcile PENDING positions (Two-Phase Commit Recovery)
+        pending_positions = await self.position_manager.get_pending_positions()
+        if pending_positions:
+            logger.info("Found PENDING positions from previous session. Reconciling...", count=len(pending_positions))
+            for pos in pending_positions:
+                if not pos.order_id:
+                    logger.warning("Pending position has no Order ID. Voiding.", symbol=pos.symbol)
+                    await self.position_manager.void_position(pos.symbol, pos.order_id)
+                    continue
+
+                try:
+                    order = await self.exchange_api.fetch_order(pos.order_id, pos.symbol)
+                    if not order:
+                        logger.warning("Order not found on exchange. Voiding pending position.", symbol=pos.symbol, order_id=pos.order_id)
+                        await self.position_manager.void_position(pos.symbol, pos.order_id)
+                        continue
+
+                    status = order.get('status')
+                    if status == 'FILLED':
+                        # Recover the position
+                        filled_qty = order.get('filled', 0.0)
+                        avg_price = order.get('average', 0.0)
+                        
+                        # Fallback SL/TP since we might not have market data yet
+                        # Default to 5% risk if we can't calculate it
+                        sl_pct = 0.05
+                        tp_pct = 0.05
+                        if pos.side == 'BUY':
+                            sl = avg_price * (1 - sl_pct)
+                            tp = avg_price * (1 + tp_pct)
+                        else:
+                            sl = avg_price * (1 + sl_pct)
+                            tp = avg_price * (1 - tp_pct)
+
+                        logger.info("Recovered FILLED order for pending position.", symbol=pos.symbol, order_id=pos.order_id)
+                        await self.position_manager.confirm_position_open(pos.symbol, pos.order_id, filled_qty, avg_price, sl, tp)
+                    
+                    elif status in ['CANCELED', 'REJECTED', 'EXPIRED']:
+                        logger.info("Pending position order was terminal but not filled. Voiding.", symbol=pos.symbol, status=status)
+                        await self.position_manager.void_position(pos.symbol, pos.order_id)
+                    
+                    elif status == 'OPEN':
+                        logger.info("Pending position order is still OPEN. Cancelling and voiding to ensure clean state.", symbol=pos.symbol)
+                        await self.exchange_api.cancel_order(pos.order_id, pos.symbol)
+                        await self.position_manager.void_position(pos.symbol, pos.order_id)
+
+                except Exception as e:
+                    logger.error("Error reconciling pending position", symbol=pos.symbol, error=str(e))
+
+        # 2. Cancel all open orders to ensure clean slate (remove orphans)
         for symbol in self.config.strategy.symbols:
             try:
                 cancelled = await self.exchange_api.cancel_all_orders(symbol)
@@ -86,7 +135,7 @@ class TradingBot:
             except Exception as e:
                 logger.error("Failed to cancel orders on startup", symbol=symbol, error=str(e))
 
-        # 2. Verify Balances vs Positions
+        # 3. Verify Balances vs Positions
         try:
             balances = await self.exchange_api.get_balance()
             expected_positions = await self.position_manager.get_aggregated_open_positions()
