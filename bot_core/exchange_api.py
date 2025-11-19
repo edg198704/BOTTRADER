@@ -8,7 +8,7 @@ from ccxt.base.errors import NetworkError, ExchangeError, InsufficientFunds, Ord
 
 from bot_core.logger import get_logger
 from bot_core.utils import async_retry, Clock
-from bot_core.config import ExchangeConfig
+from bot_core.config import ExchangeConfig, BacktestConfig
 
 logger = get_logger(__name__)
 
@@ -215,26 +215,25 @@ class BacktestExchangeAPI(ExchangeAPI):
     """
     A simulated exchange that replays historical data for backtesting.
     It uses the centralized Clock to determine the 'current' time and data availability.
+    Supports fee deduction and slippage simulation.
     """
-    def __init__(self, data_source: Dict[str, pd.DataFrame], initial_balances: Dict[str, float]):
+    def __init__(self, data_source: Dict[str, pd.DataFrame], initial_balances: Dict[str, float], config: BacktestConfig):
         self.data = data_source
         self.balances = initial_balances
+        self.config = config
         self.open_orders: Dict[str, Dict[str, Any]] = {}
         self.order_id_counter = 0
-        logger.info("BacktestExchangeAPI initialized.")
+        logger.info("BacktestExchangeAPI initialized.", 
+                    maker_fee=config.maker_fee_pct, 
+                    taker_fee=config.taker_fee_pct, 
+                    slippage=config.slippage_pct)
 
     def _get_current_candle(self, symbol: str) -> Optional[pd.Series]:
         df = self.data.get(symbol)
         if df is None or df.empty:
             return None
         
-        # Find the row closest to but not after Clock.now()
-        # Assuming df is indexed by timestamp
         current_time = pd.Timestamp(Clock.now()).tz_localize(None)
-        
-        # Efficiently find the index
-        # Note: This assumes data is sorted. 
-        # For backtesting speed, we might optimize this, but asof is decent.
         try:
             idx = df.index.get_indexer([current_time], method='pad')[0]
             if idx == -1:
@@ -244,17 +243,14 @@ class BacktestExchangeAPI(ExchangeAPI):
             return None
 
     async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[Any]]:
-        # Return data up to Clock.now()
         df = self.data.get(symbol)
         if df is None:
             return []
         
         current_time = pd.Timestamp(Clock.now()).tz_localize(None)
-        # Slice data up to current time
         mask = df.index <= current_time
         sliced = df.loc[mask].tail(limit)
         
-        # Convert to list of lists [timestamp_ms, open, high, low, close, volume]
         ohlcv = []
         for ts, row in sliced.iterrows():
             ts_ms = int(ts.timestamp() * 1000)
@@ -294,46 +290,52 @@ class BacktestExchangeAPI(ExchangeAPI):
         if order['status'] == 'OPEN':
             candle = self._get_current_candle(symbol)
             if candle is not None:
-                # Check for fill
                 should_fill = False
-                fill_price = candle['close'] # Default to close for MARKET
+                fill_price = candle['close']
                 
                 if order['type'] == 'MARKET':
                     should_fill = True
-                    # Slippage simulation could go here
-                    fill_price = candle['close']
+                    # Apply Slippage for MARKET orders
+                    slippage = self.config.slippage_pct
+                    if order['side'] == 'BUY':
+                        fill_price = fill_price * (1 + slippage)
+                    else:
+                        fill_price = fill_price * (1 - slippage)
+
                 elif order['type'] == 'LIMIT':
                     limit_price = order['price']
                     if order['side'] == 'BUY':
-                        # Buy if Low <= Limit
                         if candle['low'] <= limit_price:
                             should_fill = True
-                            # Optimistic fill at limit, or realistic at Open if Open < Limit?
-                            # Simple assumption: fill at limit price if within range
                             fill_price = limit_price
                     else: # SELL
-                        # Sell if High >= Limit
                         if candle['high'] >= limit_price:
                             should_fill = True
                             fill_price = limit_price
                 
                 if should_fill:
-                    # Update Balances
                     base, quote = symbol.split('/')
                     cost = order['quantity'] * fill_price
                     
-                    # Simple balance check (can be expanded)
+                    # Calculate Fee
+                    fee_rate = self.config.taker_fee_pct if order['type'] == 'MARKET' else self.config.maker_fee_pct
+                    fee = cost * fee_rate
+                    
+                    # Execute Balance Updates with Fees
+                    # We simulate fees being paid in the QUOTE asset for simplicity and consistency
                     if order['side'] == 'BUY':
-                        if self.balances.get(quote, 0) >= cost:
-                            self.balances[quote] -= cost
+                        total_cost = cost + fee
+                        if self.balances.get(quote, 0) >= total_cost:
+                            self.balances[quote] -= total_cost
                             self.balances[base] = self.balances.get(base, 0) + order['quantity']
                             order['status'] = 'FILLED'
                             order['filled'] = order['quantity']
                             order['average'] = fill_price
-                    else:
+                    else: # SELL
                         if self.balances.get(base, 0) >= order['quantity']:
                             self.balances[base] -= order['quantity']
-                            self.balances[quote] = self.balances.get(quote, 0) + cost
+                            net_proceeds = cost - fee
+                            self.balances[quote] = self.balances.get(quote, 0) + net_proceeds
                             order['status'] = 'FILLED'
                             order['filled'] = order['quantity']
                             order['average'] = fill_price
