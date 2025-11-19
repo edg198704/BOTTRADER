@@ -113,26 +113,36 @@ class AIEnsembleStrategy(TradingStrategy):
         prediction = await self.ensemble_learner.predict(df, symbol)
         action = prediction.get('action')
         confidence = prediction.get('confidence', 0.0)
+        model_version = prediction.get('model_version')
 
         logger.debug("AI prediction received", symbol=symbol, **prediction)
 
         if confidence < self.ai_config.confidence_threshold:
             return None
 
+        # Construct metadata for the signal
+        strategy_metadata = {
+            'model_version': model_version,
+            'confidence': confidence,
+            'regime': regime,
+            'regime_confidence': regime_result.get('confidence'),
+            'model_type': prediction.get('model_type')
+        }
+
         if position:
             if position.side == 'BUY' and action == 'sell':
                 logger.info("AI Close Long signal detected", symbol=symbol, confidence=confidence)
-                return {'action': 'SELL', 'symbol': symbol, 'confidence': confidence, 'regime': regime}
+                return {'action': 'SELL', 'symbol': symbol, 'strategy_metadata': strategy_metadata}
             if position.side == 'SELL' and action == 'buy':
                 logger.info("AI Close Short signal detected", symbol=symbol, confidence=confidence)
-                return {'action': 'BUY', 'symbol': symbol, 'confidence': confidence, 'regime': regime}
+                return {'action': 'BUY', 'symbol': symbol, 'strategy_metadata': strategy_metadata}
         else:
             if action == 'buy':
                 logger.info("AI Open Long signal detected", symbol=symbol, confidence=confidence)
-                return {'action': 'BUY', 'symbol': symbol, 'confidence': confidence, 'regime': regime}
+                return {'action': 'BUY', 'symbol': symbol, 'strategy_metadata': strategy_metadata}
             if action == 'sell':
                 logger.info("AI Open Short signal detected", symbol=symbol, confidence=confidence)
-                return {'action': 'SELL', 'symbol': symbol, 'confidence': confidence, 'regime': regime}
+                return {'action': 'SELL', 'symbol': symbol, 'strategy_metadata': strategy_metadata}
 
         return None
 
