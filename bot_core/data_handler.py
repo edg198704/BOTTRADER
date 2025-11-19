@@ -132,8 +132,25 @@ class DataHandler:
 
     async def _update_symbol_data(self, symbol: str):
         try:
-            # Fetch last few candles to handle current candle updates
-            latest_ohlcv = await self.exchange_api.get_market_data(symbol, self.timeframe, 5)
+            # Self-Healing Logic: Check if we have enough data
+            current_buffer = self._raw_buffers.get(symbol)
+            required_history = self.history_limit
+            
+            # If buffer is missing or significantly smaller than required history, 
+            # trigger a recovery fetch instead of an incremental update.
+            if current_buffer is None or len(current_buffer) < (required_history * 0.9):
+                logger.warning("Insufficient data buffer detected. Attempting recovery fetch.", 
+                               symbol=symbol, 
+                               current_len=len(current_buffer) if current_buffer is not None else 0,
+                               target_len=required_history)
+                fetch_limit = required_history
+                is_recovery = True
+            else:
+                fetch_limit = 5 # Standard incremental update
+                is_recovery = False
+
+            # Fetch data
+            latest_ohlcv = await self.exchange_api.get_market_data(symbol, self.timeframe, fetch_limit)
             if not latest_ohlcv:
                 return
 
@@ -142,23 +159,35 @@ class DataHandler:
                 return
 
             # Update Raw Buffer
-            if symbol in self._raw_buffers:
-                current_raw = self._raw_buffers[symbol]
-                combined_df = pd.concat([current_raw, latest_df])
-                combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
-                
-                # Cap the raw buffer size to prevent memory explosion
-                if len(combined_df) > self.max_training_buffer:
-                    combined_df = combined_df.iloc[-self.max_training_buffer:]
-                
-                self._raw_buffers[symbol] = combined_df
+            if is_recovery:
+                # In recovery mode, we prioritize the new block but merge to be safe
+                if current_buffer is not None:
+                    combined_df = pd.concat([current_buffer, latest_df])
+                    combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
+                    combined_df.sort_index(inplace=True)
+                    self._raw_buffers[symbol] = combined_df
+                else:
+                    self._raw_buffers[symbol] = latest_df
+                logger.info("Data recovery successful.", symbol=symbol, total_records=len(self._raw_buffers[symbol]))
             else:
-                self._raw_buffers[symbol] = latest_df
+                # Standard incremental update
+                if symbol in self._raw_buffers:
+                    current_raw = self._raw_buffers[symbol]
+                    combined_df = pd.concat([current_raw, latest_df])
+                    combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
+                    
+                    if len(combined_df) > self.max_training_buffer:
+                        combined_df = combined_df.iloc[-self.max_training_buffer:]
+                    
+                    self._raw_buffers[symbol] = combined_df
+                else:
+                    # Should be covered by recovery logic, but fallback safe
+                    self._raw_buffers[symbol] = latest_df
 
             # Process Indicators on Analysis Window
             await self._process_analysis_window(symbol)
             
-            logger.debug("Market data updated", symbol=symbol)
+            logger.debug("Market data updated", symbol=symbol, mode="recovery" if is_recovery else "incremental")
 
         except Exception as e:
             logger.warning("Failed to update market data for symbol", symbol=symbol, error=str(e))
