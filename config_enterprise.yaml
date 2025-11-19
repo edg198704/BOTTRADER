@@ -87,8 +87,11 @@ strategy:
     features:
       sequence_length: 30 # Lookback window for sequential models like LSTM/Attention
       labeling_horizon: 5 # How many candles into the future to look for labeling
-      labeling_threshold: 0.005 # % price change to define a buy/sell label
+      labeling_threshold: 0.005 # % price change to define a buy/sell label (Fallback if dynamic is off)
       normalization_window: 100 # Rolling window for Z-score normalization
+      # Dynamic Labeling: Uses ATR to adjust threshold based on volatility
+      use_dynamic_labeling: true
+      labeling_atr_multiplier: 1.0 # Threshold = ATR * 1.0
 
     # --- Model Training Parameters ---
     training:
