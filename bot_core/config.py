@@ -34,12 +34,17 @@ class MarketRegimeConfig(BaseModel):
     volatility_col: str = "atr"
     rsi_col: str = "rsi"
     
-    # --- Dynamic Confidence Thresholds ---
-    # Overrides the global confidence_threshold based on regime
+    # --- Dynamic Confidence Thresholds (Entry) ---
     bull_confidence_threshold: Optional[float] = None
     bear_confidence_threshold: Optional[float] = None
     volatile_confidence_threshold: Optional[float] = None
     sideways_confidence_threshold: Optional[float] = None
+
+    # --- Dynamic Confidence Thresholds (Exit) ---
+    bull_exit_threshold: Optional[float] = None
+    bear_exit_threshold: Optional[float] = None
+    volatile_exit_threshold: Optional[float] = None
+    sideways_exit_threshold: Optional[float] = None
 
 class AITrainingConfig(BaseModel):
     epochs: int = 50
@@ -100,6 +105,7 @@ class AIEnsembleStrategyParams(StrategyParamsBase):
     name: Literal["AIEnsembleStrategy"]
     feature_columns: List[str]
     confidence_threshold: float = Field(..., ge=0.0, le=1.0)
+    exit_confidence_threshold: float = Field(0.5, ge=0.0, le=1.0)
     model_path: str
     use_regime_filter: bool
     retrain_interval_hours: int
