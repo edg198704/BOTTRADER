@@ -73,6 +73,7 @@ class AITrainingConfig(BaseModel):
     # --- Profitability Gates (New) ---
     min_profit_factor: float = 1.05 # Require positive expectancy (Gross Profit / Gross Loss)
     min_sharpe_ratio: float = 0.05 # Require slightly positive risk-adjusted return
+    min_improvement_pct: float = 0.02 # Require 2% improvement over previous model to replace it
     
     # --- Hyperparameter Optimization ---
     auto_tune_models: bool = False
