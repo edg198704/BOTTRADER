@@ -25,6 +25,7 @@ class EnsembleWeightsConfig(BaseModel):
     lstm: float = 0.2
     attention: float = 0.2
     auto_tune: bool = True
+    use_stacking: bool = True
 
 class MarketRegimeConfig(BaseModel):
     trend_strength_threshold: float = 0.015
