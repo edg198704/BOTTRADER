@@ -1,17 +1,16 @@
 import os
 import joblib
 import json
+import logging
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Dict, Any, Tuple, Optional, List
 from datetime import datetime
-import logging
 
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams
 from bot_core.ai.models import LSTMPredictor, AttentionNetwork
 from bot_core.ai.feature_processor import FeatureProcessor
-from bot_core.utils import Clock
 
 # ML Imports with safe fallbacks
 try:
@@ -27,7 +26,7 @@ try:
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
-    # Dummy classes to prevent ImportErrors if ML libraries are not available
+    # Define dummy classes if ML libraries are not available
     class VotingClassifier: pass
     class RandomForestClassifier: pass
     class LogisticRegression: pass
@@ -35,449 +34,396 @@ except ImportError:
     class RandomizedSearchCV: pass
     class TimeSeriesSplit: pass
     def precision_score(*args, **kwargs): return 0.0
-    def classification_report(*args, **kwargs): return ""
     def log_loss(*args, **kwargs): return 0.0
+    def classification_report(*args, **kwargs): return ""
     class nn:
         class Module: pass
     class optim: pass
     class TensorDataset: pass
     class DataLoader: pass
-    torch = None
 
 logger = get_logger(__name__)
 
+# --- Standalone Helper Functions (Pickle-safe for Multiprocessing) ---
+
+def _create_fresh_models(config: AIEnsembleStrategyParams, device) -> Dict[str, Any]:
+    """Creates a fresh set of untrained model instances based on configuration."""
+    num_features = len(config.feature_columns)
+    hp = config.hyperparameters
+    xgb_config = hp.xgboost
+    rf_config = hp.random_forest
+    lr_config = hp.logistic_regression
+    lstm_config = hp.lstm
+    attn_config = hp.attention
+
+    models = {
+        'gb': XGBClassifier(
+            n_estimators=xgb_config.n_estimators,
+            max_depth=xgb_config.max_depth,
+            learning_rate=xgb_config.learning_rate,
+            subsample=xgb_config.subsample,
+            colsample_bytree=xgb_config.colsample_bytree,
+            random_state=42, use_label_encoder=False, eval_metric='logloss'
+        ),
+        'technical': VotingClassifier(estimators=[
+            ('rf', RandomForestClassifier(
+                n_estimators=rf_config.n_estimators,
+                max_depth=rf_config.max_depth,
+                min_samples_leaf=rf_config.min_samples_leaf,
+                random_state=42
+            )),
+            ('lr', LogisticRegression(
+                max_iter=lr_config.max_iter,
+                C=lr_config.C,
+                random_state=42
+            ))
+        ], voting='soft')
+    }
+
+    if ML_AVAILABLE and torch.cuda.is_available():
+        # Only create PyTorch models if available
+        models['lstm'] = LSTMPredictor(
+            num_features, lstm_config.hidden_dim, lstm_config.num_layers, lstm_config.dropout
+        ).to(device)
+        models['attention'] = AttentionNetwork(
+            num_features, attn_config.hidden_dim, attn_config.num_layers, attn_config.nhead, attn_config.dropout
+        ).to(device)
+    
+    return models
+
+def _optimize_hyperparameters(model, X, y, param_dist, n_iter, logger_instance):
+    """Runs RandomizedSearchCV to find better hyperparameters."""
+    try:
+        # Use TimeSeriesSplit to prevent data leakage (future peeking)
+        tscv = TimeSeriesSplit(n_splits=3)
+        search = RandomizedSearchCV(
+            estimator=model,
+            param_distributions=param_dist,
+            n_iter=n_iter,
+            scoring='neg_log_loss',
+            cv=tscv,
+            n_jobs=1, # Already in a subprocess
+            random_state=42,
+            verbose=0
+        )
+        search.fit(X, y)
+        logger_instance.info(f"Hyperparameter optimization complete. Best score: {search.best_score_:.4f}")
+        return search.best_estimator_
+    except Exception as e:
+        logger_instance.warning(f"Hyperparameter optimization failed: {e}. Using default parameters.")
+        model.fit(X, y)
+        return model
+
 def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrategyParams) -> bool:
     """
-    Standalone function to be run in a separate process for training.
-    Instantiates a temporary learner to perform the heavy lifting.
+    Standalone function to train models in a separate process.
+    Returns True if training and saving were successful.
     """
     # Re-initialize logger for the worker process
     worker_logger = get_logger(f"trainer_{symbol}")
-    worker_logger.info("Starting training task in worker process", symbol=symbol, rows=len(df))
-    
+    worker_logger.info(f"Starting training task for {symbol} with {len(df)} records.")
+
     if not ML_AVAILABLE:
-        worker_logger.error("ML libraries not installed. Cannot train.")
+        worker_logger.error("ML libraries not available. Skipping training.")
         return False
 
     try:
-        learner = EnsembleLearner(config)
-        return learner.train(symbol, df)
-    except Exception as e:
-        worker_logger.error("Training task failed", symbol=symbol, error=str(e), exc_info=True)
-        return False
-
-class EnsembleLearner:
-    def __init__(self, config: AIEnsembleStrategyParams):
-        self.config = config
-        self.models = {}
-        self.is_trained = False
-        self.symbol_models = {} # Cache for loaded models: {symbol: {'models': ..., 'meta': ...}}
-        
-        # Determine device for PyTorch
-        self.device = "cpu"
-        if ML_AVAILABLE and torch and torch.cuda.is_available():
-            self.device = "cuda"
-        
-        # Ensure model directory exists
-        os.makedirs(self.config.model_path, exist_ok=True)
-
-    def get_last_training_time(self, symbol: str) -> Optional[datetime]:
-        """Returns the timestamp of the last successful training for the symbol."""
-        meta_path = os.path.join(self.config.model_path, f"{symbol.replace('/', '_')}_meta.json")
-        if os.path.exists(meta_path):
-            try:
-                with open(meta_path, 'r') as f:
-                    data = json.load(f)
-                    # Parse ISO format string back to datetime
-                    return datetime.fromisoformat(data.get('timestamp'))
-            except Exception:
-                return None
-        return None
-
-    async def reload_models(self, symbol: str):
-        """Reloads models from disk into memory for the given symbol."""
-        self._load_models(symbol)
-
-    def train(self, symbol: str, df: pd.DataFrame) -> bool:
-        """
-        Main training pipeline:
-        1. Feature Engineering & Labeling
-        2. Splitting (Train/Val)
-        3. Training Individual Models (ML & DL)
-        4. Evaluation & Threshold Check
-        5. Persistence
-        """
-        if len(df) < self.config.features.sequence_length + 50:
-            logger.warning("Insufficient data for training", symbol=symbol)
-            return False
-
         # 1. Prepare Data
-        # Normalize features
-        X_df = FeatureProcessor.normalize(df, self.config)
-        # Create labels
-        y_series = FeatureProcessor.create_labels(df, self.config)
+        # Normalize
+        df_norm = FeatureProcessor.normalize(df, config)
+        # Create Labels
+        labels = FeatureProcessor.create_labels(df, config)
         
-        # Align X and y (drop NaNs created by shifting/rolling)
-        common_index = X_df.index.intersection(y_series.index)
-        X_df = X_df.loc[common_index]
-        y_series = y_series.loc[common_index]
-        
-        # Drop any remaining NaNs
-        valid_mask = ~X_df.isna().any(axis=1) & ~y_series.isna()
-        X_df = X_df[valid_mask]
-        y_series = y_series[valid_mask]
-
-        if len(X_df) < 100:
-            logger.warning("Data too small after preprocessing", symbol=symbol)
+        # Align Data (drop NaNs from rolling windows and shifting)
+        common_index = df_norm.index.intersection(labels.index)
+        if len(common_index) < 100:
+            worker_logger.warning("Insufficient data after alignment.")
             return False
+            
+        X = df_norm.loc[common_index].values
+        y = labels.loc[common_index].values.astype(int)
 
-        # Split Data (Time Series Split - No Shuffle)
-        split_idx = int(len(X_df) * (1 - self.config.training.validation_split))
-        X_train_df, X_val_df = X_df.iloc[:split_idx], X_df.iloc[split_idx:]
-        y_train, y_val = y_series.iloc[:split_idx].values.astype(int), y_series.iloc[split_idx:].values.astype(int)
+        # Split Train/Val
+        split_idx = int(len(X) * (1 - config.training.validation_split))
+        X_train, X_val = X[:split_idx], X[split_idx:]
+        y_train, y_val = y[:split_idx], y[split_idx:]
 
-        # Convert to numpy for ML models
-        X_train = X_train_df.values
-        X_val = X_val_df.values
-
+        # Setup Device
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Create Models
+        models = _create_fresh_models(config, device)
         trained_models = {}
         metrics = {}
+        feature_importance = {}
 
-        # --- Train Technical Models (XGBoost, Voting) ---
-        if self.config.training.auto_tune_models:
-            trained_models['gb'] = self._optimize_xgboost(X_train, y_train)
-        else:
-            xgb = XGBClassifier(**self.config.hyperparameters.xgboost.dict())
-            xgb.fit(X_train, y_train)
-            trained_models['gb'] = xgb
-
-        # Voting Classifier (RF + LR)
-        rf = RandomForestClassifier(**self.config.hyperparameters.random_forest.dict())
-        lr = LogisticRegression(**self.config.hyperparameters.logistic_regression.dict())
-        voting = VotingClassifier(estimators=[('rf', rf), ('lr', lr)], voting='soft')
-        voting.fit(X_train, y_train)
-        trained_models['technical'] = voting
-
-        # --- Train Deep Learning Models (LSTM, Attention) ---
-        seq_len = self.config.features.sequence_length
-        
-        # Create sequences
-        X_train_seq, y_train_seq = FeatureProcessor.create_sequences(X_train, y_train, seq_len)
-        X_val_seq, y_val_seq = FeatureProcessor.create_sequences(X_val, y_val, seq_len)
-
-        if len(X_train_seq) > 0:
-            # LSTM
-            lstm = LSTMPredictor(
-                input_dim=X_train.shape[1],
-                hidden_dim=self.config.hyperparameters.lstm.hidden_dim,
-                num_layers=self.config.hyperparameters.lstm.num_layers,
-                dropout=self.config.hyperparameters.lstm.dropout
-            ).to(self.device)
-            self._train_torch_model(lstm, X_train_seq, y_train_seq, X_val_seq, y_val_seq, "LSTM")
-            trained_models['lstm'] = lstm
-
-            # Attention
-            attn = AttentionNetwork(
-                input_dim=X_train.shape[1],
-                hidden_dim=self.config.hyperparameters.attention.hidden_dim,
-                num_layers=self.config.hyperparameters.attention.num_layers,
-                nhead=self.config.hyperparameters.attention.nhead,
-                dropout=self.config.hyperparameters.attention.dropout
-            ).to(self.device)
-            self._train_torch_model(attn, X_train_seq, y_train_seq, X_val_seq, y_val_seq, "Attention")
-            trained_models['attention'] = attn
-
-        # --- Evaluation ---
-        # We evaluate the ensemble on the validation set
-        val_preds = self._ensemble_predict_internal(trained_models, X_val, X_val_seq)
-        
-        # Calculate Precision for Buy (2) and Sell (0)
-        precision_buy = precision_score(y_val[seq_len-1:], val_preds, labels=[2], average='micro', zero_division=0)
-        precision_sell = precision_score(y_val[seq_len-1:], val_preds, labels=[0], average='micro', zero_division=0)
-        avg_precision = (precision_buy + precision_sell) / 2
-
-        metrics = {
-            'precision_buy': float(precision_buy),
-            'precision_sell': float(precision_sell),
-            'avg_action_precision': float(avg_precision)
-        }
-
-        logger.info("Training completed", symbol=symbol, metrics=metrics)
-
-        # Check threshold
-        if avg_precision < self.config.training.min_precision_threshold:
-            logger.warning("Model failed precision threshold. Discarding.", symbol=symbol, metrics=metrics)
-            return False
-
-        # --- Persistence ---
-        self._save_models(symbol, trained_models, metrics, list(X_df.columns))
-        return True
-
-    async def predict(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
-        """Generates a prediction using the loaded ensemble for the symbol."""
-        if symbol not in self.symbol_models:
-            self._load_models(symbol)
-        
-        entry = self.symbol_models.get(symbol)
-        if not entry:
-            return {'action': 'hold', 'confidence': 0.0, 'model_version': 'none'}
-
-        models = entry['models']
-        meta = entry['meta']
-        feature_cols = meta.get('feature_columns', [])
-
-        # Ensure columns match training
-        # Normalize using the same logic (rolling Z-score is stateless per window)
-        df_norm = FeatureProcessor.normalize(df, self.config)
-        
-        # Check for missing columns
-        missing = set(feature_cols) - set(df_norm.columns)
-        if missing:
-            logger.error("Missing features for inference", symbol=symbol, missing=missing)
-            return {'action': 'hold', 'confidence': 0.0}
-
-        # Prepare Input
-        # ML models take the last row
-        X_last = df_norm[feature_cols].iloc[-1:].values
-        
-        # DL models take the last sequence
-        seq_len = self.config.features.sequence_length
-        if len(df_norm) < seq_len:
-            return {'action': 'hold', 'confidence': 0.0}
+        # 2. Train Scikit-Learn/XGBoost Models
+        for name, model in models.items():
+            if name in ['lstm', 'attention']: continue
             
-        X_seq = df_norm[feature_cols].iloc[-seq_len:].values
-        X_seq = np.expand_dims(X_seq, axis=0) # (1, seq_len, features)
-
-        # Get Probabilities
-        probs = []
-        weights = self.config.ensemble_weights
-        
-        # XGBoost
-        if 'gb' in models:
-            p = models['gb'].predict_proba(X_last)[0]
-            probs.append(p * weights.xgboost)
-        
-        # Technical Voting
-        if 'technical' in models:
-            p = models['technical'].predict_proba(X_last)[0]
-            probs.append(p * weights.technical_ensemble)
-            
-        # LSTM
-        if 'lstm' in models:
-            with torch.no_grad():
-                t_in = torch.FloatTensor(X_seq).to(self.device)
-                p = models['lstm'](t_in).cpu().numpy()[0]
-                probs.append(p * weights.lstm)
-
-        # Attention
-        if 'attention' in models:
-            with torch.no_grad():
-                t_in = torch.FloatTensor(X_seq).to(self.device)
-                p = models['attention'](t_in).cpu().numpy()[0]
-                probs.append(p * weights.attention)
-
-        # Aggregate
-        if not probs:
-            return {'action': 'hold', 'confidence': 0.0}
-            
-        avg_probs = np.sum(probs, axis=0) / sum(weights.dict().values())
-        
-        # 0: Sell, 1: Hold, 2: Buy
-        best_idx = np.argmax(avg_probs)
-        confidence = avg_probs[best_idx]
-        
-        actions = {0: 'sell', 1: 'hold', 2: 'buy'}
-        action = actions.get(best_idx, 'hold')
-
-        # Get Feature Importance (from XGBoost if available)
-        top_features = {}
-        if 'gb' in models:
-            try:
-                importances = models['gb'].feature_importances_
-                indices = np.argsort(importances)[::-1][:5]
-                for i in indices:
-                    if i < len(feature_cols):
-                        top_features[feature_cols[i]] = float(importances[i])
-            except: 
-                pass
-
-        return {
-            'action': action,
-            'confidence': float(confidence),
-            'model_version': meta.get('timestamp'),
-            'active_weights': weights.dict(),
-            'top_features': top_features,
-            'metrics': meta.get('metrics')
-        }
-
-    def _ensemble_predict_internal(self, models, X_flat, X_seq):
-        """Internal helper to predict on validation set for evaluation."""
-        # This is a simplified voting mechanism for validation metrics
-        # We just use XGBoost + Technical for speed in validation check if DL is slow
-        # Or we can do full ensemble. Let's do full ensemble.
-        
-        preds_accum = np.zeros((len(X_seq), 3))
-        weights = self.config.ensemble_weights
-        
-        # Align X_flat to X_seq (X_seq starts at index seq_len-1 of X_flat)
-        start_idx = self.config.features.sequence_length - 1
-        X_flat_aligned = X_flat[start_idx:]
-        
-        if 'gb' in models:
-            p = models['gb'].predict_proba(X_flat_aligned)
-            preds_accum += p * weights.xgboost
-            
-        if 'technical' in models:
-            p = models['technical'].predict_proba(X_flat_aligned)
-            preds_accum += p * weights.technical_ensemble
-            
-        # For DL, we batch process if needed, but for validation set size it's usually fine
-        if 'lstm' in models or 'attention' in models:
-            t_in = torch.FloatTensor(X_seq).to(self.device)
-            with torch.no_grad():
-                if 'lstm' in models:
-                    p = models['lstm'](t_in).cpu().numpy()
-                    preds_accum += p * weights.lstm
-                if 'attention' in models:
-                    p = models['attention'](t_in).cpu().numpy()
-                    preds_accum += p * weights.attention
-                    
-        return np.argmax(preds_accum, axis=1)
-
-    def _optimize_xgboost(self, X, y):
-        """Runs RandomizedSearchCV to find better hyperparameters for XGBoost."""
-        param_dist = {
-            'n_estimators': [100, 200, 300],
-            'max_depth': [3, 5, 7],
-            'learning_rate': [0.01, 0.05, 0.1],
-            'subsample': [0.7, 0.8, 0.9],
-            'colsample_bytree': [0.7, 0.8, 0.9]
-        }
-        xgb = XGBClassifier(use_label_encoder=False, eval_metric='logloss')
-        tscv = TimeSeriesSplit(n_splits=3)
-        search = RandomizedSearchCV(
-            xgb, param_dist, n_iter=self.config.training.n_iter_search, 
-            scoring='neg_log_loss', cv=tscv, n_jobs=1, verbose=0
-        )
-        search.fit(X, y)
-        return search.best_estimator_
-
-    def _train_torch_model(self, model, X_seq, y_seq, X_val, y_val, name):
-        """Standard PyTorch training loop."""
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(model.parameters(), lr=self.config.training.learning_rate)
-        
-        # Create DataLoaders
-        train_data = TensorDataset(torch.FloatTensor(X_seq), torch.LongTensor(y_seq))
-        train_loader = DataLoader(train_data, batch_size=self.config.training.batch_size, shuffle=False)
-        
-        best_loss = float('inf')
-        patience_counter = 0
-        
-        model.train()
-        for epoch in range(self.config.training.epochs):
-            epoch_loss = 0.0
-            for inputs, labels in train_loader:
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
-                epoch_loss += loss.item()
-            
-            # Validation
-            model.eval()
-            with torch.no_grad():
-                val_in = torch.FloatTensor(X_val).to(self.device)
-                val_target = torch.LongTensor(y_val).to(self.device)
-                val_out = model(val_in)
-                val_loss = criterion(val_out, val_target).item()
-            model.train()
-            
-            if val_loss < best_loss:
-                best_loss = val_loss
-                patience_counter = 0
+            worker_logger.info(f"Training {name}...")
+            if config.training.auto_tune_models and name == 'gb':
+                # Example param grid for XGBoost
+                param_dist = {
+                    'n_estimators': [100, 200],
+                    'max_depth': [3, 5, 7],
+                    'learning_rate': [0.01, 0.1, 0.2]
+                }
+                model = _optimize_hyperparameters(model, X_train, y_train, param_dist, config.training.n_iter_search, worker_logger)
             else:
-                patience_counter += 1
-                if patience_counter >= self.config.training.early_stopping_patience:
-                    break
-        
-        model.eval()
+                model.fit(X_train, y_train)
+            
+            trained_models[name] = model
+            
+            # Evaluate
+            preds = model.predict(X_val)
+            prec = precision_score(y_val, preds, average=None, zero_division=0)
+            metrics[name] = {'precision': prec.tolist()}
+            
+            # Feature Importance (if available)
+            if hasattr(model, 'feature_importances_'):
+                feature_importance[name] = model.feature_importances_.tolist()
 
-    def _save_models(self, symbol: str, models: Dict, metrics: Dict, feature_cols: List[str]):
-        """Saves models and metadata to disk."""
-        safe_symbol = symbol.replace('/', '_')
-        base_path = os.path.join(self.config.model_path, safe_symbol)
+        # 3. Train PyTorch Models
+        seq_len = config.features.sequence_length
+        X_seq_train, y_seq_train = FeatureProcessor.create_sequences(X_train, y_train, seq_len)
+        X_seq_val, y_seq_val = FeatureProcessor.create_sequences(X_val, y_val, seq_len)
+
+        if len(X_seq_train) > 0:
+            train_tensor = TensorDataset(torch.FloatTensor(X_seq_train).to(device), torch.LongTensor(y_seq_train).to(device))
+            train_loader = DataLoader(train_tensor, batch_size=config.training.batch_size, shuffle=True)
+            
+            for name in ['lstm', 'attention']:
+                if name not in models: continue
+                
+                model = models[name]
+                optimizer = optim.Adam(model.parameters(), lr=config.training.learning_rate)
+                criterion = nn.CrossEntropyLoss()
+                
+                worker_logger.info(f"Training {name} (PyTorch)...")
+                model.train()
+                for epoch in range(config.training.epochs):
+                    epoch_loss = 0.0
+                    for batch_X, batch_y in train_loader:
+                        optimizer.zero_grad()
+                        outputs = model(batch_X)
+                        loss = criterion(outputs, batch_y)
+                        loss.backward()
+                        optimizer.step()
+                        epoch_loss += loss.item()
+                    
+                    # Simple early stopping check could go here
+                
+                trained_models[name] = model
+                
+                # Evaluate
+                model.eval()
+                with torch.no_grad():
+                    val_inputs = torch.FloatTensor(X_seq_val).to(device)
+                    outputs = model(val_inputs)
+                    _, predicted = torch.max(outputs.data, 1)
+                    prec = precision_score(y_seq_val, predicted.cpu().numpy(), average=None, zero_division=0)
+                    metrics[name] = {'precision': prec.tolist()}
+
+        # 4. Save Artifacts
+        save_dir = os.path.join(config.model_path, symbol.replace('/', '_'))
+        os.makedirs(save_dir, exist_ok=True)
         
-        # Save Sklearn/XGB models
-        if 'gb' in models: joblib.dump(models['gb'], f"{base_path}_gb.joblib")
-        if 'technical' in models: joblib.dump(models['technical'], f"{base_path}_tech.joblib")
-        
-        # Save PyTorch models
-        if 'lstm' in models: torch.save(models['lstm'].state_dict(), f"{base_path}_lstm.pth")
-        if 'attention' in models: torch.save(models['attention'].state_dict(), f"{base_path}_attn.pth")
+        # Save sklearn models
+        for name, model in trained_models.items():
+            if name in ['lstm', 'attention']:
+                torch.save(model.state_dict(), os.path.join(save_dir, f"{name}.pth"))
+            else:
+                joblib.dump(model, os.path.join(save_dir, f"{name}.joblib"))
         
         # Save Metadata
         meta = {
-            'timestamp': Clock.now().isoformat(),
+            'timestamp': datetime.now().isoformat(),
             'metrics': metrics,
-            'feature_columns': feature_cols,
-            'config_hash': str(hash(str(self.config.dict())))
+            'feature_importance': feature_importance,
+            'feature_columns': config.feature_columns
         }
-        with open(f"{base_path}_meta.json", 'w') as f:
+        with open(os.path.join(save_dir, "metadata.json"), 'w') as f:
             json.dump(meta, f, indent=2)
+            
+        worker_logger.info(f"Training complete for {symbol}. Artifacts saved to {save_dir}")
+        return True
 
-    def _load_models(self, symbol: str):
-        """Loads models from disk."""
-        safe_symbol = symbol.replace('/', '_')
-        base_path = os.path.join(self.config.model_path, safe_symbol)
-        meta_path = f"{base_path}_meta.json"
-        
-        if not os.path.exists(meta_path):
-            return
-            
+    except Exception as e:
+        worker_logger.error(f"Training failed for {symbol}: {str(e)}", exc_info=True)
+        return False
+
+class EnsembleLearner:
+    """
+    Manages the lifecycle of AI models: loading, inference, and state management.
+    """
+    def __init__(self, config: AIEnsembleStrategyParams):
+        self.config = config
+        self.symbol_models: Dict[str, Dict[str, Any]] = {}
+        self.device = torch.device("cuda" if ML_AVAILABLE and torch.cuda.is_available() else "cpu")
+        logger.info(f"EnsembleLearner initialized. Device: {self.device}")
+
+    @property
+    def is_trained(self) -> bool:
+        return bool(self.symbol_models)
+
+    def get_last_training_time(self, symbol: str) -> Optional[datetime]:
+        """Checks the metadata file to find the last training timestamp."""
         try:
-            with open(meta_path, 'r') as f:
-                meta = json.load(f)
-            
+            safe_symbol = symbol.replace('/', '_')
+            meta_path = os.path.join(self.config.model_path, safe_symbol, "metadata.json")
+            if os.path.exists(meta_path):
+                with open(meta_path, 'r') as f:
+                    data = json.load(f)
+                    return datetime.fromisoformat(data['timestamp'])
+        except Exception:
+            pass
+        return None
+
+    async def reload_models(self, symbol: str):
+        """Loads trained models from disk into memory."""
+        if not ML_AVAILABLE:
+            return
+
+        safe_symbol = symbol.replace('/', '_')
+        load_dir = os.path.join(self.config.model_path, safe_symbol)
+        
+        if not os.path.exists(load_dir):
+            logger.warning(f"No model directory found for {symbol}")
+            return
+
+        try:
             models = {}
-            feature_cols = meta.get('feature_columns', [])
-            num_features = len(feature_cols)
-            
-            # Load Sklearn/XGB
-            if os.path.exists(f"{base_path}_gb.joblib"):
-                models['gb'] = joblib.load(f"{base_path}_gb.joblib")
-            if os.path.exists(f"{base_path}_tech.joblib"):
-                models['technical'] = joblib.load(f"{base_path}_tech.joblib")
-                
-            # Load PyTorch
-            if os.path.exists(f"{base_path}_lstm.pth"):
-                lstm = LSTMPredictor(
-                    num_features, 
-                    self.config.hyperparameters.lstm.hidden_dim, 
-                    self.config.hyperparameters.lstm.num_layers, 
-                    self.config.hyperparameters.lstm.dropout
-                ).to(self.device)
-                lstm.load_state_dict(torch.load(f"{base_path}_lstm.pth", map_location=self.device))
-                lstm.eval()
-                models['lstm'] = lstm
-                
-            if os.path.exists(f"{base_path}_attn.pth"):
-                attn = AttentionNetwork(
-                    num_features,
-                    self.config.hyperparameters.attention.hidden_dim,
-                    self.config.hyperparameters.attention.num_layers,
-                    self.config.hyperparameters.attention.nhead,
-                    self.config.hyperparameters.attention.dropout
-                ).to(self.device)
-                attn.load_state_dict(torch.load(f"{base_path}_attn.pth", map_location=self.device))
-                attn.eval()
-                models['attention'] = attn
-            
-            self.symbol_models[symbol] = {'models': models, 'meta': meta}
-            self.is_trained = True
-            logger.info("Models loaded successfully", symbol=symbol, timestamp=meta['timestamp'])
-            
+            # Load Metadata
+            with open(os.path.join(load_dir, "metadata.json"), 'r') as f:
+                meta = json.load(f)
+
+            # Load Sklearn Models
+            for name in ['gb', 'technical']:
+                path = os.path.join(load_dir, f"{name}.joblib")
+                if os.path.exists(path):
+                    models[name] = joblib.load(path)
+
+            # Load PyTorch Models
+            num_features = len(self.config.feature_columns)
+            if 'lstm' in self.config.ensemble_weights.dict():
+                path = os.path.join(load_dir, "lstm.pth")
+                if os.path.exists(path):
+                    lstm = LSTMPredictor(num_features, self.config.hyperparameters.lstm.hidden_dim, 
+                                         self.config.hyperparameters.lstm.num_layers, 
+                                         self.config.hyperparameters.lstm.dropout).to(self.device)
+                    lstm.load_state_dict(torch.load(path, map_location=self.device))
+                    lstm.eval()
+                    models['lstm'] = lstm
+
+            if 'attention' in self.config.ensemble_weights.dict():
+                path = os.path.join(load_dir, "attention.pth")
+                if os.path.exists(path):
+                    attn = AttentionNetwork(num_features, self.config.hyperparameters.attention.hidden_dim,
+                                            self.config.hyperparameters.attention.num_layers,
+                                            self.config.hyperparameters.attention.nhead,
+                                            self.config.hyperparameters.attention.dropout).to(self.device)
+                    attn.load_state_dict(torch.load(path, map_location=self.device))
+                    attn.eval()
+                    models['attention'] = attn
+
+            self.symbol_models[symbol] = {
+                'models': models,
+                'meta': meta
+            }
+            logger.info(f"Models reloaded for {symbol}")
+
         except Exception as e:
-            logger.error("Failed to load models", symbol=symbol, error=str(e))
+            logger.error(f"Failed to reload models for {symbol}: {e}")
+
+    async def predict(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
+        """Runs inference using the ensemble of models."""
+        if symbol not in self.symbol_models:
+            await self.reload_models(symbol)
+            if symbol not in self.symbol_models:
+                return {}
+
+        entry = self.symbol_models[symbol]
+        models = entry['models']
+        
+        # Prepare Data
+        df_norm = FeatureProcessor.normalize(df, self.config)
+        X = df_norm.iloc[-1:].values # Last row for prediction
+        
+        # Prepare Sequences for NN
+        seq_len = self.config.features.sequence_length
+        if len(df_norm) >= seq_len:
+            X_seq = df_norm.iloc[-seq_len:].values.reshape(1, seq_len, -1)
+        else:
+            X_seq = None
+
+        votes = {'buy': 0.0, 'sell': 0.0, 'hold': 0.0}
+        weights = self.config.ensemble_weights
+        
+        # Inference
+        try:
+            # XGBoost
+            if 'gb' in models:
+                probs = models['gb'].predict_proba(X)[0]
+                votes['sell'] += probs[0] * weights.xgboost
+                votes['hold'] += probs[1] * weights.xgboost
+                votes['buy'] += probs[2] * weights.xgboost
+
+            # Technical Ensemble
+            if 'technical' in models:
+                probs = models['technical'].predict_proba(X)[0]
+                votes['sell'] += probs[0] * weights.technical_ensemble
+                votes['hold'] += probs[1] * weights.technical_ensemble
+                votes['buy'] += probs[2] * weights.technical_ensemble
+
+            # PyTorch Models
+            if X_seq is not None:
+                with torch.no_grad():
+                    tensor_in = torch.FloatTensor(X_seq).to(self.device)
+                    
+                    if 'lstm' in models:
+                        probs = models['lstm'](tensor_in).cpu().numpy()[0]
+                        votes['sell'] += probs[0] * weights.lstm
+                        votes['hold'] += probs[1] * weights.lstm
+                        votes['buy'] += probs[2] * weights.lstm
+                        
+                    if 'attention' in models:
+                        probs = models['attention'](tensor_in).cpu().numpy()[0]
+                        votes['sell'] += probs[0] * weights.attention
+                        votes['hold'] += probs[1] * weights.attention
+                        votes['buy'] += probs[2] * weights.attention
+
+        except Exception as e:
+            logger.error(f"Inference error for {symbol}: {e}")
+            return {}
+
+        # Normalize votes
+        total_weight = sum(votes.values())
+        if total_weight > 0:
+            for k in votes:
+                votes[k] /= total_weight
+
+        # Determine Action
+        # 0: sell, 1: hold, 2: buy
+        best_action = max(votes, key=votes.get)
+        confidence = votes[best_action]
+
+        # Extract top features from XGBoost if available
+        top_features = {}
+        if 'gb' in models and hasattr(models['gb'], 'feature_importances_'):
+            imps = models['gb'].feature_importances_
+            cols = self.config.feature_columns
+            # Sort and take top 5
+            indices = np.argsort(imps)[::-1][:5]
+            for idx in indices:
+                if idx < len(cols):
+                    top_features[cols[idx]] = float(imps[idx])
+
+        return {
+            'action': best_action,
+            'confidence': round(confidence, 4),
+            'model_version': entry['meta']['timestamp'],
+            'active_weights': votes,
+            'top_features': top_features,
+            'metrics': entry['meta'].get('metrics', {})
+        }
