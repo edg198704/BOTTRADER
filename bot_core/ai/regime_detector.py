@@ -22,12 +22,14 @@ class MarketRegimeDetector:
         logger.info("MarketRegimeDetector initialized.", 
                     trend_fast=config.market_regime.trend_fast_ma_col,
                     trend_slow=config.market_regime.trend_slow_ma_col,
-                    use_adx=config.market_regime.use_adx_filter)
+                    use_adx=config.market_regime.use_adx_filter,
+                    efficiency_period=config.market_regime.efficiency_period)
 
     def add_regime_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Calculates continuous regime metrics and adds them as columns to the DataFrame.
-        These features (regime_trend, regime_volatility) are injected into the AI model's feature set.
+        These features (regime_trend, regime_volatility, regime_efficiency) are injected 
+        into the AI model's feature set.
         """
         if df is None or df.empty:
             return df
@@ -40,27 +42,36 @@ class MarketRegimeDetector:
         vol_col = mr_config.volatility_col
         
         # 1. Trend Feature: (Fast - Slow) / Slow
-        # Positive = Bullish, Negative = Bearish, Magnitude = Strength
         if fast_ma_col in df.columns and slow_ma_col in df.columns:
             slow_ma = df[slow_ma_col].replace(0, np.nan)
             df['regime_trend'] = (df[fast_ma_col] - slow_ma) / slow_ma
         else:
-            # Fallback if columns missing (e.g. during warmup)
             df['regime_trend'] = 0.0
             
         # 2. Volatility Feature: Current / Avg(50)
-        # > 1.0 means volatility is expanding, < 1.0 means contracting
         if vol_col in df.columns:
-            # Use a rolling mean for average volatility baseline
             avg_vol = df[vol_col].rolling(window=50, min_periods=1).mean()
             avg_vol = avg_vol.replace(0, np.nan)
             df['regime_volatility'] = df[vol_col] / avg_vol
         else:
             df['regime_volatility'] = 1.0
+
+        # 3. Efficiency Feature (Kaufman Efficiency Ratio)
+        # KER = Abs(Change) / Sum(Abs(Diff))
+        # Measures signal-to-noise. 1.0 = Perfect Trend, ~0.0 = Pure Noise.
+        period = mr_config.efficiency_period
+        if 'close' in df.columns:
+            change = df['close'].diff(period).abs()
+            volatility = df['close'].diff(1).abs().rolling(window=period).sum()
             
-        # Fill NaNs that might result from rolling windows or division
-        # We use 0.0 for trend (neutral) and 1.0 for volatility (average)
-        values = {'regime_trend': 0.0, 'regime_volatility': 1.0}
+            # Avoid division by zero
+            volatility = volatility.replace(0, np.nan)
+            df['regime_efficiency'] = change / volatility
+        else:
+            df['regime_efficiency'] = 0.5 # Neutral fallback
+            
+        # Fill NaNs
+        values = {'regime_trend': 0.0, 'regime_volatility': 1.0, 'regime_efficiency': 0.5}
         return df.fillna(value=values)
 
     async def detect_regime(self, symbol: str, df: pd.DataFrame) -> Dict[str, Any]:
@@ -76,68 +87,66 @@ class MarketRegimeDetector:
         rsi_col = mr_config.rsi_col
 
         try:
-            # Use pre-calculated features if they exist (optimization)
-            if 'regime_trend' in df.columns and 'regime_volatility' in df.columns:
+            # Use pre-calculated features if they exist
+            if {'regime_trend', 'regime_volatility', 'regime_efficiency'}.issubset(df.columns):
                 trend_strength = df['regime_trend'].iloc[-1]
                 vol_ratio = df['regime_volatility'].iloc[-1]
+                efficiency = df['regime_efficiency'].iloc[-1]
             else:
-                # Fallback to manual calculation for the last row
-                fast_ma_col = mr_config.trend_fast_ma_col
-                slow_ma_col = mr_config.trend_slow_ma_col
-                vol_col = mr_config.volatility_col
-                
-                fast_ma = df[fast_ma_col].iloc[-1] if fast_ma_col in df.columns else 0
-                slow_ma = df[slow_ma_col].iloc[-1] if slow_ma_col in df.columns else 1
+                # Fallback calculation (simplified)
+                fast_ma = df[mr_config.trend_fast_ma_col].iloc[-1] if mr_config.trend_fast_ma_col in df.columns else 0
+                slow_ma = df[mr_config.trend_slow_ma_col].iloc[-1] if mr_config.trend_slow_ma_col in df.columns else 1
                 trend_strength = (fast_ma - slow_ma) / slow_ma if slow_ma > 0 else 0
-                
-                vol_ratio = 1.0
-                if vol_col in df.columns:
-                    current_vol = df[vol_col].iloc[-1]
-                    avg_vol = df[vol_col].rolling(50).mean().iloc[-1]
-                    if avg_vol > 0:
-                        vol_ratio = current_vol / avg_vol
+                vol_ratio = 1.0 # Simplified
+                efficiency = 0.5 # Simplified
 
             # --- Determine Thresholds (Adaptive vs Static) ---
             trend_thresh = mr_config.trend_strength_threshold
             vol_thresh = mr_config.volatility_multiplier
+            eff_thresh = mr_config.efficiency_threshold
 
             if mr_config.use_dynamic_thresholds and len(df) >= mr_config.dynamic_window:
-                # Calculate dynamic thresholds based on historical distribution
                 window = df.iloc[-mr_config.dynamic_window:]
                 
-                # Trend Strength: We care about magnitude (abs value)
                 if 'regime_trend' in window.columns:
                     trend_series = window['regime_trend'].abs()
-                    # e.g., 75th percentile of absolute trend strength
                     calc_trend_thresh = trend_series.quantile(mr_config.trend_percentile)
-                    # Ensure we don't get a near-zero threshold in flat markets
                     trend_thresh = max(calc_trend_thresh, 0.001)
                 
-                # Volatility Ratio
                 if 'regime_volatility' in window.columns:
                     vol_series = window['regime_volatility']
-                    # e.g., 80th percentile of volatility ratio
                     vol_thresh = vol_series.quantile(mr_config.volatility_percentile)
 
             # --- Regime Classification ---
             regime = MarketRegime.SIDEWAYS
             confidence = 0.0
             
-            # 1. ADX Check (Priority)
-            adx_forced_sideways = False
+            # 1. ADX Filter (Priority 1)
+            forced_sideways = False
             if mr_config.use_adx_filter and mr_config.adx_col in df.columns:
                 adx_val = df[mr_config.adx_col].iloc[-1]
                 if adx_val < mr_config.adx_threshold:
                     regime = MarketRegime.SIDEWAYS
-                    adx_forced_sideways = True
-                    # Confidence is higher if ADX is significantly below threshold
-                    # e.g. Thresh 25, ADX 10 -> (25-10)/25 = 0.6 base confidence
+                    forced_sideways = True
                     confidence = min(1.0, (mr_config.adx_threshold - adx_val) / mr_config.adx_threshold)
-                    # Boost confidence for sideways
                     confidence = 0.5 + (confidence * 0.5)
 
-            # 2. Standard Logic (if not forced by ADX)
-            if not adx_forced_sideways:
+            # 2. Efficiency Filter (Priority 2)
+            # If efficiency is low, it's choppy/noisy regardless of trend strength
+            if not forced_sideways:
+                if efficiency < eff_thresh:
+                    # Low efficiency = Chop or Volatile
+                    if vol_ratio > vol_thresh:
+                        regime = MarketRegime.VOLATILE
+                    else:
+                        regime = MarketRegime.SIDEWAYS
+                    
+                    forced_sideways = True
+                    # Confidence based on how inefficient it is
+                    confidence = min(1.0, (eff_thresh - efficiency) / eff_thresh)
+
+            # 3. Standard Trend/Vol Logic (Priority 3)
+            if not forced_sideways:
                 is_volatile = vol_ratio > vol_thresh
                 
                 if is_volatile:
@@ -150,19 +159,16 @@ class MarketRegimeDetector:
                     regime = MarketRegime.SIDEWAYS
 
                 # --- Confidence Calculation ---
-                # RSI (Momentum) Check
                 rsi_val = df[rsi_col].iloc[-1] if rsi_col in df.columns else 50
-                
-                # Normalize trend confidence relative to the threshold used
                 trend_conf = min(1.0, abs(trend_strength) / (trend_thresh * 2)) if trend_thresh > 0 else 0.0
                 rsi_conf = abs(rsi_val - 50) / 50
                 
-                confidence = (trend_conf * 0.7) + (rsi_conf * 0.3)
+                confidence = (trend_conf * 0.6) + (rsi_conf * 0.2) + (efficiency * 0.2)
             
             result = {
                 'regime': regime.value, 
                 'confidence': round(confidence, 2),
-                'thresholds': {'trend': round(trend_thresh, 5), 'vol': round(vol_thresh, 3)}
+                'thresholds': {'trend': round(trend_thresh, 5), 'vol': round(vol_thresh, 3), 'eff': round(eff_thresh, 2)}
             }
             logger.debug("Market regime detected", symbol=symbol, result=result)
             return result
