@@ -2,6 +2,7 @@ import os
 import joblib
 import json
 import logging
+import shutil
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, Tuple, Optional, List
@@ -321,30 +322,50 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 worker_logger.warning(f"Model rejected: Sharpe {sharpe:.4f} < {config.training.min_sharpe_ratio}")
                 return False
 
-        # 5. Save Artifacts
-        save_dir = os.path.join(config.model_path, symbol.replace('/', '_'))
-        os.makedirs(save_dir, exist_ok=True)
+        # 5. Atomic Save Artifacts
+        safe_symbol = symbol.replace('/', '_')
+        final_dir = os.path.join(config.model_path, safe_symbol)
+        temp_dir = os.path.join(config.model_path, f"{safe_symbol}_temp")
         
-        # Save sklearn models
-        for name, model in trained_models.items():
-            if name in ['lstm', 'attention']:
-                torch.save(model.state_dict(), os.path.join(save_dir, f"{name}.pth"))
-            else:
-                joblib.dump(model, os.path.join(save_dir, f"{name}.joblib"))
+        # Clean up any existing temp dir
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        os.makedirs(temp_dir, exist_ok=True)
         
-        # Save Metadata
-        meta = {
-            'timestamp': datetime.now().isoformat(),
-            'metrics': metrics,
-            'feature_importance': feature_importance,
-            'feature_columns': config.feature_columns,
-            'num_features': num_features # Save this to ensure correct loading
-        }
-        with open(os.path.join(save_dir, "metadata.json"), 'w') as f:
-            json.dump(meta, f, indent=2)
+        try:
+            # Save sklearn models
+            for name, model in trained_models.items():
+                if name in ['lstm', 'attention']:
+                    torch.save(model.state_dict(), os.path.join(temp_dir, f"{name}.pth"))
+                else:
+                    joblib.dump(model, os.path.join(temp_dir, f"{name}.joblib"))
             
-        worker_logger.info(f"Training complete for {symbol}. Artifacts saved to {save_dir}")
-        return True
+            # Save Metadata
+            meta = {
+                'timestamp': datetime.now().isoformat(),
+                'metrics': metrics,
+                'feature_importance': feature_importance,
+                'feature_columns': config.feature_columns,
+                'num_features': num_features # Save this to ensure correct loading
+            }
+            with open(os.path.join(temp_dir, "metadata.json"), 'w') as f:
+                json.dump(meta, f, indent=2)
+            
+            # Atomic Swap
+            if os.path.exists(final_dir):
+                shutil.rmtree(final_dir)
+            
+            # Rename temp to final
+            os.rename(temp_dir, final_dir)
+            
+            worker_logger.info(f"Training complete for {symbol}. Artifacts saved atomically to {final_dir}")
+            return True
+            
+        except Exception as e:
+            worker_logger.error(f"Failed to save artifacts for {symbol}: {e}")
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+            return False
 
     except Exception as e:
         worker_logger.error(f"Training failed for {symbol}: {str(e)}", exc_info=True)
@@ -578,16 +599,8 @@ class EnsembleLearner:
         top_features = {}
         if 'gb' in models and hasattr(models['gb'], 'feature_importances_'):
             imps = models['gb'].feature_importances_
-            # We need to map these back to feature names (base + lags)
-            # Reconstruct feature names
-            cols = self.config.feature_columns.copy()
-            lags = self.config.features.lag_features
-            depth = self.config.features.lag_depth
-            if depth > 0 and lags:
-                for col in lags:
-                    if col in cols:
-                        for i in range(1, depth + 1):
-                            cols.append(f"{col}_lag_{i}")
+            # Use the centralized feature name generator to ensure alignment
+            cols = FeatureProcessor.get_feature_names(self.config)
             
             # Sort and take top 5
             indices = np.argsort(imps)[::-1][:5]
