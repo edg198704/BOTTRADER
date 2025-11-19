@@ -1,9 +1,10 @@
 import datetime
 import asyncio
 import enum
-from typing import List, Optional, Dict, TYPE_CHECKING
+import json
+from typing import List, Optional, Dict, Any, TYPE_CHECKING
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLAlchemyEnum, func, Boolean, cast, Date
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLAlchemyEnum, func, Boolean, cast, Date, text, inspect
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 from bot_core.logger import get_logger
@@ -38,6 +39,8 @@ class Position(Base):
     # trailing_ref_price tracks peak price for longs, and trough price for shorts
     trailing_ref_price = Column(Float, nullable=True)
     trailing_stop_active = Column(Boolean, default=False, nullable=False)
+    # Stores JSON context about the strategy decision (model version, confidence, etc.)
+    strategy_metadata = Column(String, nullable=True)
 
 class PortfolioState(Base):
     __tablename__ = 'portfolio_state'
@@ -50,6 +53,7 @@ class PositionManager:
     def __init__(self, config: DatabaseConfig, initial_capital: float, alert_system: Optional['AlertSystem'] = None):
         self.engine = create_engine(f'sqlite:///{config.path}')
         Base.metadata.create_all(self.engine)
+        self._ensure_schema_updates()
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
         self._initial_capital = initial_capital
         self._realized_pnl = 0.0
@@ -57,6 +61,19 @@ class PositionManager:
         # Lock to serialize DB access across async tasks to prevent SQLite locking errors
         self._db_lock = asyncio.Lock()
         logger.info("PositionManager initialized and database table created.")
+
+    def _ensure_schema_updates(self):
+        """Checks for missing columns and updates schema if necessary (SQLite migration)."""
+        try:
+            insp = inspect(self.engine)
+            if insp.has_table('positions'):
+                columns = [c['name'] for c in insp.get_columns('positions')]
+                if 'strategy_metadata' not in columns:
+                    with self.engine.connect() as conn:
+                        conn.execute(text("ALTER TABLE positions ADD COLUMN strategy_metadata TEXT"))
+                        logger.info("Schema updated: Added strategy_metadata column to positions table.")
+        except Exception as e:
+            logger.warning(f"Schema update check failed: {e}")
 
     async def initialize(self):
         """Calculates initial realized PnL and ensures portfolio state exists."""
@@ -141,11 +158,11 @@ class PositionManager:
 
     # --- Pending Position Management (Two-Phase Commit) ---
 
-    async def create_pending_position(self, symbol: str, side: str, order_id: str) -> Optional[Position]:
+    async def create_pending_position(self, symbol: str, side: str, order_id: str, strategy_metadata: Optional[Dict[str, Any]] = None) -> Optional[Position]:
         async with self._db_lock:
-            return await self._run_in_executor(self._create_pending_position_sync, symbol, side, order_id)
+            return await self._run_in_executor(self._create_pending_position_sync, symbol, side, order_id, strategy_metadata)
 
-    def _create_pending_position_sync(self, symbol: str, side: str, order_id: str) -> Optional[Position]:
+    def _create_pending_position_sync(self, symbol: str, side: str, order_id: str, strategy_metadata: Optional[Dict[str, Any]]) -> Optional[Position]:
         session = self.SessionLocal()
         try:
             # Check for existing open or pending positions to prevent duplicates
@@ -158,6 +175,8 @@ class PositionManager:
                 logger.warning("Cannot create pending position: Active position already exists.", symbol=symbol, status=existing.status)
                 return None
 
+            metadata_json = json.dumps(strategy_metadata) if strategy_metadata else None
+
             new_position = Position(
                 symbol=symbol,
                 side=side,
@@ -166,7 +185,8 @@ class PositionManager:
                 status=PositionStatus.PENDING,
                 order_id=order_id,
                 trailing_ref_price=0.0,
-                trailing_stop_active=False
+                trailing_stop_active=False,
+                strategy_metadata=metadata_json
             )
             session.add(new_position)
             session.commit()
