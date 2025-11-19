@@ -28,12 +28,21 @@ class EnsembleWeightsConfig(BaseModel):
     use_stacking: bool = True
 
 class MarketRegimeConfig(BaseModel):
+    # Static Fallbacks
     trend_strength_threshold: float = 0.015
     volatility_multiplier: float = 1.5
+    
+    # Column Mappings
     trend_fast_ma_col: str = "sma_fast"
     trend_slow_ma_col: str = "sma_slow"
     volatility_col: str = "atr"
     rsi_col: str = "rsi"
+    
+    # --- Adaptive Regime Settings ---
+    use_dynamic_thresholds: bool = False
+    dynamic_window: int = 500
+    trend_percentile: float = 0.75 # Top 25% of absolute trend values define a trend
+    volatility_percentile: float = 0.80 # Top 20% of volatility values define volatile regime
     
     # --- Dynamic Confidence Thresholds (Entry) ---
     bull_confidence_threshold: Optional[float] = None
