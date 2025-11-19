@@ -40,10 +40,16 @@ class MarketRegimeConfig(BaseModel):
     volatility_col: str = "atr"
     rsi_col: str = "rsi"
     
-    # --- ADX Filter Settings (New) ---
+    # --- ADX Filter Settings ---
     use_adx_filter: bool = False
     adx_col: str = "adx"
     adx_threshold: float = 25.0
+
+    # --- Efficiency Filter Settings (New) ---
+    # Kaufman Efficiency Ratio (KER): Change / Volatility
+    # High values (>0.3) indicate smooth trends. Low values indicate chop.
+    efficiency_period: int = 10
+    efficiency_threshold: float = 0.3
     
     # --- Adaptive Regime Settings ---
     use_dynamic_thresholds: bool = False
@@ -70,7 +76,7 @@ class AITrainingConfig(BaseModel):
     early_stopping_patience: int = 5
     validation_split: float = Field(0.15, ge=0.0, lt=1.0)
     min_precision_threshold: float = Field(0.5, ge=0.0, le=1.0)
-    # --- Profitability Gates (New) ---
+    # --- Profitability Gates ---
     min_profit_factor: float = 1.05 # Require positive expectancy (Gross Profit / Gross Loss)
     min_sharpe_ratio: float = 0.05 # Require slightly positive risk-adjusted return
     min_improvement_pct: float = 0.02 # Require 2% improvement over previous model to replace it
@@ -80,8 +86,6 @@ class AITrainingConfig(BaseModel):
     n_iter_search: int = 10
     # --- Data Handling ---
     use_class_weighting: bool = True
-    # --- Probability Calibration ---
-    calibration_method: str = "isotonic" # 'isotonic', 'sigmoid', or 'none'
 
 class AILSTMConfig(BaseModel):
     hidden_dim: int = 64
@@ -109,7 +113,7 @@ class AIFeatureEngineeringConfig(BaseModel):
     lag_features: List[str] = [] # List of column names to generate lags for
     lag_depth: int = 0 # Number of past periods to include as features
 
-    # --- Feature Selection (New) ---
+    # --- Feature Selection ---
     use_feature_selection: bool = True
     max_active_features: int = 20 # Cap the number of features fed to models to reduce noise
 
@@ -239,7 +243,7 @@ class RiskManagementConfig(BaseModel):
     confidence_rr_scaling_factor: float = 0.0
     max_confidence_rr_multiplier: float = 1.5
 
-    # --- Kelly Criterion Sizing (New) ---
+    # --- Kelly Criterion Sizing ---
     use_kelly_criterion: bool = False
     kelly_fraction: float = 0.5 # Half-Kelly by default for safety
 
