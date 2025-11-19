@@ -67,12 +67,12 @@ class TradeExecutor:
                 await self.close_position(position, "Strategy Signal")
 
     async def _execute_open_position(self, symbol: str, side: str, current_price: float, df: pd.DataFrame, regime: Optional[str], signal: Dict):
-        # Await async DB call
-        open_positions = await self.position_manager.get_all_open_positions()
-        if not self.risk_manager.check_trade_allowed(symbol, open_positions):
+        # Await async DB call to get ALL active positions (OPEN + PENDING) for accurate risk check
+        active_positions = await self.position_manager.get_all_active_positions()
+        if not self.risk_manager.check_trade_allowed(symbol, active_positions):
             return
 
-        portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, open_positions)
+        portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, active_positions)
         stop_loss = self.risk_manager.calculate_stop_loss(side, current_price, df, market_regime=regime)
         
         # Extract confidence data for risk scaling
@@ -81,13 +81,13 @@ class TradeExecutor:
         # Try to get threshold from config if it exists for the current strategy
         confidence_threshold = getattr(self.config.strategy.params, 'confidence_threshold', None)
 
-        # Pass symbol and open_positions for correlation check
+        # Pass symbol and active_positions for correlation check
         ideal_quantity = self.risk_manager.calculate_position_size(
             symbol=symbol,
             portfolio_equity=portfolio_equity, 
             entry_price=current_price, 
             stop_loss_price=stop_loss, 
-            open_positions=open_positions,
+            open_positions=active_positions,
             market_regime=regime,
             confidence=confidence,
             confidence_threshold=confidence_threshold
@@ -140,6 +140,7 @@ class TradeExecutor:
         )
         
         fill_quantity = final_order_state.get('filled', 0.0) if final_order_state else 0.0
+        final_status = final_order_state.get('status') if final_order_state else 'UNKNOWN'
         
         # 4. Confirm or Void Position (Two-Phase Commit End)
         if fill_quantity > 0:
@@ -154,8 +155,21 @@ class TradeExecutor:
             final_take_profit = self.risk_manager.calculate_take_profit(side, fill_price, final_stop_loss, market_regime=regime)
             
             await self.position_manager.confirm_position_open(symbol, order_id, fill_quantity, fill_price, final_stop_loss, final_take_profit)
+        
+        elif final_status == 'OPEN':
+            # CRITICAL: The order is still OPEN on the exchange (cancellation failed), but we stopped chasing.
+            # We MUST NOT void the position, or we lose track of a live order (Zombie Order).
+            logger.critical("Order is stuck in OPEN state after lifecycle management. Leaving position as PENDING.", 
+                            symbol=symbol, order_id=order_id)
+            await self.alert_system.send_alert(
+                level='critical',
+                message=f"🚨 ZOMBIE ORDER RISK: Order {order_id} for {symbol} is stuck OPEN. Manual intervention required.",
+                details={'symbol': symbol, 'order_id': order_id, 'status': 'OPEN'}
+            )
+            # Do NOT void.
+            
         else:
-            final_status = final_order_state.get('status') if final_order_state else 'UNKNOWN'
+            # Order is definitively dead (CANCELED, REJECTED, EXPIRED) and empty.
             logger.error("Order to open position did not fill. Voiding pending position.", order_id=order_id, final_status=final_status)
             await self.position_manager.void_position(symbol, order_id)
             
