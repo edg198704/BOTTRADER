@@ -286,6 +286,7 @@ class OptimizerConfig(BaseModel):
     adjustment_step: float = 0.02
     max_threshold_cap: float = 0.90
     min_threshold_floor: float = 0.55
+    state_file_path: str = "optimizer_state.json"
 
 # --- Top-Level Bot Config ---
 
