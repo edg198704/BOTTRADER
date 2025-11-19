@@ -41,14 +41,6 @@ class TradingStrategy(abc.ABC):
         """Returns the number of historical candles needed for training."""
         pass
 
-    async def warmup(self, symbols: List[str]):
-        """Preloads necessary resources (models, data) for the given symbols."""
-        pass
-
-    async def close(self):
-        """Cleans up resources (executors, connections) on shutdown."""
-        pass
-
 class SimpleMACrossoverStrategy(TradingStrategy):
     def __init__(self, config: SimpleMACrossoverStrategyParams):
         super().__init__(config)
@@ -118,15 +110,6 @@ class AIEnsembleStrategy(TradingStrategy):
         except ImportError as e:
             logger.critical("Failed to initialize AIEnsembleStrategy due to missing ML libraries", error=str(e))
             raise
-
-    async def warmup(self, symbols: List[str]):
-        """Preloads models for all symbols to prevent first-tick latency."""
-        logger.info("Warming up AI models...", symbols=symbols)
-        await self.ensemble_learner.warmup_models(symbols)
-
-    async def close(self):
-        """Shuts down the learner's executor."""
-        self.ensemble_learner.close()
 
     def _in_cooldown(self, symbol: str) -> bool:
         """Checks if the symbol is in a signal cooldown period."""
@@ -373,6 +356,12 @@ class AIEnsembleStrategy(TradingStrategy):
             logger.error("Error during async model retraining", symbol=symbol, error=str(e))
 
     def needs_retraining(self, symbol: str) -> bool:
+        # 0. Check if we even have a valid model loaded
+        # This handles the case where config changed and old models were rejected
+        if not self.ensemble_learner.has_valid_model(symbol):
+            logger.info(f"No valid model found for {symbol} (or feature mismatch). Retraining required.")
+            return True
+
         # 1. Check forced retrain flag (Performance based)
         if self.force_retrain_flags.get(symbol, False):
             return True
