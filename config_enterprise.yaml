@@ -151,6 +151,12 @@ strategy:
       volatility_col: "atr"
       rsi_col: "rsi"
 
+    # --- Runtime Performance Monitoring (New) ---
+    performance:
+      enabled: true
+      window_size: 50 # Evaluate last 50 predictions
+      min_accuracy: 0.45 # Trigger retrain if accuracy drops below 45%
+
 # --- Example for SimpleMACrossoverStrategy (for reference) ---
 # strategy:
 #   symbols: ["BTC/USDT"]
