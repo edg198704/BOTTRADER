@@ -220,6 +220,13 @@ risk_management:
   trailing_stop_activation_pct: 0.02 # Activate TSL after 2% profit
   trailing_stop_pct: 0.01 # Trail by 1% of peak price
 
+  # --- Breakeven Stop (New) ---
+  # Moves Stop Loss to Entry Price (+ buffer) once a profit threshold is reached.
+  breakeven:
+    enabled: true
+    activation_pct: 0.015 # Move to BE after 1.5% profit
+    buffer_pct: 0.002 # Lock in 0.2% to cover fees
+
   # --- Confidence-Based Sizing ---
   # Scales position size based on AI model confidence surplus.
   # Multiplier = 1 + (Confidence - Threshold) * confidence_scaling_factor
