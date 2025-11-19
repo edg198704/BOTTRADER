@@ -182,6 +182,12 @@ risk_management:
   trailing_stop_activation_pct: 0.02 # Activate TSL after 2% profit
   trailing_stop_pct: 0.01 # Trail by 1% of peak price
 
+  # --- Confidence-Based Sizing (New) ---
+  # Scales position size based on AI model confidence surplus.
+  # Multiplier = 1 + (Confidence - Threshold) * confidence_scaling_factor
+  confidence_scaling_factor: 0.0 # Set to e.g. 5.0 to enable. 0.0 = disabled.
+  max_confidence_risk_multiplier: 1.5 # Cap risk increase at 1.5x base risk.
+
   regime_based_risk:
     # Override default risk parameters based on the detected market regime.
     # If a parameter is not set here, the default value above will be used.
