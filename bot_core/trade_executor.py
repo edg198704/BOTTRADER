@@ -74,7 +74,16 @@ class TradeExecutor:
 
         portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, open_positions)
         stop_loss = self.risk_manager.calculate_stop_loss(side, current_price, df, market_regime=regime)
-        ideal_quantity = self.risk_manager.calculate_position_size(portfolio_equity, current_price, stop_loss, market_regime=regime)
+        
+        # Pass symbol and open_positions for correlation check
+        ideal_quantity = self.risk_manager.calculate_position_size(
+            symbol=symbol,
+            portfolio_equity=portfolio_equity, 
+            entry_price=current_price, 
+            stop_loss_price=stop_loss, 
+            open_positions=open_positions,
+            market_regime=regime
+        )
         
         market_details = self.market_details.get(symbol)
         if not market_details:
