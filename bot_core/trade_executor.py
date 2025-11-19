@@ -177,7 +177,14 @@ class TradeExecutor:
 
             logger.info("Order to open position was filled.", order_id=current_order_id, filled_qty=fill_quantity, fill_price=fill_price)
             final_stop_loss = self.risk_manager.calculate_stop_loss(side, fill_price, df, market_regime=regime)
-            final_take_profit = self.risk_manager.calculate_take_profit(side, fill_price, final_stop_loss, market_regime=regime)
+            final_take_profit = self.risk_manager.calculate_take_profit(
+                side, 
+                fill_price, 
+                final_stop_loss, 
+                market_regime=regime,
+                confidence=confidence,
+                confidence_threshold=confidence_threshold
+            )
             
             await self.position_manager.confirm_position_open(symbol, current_order_id, fill_quantity, fill_price, final_stop_loss, final_take_profit)
         
