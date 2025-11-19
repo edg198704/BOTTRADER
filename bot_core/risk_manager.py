@@ -1,5 +1,6 @@
 from typing import List, Optional, Any, TYPE_CHECKING
 import pandas as pd
+from datetime import datetime
 
 from bot_core.config import RiskManagementConfig
 from bot_core.logger import get_logger
@@ -184,3 +185,24 @@ class RiskManager:
             return entry_price + profit_target
         else: # SELL
             return entry_price - profit_target
+
+    def check_time_based_exit(self, position: Position, current_price: float) -> bool:
+        """Checks if a position has been open too long without sufficient profit."""
+        cfg = self.config.time_based_exit
+        if not cfg.enabled: return False
+        
+        now = datetime.utcnow()
+        duration = now - position.open_timestamp
+        if duration.total_seconds() > (cfg.max_hold_time_hours * 3600):
+            # Calculate PnL %
+            pnl_pct = (current_price - position.entry_price) / position.entry_price
+            if position.side == 'SELL':
+                pnl_pct = -pnl_pct
+            
+            if pnl_pct < cfg.threshold_pct:
+                logger.info("Time-based exit triggered", 
+                            symbol=position.symbol, 
+                            duration_hours=duration.total_seconds()/3600, 
+                            pnl_pct=pnl_pct)
+                return True
+        return False
