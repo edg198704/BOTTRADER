@@ -71,8 +71,9 @@ async def run_backtest():
         return
 
     # 2. Initialize Backtest Exchange
-    initial_balances = {"USDT": config.initial_capital}
-    exchange_api = BacktestExchangeAPI(historical_data, initial_balances)
+    initial_balances = {"USDT": config.backtest.initial_balance}
+    # Pass the backtest config to the exchange API
+    exchange_api = BacktestExchangeAPI(historical_data, initial_balances, config.backtest)
 
     # 3. Initialize Components
     shared_latest_prices = {}
@@ -82,7 +83,7 @@ async def run_backtest():
     # Pre-load data handler buffers manually since we won't run its loop
     # We don't need to do anything yet, update_symbol_data will handle it
 
-    position_manager = PositionManager(config.database, config.initial_capital, alert_system)
+    position_manager = PositionManager(config.database, config.backtest.initial_balance, alert_system)
     await position_manager.initialize()
 
     risk_manager = RiskManager(config.risk_management, position_manager, data_handler, alert_system)
@@ -156,9 +157,9 @@ async def run_backtest():
     # 6. Final Report
     final_equity = position_manager.get_portfolio_value(shared_latest_prices, await position_manager.get_all_open_positions())
     logger.info("Backtest Complete.")
-    logger.info(f"Initial Capital: ${config.initial_capital}")
+    logger.info(f"Initial Capital: ${config.backtest.initial_balance}")
     logger.info(f"Final Equity: ${final_equity:.2f}")
-    logger.info(f"Return: {((final_equity - config.initial_capital) / config.initial_capital) * 100:.2f}%")
+    logger.info(f"Return: {((final_equity - config.backtest.initial_balance) / config.backtest.initial_balance) * 100:.2f}%")
 
 if __name__ == "__main__":
     asyncio.run(run_backtest())
