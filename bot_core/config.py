@@ -40,6 +40,11 @@ class MarketRegimeConfig(BaseModel):
     volatility_col: str = "atr"
     rsi_col: str = "rsi"
     
+    # --- ADX Filter Settings (New) ---
+    use_adx_filter: bool = False
+    adx_col: str = "adx"
+    adx_threshold: float = 25.0
+    
     # --- Adaptive Regime Settings ---
     use_dynamic_thresholds: bool = False
     dynamic_window: int = 500
