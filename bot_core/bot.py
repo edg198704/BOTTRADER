@@ -3,6 +3,7 @@ import time
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
 import pandas as pd
+from concurrent.futures import ProcessPoolExecutor
 
 from bot_core.logger import get_logger, set_correlation_id
 from bot_core.exchange_api import ExchangeAPI
@@ -43,6 +44,9 @@ class TradingBot:
         self.latest_prices = shared_latest_prices
         self.market_details: Dict[str, Dict[str, Any]] = {}
         self.tasks: list[asyncio.Task] = []
+        
+        # Executor for CPU-intensive tasks like AI training
+        self.process_executor = ProcessPoolExecutor(max_workers=2)
         
         self._initialize_shared_state()
         logger.info("TradingBot orchestrator initialized.")
@@ -276,14 +280,12 @@ class TradingBot:
                         )
 
                         if training_df is not None and not training_df.empty:
-                            # Run the potentially CPU-intensive training in a separate thread
-                            # to avoid blocking the main async event loop.
-                            loop = asyncio.get_running_loop()
-                            await loop.run_in_executor(
-                                None, 
-                                self.strategy.retrain,
+                            # Run the potentially CPU-intensive training in a separate process
+                            # We pass the executor to the strategy so it can manage the process submission
+                            await self.strategy.retrain(
                                 symbol,
-                                training_df
+                                training_df,
+                                self.process_executor
                             )
                         else:
                             logger.error("Could not fetch training data, skipping retraining for now.", symbol=symbol)
@@ -345,5 +347,9 @@ class TradingBot:
         if self.exchange_api: await self.exchange_api.close()
         if self.position_manager: self.position_manager.close()
         if self.metrics_writer: await self.metrics_writer.close()
+        
+        # Shutdown the process executor
+        self.process_executor.shutdown(wait=False)
+        
         logger.info("TradingBot stopped gracefully.")
         self.shared_bot_state['status'] = 'stopped'
