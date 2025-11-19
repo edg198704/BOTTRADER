@@ -481,6 +481,18 @@ class PositionManager:
         finally:
             session.close()
 
+    async def get_all_closed_positions(self) -> List[Position]:
+        """Retrieves all closed positions for performance analysis."""
+        async with self._db_lock:
+            return await self._run_in_executor(self._get_all_closed_positions_sync)
+
+    def _get_all_closed_positions_sync(self) -> List[Position]:
+        session = self.SessionLocal()
+        try:
+            return session.query(Position).filter(Position.status == PositionStatus.CLOSED).all()
+        finally:
+            session.close()
+
     async def get_aggregated_open_positions(self) -> Dict[str, float]:
         async with self._db_lock:
             return await self._run_in_executor(self._get_aggregated_open_positions_sync)
