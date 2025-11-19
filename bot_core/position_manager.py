@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, 
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 from bot_core.logger import get_logger
-from bot_core.config import DatabaseConfig, RiskManagementConfig
+from bot_core.config import DatabaseConfig, RiskManagementConfig, BreakevenConfig
 from bot_core.utils import Clock
 
 if TYPE_CHECKING:
@@ -43,6 +43,7 @@ class Position(Base):
     # trailing_ref_price tracks peak price for longs, and trough price for shorts
     trailing_ref_price = Column(Float, nullable=True)
     trailing_stop_active = Column(Boolean, default=False, nullable=False)
+    breakeven_active = Column(Boolean, default=False, nullable=False)
     # Stores JSON context about the strategy decision (model version, confidence, etc.)
     strategy_metadata = Column(String, nullable=True)
 
@@ -90,6 +91,9 @@ class PositionManager:
                     if 'fees' not in columns:
                         conn.execute(text("ALTER TABLE positions ADD COLUMN fees FLOAT DEFAULT 0.0"))
                         logger.info("Schema updated: Added fees column to positions table.")
+                    if 'breakeven_active' not in columns:
+                        conn.execute(text("ALTER TABLE positions ADD COLUMN breakeven_active BOOLEAN DEFAULT 0"))
+                        logger.info("Schema updated: Added breakeven_active column to positions table.")
         except Exception as e:
             logger.warning(f"Schema update check failed: {e}")
 
@@ -205,6 +209,7 @@ class PositionManager:
                 trade_id=trade_id,
                 trailing_ref_price=0.0,
                 trailing_stop_active=False,
+                breakeven_active=False,
                 strategy_metadata=metadata_json,
                 fees=0.0
             )
@@ -413,10 +418,6 @@ class PositionManager:
                 gross_pnl = -gross_pnl
 
             # Pro-rate entry fees for the chunk being closed
-            # chunk_ratio = quantity / position.quantity
-            # entry_fees_chunk = position.fees * chunk_ratio
-            # But wait, position.fees currently holds TOTAL entry fees for the WHOLE position.
-            # We need to move the chunk's share of entry fees to the new closed record.
             chunk_ratio = quantity / position.quantity
             entry_fees_chunk = position.fees * chunk_ratio
             
@@ -444,6 +445,7 @@ class PositionManager:
                 fees=total_chunk_fees,
                 trailing_ref_price=position.trailing_ref_price,
                 trailing_stop_active=position.trailing_stop_active,
+                breakeven_active=position.breakeven_active,
                 strategy_metadata=position.strategy_metadata
             )
             session.add(closed_chunk)
@@ -518,6 +520,50 @@ class PositionManager:
             return pos
         except Exception as e:
             logger.error("Failed to manage trailing stop", symbol=pos.symbol, error=str(e))
+            session.rollback()
+            return pos
+        finally:
+            session.close()
+
+    async def manage_breakeven_stop(self, pos: Position, current_price: float, be_config: BreakevenConfig) -> Position:
+        async with self._db_lock:
+            return await self._run_in_executor(self._manage_breakeven_stop_sync, pos, current_price, be_config)
+
+    def _manage_breakeven_stop_sync(self, pos: Position, current_price: float, be_config: BreakevenConfig) -> Position:
+        if not be_config.enabled or pos.breakeven_active:
+            return pos
+            
+        session = self.SessionLocal()
+        try:
+            pos = session.merge(pos)
+            updated = False
+            
+            if pos.side == 'BUY':
+                activation_price = pos.entry_price * (1 + be_config.activation_pct)
+                if current_price >= activation_price:
+                    new_sl = pos.entry_price * (1 + be_config.buffer_pct)
+                    if new_sl > pos.stop_loss_price:
+                        pos.stop_loss_price = new_sl
+                        pos.breakeven_active = True
+                        updated = True
+                        
+            elif pos.side == 'SELL':
+                activation_price = pos.entry_price * (1 - be_config.activation_pct)
+                if current_price <= activation_price:
+                    new_sl = pos.entry_price * (1 - be_config.buffer_pct)
+                    if new_sl < pos.stop_loss_price:
+                        pos.stop_loss_price = new_sl
+                        pos.breakeven_active = True
+                        updated = True
+            
+            if updated:
+                session.commit()
+                session.refresh(pos)
+                logger.info("Breakeven stop activated", symbol=pos.symbol, new_sl=pos.stop_loss_price)
+            
+            return pos
+        except Exception as e:
+            logger.error("Failed to manage breakeven stop", symbol=pos.symbol, error=str(e))
             session.rollback()
             return pos
         finally:
