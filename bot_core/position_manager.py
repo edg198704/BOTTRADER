@@ -38,7 +38,8 @@ class Position(Base):
     open_timestamp = Column(DateTime, default=Clock.now)
     close_timestamp = Column(DateTime, nullable=True)
     close_price = Column(Float, nullable=True)
-    pnl = Column(Float, nullable=True)
+    pnl = Column(Float, nullable=True) # Net PnL (after fees)
+    fees = Column(Float, default=0.0, nullable=False) # Total fees paid (entry + exit)
     # trailing_ref_price tracks peak price for longs, and trough price for shorts
     trailing_ref_price = Column(Float, nullable=True)
     trailing_stop_active = Column(Boolean, default=False, nullable=False)
@@ -86,6 +87,9 @@ class PositionManager:
                     if 'trade_id' not in columns:
                         conn.execute(text("ALTER TABLE positions ADD COLUMN trade_id TEXT"))
                         logger.info("Schema updated: Added trade_id column to positions table.")
+                    if 'fees' not in columns:
+                        conn.execute(text("ALTER TABLE positions ADD COLUMN fees FLOAT DEFAULT 0.0"))
+                        logger.info("Schema updated: Added fees column to positions table.")
         except Exception as e:
             logger.warning(f"Schema update check failed: {e}")
 
@@ -201,7 +205,8 @@ class PositionManager:
                 trade_id=trade_id,
                 trailing_ref_price=0.0,
                 trailing_stop_active=False,
-                strategy_metadata=metadata_json
+                strategy_metadata=metadata_json,
+                fees=0.0
             )
             session.add(new_position)
             session.commit()
@@ -244,11 +249,11 @@ class PositionManager:
         finally:
             session.close()
 
-    async def confirm_position_open(self, symbol: str, order_id: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float) -> Optional[Position]:
+    async def confirm_position_open(self, symbol: str, order_id: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float, fees: float = 0.0) -> Optional[Position]:
         async with self._db_lock:
-            return await self._run_in_executor(self._confirm_position_open_sync, symbol, order_id, quantity, entry_price, stop_loss, take_profit)
+            return await self._run_in_executor(self._confirm_position_open_sync, symbol, order_id, quantity, entry_price, stop_loss, take_profit, fees)
 
-    def _confirm_position_open_sync(self, symbol: str, order_id: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float) -> Optional[Position]:
+    def _confirm_position_open_sync(self, symbol: str, order_id: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float, fees: float) -> Optional[Position]:
         session = self.SessionLocal()
         try:
             position = session.query(Position).filter(
@@ -268,16 +273,17 @@ class PositionManager:
             position.take_profit_price = take_profit
             position.trailing_ref_price = entry_price
             position.open_timestamp = Clock.now()
+            position.fees += fees # Add entry fees
             
             session.commit()
             session.refresh(position)
-            logger.info("Confirmed position as OPEN", symbol=symbol, order_id=order_id, quantity=quantity, price=entry_price)
+            logger.info("Confirmed position as OPEN", symbol=symbol, order_id=order_id, quantity=quantity, price=entry_price, fees=fees)
             
             if self.alert_system:
                 asyncio.run_coroutine_threadsafe(self.alert_system.send_alert(
                     level='info',
                     message=f"🟢 Opened {position.side} position for {symbol}",
-                    details={'symbol': symbol, 'side': position.side, 'quantity': quantity, 'entry_price': entry_price}
+                    details={'symbol': symbol, 'side': position.side, 'quantity': quantity, 'entry_price': entry_price, 'fees': fees}
                 ), asyncio.get_running_loop())
 
             return position
@@ -325,57 +331,19 @@ class PositionManager:
 
     # --- Standard Position Management ---
 
-    async def open_position(self, symbol: str, side: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float) -> Optional[Position]:
-        """Legacy method for direct opening, kept for compatibility or manual overrides."""
-        async with self._db_lock:
-            return await self._run_in_executor(
-                self._open_position_sync, symbol, side, quantity, entry_price, stop_loss, take_profit
-            )
-
-    def _open_position_sync(self, symbol: str, side: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float) -> Optional[Position]:
-        session = self.SessionLocal()
-        try:
-            if session.query(Position).filter(Position.symbol == symbol, Position.status == PositionStatus.OPEN).first():
-                logger.warning("Attempted to open a position for a symbol that already has one.", symbol=symbol)
-                return None
-
-            new_position = Position(
-                symbol=symbol,
-                side=side,
-                quantity=quantity,
-                entry_price=entry_price,
-                stop_loss_price=stop_loss,
-                take_profit_price=take_profit,
-                status=PositionStatus.OPEN,
-                trailing_ref_price=entry_price,
-                trailing_stop_active=False,
-                open_timestamp=Clock.now()
-            )
-            session.add(new_position)
-            session.commit()
-            session.refresh(new_position)
-            logger.info("Opened new position", symbol=symbol, side=side, quantity=quantity, entry_price=entry_price)
-            return new_position
-        except Exception as e:
-            logger.error("Failed to open position", symbol=symbol, error=str(e))
-            session.rollback()
-            return None
-        finally:
-            session.close()
-
-    async def close_position(self, symbol: str, close_price: float, reason: str = "Unknown", actual_filled_qty: Optional[float] = None) -> Optional[Position]:
+    async def close_position(self, symbol: str, close_price: float, reason: str = "Unknown", actual_filled_qty: Optional[float] = None, fees: float = 0.0) -> Optional[Position]:
         """
         Closes an open position.
-        If actual_filled_qty is provided, it uses that for PnL calculation, allowing for 
-        closing positions where the balance was slightly less than the tracked quantity (dust/fees).
+        If actual_filled_qty is provided, it uses that for PnL calculation.
+        Calculates Net PnL by subtracting total fees (entry + exit).
         """
         async with self._db_lock:
-            position = await self._run_in_executor(self._close_position_sync, symbol, close_price, reason, actual_filled_qty)
+            position = await self._run_in_executor(self._close_position_sync, symbol, close_price, reason, actual_filled_qty, fees)
         if position:
             self._realized_pnl += position.pnl
         return position
 
-    def _close_position_sync(self, symbol: str, close_price: float, reason: str, actual_filled_qty: Optional[float]) -> Optional[Position]:
+    def _close_position_sync(self, symbol: str, close_price: float, reason: str, actual_filled_qty: Optional[float], fees: float) -> Optional[Position]:
         session = self.SessionLocal()
         try:
             position = session.query(Position).filter(Position.symbol == symbol, Position.status == PositionStatus.OPEN).first()
@@ -383,28 +351,33 @@ class PositionManager:
                 logger.warning("No open position found to close for symbol", symbol=symbol)
                 return None
 
-            # Use actual filled quantity if provided (e.g. wallet balance was slightly less than tracked qty)
-            # Otherwise use the tracked quantity.
             calc_qty = actual_filled_qty if actual_filled_qty is not None else position.quantity
 
-            pnl = (close_price - position.entry_price) * calc_qty
+            # Gross PnL
+            gross_pnl = (close_price - position.entry_price) * calc_qty
             if position.side == 'SELL':
-                pnl = -pnl
+                gross_pnl = -gross_pnl
+
+            # Update fees
+            position.fees += fees
+            
+            # Net PnL
+            net_pnl = gross_pnl - position.fees
 
             position.status = PositionStatus.CLOSED
             position.close_price = close_price
             position.close_timestamp = Clock.now()
-            position.pnl = pnl
+            position.pnl = net_pnl
             session.commit()
             session.refresh(position)
-            logger.info("Closed position", symbol=symbol, pnl=f"{pnl:.2f}", reason=reason, tracked_qty=position.quantity, actual_qty=calc_qty)
+            logger.info("Closed position", symbol=symbol, net_pnl=f"{net_pnl:.2f}", gross_pnl=f"{gross_pnl:.2f}", fees=f"{position.fees:.2f}", reason=reason)
 
             if self.alert_system:
-                pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+                pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
                 asyncio.run_coroutine_threadsafe(self.alert_system.send_alert(
                     level='info',
                     message=f"{pnl_emoji} Closed position for {symbol} due to {reason}",
-                    details={'symbol': symbol, 'pnl': f'{pnl:.2f}', 'reason': reason, 'close_price': close_price}
+                    details={'symbol': symbol, 'net_pnl': f'{net_pnl:.2f}', 'fees': f'{position.fees:.2f}', 'reason': reason, 'close_price': close_price}
                 ), asyncio.get_running_loop())
 
             return position
@@ -415,12 +388,12 @@ class PositionManager:
         finally:
             session.close()
 
-    async def reduce_position(self, symbol: str, quantity: float, price: float, reason: str) -> Optional[Position]:
+    async def reduce_position(self, symbol: str, quantity: float, price: float, reason: str, fees: float = 0.0) -> Optional[Position]:
         """Reduces the quantity of an open position (partial close)."""
         async with self._db_lock:
-            return await self._run_in_executor(self._reduce_position_sync, symbol, quantity, price, reason)
+            return await self._run_in_executor(self._reduce_position_sync, symbol, quantity, price, reason, fees)
 
-    def _reduce_position_sync(self, symbol: str, quantity: float, price: float, reason: str) -> Optional[Position]:
+    def _reduce_position_sync(self, symbol: str, quantity: float, price: float, reason: str, fees: float) -> Optional[Position]:
         session = self.SessionLocal()
         try:
             position = session.query(Position).filter(Position.symbol == symbol, Position.status == PositionStatus.OPEN).first()
@@ -429,16 +402,29 @@ class PositionManager:
                 return None
 
             # If reduction quantity covers the whole position (or more), close it fully
-            # We pass the reduction quantity as the actual_filled_qty to ensure PnL is accurate
             if quantity >= (position.quantity * 0.999):
                 logger.info("Reduction quantity covers entire position. Closing fully.", symbol=symbol, qty=quantity, pos_qty=position.quantity)
-                session.close() # Close session before calling internal sync method to avoid conflict
-                return self._close_position_sync(symbol, price, reason, actual_filled_qty=quantity)
+                session.close()
+                return self._close_position_sync(symbol, price, reason, actual_filled_qty=quantity, fees=fees)
 
-            # Calculate PnL for the portion being closed
-            pnl = (price - position.entry_price) * quantity
+            # Calculate Gross PnL for the portion being closed
+            gross_pnl = (price - position.entry_price) * quantity
             if position.side == 'SELL':
-                pnl = -pnl
+                gross_pnl = -gross_pnl
+
+            # Pro-rate entry fees for the chunk being closed
+            # chunk_ratio = quantity / position.quantity
+            # entry_fees_chunk = position.fees * chunk_ratio
+            # But wait, position.fees currently holds TOTAL entry fees for the WHOLE position.
+            # We need to move the chunk's share of entry fees to the new closed record.
+            chunk_ratio = quantity / position.quantity
+            entry_fees_chunk = position.fees * chunk_ratio
+            
+            # Total fees for this chunk = pro-rated entry fees + specific exit fees for this trade
+            total_chunk_fees = entry_fees_chunk + fees
+            
+            # Net PnL for chunk
+            net_pnl = gross_pnl - total_chunk_fees
 
             # Create a "child" record for the closed portion
             closed_chunk = Position(
@@ -447,14 +433,15 @@ class PositionManager:
                 quantity=quantity,
                 entry_price=position.entry_price,
                 status=PositionStatus.CLOSED,
-                order_id=position.order_id, # Link to original entry order
-                trade_id=position.trade_id, # Link to original trade
+                order_id=position.order_id,
+                trade_id=position.trade_id,
                 stop_loss_price=position.stop_loss_price,
                 take_profit_price=position.take_profit_price,
                 open_timestamp=position.open_timestamp,
                 close_timestamp=Clock.now(),
                 close_price=price,
-                pnl=pnl,
+                pnl=net_pnl,
+                fees=total_chunk_fees,
                 trailing_ref_price=position.trailing_ref_price,
                 trailing_stop_active=position.trailing_stop_active,
                 strategy_metadata=position.strategy_metadata
@@ -463,19 +450,20 @@ class PositionManager:
 
             # Update the remaining position
             position.quantity -= quantity
+            position.fees -= entry_fees_chunk # Remove the pro-rated entry fees from the active record
             
-            self._realized_pnl += pnl
+            self._realized_pnl += net_pnl
             session.commit()
             session.refresh(position)
             
-            logger.info("Reduced position", symbol=symbol, reduced_by=quantity, remaining=position.quantity, pnl=f"{pnl:.2f}", reason=reason)
+            logger.info("Reduced position", symbol=symbol, reduced_by=quantity, remaining=position.quantity, net_pnl=f"{net_pnl:.2f}", fees=f"{total_chunk_fees:.2f}", reason=reason)
 
             if self.alert_system:
-                pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+                pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
                 asyncio.run_coroutine_threadsafe(self.alert_system.send_alert(
                     level='info',
                     message=f"{pnl_emoji} Partially closed {symbol} ({reason})",
-                    details={'symbol': symbol, 'reduced_qty': quantity, 'remaining': position.quantity, 'pnl': f'{pnl:.2f}'}
+                    details={'symbol': symbol, 'reduced_qty': quantity, 'remaining': position.quantity, 'net_pnl': f'{net_pnl:.2f}'}
                 ), asyncio.get_running_loop())
 
             return position
