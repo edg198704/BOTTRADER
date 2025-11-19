@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams
@@ -19,12 +19,28 @@ class FeatureProcessor:
         Calculates the total number of features expected after processing,
         including base features and generated lags.
         """
-        base_count = len(config.feature_columns)
-        # Count how many lag columns will be generated
-        # Only lag columns that are actually in the feature_columns list
-        lag_targets = [c for c in config.features.lag_features if c in config.feature_columns]
-        lag_count = len(lag_targets) * config.features.lag_depth
-        return base_count + lag_count
+        return len(FeatureProcessor.get_feature_names(config))
+
+    @staticmethod
+    def get_feature_names(config: AIEnsembleStrategyParams) -> List[str]:
+        """
+        Returns the ordered list of feature names including generated lags.
+        This serves as the single source of truth for feature alignment.
+        """
+        # Start with base feature columns in the order defined in config
+        cols = list(config.feature_columns)
+        
+        # Add lag features in the exact order they are generated
+        lags = config.features.lag_features
+        depth = config.features.lag_depth
+        
+        if depth > 0 and lags:
+            for col in lags:
+                # Only generate lags for columns that are actually in the feature set
+                if col in config.feature_columns:
+                    for i in range(1, depth + 1):
+                        cols.append(f"{col}_lag_{i}")
+        return cols
 
     @staticmethod
     def process_data(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> pd.DataFrame:
@@ -34,6 +50,7 @@ class FeatureProcessor:
         2. Generates lagged features (if configured).
         3. Drops NaNs introduced by lags.
         4. Applies Z-score normalization.
+        5. Enforces column order matching get_feature_names.
         """
         # 1. Select Base Columns
         cols = config.feature_columns
@@ -69,7 +86,13 @@ class FeatureProcessor:
         # Rolling normalization introduces NaNs at the start of the window
         normalized.dropna(inplace=True)
         
-        return normalized
+        # 5. Enforce Column Order
+        # Ensure the output DataFrame has columns in the exact order expected by the model
+        expected_cols = FeatureProcessor.get_feature_names(config)
+        # Filter expected cols to those present (handling potential missing base cols gracefully)
+        final_cols = [c for c in expected_cols if c in normalized.columns]
+        
+        return normalized[final_cols]
 
     @staticmethod
     def create_labels(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> pd.Series:
