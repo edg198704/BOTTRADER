@@ -10,6 +10,7 @@ import numpy as np
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams
 from bot_core.ai.models import LSTMPredictor, AttentionNetwork
+from bot_core.ai.feature_processor import FeatureProcessor
 
 # ML Imports with safe fallbacks
 try:
@@ -80,128 +81,6 @@ def _create_fresh_models(config: AIEnsembleStrategyParams, device) -> Dict[str, 
             ))
         ], voting='soft')
     }
-
-def _normalize(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> pd.DataFrame:
-    """Applies rolling Z-score normalization."""
-    window = config.features.normalization_window
-    cols = config.feature_columns
-    
-    subset = df[cols].copy()
-    rolling_mean = subset.rolling(window=window).mean()
-    rolling_std = subset.rolling(window=window).std()
-    
-    epsilon = 1e-8
-    normalized = (subset - rolling_mean) / (rolling_std + epsilon)
-    return normalized
-
-def _create_triple_barrier_labels(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> pd.Series:
-    """
-    Implements the Triple Barrier Method for labeling.
-    Labels: 0 (SELL), 1 (HOLD), 2 (BUY)
-    """
-    horizon = config.features.labeling_horizon
-    tp_mult = config.features.triple_barrier_tp_multiplier
-    sl_mult = config.features.triple_barrier_sl_multiplier
-    
-    # Use ATR for volatility if available, else fallback to percentage
-    atr_col = config.market_regime.volatility_col
-    
-    # Prepare arrays for speed
-    close_arr = df['close'].values
-    high_arr = df['high'].values
-    low_arr = df['low'].values
-    
-    if atr_col in df.columns:
-        vol_arr = df[atr_col].values
-    else:
-        # Fallback volatility: 1% of price if ATR is missing
-        vol_arr = close_arr * 0.01
-    
-    labels = np.ones(len(df), dtype=int) # Default 1 (HOLD)
-    
-    # Iterate up to len - horizon
-    limit = len(df) - horizon
-    
-    for i in range(limit):
-        current_close = close_arr[i]
-        vol = vol_arr[i]
-        
-        if np.isnan(vol) or vol == 0:
-            continue
-            
-        upper_barrier = current_close + (vol * tp_mult)
-        lower_barrier = current_close - (vol * sl_mult)
-        
-        # Slice the future window (path dependency)
-        window_high = high_arr[i+1 : i+1+horizon]
-        window_low = low_arr[i+1 : i+1+horizon]
-        
-        # Check hits
-        hit_upper_mask = window_high >= upper_barrier
-        hit_lower_mask = window_low <= lower_barrier
-        
-        has_upper = hit_upper_mask.any()
-        has_lower = hit_lower_mask.any()
-        
-        if has_upper and not has_lower:
-            labels[i] = 2 # BUY
-        elif has_lower and not has_upper:
-            labels[i] = 0 # SELL
-        elif has_upper and has_lower:
-            # Both hit. Which was first?
-            first_upper_idx = np.argmax(hit_upper_mask)
-            first_lower_idx = np.argmax(hit_lower_mask)
-            
-            if first_upper_idx < first_lower_idx:
-                labels[i] = 2 # BUY
-            elif first_lower_idx < first_upper_idx:
-                labels[i] = 0 # SELL
-            else:
-                # Same bar hit both barriers (extreme volatility). Default to HOLD/Avoid.
-                labels[i] = 1
-        else:
-            labels[i] = 1 # HOLD
-            
-    return pd.Series(labels, index=df.index).iloc[:-horizon]
-
-def _create_labels(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> pd.Series:
-    if config.features.use_triple_barrier:
-        return _create_triple_barrier_labels(df, config)
-
-    horizon = config.features.labeling_horizon
-    future_price = df['close'].shift(-horizon)
-    price_change_pct = (future_price - df['close']) / df['close']
-
-    labels = pd.Series(1, index=df.index)  # Default to 'hold' (1)
-
-    if config.features.use_dynamic_labeling:
-        atr_col = config.market_regime.volatility_col
-        if atr_col in df.columns:
-            multiplier = config.features.labeling_atr_multiplier
-            dynamic_threshold = (df[atr_col] * multiplier) / df['close']
-            labels[price_change_pct > dynamic_threshold] = 2  # 'buy'
-            labels[price_change_pct < -dynamic_threshold] = 0 # 'sell'
-        else:
-            threshold = config.features.labeling_threshold
-            labels[price_change_pct > threshold] = 2
-            labels[price_change_pct < -threshold] = 0
-    else:
-        threshold = config.features.labeling_threshold
-        labels[price_change_pct > threshold] = 2
-        labels[price_change_pct < -threshold] = 0
-    
-    return labels.iloc[:-horizon]
-
-def _create_sequences(X: np.ndarray, y: np.ndarray, seq_length: int) -> Tuple[np.ndarray, np.ndarray]:
-    X_seq, y_seq = [], []
-    if len(X) <= seq_length:
-        return np.array([]), np.array([])
-        
-    for i in range(len(X) - seq_length + 1):
-        X_seq.append(X[i:i+seq_length])
-        y_seq.append(y[i+seq_length-1])
-        
-    return np.array(X_seq), np.array(y_seq)
 
 def _train_pytorch_model(model: nn.Module, X_train: torch.Tensor, y_train: torch.Tensor, X_val: torch.Tensor, y_val: torch.Tensor, config: AIEnsembleStrategyParams):
     train_cfg = config.training
@@ -277,6 +156,25 @@ def _get_ensemble_prediction_static(models: Dict[str, Any], X_flat: np.ndarray, 
     ensemble_pred = np.average(stacked_preds, weights=weights, axis=0)
     return ensemble_pred
 
+def _atomic_save(obj: Any, path: str, method: str = 'joblib'):
+    """Saves an object to a temporary file and then atomically renames it."""
+    temp_path = f"{path}.tmp"
+    try:
+        if method == 'joblib':
+            joblib.dump(obj, temp_path)
+        elif method == 'torch':
+            torch.save(obj, temp_path)
+        elif method == 'json':
+            with open(temp_path, 'w') as f:
+                json.dump(obj, f)
+        
+        # Atomic replacement
+        os.replace(temp_path, path)
+    except Exception as e:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise e
+
 def _save_models_to_disk(symbol: str, models: Dict[str, Any], config: AIEnsembleStrategyParams, learned_weights: Optional[List[float]] = None):
     symbol_path_str = symbol.replace('/', '_')
     save_path = os.path.join(config.model_path, symbol_path_str)
@@ -288,13 +186,13 @@ def _save_models_to_disk(symbol: str, models: Dict[str, Any], config: AIEnsemble
         'timestamp': str(pd.Timestamp.utcnow()),
         'learned_weights': learned_weights
     }
-    with open(os.path.join(save_path, "metadata.json"), 'w') as f:
-        json.dump(metadata, f)
-
-    joblib.dump(models['gb'], os.path.join(save_path, "gb_model.pkl"))
-    joblib.dump(models['technical'], os.path.join(save_path, "technical_model.pkl"))
-    torch.save(models['lstm'].state_dict(), os.path.join(save_path, "lstm_model.pth"))
-    torch.save(models['attention'].state_dict(), os.path.join(save_path, "attention_model.pth"))
+    
+    # Use atomic saves to prevent corruption if read occurs during write
+    _atomic_save(metadata, os.path.join(save_path, "metadata.json"), method='json')
+    _atomic_save(models['gb'], os.path.join(save_path, "gb_model.pkl"), method='joblib')
+    _atomic_save(models['technical'], os.path.join(save_path, "technical_model.pkl"), method='joblib')
+    _atomic_save(models['lstm'].state_dict(), os.path.join(save_path, "lstm_model.pth"), method='torch')
+    _atomic_save(models['attention'].state_dict(), os.path.join(save_path, "attention_model.pth"), method='torch')
 
 # --- Main Training Task (Executed in ProcessPool) ---
 
@@ -314,11 +212,11 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
 
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # 1. Create labels
-        labels = _create_labels(df, config)
+        # 1. Create labels using FeatureProcessor
+        labels = FeatureProcessor.create_labels(df, config)
         
-        # 2. Normalize features
-        normalized_df = _normalize(df, config)
+        # 2. Normalize features using FeatureProcessor
+        normalized_df = FeatureProcessor.normalize(df, config)
         
         # Align features and labels
         valid_indices = normalized_df.dropna().index.intersection(labels.index)
@@ -333,8 +231,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             worker_logger.warning("Training data has fewer than 3 unique labels.", symbol=symbol)
             return False
 
-        # 3. Create sequences
-        X_seq, y_seq = _create_sequences(X_normalized, y, config.features.sequence_length)
+        # 3. Create sequences using FeatureProcessor
+        X_seq, y_seq = FeatureProcessor.create_sequences(X_normalized, y, config.features.sequence_length)
         if len(X_seq) == 0:
             return False
 
@@ -546,8 +444,8 @@ class EnsembleLearner:
             return {'action': 'hold', 'confidence': 0.0}
 
         try:
-            # Use the standalone normalize function
-            normalized_df = _normalize(df, self.config)
+            # Use FeatureProcessor for normalization
+            normalized_df = FeatureProcessor.normalize(df, self.config)
             sequence_df = normalized_df.tail(seq_len)
             
             if sequence_df.isnull().values.any():
