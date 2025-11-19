@@ -47,6 +47,7 @@ class DataHandler:
         self._shared_latest_prices = shared_latest_prices
         self._running = False
         self._update_task: Optional[asyncio.Task] = None
+        self._save_task: Optional[asyncio.Task] = None
         
         # Event system for new candle notification
         self._new_candle_events: Dict[str, asyncio.Event] = {s: asyncio.Event() for s in self.symbols}
@@ -55,6 +56,7 @@ class DataHandler:
         # Persistence settings
         self.cache_dir = "market_data_cache"
         os.makedirs(self.cache_dir, exist_ok=True)
+        self.auto_save_interval = 900 # Save every 15 minutes
         
         # Buffer Limits
         self.max_training_buffer = 10000 # Max rows to keep in raw buffer
@@ -111,18 +113,21 @@ class DataHandler:
             logger.error("Failed to initialize data for symbol", symbol=symbol, error=str(e))
 
     async def run(self):
-        """Starts the background data update loop."""
+        """Starts the background data update and auto-save loops."""
         if self._running:
             return
         self._running = True
         self._update_task = asyncio.create_task(self._update_loop())
-        logger.info("DataHandler update loop started.")
+        self._save_task = asyncio.create_task(self._auto_save_loop())
+        logger.info("DataHandler update and auto-save loops started.")
 
     async def stop(self):
-        """Stops the background data update loop and saves cache."""
+        """Stops the background loops and saves cache."""
         self._running = False
         if self._update_task and not self._update_task.done():
             self._update_task.cancel()
+        if self._save_task and not self._save_task.done():
+            self._save_task.cancel()
         
         # Save cache on shutdown (saving the RAW buffers)
         logger.info("Saving market data cache...")
@@ -144,6 +149,19 @@ class DataHandler:
                 logger.error("Error in data update loop", error=str(e), exc_info=True)
             
             await asyncio.sleep(self.update_interval)
+
+    async def _auto_save_loop(self):
+        """Periodically saves the raw data buffers to disk."""
+        while self._running:
+            try:
+                await asyncio.sleep(self.auto_save_interval)
+                logger.debug("Auto-saving market data cache...")
+                save_tasks = [self._save_to_cache(symbol, df) for symbol, df in self._raw_buffers.items()]
+                await asyncio.gather(*save_tasks)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Error in auto-save loop", error=str(e))
 
     async def update_symbol_data(self, symbol: str):
         """Fetches latest data for a symbol and updates internal buffers. Public for backtesting."""
