@@ -3,7 +3,6 @@ import time
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
 import pandas as pd
-from concurrent.futures import ProcessPoolExecutor
 
 from bot_core.logger import get_logger, set_correlation_id
 from bot_core.exchange_api import ExchangeAPI
@@ -45,9 +44,6 @@ class TradingBot:
         self.market_details: Dict[str, Dict[str, Any]] = {}
         self.tasks: list[asyncio.Task] = []
         
-        # Executor for CPU-intensive tasks (AI Training) to avoid blocking the asyncio loop
-        self.training_executor = ProcessPoolExecutor(max_workers=1)
-        
         self._initialize_shared_state()
         logger.info("TradingBot orchestrator initialized.")
 
@@ -73,6 +69,7 @@ class TradingBot:
                     logger.error("Failed to load market details for symbol, trading may fail.", symbol=symbol)
             except Exception as e:
                 logger.critical("Could not load market details for symbol due to an exception.", symbol=symbol, error=str(e))
+        # Pass the loaded market details to the trade executor
         self.trade_executor.market_details = self.market_details
         logger.info("Market details loading complete and passed to TradeExecutor.")
 
@@ -80,6 +77,7 @@ class TradingBot:
         """Performs safety checks and state reconciliation on startup."""
         logger.info("Performing startup state reconciliation...")
         
+        # 1. Reconcile PENDING positions (Two-Phase Commit Recovery)
         pending_positions = await self.position_manager.get_pending_positions()
         if pending_positions:
             logger.info("Found PENDING positions from previous session. Reconciling...", count=len(pending_positions))
@@ -98,8 +96,12 @@ class TradingBot:
 
                     status = order.get('status')
                     if status == 'FILLED':
+                        # Recover the position
                         filled_qty = order.get('filled', 0.0)
                         avg_price = order.get('average', 0.0)
+                        
+                        # Fallback SL/TP since we might not have market data yet
+                        # Default to 5% risk if we can't calculate it
                         sl_pct = 0.05
                         tp_pct = 0.05
                         if pos.side == 'BUY':
@@ -124,6 +126,7 @@ class TradingBot:
                 except Exception as e:
                     logger.error("Error reconciling pending position", symbol=pos.symbol, error=str(e))
 
+        # 2. Cancel all open orders to ensure clean slate (remove orphans)
         for symbol in self.config.strategy.symbols:
             try:
                 cancelled = await self.exchange_api.cancel_all_orders(symbol)
@@ -132,14 +135,17 @@ class TradingBot:
             except Exception as e:
                 logger.error("Failed to cancel orders on startup", symbol=symbol, error=str(e))
 
+        # 3. Verify Balances vs Positions
         try:
             balances = await self.exchange_api.get_balance()
             expected_positions = await self.position_manager.get_aggregated_open_positions()
             
             for symbol, expected_qty in expected_positions.items():
                 base_asset = symbol.split('/')[0]
+                # Check 'total' because we just cancelled orders, so 'used' should be 0
                 actual_qty = balances.get(base_asset, {}).get('total', 0.0)
                 
+                # Allow for small dust difference (e.g. fees)
                 if actual_qty < (expected_qty * 0.98): 
                     logger.critical("CRITICAL: Balance mismatch detected!", 
                                     symbol=symbol, 
@@ -162,17 +168,20 @@ class TradingBot:
         await self._load_market_details()
         await self._reconcile_start_state()
 
+        # Start shared loops
         self.tasks.append(asyncio.create_task(self.data_handler.run()))
         self.tasks.append(asyncio.create_task(self._monitoring_loop()))
         self.tasks.append(asyncio.create_task(self.position_monitor.run()))
         self.tasks.append(asyncio.create_task(self._retraining_loop()))
 
+        # Start a trading cycle for each symbol
         for symbol in self.config.strategy.symbols:
             self.tasks.append(asyncio.create_task(self._trading_cycle_for_symbol(symbol)))
         
         await asyncio.gather(*self.tasks, return_exceptions=True)
 
     async def _trading_cycle_for_symbol(self, symbol: str):
+        """Runs the trading logic loop for a single symbol to find entry/exit signals."""
         logger.info("Starting trading cycle for symbol", symbol=symbol)
         while self.running:
             set_correlation_id()
@@ -187,6 +196,7 @@ class TradingBot:
             await asyncio.sleep(self.config.strategy.interval_seconds)
 
     async def _monitoring_loop(self):
+        """Periodically runs health checks and portfolio monitoring."""
         while self.running:
             try:
                 health_status = self.health_checker.get_health_status()
@@ -198,12 +208,21 @@ class TradingBot:
                     await asyncio.sleep(5)
                     continue
 
+                # Await the async DB call
                 open_positions = await self.position_manager.get_all_open_positions()
                 portfolio_value = self.position_manager.get_portfolio_value(self.latest_prices, open_positions)
                 
                 daily_pnl = await self.position_manager.get_daily_realized_pnl()
+                
+                # Update Risk Manager and check for emergency liquidation
                 await self.risk_manager.update_portfolio_risk(portfolio_value, daily_pnl)
+                
+                if self.risk_manager.liquidation_needed:
+                    logger.critical("Risk Manager requested emergency liquidation. Closing all positions.")
+                    await self._liquidate_all_positions("Emergency Risk Halt")
+                    self.risk_manager.liquidation_needed = False # Reset flag after action
 
+                # Update shared state for Telegram bot
                 self.shared_bot_state['portfolio_equity'] = portfolio_value
                 self.shared_bot_state['open_positions_count'] = len(open_positions)
                 self.shared_bot_state['daily_pnl'] = daily_pnl
@@ -216,11 +235,29 @@ class TradingBot:
                 break
             except Exception as e:
                 logger.error("Error in monitoring loop", error=str(e))
-            await asyncio.sleep(60)
+            await asyncio.sleep(60) # Monitoring interval
+
+    async def _liquidate_all_positions(self, reason: str):
+        """Closes all open positions immediately."""
+        logger.warning("Initiating portfolio liquidation...", reason=reason)
+        open_positions = await self.position_manager.get_all_open_positions()
+        
+        if not open_positions:
+            logger.info("No positions to liquidate.")
+            return
+
+        tasks = []
+        for pos in open_positions:
+            logger.info("Liquidating position", symbol=pos.symbol, qty=pos.quantity)
+            tasks.append(self.trade_executor.close_position(pos, reason))
+        
+        await asyncio.gather(*tasks)
+        logger.info("Portfolio liquidation complete.")
 
     async def _retraining_loop(self):
         """Periodically checks if the strategy models need retraining and triggers it."""
         logger.info("Starting model retraining loop.")
+        # Wait a bit on startup to let data load
         await asyncio.sleep(60)
 
         while self.running:
@@ -231,6 +268,7 @@ class TradingBot:
                         
                         training_data_limit = self.strategy.get_training_data_limit()
                         if training_data_limit <= 0:
+                            logger.info("Strategy does not require training data, skipping.", symbol=symbol, strategy=self.strategy.__class__.__name__)
                             continue
 
                         training_df = await self.data_handler.fetch_full_history_for_symbol(
@@ -238,11 +276,19 @@ class TradingBot:
                         )
 
                         if training_df is not None and not training_df.empty:
-                            # Pass the ProcessPoolExecutor to the strategy
-                            await self.strategy.retrain(symbol, training_df, self.training_executor)
+                            # Run the potentially CPU-intensive training in a separate thread
+                            # to avoid blocking the main async event loop.
+                            loop = asyncio.get_running_loop()
+                            await loop.run_in_executor(
+                                None, 
+                                self.strategy.retrain,
+                                symbol,
+                                training_df
+                            )
                         else:
                             logger.error("Could not fetch training data, skipping retraining for now.", symbol=symbol)
                 
+                # Check again in an hour
                 await asyncio.sleep(3600)
 
             except asyncio.CancelledError:
@@ -250,7 +296,7 @@ class TradingBot:
                 break
             except Exception as e:
                 logger.error("Error in retraining loop", error=str(e), exc_info=True)
-                await asyncio.sleep(3600)
+                await asyncio.sleep(3600) # Wait before retrying on error
 
     async def _run_single_trade_check(self, symbol: str):
         logger.debug("Starting new trade check", symbol=symbol)
@@ -268,15 +314,18 @@ class TradingBot:
             logger.warning("Latest price for symbol not available yet.", symbol=symbol)
             return
 
+        # Await the async DB call
         position = await self.position_manager.get_open_position(symbol)
         signal = await self.strategy.analyze_market(symbol, df_with_indicators, position)
 
         if signal: await self._handle_signal(signal, df_with_indicators, position)
 
     async def _handle_signal(self, signal: Dict, df_with_indicators: pd.DataFrame, position: Optional[Position]):
+        """Delegates signal handling to the TradeExecutor."""
         await self.trade_executor.execute_trade_signal(signal, df_with_indicators, position)
 
     async def _close_position(self, position: Position, reason: str):
+        """Delegates position closing to the TradeExecutor."""
         await self.trade_executor.close_position(position, reason)
 
     async def stop(self):
@@ -292,10 +341,6 @@ class TradingBot:
                 task.cancel()
         
         await asyncio.gather(*[task for task in self.tasks if not task.done()], return_exceptions=True)
-
-        # Shutdown the training executor
-        logger.info("Shutting down training executor...")
-        self.training_executor.shutdown(wait=True)
 
         if self.exchange_api: await self.exchange_api.close()
         if self.position_manager: self.position_manager.close()
