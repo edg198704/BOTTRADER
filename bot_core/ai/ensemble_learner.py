@@ -22,6 +22,7 @@ try:
     from sklearn.ensemble import VotingClassifier, RandomForestClassifier
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import precision_score, classification_report
+    from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
     from xgboost import XGBClassifier
     ML_AVAILABLE = True
 except ImportError:
@@ -31,6 +32,8 @@ except ImportError:
     class RandomForestClassifier: pass
     class LogisticRegression: pass
     class XGBClassifier: pass
+    class RandomizedSearchCV: pass
+    class TimeSeriesSplit: pass
     def precision_score(*args, **kwargs): return 0.0
     def classification_report(*args, **kwargs): return ""
     class nn:
@@ -82,6 +85,28 @@ def _create_fresh_models(config: AIEnsembleStrategyParams, device) -> Dict[str, 
             ))
         ], voting='soft')
     }
+
+def _optimize_hyperparameters(model, X, y, param_dist, n_iter, logger_instance, symbol):
+    """Runs RandomizedSearchCV to find better hyperparameters."""
+    try:
+        # Use TimeSeriesSplit to prevent data leakage (future peeking)
+        tscv = TimeSeriesSplit(n_splits=3)
+        search = RandomizedSearchCV(
+            estimator=model,
+            param_distributions=param_dist,
+            n_iter=n_iter,
+            scoring='neg_log_loss',
+            cv=tscv,
+            n_jobs=1, # Already in a subprocess
+            random_state=42,
+            verbose=0
+        )
+        search.fit(X, y)
+        logger_instance.info("Hyperparameter optimization complete", symbol=symbol, best_params=search.best_params_)
+        return search.best_estimator_
+    except Exception as e:
+        logger_instance.warning("Hyperparameter optimization failed, using default.", symbol=symbol, error=str(e))
+        return model
 
 def _train_pytorch_model(model: nn.Module, X_train: torch.Tensor, y_train: torch.Tensor, X_val: torch.Tensor, y_val: torch.Tensor, config: AIEnsembleStrategyParams):
     train_cfg = config.training
@@ -255,11 +280,53 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         X_val_flat = X_val_seq.reshape(X_val_seq.shape[0], -1)
         y_val_flat = y_val_seq
         
-        # 5. Create and Train Models
+        # 5. Create Models
         models = _create_fresh_models(config, device)
 
+        # --- Hyperparameter Optimization (Optional) ---
+        if config.training.auto_tune_models:
+            worker_logger.info("Running hyperparameter optimization...", symbol=symbol)
+            
+            # XGBoost Optimization
+            xgb_params = {
+                'learning_rate': [0.01, 0.05, 0.1, 0.2],
+                'max_depth': [3, 5, 7, 9],
+                'n_estimators': [50, 100, 200],
+                'subsample': [0.6, 0.8, 1.0],
+                'colsample_bytree': [0.6, 0.8, 1.0]
+            }
+            models['gb'] = _optimize_hyperparameters(
+                models['gb'], X_train_flat, y_train_flat, xgb_params, 
+                config.training.n_iter_search, worker_logger, symbol
+            )
+
+            # Random Forest Optimization (Standalone first)
+            rf_params = {
+                'n_estimators': [50, 100, 200],
+                'max_depth': [None, 10, 20, 30],
+                'min_samples_leaf': [1, 2, 4, 10]
+            }
+            # Extract RF from VotingClassifier or create new
+            rf_base = RandomForestClassifier(random_state=42)
+            optimized_rf = _optimize_hyperparameters(
+                rf_base, X_train_flat, y_train_flat, rf_params,
+                config.training.n_iter_search, worker_logger, symbol
+            )
+            
+            # Reconstruct VotingClassifier with optimized RF
+            lr_base = models['technical'].estimators[1][1] # Get existing LR
+            models['technical'] = VotingClassifier(estimators=[
+                ('rf', optimized_rf),
+                ('lr', lr_base)
+            ], voting='soft')
+
+        # 6. Train Models
         worker_logger.info("Training scikit-learn models with flattened history...", symbol=symbol)
-        models['gb'].fit(X_train_flat, y_train_flat)
+        # Note: If HPO ran, models['gb'] is already fitted on X_train_flat by RandomizedSearchCV (refit=True)
+        # But VotingClassifier needs to be fitted.
+        if not config.training.auto_tune_models:
+            models['gb'].fit(X_train_flat, y_train_flat)
+        
         models['technical'].fit(X_train_flat, y_train_flat)
         
         worker_logger.info("Training PyTorch models...", symbol=symbol)
@@ -271,7 +338,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         _train_pytorch_model(models['lstm'], X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor, config)
         _train_pytorch_model(models['attention'], X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor, config)
 
-        # 6. Auto-Tune Ensemble Weights (Auto-ML)
+        # 7. Auto-Tune Ensemble Weights (Auto-ML)
         weights_config = config.ensemble_weights
         default_weights = [
             weights_config.xgboost,
@@ -317,7 +384,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             else:
                 worker_logger.warning("Validation scores too low, reverting to default weights.", symbol=symbol)
 
-        # 7. Evaluation with Final Weights
+        # 8. Evaluation with Final Weights
         worker_logger.info("Evaluating ensemble...", symbol=symbol)
         ensemble_probs = _get_ensemble_prediction_static(models, X_val_flat, X_val_tensor, final_weights)
         y_pred = np.argmax(ensemble_probs, axis=1)
@@ -333,7 +400,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             worker_logger.warning("Model failed validation threshold.", symbol=symbol)
             return False
 
-        # 8. Feature Importance Extraction
+        # 9. Feature Importance Extraction
         # We aggregate importance across the sequence length for each feature
         feature_importance_map = {}
         try:
@@ -382,7 +449,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             'top_features': feature_importance_map
         }
 
-        # 9. Save Models & Weights
+        # 10. Save Models & Weights
         _save_models_to_disk(symbol, models, config, learned_weights=final_weights, extra_meta=extra_meta)
         worker_logger.info("Models saved successfully.", symbol=symbol)
         return True
