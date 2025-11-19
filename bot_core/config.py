@@ -189,8 +189,15 @@ class RiskManagementConfig(BaseModel):
     reward_to_risk_ratio: float
     trailing_stop_activation_pct: float
     trailing_stop_pct: float
+    
+    # --- Confidence-Based Sizing ---
     confidence_scaling_factor: float = 0.0
     max_confidence_risk_multiplier: float = 1.0
+    
+    # --- Confidence-Based Reward Targeting (New) ---
+    confidence_rr_scaling_factor: float = 0.0
+    max_confidence_rr_multiplier: float = 1.5
+
     regime_based_risk: RegimeBasedRiskConfig
     time_based_exit: TimeBasedExitConfig = TimeBasedExitConfig()
     correlation: CorrelationConfig = CorrelationConfig()
