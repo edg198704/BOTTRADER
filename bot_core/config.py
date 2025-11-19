@@ -92,6 +92,8 @@ class AIEnsembleStrategyParams(StrategyParamsBase):
     use_regime_filter: bool
     retrain_interval_hours: int
     training_data_limit: int = 5000
+    signal_cooldown_candles: int = 1
+    inference_workers: int = 2
     features: AIFeatureEngineeringConfig
     training: AITrainingConfig = AITrainingConfig()
     hyperparameters: AIHyperparameters = AIHyperparameters()
