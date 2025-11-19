@@ -33,6 +33,13 @@ class MarketRegimeConfig(BaseModel):
     trend_slow_ma_col: str = "sma_slow"
     volatility_col: str = "atr"
     rsi_col: str = "rsi"
+    
+    # --- Dynamic Confidence Thresholds ---
+    # Overrides the global confidence_threshold based on regime
+    bull_confidence_threshold: Optional[float] = None
+    bear_confidence_threshold: Optional[float] = None
+    volatile_confidence_threshold: Optional[float] = None
+    sideways_confidence_threshold: Optional[float] = None
 
 class AITrainingConfig(BaseModel):
     epochs: int = 50
