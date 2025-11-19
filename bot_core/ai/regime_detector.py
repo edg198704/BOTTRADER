@@ -1,5 +1,6 @@
 from enum import Enum
 import pandas as pd
+import numpy as np
 from typing import Dict, Any
 
 from bot_core.logger import get_logger
@@ -22,53 +23,77 @@ class MarketRegimeDetector:
                     trend_fast=config.market_regime.trend_fast_ma_col,
                     trend_slow=config.market_regime.trend_slow_ma_col)
 
+    def add_regime_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculates continuous regime metrics and adds them as columns to the DataFrame.
+        These features (regime_trend, regime_volatility) can be used by the AI model.
+        """
+        df = df.copy()
+        mr_config = self.config.market_regime
+        
+        fast_ma_col = mr_config.trend_fast_ma_col
+        slow_ma_col = mr_config.trend_slow_ma_col
+        vol_col = mr_config.volatility_col
+        
+        # 1. Trend Feature: (Fast - Slow) / Slow
+        # Positive = Bullish, Negative = Bearish, Magnitude = Strength
+        if fast_ma_col in df.columns and slow_ma_col in df.columns:
+            slow_ma = df[slow_ma_col].replace(0, np.nan)
+            df['regime_trend'] = (df[fast_ma_col] - slow_ma) / slow_ma
+        else:
+            df['regime_trend'] = 0.0
+            
+        # 2. Volatility Feature: Current / Avg(50)
+        # > 1.0 means volatility is expanding, < 1.0 means contracting
+        if vol_col in df.columns:
+            avg_vol = df[vol_col].rolling(50).mean()
+            avg_vol = avg_vol.replace(0, np.nan)
+            df['regime_volatility'] = df[vol_col] / avg_vol
+        else:
+            df['regime_volatility'] = 1.0
+            
+        # Fill NaNs that might result from rolling windows or division
+        return df.fillna(0.0)
+
     async def detect_regime(self, symbol: str, df: pd.DataFrame) -> Dict[str, Any]:
         """
         Analyzes the provided DataFrame to determine the market regime.
-        Uses columns defined in config.market_regime to avoid hardcoded assumptions.
+        Uses pre-calculated regime features if available, otherwise calculates on the fly.
         """
         if len(df) < 50:
             return {'regime': MarketRegime.UNKNOWN.value, 'confidence': 0.0}
         
         mr_config = self.config.market_regime
-        
-        # Resolve column names from config
-        fast_ma_col = mr_config.trend_fast_ma_col
-        slow_ma_col = mr_config.trend_slow_ma_col
-        vol_col = mr_config.volatility_col
         rsi_col = mr_config.rsi_col
 
-        # Check if required columns exist
-        missing_cols = [col for col in [fast_ma_col, slow_ma_col] if col not in df.columns]
-        if missing_cols:
-            logger.warning("Missing required columns for regime detection", symbol=symbol, missing=missing_cols)
-            return {'regime': MarketRegime.UNKNOWN.value, 'confidence': 0.0}
-
         try:
-            # 1. Trend Detection
-            fast_ma = df[fast_ma_col].iloc[-1]
-            slow_ma = df[slow_ma_col].iloc[-1]
-            
-            # Calculate trend strength: (Fast - Slow) / Slow
-            trend_strength = (fast_ma - slow_ma) / slow_ma if slow_ma > 0 else 0
-            
-            # 2. Volatility Detection
-            # Compare current volatility (e.g., ATR) to its long-term average
-            is_volatile = False
-            if vol_col in df.columns:
-                current_vol = df[vol_col].iloc[-1]
-                # Calculate rolling average of volatility on the fly if not present
-                # This is fast enough for a single column
-                avg_vol = df[vol_col].rolling(50).mean().iloc[-1]
+            # Use pre-calculated features if they exist (optimization)
+            if 'regime_trend' in df.columns and 'regime_volatility' in df.columns:
+                trend_strength = df['regime_trend'].iloc[-1]
+                vol_ratio = df['regime_volatility'].iloc[-1]
+            else:
+                # Fallback to manual calculation for the last row
+                fast_ma_col = mr_config.trend_fast_ma_col
+                slow_ma_col = mr_config.trend_slow_ma_col
+                vol_col = mr_config.volatility_col
                 
-                if avg_vol > 0 and current_vol > (avg_vol * mr_config.volatility_multiplier):
-                    is_volatile = True
-            
+                fast_ma = df[fast_ma_col].iloc[-1] if fast_ma_col in df.columns else 0
+                slow_ma = df[slow_ma_col].iloc[-1] if slow_ma_col in df.columns else 1
+                trend_strength = (fast_ma - slow_ma) / slow_ma if slow_ma > 0 else 0
+                
+                vol_ratio = 1.0
+                if vol_col in df.columns:
+                    current_vol = df[vol_col].iloc[-1]
+                    avg_vol = df[vol_col].rolling(50).mean().iloc[-1]
+                    if avg_vol > 0:
+                        vol_ratio = current_vol / avg_vol
+
             # 3. RSI (Momentum) Check
             rsi_val = df[rsi_col].iloc[-1] if rsi_col in df.columns else 50
 
             # Determine Regime
             trend_thresh = mr_config.trend_strength_threshold
+            is_volatile = vol_ratio > mr_config.volatility_multiplier
             
             if is_volatile:
                 regime = MarketRegime.VOLATILE
@@ -80,7 +105,6 @@ class MarketRegimeDetector:
                 regime = MarketRegime.SIDEWAYS
 
             # Calculate Confidence
-            # Base confidence on trend strength magnitude and RSI confirmation
             trend_conf = min(1.0, abs(trend_strength) * 20)
             rsi_conf = abs(rsi_val - 50) / 50
             confidence = (trend_conf * 0.7) + (rsi_conf * 0.3)
