@@ -176,7 +176,11 @@ def _train_pytorch_model(model: nn.Module, X_train: torch.Tensor, y_train: torch
         model.load_state_dict(best_model_state)
 
 def _get_ensemble_prediction_static(models: Dict[str, Any], X_flat: np.ndarray, X_seq: torch.Tensor, config: AIEnsembleStrategyParams) -> np.ndarray:
-    """Static version of prediction logic for validation during training."""
+    """
+    Static version of prediction logic for validation during training.
+    X_flat: Flattened sequence history for tree models (N, seq_len * features)
+    X_seq: 3D Tensor for deep learning models (N, seq_len, features)
+    """
     predictions = []
     weights_config = config.ensemble_weights
     weights = [
@@ -186,6 +190,7 @@ def _get_ensemble_prediction_static(models: Dict[str, Any], X_flat: np.ndarray, 
         weights_config.attention
     ]
 
+    # Tree models now receive the full flattened history
     gb_pred = models['gb'].predict_proba(X_flat)
     predictions.append(gb_pred)
     tech_pred = models['technical'].predict_proba(X_flat)
@@ -275,15 +280,16 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         if len(X_train_seq) == 0 or len(X_val_seq) == 0:
             return False
 
-        X_train_flat = X_train_seq[:, -1, :]
+        # Flatten sequences for tree models: (N, seq_len, features) -> (N, seq_len * features)
+        X_train_flat = X_train_seq.reshape(X_train_seq.shape[0], -1)
         y_train_flat = y_train_seq
-        X_val_flat = X_val_seq[:, -1, :]
+        X_val_flat = X_val_seq.reshape(X_val_seq.shape[0], -1)
         y_val_flat = y_val_seq
         
         # 5. Create and Train Models
         models = _create_fresh_models(config, device)
 
-        worker_logger.info("Training scikit-learn models...", symbol=symbol)
+        worker_logger.info("Training scikit-learn models with flattened history...", symbol=symbol)
         models['gb'].fit(X_train_flat, y_train_flat)
         models['technical'].fit(X_train_flat, y_train_flat)
         
@@ -415,11 +421,15 @@ class EnsembleLearner:
                 return {'action': 'hold', 'confidence': 0.0}
 
             features = np.nan_to_num(sequence_df.values, nan=0.0)
-            last_step_features = features[-1, :].reshape(1, -1)
+            
+            # Flatten the sequence for tree models: (1, seq_len * features)
+            flattened_features = features.reshape(1, -1)
+            
+            # Tensor for Deep Learning models: (1, seq_len, features)
             sequence_tensor = torch.FloatTensor(features).unsqueeze(0).to(self.device)
 
             # Use the static prediction logic
-            ensemble_pred = _get_ensemble_prediction_static(models, last_step_features, sequence_tensor, self.config)
+            ensemble_pred = _get_ensemble_prediction_static(models, flattened_features, sequence_tensor, self.config)
             
             action_idx = np.argmax(ensemble_pred)
             confidence = float(ensemble_pred[action_idx])
