@@ -67,6 +67,11 @@ class AIFeatureEngineeringConfig(BaseModel):
     triple_barrier_tp_multiplier: float = 2.0
     triple_barrier_sl_multiplier: float = 2.0
 
+class AIPerformanceConfig(BaseModel):
+    enabled: bool = True
+    window_size: int = 50 # Number of past predictions to evaluate
+    min_accuracy: float = 0.45 # Trigger retrain if accuracy drops below this
+
 class AIHyperparameters(BaseModel):
     xgboost: XGBoostConfig = XGBoostConfig()
     random_forest: RandomForestConfig = RandomForestConfig()
@@ -100,6 +105,7 @@ class AIEnsembleStrategyParams(StrategyParamsBase):
     hyperparameters: AIHyperparameters = AIHyperparameters()
     ensemble_weights: EnsembleWeightsConfig = EnsembleWeightsConfig()
     market_regime: MarketRegimeConfig = MarketRegimeConfig()
+    performance: AIPerformanceConfig = AIPerformanceConfig()
 
 # --- Core Component Configs ---
 
