@@ -340,6 +340,7 @@ class EnsembleLearner:
         
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Stores models AND metadata: {symbol: {'models': {...}, 'meta': {...}}}
         self.symbol_models: Dict[str, Dict[str, Any]] = {}
         self.is_trained = False
         
@@ -371,12 +372,12 @@ class EnsembleLearner:
         try:
             # Run IO-bound load in thread pool
             loop = asyncio.get_running_loop()
-            models = await loop.run_in_executor(None, self._load_models_sync, symbol_path)
+            loaded_data = await loop.run_in_executor(None, self._load_models_sync, symbol_path)
             
-            if models:
-                self.symbol_models[symbol] = models
+            if loaded_data:
+                self.symbol_models[symbol] = loaded_data
                 self.is_trained = True
-                logger.info("Models reloaded successfully.", symbol=symbol)
+                logger.info("Models reloaded successfully.", symbol=symbol, version=loaded_data['meta'].get('timestamp'))
         except Exception as e:
             logger.error("Failed to reload models", symbol=symbol, error=str(e))
 
@@ -396,14 +397,21 @@ class EnsembleLearner:
             models['technical'] = joblib.load(os.path.join(symbol_path, "technical_model.pkl"))
             models['lstm'].load_state_dict(torch.load(os.path.join(symbol_path, "lstm_model.pth"), map_location=self.device))
             models['attention'].load_state_dict(torch.load(os.path.join(symbol_path, "attention_model.pth"), map_location=self.device))
-            return models
+            
+            return {
+                'models': models,
+                'meta': meta
+            }
         except Exception:
             return None
 
     async def predict(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
-        models = self.symbol_models.get(symbol)
-        if not models:
+        entry = self.symbol_models.get(symbol)
+        if not entry:
             return {'action': 'hold', 'confidence': 0.0}
+        
+        models = entry['models']
+        meta = entry['meta']
         
         seq_len = self.config.features.sequence_length
         norm_window = self.config.features.normalization_window
@@ -435,7 +443,12 @@ class EnsembleLearner:
             confidence = float(ensemble_pred[action_idx])
             action_map = {0: 'sell', 1: 'hold', 2: 'buy'}
             
-            return {'action': action_map.get(action_idx, 'hold'), 'confidence': confidence}
+            return {
+                'action': action_map.get(action_idx, 'hold'), 
+                'confidence': confidence,
+                'model_version': meta.get('timestamp'),
+                'model_type': 'ensemble'
+            }
         except Exception as e:
             logger.error("Error during prediction", symbol=symbol, error=str(e))
             return {'action': 'hold', 'confidence': 0.0}
