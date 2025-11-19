@@ -67,6 +67,22 @@ class TradeExecutor:
             if is_close_long_signal or is_close_short_signal:
                 await self.close_position(position, "Strategy Signal")
 
+    def _calculate_or_extract_fee(self, order_state: Dict[str, Any], price: float, quantity: float) -> float:
+        """Extracts fee from order state or estimates it based on config."""
+        # 1. Try to get explicit fee from exchange response
+        if order_state and 'fee' in order_state and order_state['fee']:
+            fee_data = order_state['fee']
+            # CCXT usually returns {'cost': float, 'currency': str}
+            if 'cost' in fee_data and fee_data['cost'] is not None:
+                return float(fee_data['cost'])
+        
+        # 2. Fallback: Estimate based on config
+        # We assume taker fee for market orders (which most closes are, or aggressive limits)
+        # For simplicity in estimation, we use taker fee as conservative estimate if unknown
+        fee_rate = self.config.exchange.taker_fee_pct
+        estimated_fee = price * quantity * fee_rate
+        return estimated_fee
+
     async def _execute_open_position(self, symbol: str, side: str, current_price: float, df: pd.DataFrame, regime: Optional[str], signal: Dict):
         # Await async DB call to get ALL active positions (OPEN + PENDING) for accurate risk check
         active_positions = await self.position_manager.get_all_active_positions()
@@ -177,7 +193,10 @@ class TradeExecutor:
                 # We leave it as PENDING so it can be reconciled manually or on restart.
                 return
 
-            logger.info("Order to open position was filled.", order_id=current_order_id, filled_qty=fill_quantity, fill_price=fill_price)
+            # Calculate Fees
+            fees = self._calculate_or_extract_fee(final_order_state, fill_price, fill_quantity)
+
+            logger.info("Order to open position was filled.", order_id=current_order_id, filled_qty=fill_quantity, fill_price=fill_price, fees=fees)
             final_stop_loss = self.risk_manager.calculate_stop_loss(side, fill_price, df, market_regime=regime)
             final_take_profit = self.risk_manager.calculate_take_profit(
                 side, 
@@ -188,7 +207,7 @@ class TradeExecutor:
                 confidence_threshold=confidence_threshold
             )
             
-            await self.position_manager.confirm_position_open(symbol, current_order_id, fill_quantity, fill_price, final_stop_loss, final_take_profit)
+            await self.position_manager.confirm_position_open(symbol, current_order_id, fill_quantity, fill_price, final_stop_loss, final_take_profit, fees=fees)
         
         elif final_status == 'OPEN':
             # CRITICAL: The order is still OPEN on the exchange (cancellation failed), but we stopped chasing.
@@ -312,6 +331,9 @@ class TradeExecutor:
             # Use the aggregated average price for PnL calculation
             close_price = final_order_state['average']
             
+            # Calculate Fees
+            fees = self._calculate_or_extract_fee(final_order_state, close_price, fill_quantity)
+            
             # Check if full close (with tolerance for float precision)
             # OR if we used the 'Smart Retry' quantity (meaning we sold everything we had)
             is_full_close = fill_quantity >= (position.quantity * 0.999)
@@ -320,10 +342,10 @@ class TradeExecutor:
             if is_full_close or is_smart_retry_close:
                 # We pass the actual filled quantity to ensure PnL is calculated on what was sold,
                 # but the position record is closed fully, effectively discarding any dust discrepancy.
-                await self.position_manager.close_position(position.symbol, close_price, reason, actual_filled_qty=fill_quantity)
+                await self.position_manager.close_position(position.symbol, close_price, reason, actual_filled_qty=fill_quantity, fees=fees)
             else:
                 # Partial fill handling
-                await self.position_manager.reduce_position(position.symbol, fill_quantity, close_price, reason)
+                await self.position_manager.reduce_position(position.symbol, fill_quantity, close_price, reason, fees=fees)
                 
         else:
             final_status = final_order_state.get('status') if final_order_state else 'UNKNOWN'
