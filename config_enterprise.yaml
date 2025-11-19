@@ -285,6 +285,7 @@ optimizer:
   adjustment_step: 0.02 # Change threshold by 2% per run
   max_threshold_cap: 0.90 # Never go above 90% confidence req
   min_threshold_floor: 0.55 # Never go below 55% confidence req
+  state_file_path: "optimizer_state.json" # File to persist learned thresholds
 
 backtest:
   enabled: true
