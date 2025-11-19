@@ -58,6 +58,9 @@ class AIFeatureEngineeringConfig(BaseModel):
     labeling_horizon: int = 5
     labeling_threshold: float = 0.005
     normalization_window: int = 100
+    # Dynamic Labeling Parameters
+    use_dynamic_labeling: bool = False
+    labeling_atr_multiplier: float = 1.0
 
 class AIHyperparameters(BaseModel):
     xgboost: XGBoostConfig = XGBoostConfig()
