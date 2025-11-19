@@ -43,26 +43,78 @@ class FeatureProcessor:
         return cols
 
     @staticmethod
+    def _stationarize_data(df: pd.DataFrame, cols_to_process: List[str]) -> pd.DataFrame:
+        """
+        Transforms non-stationary features (absolute prices, raw volume) into stationary ratios.
+        This improves model generalization across different price regimes.
+        """
+        df_trans = df.copy()
+        
+        # 1. Handle Volume -> Relative Volume
+        if 'volume' in df_trans.columns and 'volume' in cols_to_process:
+            # Use a 50-period rolling average for baseline
+            vol_ma = df_trans['volume'].rolling(window=50, min_periods=1).mean()
+            # Avoid division by zero
+            vol_ma = vol_ma.replace(0, 1.0)
+            df_trans['volume'] = df_trans['volume'] / vol_ma
+
+        # 2. Handle Price Levels -> % Distance from Close
+        # Heuristic: If a column name suggests it's a price level (e.g. 'upper', 'sma')
+        # and its value is close to the current price, transform it to a relative distance.
+        price_keywords = ['upper', 'lower', 'sma', 'ema', 'wma', 'kama', 'mid', 'top', 'bot', 'open', 'high', 'low']
+        
+        if 'close' in df_trans.columns:
+            close_price = df_trans['close']
+            for col in cols_to_process:
+                if col == 'close': continue # 'close' itself is usually not a feature, or handled via log_return
+                if col not in df_trans.columns: continue
+                
+                # Check naming convention
+                is_price_like = any(k in col.lower() for k in price_keywords)
+                
+                if is_price_like:
+                    try:
+                        # Safety check: Magnitude should be comparable to close price (e.g. within 50%)
+                        # This prevents transforming oscillators like RSI that might accidentally match a keyword
+                        # We check the last valid value for efficiency
+                        last_val = df_trans[col].iloc[-1]
+                        last_close = close_price.iloc[-1]
+                        
+                        if last_close > 0 and 0.5 < (last_val / last_close) < 1.5:
+                            # Transform to percentage distance: (Indicator - Close) / Close
+                            df_trans[col] = (df_trans[col] - close_price) / close_price
+                    except Exception:
+                        # If check fails (e.g. NaNs), skip transformation
+                        pass
+
+        return df_trans
+
+    @staticmethod
     def process_data(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> pd.DataFrame:
         """
         Applies the full feature engineering pipeline:
-        1. Selects base feature columns.
-        2. Generates lagged features (if configured).
-        3. Drops NaNs introduced by lags.
-        4. Applies Z-score normalization.
-        5. Enforces column order matching get_feature_names.
+        1. Stationarize features (Absolute -> Relative).
+        2. Select base feature columns.
+        3. Generates lagged features (if configured).
+        4. Drops NaNs introduced by lags.
+        5. Applies Z-score normalization.
+        6. Enforces column order matching get_feature_names.
         """
-        # 1. Select Base Columns
+        # 1. Stationarize Data (Transform absolute prices/volume to ratios)
+        # We pass the list of intended features so we only transform what's needed
+        df_stationary = FeatureProcessor._stationarize_data(df, config.feature_columns)
+
+        # 2. Select Base Columns
         cols = config.feature_columns
-        valid_cols = [c for c in cols if c in df.columns]
+        valid_cols = [c for c in cols if c in df_stationary.columns]
         
         if len(valid_cols) != len(cols):
             missing = set(cols) - set(valid_cols)
             logger.warning("Missing columns during processing", missing=missing)
         
-        subset = df[valid_cols].copy()
+        subset = df_stationary[valid_cols].copy()
         
-        # 2. Generate Lags
+        # 3. Generate Lags
         lags = config.features.lag_features
         depth = config.features.lag_depth
         
@@ -72,10 +124,10 @@ class FeatureProcessor:
                     for i in range(1, depth + 1):
                         subset[f"{col}_lag_{i}"] = subset[col].shift(i)
         
-        # 3. Drop NaNs (from lags and missing data)
+        # 4. Drop NaNs (from lags and missing data)
         subset.dropna(inplace=True)
         
-        # 4. Normalize
+        # 5. Normalize
         window = config.features.normalization_window
         rolling_mean = subset.rolling(window=window).mean()
         rolling_std = subset.rolling(window=window).std()
@@ -86,7 +138,7 @@ class FeatureProcessor:
         # Rolling normalization introduces NaNs at the start of the window
         normalized.dropna(inplace=True)
         
-        # 5. Enforce Column Order
+        # 6. Enforce Column Order
         # Ensure the output DataFrame has columns in the exact order expected by the model
         expected_cols = FeatureProcessor.get_feature_names(config)
         # Filter expected cols to those present (handling potential missing base cols gracefully)
