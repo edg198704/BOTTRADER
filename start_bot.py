@@ -77,27 +77,32 @@ async def main():
     alert_system = AlertSystem()
 
     exchange_api = get_exchange_api(config)
-    position_manager = PositionManager(
-        config.database, 
-        config.initial_capital,
-        alert_system=alert_system
-    )
-    # RiskManager now requires position_manager to persist state
-    risk_manager = RiskManager(
-        config.risk_management,
-        position_manager=position_manager,
-        alert_system=alert_system
-    )
-    strategy = get_strategy(config)
-    order_sizer = OrderSizer()
-    health_checker = HealthChecker()
-    metrics_writer = InfluxDBMetrics(url=os.getenv('INFLUXDB_URL'), token=os.getenv('INFLUXDB_TOKEN'), org=os.getenv('INFLUXDB_ORG'), bucket=os.getenv('INFLUXDB_BUCKET'))
-
+    
+    # Initialize DataHandler early so it can be injected into RiskManager
     data_handler = DataHandler(
         exchange_api=exchange_api,
         config=config,
         shared_latest_prices=latest_prices
     )
+
+    position_manager = PositionManager(
+        config.database, 
+        config.initial_capital,
+        alert_system=alert_system
+    )
+    
+    # RiskManager now requires position_manager AND data_handler (for correlation checks)
+    risk_manager = RiskManager(
+        config.risk_management,
+        position_manager=position_manager,
+        data_handler=data_handler,
+        alert_system=alert_system
+    )
+    
+    strategy = get_strategy(config)
+    order_sizer = OrderSizer()
+    health_checker = HealthChecker()
+    metrics_writer = InfluxDBMetrics(url=os.getenv('INFLUXDB_URL'), token=os.getenv('INFLUXDB_TOKEN'), org=os.getenv('INFLUXDB_ORG'), bucket=os.getenv('INFLUXDB_BUCKET'))
 
     position_monitor = PositionMonitor(
         config=config,
