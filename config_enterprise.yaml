@@ -89,9 +89,16 @@ strategy:
       labeling_horizon: 5 # How many candles into the future to look for labeling
       labeling_threshold: 0.005 # % price change to define a buy/sell label (Fallback if dynamic is off)
       normalization_window: 100 # Rolling window for Z-score normalization
+      
       # Dynamic Labeling: Uses ATR to adjust threshold based on volatility
-      use_dynamic_labeling: true
+      use_dynamic_labeling: false
       labeling_atr_multiplier: 1.0 # Threshold = ATR * 1.0
+      
+      # Triple Barrier Labeling (Advanced)
+      # Uses path-dependent checks for TP/SL hits within the horizon
+      use_triple_barrier: true
+      triple_barrier_tp_multiplier: 2.0 # Target 2x ATR profit
+      triple_barrier_sl_multiplier: 2.0 # Stop at 2x ATR loss
 
     # --- Model Training Parameters ---
     training:
