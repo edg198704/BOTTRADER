@@ -158,20 +158,31 @@ class AIEnsembleStrategy(TradingStrategy):
             'active_weights': active_weights
         }
 
+        # NOTE: We explicitly pass 'regime' at the top level so RiskManager can see it.
+        signal = {
+            'symbol': symbol,
+            'regime': regime,
+            'strategy_metadata': strategy_metadata
+        }
+
         if position:
             if position.side == 'BUY' and action == 'sell':
                 logger.info("AI Close Long signal detected", symbol=symbol, confidence=confidence)
-                return {'action': 'SELL', 'symbol': symbol, 'strategy_metadata': strategy_metadata}
+                signal['action'] = 'SELL'
+                return signal
             if position.side == 'SELL' and action == 'buy':
                 logger.info("AI Close Short signal detected", symbol=symbol, confidence=confidence)
-                return {'action': 'BUY', 'symbol': symbol, 'strategy_metadata': strategy_metadata}
+                signal['action'] = 'BUY'
+                return signal
         else:
             if action == 'buy':
                 logger.info("AI Open Long signal detected", symbol=symbol, confidence=confidence)
-                return {'action': 'BUY', 'symbol': symbol, 'strategy_metadata': strategy_metadata}
+                signal['action'] = 'BUY'
+                return signal
             if action == 'sell':
                 logger.info("AI Open Short signal detected", symbol=symbol, confidence=confidence)
-                return {'action': 'SELL', 'symbol': symbol, 'strategy_metadata': strategy_metadata}
+                signal['action'] = 'SELL'
+                return signal
 
         return None
 
