@@ -28,6 +28,11 @@ class EnsembleWeightsConfig(BaseModel):
 class MarketRegimeConfig(BaseModel):
     trend_strength_threshold: float = 0.015
     volatility_multiplier: float = 1.5
+    # Column aliases to use for detection (must match aliases in strategy.indicators)
+    trend_fast_ma_col: str = "sma_fast"
+    trend_slow_ma_col: str = "sma_slow"
+    volatility_col: str = "atr"
+    rsi_col: str = "rsi"
 
 class AITrainingConfig(BaseModel):
     epochs: int = 50
