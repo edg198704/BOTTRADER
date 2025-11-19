@@ -26,6 +26,7 @@ try:
     from sklearn.metrics import precision_score, classification_report, log_loss
     from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
     from sklearn.utils.class_weight import compute_class_weight, compute_sample_weight
+    from sklearn.isotonic import IsotonicRegression
     from xgboost import XGBClassifier
     ML_AVAILABLE = True
 except ImportError:
@@ -37,6 +38,7 @@ except ImportError:
     class XGBClassifier: pass
     class RandomizedSearchCV: pass
     class TimeSeriesSplit: pass
+    class IsotonicRegression: pass
     def precision_score(*args, **kwargs): return 0.0
     def log_loss(*args, **kwargs): return 0.0
     def classification_report(*args, **kwargs): return ""
@@ -49,6 +51,44 @@ except ImportError:
     class DataLoader: pass
 
 logger = get_logger(__name__)
+
+# --- Helper Classes ---
+
+class MulticlassCalibrator:
+    """Calibrates probabilities for multiclass classification using One-vs-Rest Isotonic Regression."""
+    def __init__(self, method='isotonic'):
+        self.method = method
+        self.calibrators = {} # class_idx -> regressor
+
+    def fit(self, X_probs, y):
+        # X_probs: (N, n_classes)
+        # y: (N,)
+        n_classes = X_probs.shape[1]
+        for i in range(n_classes):
+            # Binary target: 1 if sample is class i, else 0
+            y_binary = (y == i).astype(int)
+            # Input: probability of class i
+            X_col = X_probs[:, i]
+            
+            reg = IsotonicRegression(out_of_bounds='clip')
+            reg.fit(X_col, y_binary)
+            self.calibrators[i] = reg
+            
+    def predict(self, X_probs):
+        n_samples, n_classes = X_probs.shape
+        calibrated = np.zeros_like(X_probs)
+        
+        for i in range(n_classes):
+            if i in self.calibrators:
+                calibrated[:, i] = self.calibrators[i].predict(X_probs[:, i])
+            else:
+                calibrated[:, i] = X_probs[:, i]
+        
+        # Normalize to sum to 1
+        row_sums = calibrated.sum(axis=1, keepdims=True)
+        # Avoid division by zero
+        row_sums[row_sums == 0] = 1.0
+        return calibrated / row_sums
 
 # --- Standalone Helper Functions (Pickle-safe for Multiprocessing) ---
 
@@ -181,18 +221,12 @@ def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyP
             meta = json.load(f)
 
         # --- CONFIG CONSISTENCY CHECK ---
-        # We check if the model's required features are available in the current config.
-        # The model might use a subset (due to feature selection), which is fine.
         saved_active_features = meta.get('active_feature_columns', meta.get('feature_columns', []))
-        
-        # Get all currently available features from config
         current_available_features = FeatureProcessor.get_feature_names(config)
         
-        # Check if saved features are a subset of current available features
         if not set(saved_active_features).issubset(set(current_available_features)):
             return None
         
-        # The number of features the model expects
         saved_num_features = meta.get('num_features', len(saved_active_features))
         # --------------------------------
 
@@ -202,6 +236,12 @@ def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyP
             path = os.path.join(load_dir, f"{name}.joblib")
             if os.path.exists(path):
                 models[name] = joblib.load(path)
+
+        # Load Calibrator
+        calibrator = None
+        calib_path = os.path.join(load_dir, "calibrator.joblib")
+        if os.path.exists(calib_path):
+            calibrator = joblib.load(calib_path)
 
         # Load PyTorch Models
         if 'lstm' in config.ensemble_weights.dict():
@@ -227,6 +267,7 @@ def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyP
 
         return {
             'models': models,
+            'calibrator': calibrator,
             'meta': meta
         }
 
@@ -241,9 +282,11 @@ def _evaluate_ensemble(models: Dict[str, Any],
                        config: AIEnsembleStrategyParams, 
                        device, 
                        market_returns: np.ndarray, 
-                       weights_override: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+                       weights_override: Optional[Dict[str, float]] = None,
+                       calibrator: Optional[MulticlassCalibrator] = None) -> Dict[str, Any]:
     """
     Evaluates a set of models on a dataset and returns performance metrics.
+    Applies calibration if provided.
     """
     seq_len = config.features.sequence_length
     num_samples = len(y)
@@ -268,7 +311,6 @@ def _evaluate_ensemble(models: Dict[str, Any],
         ensemble_probs += probs * w
         
     # NN Models (Alignment required)
-    # Sequence models lose (seq_len - 1) samples at the start
     valid_nn_indices = slice(seq_len - 1, None)
     
     if len(X_seq) > 0:
@@ -279,7 +321,6 @@ def _evaluate_ensemble(models: Dict[str, Any],
                 with torch.no_grad():
                     inputs = torch.FloatTensor(X_seq).to(device)
                     probs = model(inputs).cpu().numpy()
-                    # Add to the slice of ensemble_probs
                     target_len = len(ensemble_probs[valid_nn_indices])
                     if len(probs) == target_len:
                         w = get_weight(model_name, default_weight)
@@ -288,8 +329,13 @@ def _evaluate_ensemble(models: Dict[str, Any],
         add_nn_probs('lstm', config_weights.lstm)
         add_nn_probs('attention', config_weights.attention)
 
-    # Determine Final Predictions on the subset where all models could predict
+    # Determine Final Predictions
     eval_probs = ensemble_probs[valid_nn_indices]
+    
+    # Apply Calibration if available
+    if calibrator:
+        eval_probs = calibrator.predict(eval_probs)
+
     final_preds = np.argmax(eval_probs, axis=1) # 0, 1, 2
     
     # Map to Signal: 0->-1 (Short), 1->0 (Hold), 2->1 (Long)
@@ -297,9 +343,6 @@ def _evaluate_ensemble(models: Dict[str, Any],
     signals[final_preds == 0] = -1
     signals[final_preds == 2] = 1
     
-    # Align market returns
-    # X was aligned with y. y was aligned with market_returns.
-    # We need the subset corresponding to valid_nn_indices
     eval_returns = market_returns[valid_nn_indices]
     
     if len(eval_returns) != len(signals):
@@ -330,8 +373,7 @@ def _evaluate_ensemble(models: Dict[str, Any],
 def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrategyParams) -> bool:
     """
     Standalone function to train models in a separate process.
-    Implements Champion/Challenger logic to ensure model quality.
-    Returns True if training and saving were successful.
+    Implements Champion/Challenger logic and Probability Calibration.
     """
     worker_logger = get_logger(f"trainer_{symbol}")
     worker_logger.info(f"Starting training task for {symbol} with {len(df)} records.")
@@ -348,9 +390,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         all_feature_names = list(df_proc.columns)
         labels = FeatureProcessor.create_labels(df, config)
         
-        # Align Data
         common_index = df_proc.index.intersection(labels.index)
-        if len(common_index) < 100:
+        if len(common_index) < 200:
             worker_logger.warning("Insufficient data after alignment.")
             return False
             
@@ -358,78 +399,74 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         y = labels.loc[common_index].values.astype(int)
 
         # --- FEATURE SELECTION ---
-        selected_indices = list(range(X_full.shape[1])) # Default to all
+        selected_indices = list(range(X_full.shape[1]))
         active_feature_names = all_feature_names
 
         if config.features.use_feature_selection:
-            worker_logger.info("Running Feature Selection...")
             try:
-                # Use a lightweight Random Forest for selection
                 selector = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42, n_jobs=1)
                 selector.fit(X_full, y)
                 importances = selector.feature_importances_
-                
-                # Select top K features
                 k = min(config.features.max_active_features, len(all_feature_names))
                 top_k_indices = np.argsort(importances)[::-1][:k]
-                
-                # Sort indices to maintain relative order (important for time series structure if any)
                 selected_indices = sorted(top_k_indices)
                 active_feature_names = [all_feature_names[i] for i in selected_indices]
-                
-                worker_logger.info(f"Selected {len(active_feature_names)} features out of {len(all_feature_names)}.")
-                worker_logger.debug(f"Active features: {active_feature_names}")
-                
             except Exception as e:
                 worker_logger.error(f"Feature selection failed: {e}. Using all features.")
 
-        # Subset X to selected features
         X = X_full[:, selected_indices]
         num_features = X.shape[1]
 
-        # Calculate Market Returns for Evaluation (Next candle return)
         full_returns = df['close'].pct_change().shift(-1)
         market_returns = full_returns.loc[common_index].fillna(0.0).values
 
-        # Split Train/Val
-        split_idx = int(len(X) * (1 - config.training.validation_split))
-        X_train, X_val = X[:split_idx], X[split_idx:]
-        y_train, y_val = y[:split_idx], y[split_idx:]
-        returns_val = market_returns[split_idx:]
+        # --- DATA SPLITTING (Train / Calibration / Test) ---
+        # We need 3 sets to avoid leakage: Train models -> Calibrate on held-out -> Evaluate on held-out
+        # Config validation_split is treated as the Test set size.
+        test_split_idx = int(len(X) * (1 - config.training.validation_split))
+        
+        X_temp, X_test = X[:test_split_idx], X[test_split_idx:]
+        y_temp, y_test = y[:test_split_idx], y[test_split_idx:]
+        returns_test = market_returns[test_split_idx:]
 
-        # Prepare Sequences for NN Evaluation
+        # From the remaining temp data, take ~15% for calibration
+        # If val_split is 0.15, temp is 0.85. 0.15/0.85 ~= 0.176
+        calib_split_idx = int(len(X_temp) * (1 - 0.176))
+        
+        X_train, X_calib = X_temp[:calib_split_idx], X_temp[calib_split_idx:]
+        y_train, y_calib = y_temp[:calib_split_idx], y_temp[calib_split_idx:]
+        
+        # Prepare Sequences
         seq_len = config.features.sequence_length
-        X_seq_val, y_seq_val = FeatureProcessor.create_sequences(X_val, y_val, seq_len)
+        X_seq_calib, y_seq_calib = FeatureProcessor.create_sequences(X_calib, y_calib, seq_len)
+        X_seq_test, y_seq_test = FeatureProcessor.create_sequences(X_test, y_test, seq_len)
 
         # --- CHAMPION EVALUATION ---
         champion_metrics = None
         champion_data = _load_saved_models(symbol, config.model_path, config, device)
         
         if champion_data:
-            worker_logger.info("Evaluating existing Champion model on new validation data...")
             champion_models = champion_data['models']
             champion_weights = champion_data['meta'].get('optimized_weights')
-            
+            champion_calibrator = champion_data.get('calibrator')
             champ_features = champion_data['meta'].get('active_feature_columns', champion_data['meta'].get('feature_columns'))
             
-            # Reconstruct X for champion
             try:
                 champ_indices = [all_feature_names.index(f) for f in champ_features if f in all_feature_names]
                 if len(champ_indices) == len(champ_features):
                     X_champ_full = X_full[:, champ_indices]
-                    X_champ_val = X_champ_full[split_idx:]
-                    X_champ_seq_val, y_champ_seq_val = FeatureProcessor.create_sequences(X_champ_val, y_val, seq_len)
+                    X_champ_test = X_champ_full[test_split_idx:]
+                    X_champ_seq_test, y_champ_seq_test = FeatureProcessor.create_sequences(X_champ_test, y_test, seq_len)
                     
                     champion_metrics = _evaluate_ensemble(
-                        champion_models, X_champ_val, y_val, X_champ_seq_val, y_champ_seq_val, 
-                        config, device, returns_val, weights_override=champion_weights
+                        champion_models, X_champ_test, y_test, X_champ_seq_test, y_champ_seq_test, 
+                        config, device, returns_test, weights_override=champion_weights, calibrator=champion_calibrator
                     )
                     worker_logger.info(f"Champion Metrics: PF={champion_metrics.get('profit_factor', 0):.2f}, Sharpe={champion_metrics.get('sharpe', 0):.4f}")
             except Exception as e:
-                worker_logger.warning(f"Could not evaluate champion due to feature mismatch: {e}")
+                worker_logger.warning(f"Could not evaluate champion: {e}")
 
         # --- CHALLENGER TRAINING ---
-        # Class Weighting
         sample_weights = None
         torch_weights = None
         if config.training.use_class_weighting:
@@ -440,7 +477,6 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             final_weights = [weight_map.get(c, 1.0) for c in [0, 1, 2]]
             torch_weights = torch.FloatTensor(final_weights).to(device)
 
-        # Create & Train Models
         models = _create_fresh_models(config, num_features, device)
         trained_models = {}
         feature_importance = {}
@@ -448,7 +484,6 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         # Train Sklearn/XGBoost
         for name, model in models.items():
             if name in ['lstm', 'attention']: continue
-            worker_logger.info(f"Training {name}...")
             fit_params = {}
             if name == 'gb' and sample_weights is not None:
                 fit_params['sample_weight'] = sample_weights
@@ -461,7 +496,6 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             
             trained_models[name] = model
             if hasattr(model, 'feature_importances_'):
-                # Map importances back to active feature names
                 imps = model.feature_importances_.tolist()
                 if len(imps) == len(active_feature_names):
                     feature_importance[name] = dict(zip(active_feature_names, imps))
@@ -478,7 +512,6 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 optimizer = optim.Adam(model.parameters(), lr=config.training.learning_rate)
                 criterion = nn.CrossEntropyLoss(weight=torch_weights) if torch_weights is not None else nn.CrossEntropyLoss()
                 
-                worker_logger.info(f"Training {name} (PyTorch)...")
                 model.train()
                 for epoch in range(config.training.epochs):
                     for batch_X, batch_y in train_loader:
@@ -489,42 +522,67 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                         optimizer.step()
                 trained_models[name] = model
 
-        # Optimize Weights
+        # --- OPTIMIZE WEIGHTS & CALIBRATE (Using Calibration Set) ---
         optimized_weights = {}
-        if config.ensemble_weights.auto_tune:
-            worker_logger.info("Optimizing ensemble weights...")
-            val_preds = {}
-            if 'gb' in trained_models: val_preds['gb'] = trained_models['gb'].predict_proba(X_val)
-            if 'technical' in trained_models: val_preds['technical'] = trained_models['technical'].predict_proba(X_val)
-            
-            if len(X_seq_val) > 0:
-                valid_indices = slice(seq_len - 1, None)
-                for k in list(val_preds.keys()): val_preds[k] = val_preds[k][valid_indices]
-                y_val_opt = y_val[valid_indices]
-                for name in ['lstm', 'attention']:
-                    if name in trained_models:
-                        model = trained_models[name]
-                        model.eval()
-                        with torch.no_grad():
-                            val_preds[name] = model(torch.FloatTensor(X_seq_val).to(device)).cpu().numpy()
-            else:
-                y_val_opt = y_val
-            
-            if val_preds:
-                optimized_weights = _optimize_ensemble_weights(val_preds, y_val_opt)
+        calibrator = None
+        
+        # Generate predictions on Calibration Set
+        calib_preds = {}
+        if 'gb' in trained_models: calib_preds['gb'] = trained_models['gb'].predict_proba(X_calib)
+        if 'technical' in trained_models: calib_preds['technical'] = trained_models['technical'].predict_proba(X_calib)
+        
+        if len(X_seq_calib) > 0:
+            valid_indices = slice(seq_len - 1, None)
+            for k in list(calib_preds.keys()): calib_preds[k] = calib_preds[k][valid_indices]
+            y_calib_aligned = y_calib[valid_indices]
+            for name in ['lstm', 'attention']:
+                if name in trained_models:
+                    model = trained_models[name]
+                    model.eval()
+                    with torch.no_grad():
+                        calib_preds[name] = model(torch.FloatTensor(X_seq_calib).to(device)).cpu().numpy()
+        else:
+            y_calib_aligned = y_calib
 
-        # --- CHALLENGER EVALUATION ---
+        if calib_preds:
+            # 1. Optimize Weights
+            if config.ensemble_weights.auto_tune:
+                optimized_weights = _optimize_ensemble_weights(calib_preds, y_calib_aligned)
+            else:
+                # Use default weights
+                cw = config.ensemble_weights
+                optimized_weights = {
+                    'gb': cw.xgboost, 'technical': cw.technical_ensemble,
+                    'lstm': cw.lstm, 'attention': cw.attention
+                }
+
+            # 2. Fit Calibrator (on weighted ensemble output)
+            if config.training.calibration_method != 'none':
+                worker_logger.info(f"Calibrating ensemble using {config.training.calibration_method}...")
+                # Calculate weighted ensemble probabilities on calibration set
+                model_names = list(calib_preds.keys())
+                pred_stack = np.array([calib_preds[name] for name in model_names])
+                weights = np.array([optimized_weights.get(name, 0.0) for name in model_names])
+                
+                # Normalize weights if they don't sum to 1 (safety)
+                if weights.sum() > 0: weights /= weights.sum()
+                
+                ensemble_probs_calib = np.tensordot(weights, pred_stack, axes=([0],[0]))
+                
+                calibrator = MulticlassCalibrator(method=config.training.calibration_method)
+                calibrator.fit(ensemble_probs_calib, y_calib_aligned)
+
+        # --- CHALLENGER EVALUATION (Using Test Set) ---
         challenger_metrics = _evaluate_ensemble(
-            trained_models, X_val, y_val, X_seq_val, y_seq_val, 
-            config, device, returns_val, weights_override=optimized_weights
+            trained_models, X_test, y_test, X_seq_test, y_seq_test, 
+            config, device, returns_test, weights_override=optimized_weights, calibrator=calibrator
         )
         
         pf = challenger_metrics.get('profit_factor', 0)
         sharpe = challenger_metrics.get('sharpe', 0)
         worker_logger.info(f"Challenger Metrics: PF={pf:.2f}, Sharpe={sharpe:.4f}")
 
-        # --- GATING & COMPARISON ---
-        # 1. Absolute Gates
+        # --- GATING ---
         if pf < config.training.min_profit_factor:
             worker_logger.warning(f"Challenger rejected: PF {pf:.2f} < {config.training.min_profit_factor}")
             return False
@@ -532,24 +590,18 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             worker_logger.warning(f"Challenger rejected: Sharpe {sharpe:.4f} < {config.training.min_sharpe_ratio}")
             return False
 
-        # 2. Champion vs Challenger
         if champion_metrics:
             champ_sharpe = champion_metrics.get('sharpe', 0)
             improvement_needed = config.training.min_improvement_pct
-            
             is_better = False
             if champ_sharpe <= 0:
-                if sharpe > champ_sharpe + 0.05: 
-                    is_better = True
+                if sharpe > champ_sharpe + 0.05: is_better = True
             else:
-                if sharpe > champ_sharpe * (1 + improvement_needed):
-                    is_better = True
+                if sharpe > champ_sharpe * (1 + improvement_needed): is_better = True
             
             if not is_better:
                 worker_logger.warning(f"Challenger failed to beat Champion. Champ Sharpe: {champ_sharpe:.4f}, Challenger: {sharpe:.4f}")
                 return False
-            else:
-                worker_logger.info(f"Challenger defeated Champion! ({sharpe:.4f} vs {champ_sharpe:.4f})")
 
         # --- SAVE ARTIFACTS ---
         safe_symbol = symbol.replace('/', '_')
@@ -566,12 +618,15 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 else:
                     joblib.dump(model, os.path.join(temp_dir, f"{name}.joblib"))
             
+            if calibrator:
+                joblib.dump(calibrator, os.path.join(temp_dir, "calibrator.joblib"))
+
             meta = {
                 'timestamp': datetime.now().isoformat(),
                 'metrics': {'ensemble': challenger_metrics},
                 'feature_importance': feature_importance,
-                'feature_columns': config.feature_columns, # Full list from config
-                'active_feature_columns': active_feature_names, # Actual subset used
+                'feature_columns': config.feature_columns,
+                'active_feature_columns': active_feature_names,
                 'num_features': num_features,
                 'optimized_weights': optimized_weights
             }
@@ -602,12 +657,10 @@ class EnsembleLearner:
         self.config = config
         self.symbol_models: Dict[str, Dict[str, Any]] = {}
         self.device = torch.device("cuda" if ML_AVAILABLE and torch.cuda.is_available() else "cpu")
-        # Executor for inference and loading to avoid blocking main loop
         self.executor = ThreadPoolExecutor(max_workers=4)
         logger.info(f"EnsembleLearner initialized. Device: {self.device}")
 
     async def close(self):
-        """Shuts down the internal executor."""
         self.executor.shutdown(wait=True)
         logger.info("EnsembleLearner executor shut down.")
 
@@ -631,13 +684,11 @@ class EnsembleLearner:
         return None
 
     async def reload_models(self, symbol: str):
-        """Loads trained models from disk into memory, ensuring config consistency."""
         if not ML_AVAILABLE:
             return
 
         try:
             loop = asyncio.get_running_loop()
-            # Offload blocking I/O (joblib.load, torch.load) to thread
             loaded_data = await loop.run_in_executor(
                 self.executor, 
                 _load_saved_models, 
@@ -651,7 +702,6 @@ class EnsembleLearner:
                 self.symbol_models[symbol] = loaded_data
                 logger.info(f"Models reloaded successfully for {symbol}")
             else:
-                # If load failed (e.g. config mismatch), remove existing model to force retrain
                 if symbol in self.symbol_models:
                     del self.symbol_models[symbol]
                 logger.warning(f"Could not load valid models for {symbol} (possible config mismatch).")
@@ -660,33 +710,25 @@ class EnsembleLearner:
             logger.error(f"Failed to reload models for {symbol}: {e}")
 
     def _predict_sync(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
-        """Synchronous inference logic to be run in executor."""
         entry = self.symbol_models.get(symbol)
         if not entry:
             return {}
 
         models = entry['models']
         meta = entry['meta']
+        calibrator = entry.get('calibrator')
         
         # Prepare Data
         df_proc = FeatureProcessor.process_data(df, self.config)
-        
-        # --- FILTER FEATURES ---
-        # The model might use a subset of features defined in metadata
         active_features = meta.get('active_feature_columns', meta.get('feature_columns'))
         
-        # Ensure we have all required columns
         if not set(active_features).issubset(set(df_proc.columns)):
             logger.error(f"Inference failed: Missing features for {symbol}. Model expects {active_features}")
             return {}
             
-        # Subset to active features in correct order
         df_proc = df_proc[active_features]
-        # -----------------------
-
-        X = df_proc.iloc[-1:].values # Last row for prediction
+        X = df_proc.iloc[-1:].values
         
-        # Prepare Sequences for NN
         seq_len = self.config.features.sequence_length
         if len(df_proc) >= seq_len:
             X_seq = df_proc.iloc[-seq_len:].values.reshape(1, seq_len, -1)
@@ -696,7 +738,6 @@ class EnsembleLearner:
         votes = {'buy': 0.0, 'sell': 0.0, 'hold': 0.0}
         config_weights = self.config.ensemble_weights
         
-        # Determine Weights (Dynamic vs Static)
         optimized_weights = meta.get('optimized_weights')
         use_dynamic = config_weights.auto_tune and optimized_weights
         
@@ -705,10 +746,8 @@ class EnsembleLearner:
                 return optimized_weights.get(name, 0.0)
             return default_weight
 
-        # Store individual predictions for variance calculation
         model_predictions = []
         
-        # Inference
         try:
             # XGBoost
             if 'gb' in models:
@@ -759,27 +798,33 @@ class EnsembleLearner:
             for k in votes:
                 votes[k] /= total_weight
 
+        # --- APPLY CALIBRATION ---
+        if calibrator:
+            # Calibrator expects (N, 3) array
+            raw_probs = np.array([[votes['sell'], votes['hold'], votes['buy']]])
+            calibrated_probs = calibrator.predict(raw_probs)[0]
+            votes['sell'] = calibrated_probs[0]
+            votes['hold'] = calibrated_probs[1]
+            votes['buy'] = calibrated_probs[2]
+
         # Determine Action
         best_action = max(votes, key=votes.get)
         confidence = votes[best_action]
 
-        # --- Disagreement Penalty ---
+        # --- Disagreement Penalty (Only if not calibrated, or applied before calibration?) ---
+        # If calibrated, the probability should theoretically account for uncertainty.
+        # However, we keep it as a safety mechanism for model divergence.
         if model_predictions and config_weights.disagreement_penalty > 0:
             action_map = {'sell': 0, 'hold': 1, 'buy': 2}
             best_action_idx = action_map[best_action]
-            
-            # Only consider models that actually contributed
             relevant_probs = [p[best_action_idx] for w, p in model_predictions if w > 0]
-            
             if len(relevant_probs) > 1:
                 std_dev = np.std(relevant_probs)
                 penalty = std_dev * config_weights.disagreement_penalty
                 confidence = max(0.0, confidence - penalty)
 
-        # Extract top features from XGBoost if available
         top_features = {}
         if 'gb' in models and hasattr(models['gb'], 'feature_importances_'):
-            # Need to map back to names since we subsetted
             imps = models['gb'].feature_importances_
             cols = active_features
             indices = np.argsort(imps)[::-1][:5]
@@ -798,12 +843,10 @@ class EnsembleLearner:
         }
 
     async def predict(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
-        """Runs inference using the ensemble of models."""
         if symbol not in self.symbol_models:
             await self.reload_models(symbol)
             if symbol not in self.symbol_models:
                 return {}
 
         loop = asyncio.get_running_loop()
-        # Offload CPU-bound inference to thread
         return await loop.run_in_executor(self.executor, self._predict_sync, df, symbol)
