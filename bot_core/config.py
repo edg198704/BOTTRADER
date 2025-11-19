@@ -169,6 +169,7 @@ class ExecutionConfig(BaseModel):
     chase_interval_seconds: int
     max_chase_attempts: int
     chase_aggressiveness_pct: float
+    max_chase_slippage_pct: float = 0.02 # Max 2% deviation from initial price during chase
     execute_on_timeout: bool
 
 class DataHandlerConfig(BaseModel):
