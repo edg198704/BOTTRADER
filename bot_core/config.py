@@ -205,6 +205,11 @@ class CorrelationConfig(BaseModel):
     penalty_factor: float = 0.5
     lookback_periods: int = 50
 
+class BreakevenConfig(BaseModel):
+    enabled: bool = False
+    activation_pct: float = 0.015 # 1.5% profit triggers BE
+    buffer_pct: float = 0.001 # Lock in 0.1% profit to cover fees
+
 class RiskManagementConfig(BaseModel):
     max_position_size_usd: float
     max_daily_loss_usd: float
@@ -230,6 +235,7 @@ class RiskManagementConfig(BaseModel):
     regime_based_risk: RegimeBasedRiskConfig
     time_based_exit: TimeBasedExitConfig = TimeBasedExitConfig()
     correlation: CorrelationConfig = CorrelationConfig()
+    breakeven: BreakevenConfig = BreakevenConfig()
 
 class DatabaseConfig(BaseModel):
     path: str
