@@ -358,14 +358,19 @@ class PositionManager:
         finally:
             session.close()
 
-    async def close_position(self, symbol: str, close_price: float, reason: str = "Unknown") -> Optional[Position]:
+    async def close_position(self, symbol: str, close_price: float, reason: str = "Unknown", actual_filled_qty: Optional[float] = None) -> Optional[Position]:
+        """
+        Closes an open position.
+        If actual_filled_qty is provided, it uses that for PnL calculation, allowing for 
+        closing positions where the balance was slightly less than the tracked quantity (dust/fees).
+        """
         async with self._db_lock:
-            position = await self._run_in_executor(self._close_position_sync, symbol, close_price, reason)
+            position = await self._run_in_executor(self._close_position_sync, symbol, close_price, reason, actual_filled_qty)
         if position:
             self._realized_pnl += position.pnl
         return position
 
-    def _close_position_sync(self, symbol: str, close_price: float, reason: str) -> Optional[Position]:
+    def _close_position_sync(self, symbol: str, close_price: float, reason: str, actual_filled_qty: Optional[float]) -> Optional[Position]:
         session = self.SessionLocal()
         try:
             position = session.query(Position).filter(Position.symbol == symbol, Position.status == PositionStatus.OPEN).first()
@@ -373,7 +378,11 @@ class PositionManager:
                 logger.warning("No open position found to close for symbol", symbol=symbol)
                 return None
 
-            pnl = (close_price - position.entry_price) * position.quantity
+            # Use actual filled quantity if provided (e.g. wallet balance was slightly less than tracked qty)
+            # Otherwise use the tracked quantity.
+            calc_qty = actual_filled_qty if actual_filled_qty is not None else position.quantity
+
+            pnl = (close_price - position.entry_price) * calc_qty
             if position.side == 'SELL':
                 pnl = -pnl
 
@@ -383,7 +392,7 @@ class PositionManager:
             position.pnl = pnl
             session.commit()
             session.refresh(position)
-            logger.info("Closed position", symbol=symbol, pnl=f"{pnl:.2f}", reason=reason)
+            logger.info("Closed position", symbol=symbol, pnl=f"{pnl:.2f}", reason=reason, tracked_qty=position.quantity, actual_qty=calc_qty)
 
             if self.alert_system:
                 pnl_emoji = "🟢" if pnl >= 0 else "🔴"
@@ -415,10 +424,11 @@ class PositionManager:
                 return None
 
             # If reduction quantity covers the whole position (or more), close it fully
+            # We pass the reduction quantity as the actual_filled_qty to ensure PnL is accurate
             if quantity >= (position.quantity * 0.999):
                 logger.info("Reduction quantity covers entire position. Closing fully.", symbol=symbol, qty=quantity, pos_qty=position.quantity)
                 session.close() # Close session before calling internal sync method to avoid conflict
-                return self._close_position_sync(symbol, price, reason)
+                return self._close_position_sync(symbol, price, reason, actual_filled_qty=quantity)
 
             # Calculate PnL for the portion being closed
             pnl = (price - position.entry_price) * quantity
