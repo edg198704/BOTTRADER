@@ -52,6 +52,7 @@ class AIFeatureEngineeringConfig(BaseModel):
     sequence_length: int
     labeling_horizon: int = 5
     labeling_threshold: float = 0.005
+    normalization_window: int = 100
 
 class AIHyperparameters(BaseModel):
     xgboost: XGBoostConfig = XGBoostConfig()
