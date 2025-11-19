@@ -235,3 +235,24 @@ def parse_timeframe_to_seconds(timeframe: str) -> int:
 
     multipliers = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}
     return value * multipliers.get(unit, 60)
+
+def calculate_min_history_depth(indicators_config: List[Dict[str, Any]]) -> int:
+    """
+    Calculates the minimum historical data points required to compute all configured indicators.
+    Adds a safety buffer to ensure convergence (e.g. for EMA/RSI).
+    """
+    max_lookback = 0
+    for conf in indicators_config:
+        kind = conf.get("kind", "")
+        # Check common length parameters
+        length = conf.get("length", 0)
+        slow = conf.get("slow", 0)
+        
+        current_max = max(length, slow)
+        if current_max > max_lookback:
+            max_lookback = current_max
+            
+    # Add buffer: 50 candles or 2x lookback for convergence stability
+    # e.g. EMA needs more than 'length' to converge accurately
+    buffer = max(50, max_lookback)
+    return max_lookback + buffer
