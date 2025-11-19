@@ -145,9 +145,6 @@ def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.nd
         w = np.random.dirichlet(np.ones(len(model_names)))
         
         # Weighted average: sum(w[i] * pred_stack[i])
-        # w shape: (num_models,)
-        # pred_stack shape: (num_models, num_samples, num_classes)
-        # Result: (num_samples, num_classes)
         ensemble_probs = np.tensordot(w, pred_stack, axes=([0],[0]))
         
         # Clip to avoid log(0)
@@ -162,12 +159,176 @@ def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.nd
             
     return best_weights
 
+def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyParams, device) -> Optional[Dict[str, Any]]:
+    """
+    Loads trained models and metadata from disk. 
+    Returns None if not found or if feature configuration mismatches.
+    """
+    safe_symbol = symbol.replace('/', '_')
+    load_dir = os.path.join(model_path, safe_symbol)
+    
+    if not os.path.exists(load_dir):
+        return None
+
+    try:
+        meta_path = os.path.join(load_dir, "metadata.json")
+        if not os.path.exists(meta_path):
+            return None
+
+        with open(meta_path, 'r') as f:
+            meta = json.load(f)
+
+        # --- CONFIG CONSISTENCY CHECK ---
+        saved_features = meta.get('feature_columns', [])
+        current_features = config.feature_columns
+        
+        if saved_features != current_features:
+            return None
+        
+        expected_num_features = FeatureProcessor.get_expected_feature_count(config)
+        saved_num_features = meta.get('num_features', len(saved_features))
+        
+        if expected_num_features != saved_num_features:
+            return None
+        # --------------------------------
+
+        models = {}
+        # Load Sklearn Models
+        for name in ['gb', 'technical']:
+            path = os.path.join(load_dir, f"{name}.joblib")
+            if os.path.exists(path):
+                models[name] = joblib.load(path)
+
+        # Load PyTorch Models
+        if 'lstm' in config.ensemble_weights.dict():
+            path = os.path.join(load_dir, "lstm.pth")
+            if os.path.exists(path):
+                lstm = LSTMPredictor(expected_num_features, config.hyperparameters.lstm.hidden_dim, 
+                                     config.hyperparameters.lstm.num_layers, 
+                                     config.hyperparameters.lstm.dropout).to(device)
+                lstm.load_state_dict(torch.load(path, map_location=device))
+                lstm.eval()
+                models['lstm'] = lstm
+
+        if 'attention' in config.ensemble_weights.dict():
+            path = os.path.join(load_dir, "attention.pth")
+            if os.path.exists(path):
+                attn = AttentionNetwork(expected_num_features, config.hyperparameters.attention.hidden_dim,
+                                        config.hyperparameters.attention.num_layers,
+                                        config.hyperparameters.attention.nhead,
+                                        config.hyperparameters.attention.dropout).to(device)
+                attn.load_state_dict(torch.load(path, map_location=device))
+                attn.eval()
+                models['attention'] = attn
+
+        return {
+            'models': models,
+            'meta': meta
+        }
+
+    except Exception:
+        return None
+
+def _evaluate_ensemble(models: Dict[str, Any], 
+                       X: np.ndarray, 
+                       y: np.ndarray, 
+                       X_seq: np.ndarray, 
+                       y_seq: np.ndarray, 
+                       config: AIEnsembleStrategyParams, 
+                       device, 
+                       market_returns: np.ndarray, 
+                       weights_override: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+    """
+    Evaluates a set of models on a dataset and returns performance metrics.
+    """
+    seq_len = config.features.sequence_length
+    num_samples = len(y)
+    ensemble_probs = np.zeros((num_samples, 3))
+    
+    # Helper to get weight
+    config_weights = config.ensemble_weights
+    def get_weight(name, default_weight):
+        if weights_override:
+            return weights_override.get(name, 0.0)
+        return default_weight
+
+    # Sklearn Models
+    if 'gb' in models:
+        probs = models['gb'].predict_proba(X)
+        w = get_weight('gb', config_weights.xgboost)
+        ensemble_probs += probs * w
+        
+    if 'technical' in models:
+        probs = models['technical'].predict_proba(X)
+        w = get_weight('technical', config_weights.technical_ensemble)
+        ensemble_probs += probs * w
+        
+    # NN Models (Alignment required)
+    # Sequence models lose (seq_len - 1) samples at the start
+    valid_nn_indices = slice(seq_len - 1, None)
+    
+    if len(X_seq) > 0:
+        def add_nn_probs(model_name, default_weight):
+            if model_name in models:
+                model = models[model_name]
+                model.eval()
+                with torch.no_grad():
+                    inputs = torch.FloatTensor(X_seq).to(device)
+                    probs = model(inputs).cpu().numpy()
+                    # Add to the slice of ensemble_probs
+                    target_len = len(ensemble_probs[valid_nn_indices])
+                    if len(probs) == target_len:
+                        w = get_weight(model_name, default_weight)
+                        ensemble_probs[valid_nn_indices] += probs * w
+        
+        add_nn_probs('lstm', config_weights.lstm)
+        add_nn_probs('attention', config_weights.attention)
+
+    # Determine Final Predictions on the subset where all models could predict
+    eval_probs = ensemble_probs[valid_nn_indices]
+    final_preds = np.argmax(eval_probs, axis=1) # 0, 1, 2
+    
+    # Map to Signal: 0->-1 (Short), 1->0 (Hold), 2->1 (Long)
+    signals = np.zeros_like(final_preds)
+    signals[final_preds == 0] = -1
+    signals[final_preds == 2] = 1
+    
+    # Align market returns
+    # X was aligned with y. y was aligned with market_returns.
+    # We need the subset corresponding to valid_nn_indices
+    eval_returns = market_returns[valid_nn_indices]
+    
+    if len(eval_returns) != len(signals):
+        return {}
+
+    # Strategy Returns
+    strategy_returns = signals * eval_returns
+    
+    winning_returns = strategy_returns[strategy_returns > 0]
+    losing_returns = strategy_returns[strategy_returns < 0]
+    
+    gross_profit = np.sum(winning_returns)
+    gross_loss = np.abs(np.sum(losing_returns))
+    
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else 999.0
+    
+    mean_ret = np.mean(strategy_returns)
+    std_ret = np.std(strategy_returns)
+    sharpe = mean_ret / std_ret if std_ret > 0 else 0.0
+    
+    return {
+        'profit_factor': float(profit_factor),
+        'sharpe': float(sharpe),
+        'total_return': float(np.sum(strategy_returns)),
+        'win_rate': float(len(winning_returns) / len(strategy_returns)) if len(strategy_returns) > 0 else 0.0
+    }
+
 def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrategyParams) -> bool:
     """
     Standalone function to train models in a separate process.
+    Implements Champion/Challenger logic to ensure model quality.
     Returns True if training and saving were successful.
     """
-    # Re-initialize logger for the worker process
     worker_logger = get_logger(f"trainer_{symbol}")
     worker_logger.info(f"Starting training task for {symbol} with {len(df)} records.")
 
@@ -176,15 +337,14 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         return False
 
     try:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         # 1. Prepare Data
-        # Process (Lag generation + Normalization)
         df_proc = FeatureProcessor.process_data(df, config)
         num_features = df_proc.shape[1]
-        
-        # Create Labels
         labels = FeatureProcessor.create_labels(df, config)
         
-        # Align Data (drop NaNs from rolling windows and shifting)
+        # Align Data
         common_index = df_proc.index.intersection(labels.index)
         if len(common_index) < 100:
             worker_logger.warning("Insufficient data after alignment.")
@@ -193,301 +353,194 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         X = df_proc.loc[common_index].values
         y = labels.loc[common_index].values.astype(int)
 
+        # Calculate Market Returns for Evaluation (Next candle return)
+        full_returns = df['close'].pct_change().shift(-1)
+        market_returns = full_returns.loc[common_index].fillna(0.0).values
+
         # Split Train/Val
         split_idx = int(len(X) * (1 - config.training.validation_split))
         X_train, X_val = X[:split_idx], X[split_idx:]
         y_train, y_val = y[:split_idx], y[split_idx:]
+        returns_val = market_returns[split_idx:]
 
-        # --- Class Weighting Calculation ---
+        # Prepare Sequences for NN Evaluation
+        seq_len = config.features.sequence_length
+        X_seq_val, y_seq_val = FeatureProcessor.create_sequences(X_val, y_val, seq_len)
+
+        # --- CHAMPION EVALUATION ---
+        champion_metrics = None
+        champion_data = _load_saved_models(symbol, config.model_path, config, device)
+        
+        if champion_data:
+            worker_logger.info("Evaluating existing Champion model on new validation data...")
+            champion_models = champion_data['models']
+            champion_weights = champion_data['meta'].get('optimized_weights')
+            
+            champion_metrics = _evaluate_ensemble(
+                champion_models, X_val, y_val, X_seq_val, y_seq_val, 
+                config, device, returns_val, weights_override=champion_weights
+            )
+            worker_logger.info(f"Champion Metrics: PF={champion_metrics.get('profit_factor', 0):.2f}, Sharpe={champion_metrics.get('sharpe', 0):.4f}")
+
+        # --- CHALLENGER TRAINING ---
+        # Class Weighting
         sample_weights = None
         torch_weights = None
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
         if config.training.use_class_weighting:
-            # For XGBoost (Sample Weights)
             sample_weights = compute_sample_weight(class_weight='balanced', y=y_train)
-            
-            # For PyTorch (Class Weights Tensor)
             unique_classes = np.unique(y_train)
             class_weights = compute_class_weight(class_weight='balanced', classes=unique_classes, y=y_train)
-            
-            # Map to fixed size 3 array [Sell(0), Hold(1), Buy(2)] to handle missing classes in small datasets
             weight_map = {c: w for c, w in zip(unique_classes, class_weights)}
             final_weights = [weight_map.get(c, 1.0) for c in [0, 1, 2]]
             torch_weights = torch.FloatTensor(final_weights).to(device)
-            
-            worker_logger.info(f"Using Class Weights: {final_weights}")
 
-        # Create Models with dynamic feature count
+        # Create & Train Models
         models = _create_fresh_models(config, num_features, device)
         trained_models = {}
-        metrics = {}
         feature_importance = {}
 
-        # 2. Train Scikit-Learn/XGBoost Models
+        # Train Sklearn/XGBoost
         for name, model in models.items():
             if name in ['lstm', 'attention']: continue
-            
             worker_logger.info(f"Training {name}...")
-            
             fit_params = {}
             if name == 'gb' and sample_weights is not None:
                 fit_params['sample_weight'] = sample_weights
 
             if config.training.auto_tune_models and name == 'gb':
-                # Example param grid for XGBoost
-                param_dist = {
-                    'n_estimators': [100, 200],
-                    'max_depth': [3, 5, 7],
-                    'learning_rate': [0.01, 0.1, 0.2]
-                }
+                param_dist = {'n_estimators': [100, 200], 'max_depth': [3, 5, 7], 'learning_rate': [0.01, 0.1, 0.2]}
                 model = _optimize_hyperparameters(model, X_train, y_train, param_dist, config.training.n_iter_search, worker_logger, fit_params)
             else:
                 model.fit(X_train, y_train, **fit_params)
             
             trained_models[name] = model
-            
-            # Evaluate
-            preds = model.predict(X_val)
-            prec = precision_score(y_val, preds, average=None, zero_division=0)
-            metrics[name] = {'precision': prec.tolist()}
-            
-            # Feature Importance (if available)
             if hasattr(model, 'feature_importances_'):
                 feature_importance[name] = model.feature_importances_.tolist()
 
-        # 3. Train PyTorch Models
-        seq_len = config.features.sequence_length
+        # Train PyTorch
         X_seq_train, y_seq_train = FeatureProcessor.create_sequences(X_train, y_train, seq_len)
-        X_seq_val, y_seq_val = FeatureProcessor.create_sequences(X_val, y_val, seq_len)
-
         if len(X_seq_train) > 0:
             train_tensor = TensorDataset(torch.FloatTensor(X_seq_train).to(device), torch.LongTensor(y_seq_train).to(device))
             train_loader = DataLoader(train_tensor, batch_size=config.training.batch_size, shuffle=True)
             
             for name in ['lstm', 'attention']:
                 if name not in models: continue
-                
                 model = models[name]
                 optimizer = optim.Adam(model.parameters(), lr=config.training.learning_rate)
-                
-                # Apply weights to loss function if calculated
-                if torch_weights is not None:
-                    criterion = nn.CrossEntropyLoss(weight=torch_weights)
-                else:
-                    criterion = nn.CrossEntropyLoss()
+                criterion = nn.CrossEntropyLoss(weight=torch_weights) if torch_weights is not None else nn.CrossEntropyLoss()
                 
                 worker_logger.info(f"Training {name} (PyTorch)...")
                 model.train()
                 for epoch in range(config.training.epochs):
-                    epoch_loss = 0.0
                     for batch_X, batch_y in train_loader:
                         optimizer.zero_grad()
                         outputs = model(batch_X)
                         loss = criterion(outputs, batch_y)
                         loss.backward()
                         optimizer.step()
-                        epoch_loss += loss.item()
-                    
-                    # Simple early stopping check could go here
-                
                 trained_models[name] = model
-                
-                # Evaluate
-                model.eval()
-                with torch.no_grad():
-                    val_inputs = torch.FloatTensor(X_seq_val).to(device)
-                    outputs = model(val_inputs)
-                    _, predicted = torch.max(outputs.data, 1)
-                    prec = precision_score(y_seq_val, predicted.cpu().numpy(), average=None, zero_division=0)
-                    metrics[name] = {'precision': prec.tolist()}
 
-        # 4. Dynamic Weight Optimization (Auto-Tune)
+        # Optimize Weights
         optimized_weights = {}
         if config.ensemble_weights.auto_tune:
-            worker_logger.info("Optimizing ensemble weights on validation set...")
+            worker_logger.info("Optimizing ensemble weights...")
             val_preds = {}
+            if 'gb' in trained_models: val_preds['gb'] = trained_models['gb'].predict_proba(X_val)
+            if 'technical' in trained_models: val_preds['technical'] = trained_models['technical'].predict_proba(X_val)
             
-            # Collect predictions from flat models
-            if 'gb' in trained_models:
-                val_preds['gb'] = trained_models['gb'].predict_proba(X_val)
-            if 'technical' in trained_models:
-                val_preds['technical'] = trained_models['technical'].predict_proba(X_val)
-            
-            # Collect predictions from sequence models (aligned)
             if len(X_seq_val) > 0:
-                # Sequence models lose (seq_len - 1) samples at the start
                 valid_indices = slice(seq_len - 1, None)
-                
-                # Truncate flat model preds to match sequence length
-                for k in list(val_preds.keys()):
-                    val_preds[k] = val_preds[k][valid_indices]
-                
+                for k in list(val_preds.keys()): val_preds[k] = val_preds[k][valid_indices]
                 y_val_opt = y_val[valid_indices]
-                
                 for name in ['lstm', 'attention']:
                     if name in trained_models:
                         model = trained_models[name]
                         model.eval()
                         with torch.no_grad():
-                            inputs = torch.FloatTensor(X_seq_val).to(device)
-                            probs = model(inputs).cpu().numpy()
-                            val_preds[name] = probs
+                            val_preds[name] = model(torch.FloatTensor(X_seq_val).to(device)).cpu().numpy()
             else:
-                # If sequence data is too short, we can't use NNs in optimization properly
-                # or we just use flat models. For now, assume we use what we have.
                 y_val_opt = y_val
             
-            # Run Optimization
             if val_preds:
                 optimized_weights = _optimize_ensemble_weights(val_preds, y_val_opt)
-                worker_logger.info(f"Optimized Weights: {optimized_weights}")
 
-        # 5. Walk-Forward Validation (Profitability Check)
-        worker_logger.info("Performing Walk-Forward Validation on Validation Set...")
+        # --- CHALLENGER EVALUATION ---
+        challenger_metrics = _evaluate_ensemble(
+            trained_models, X_val, y_val, X_seq_val, y_seq_val, 
+            config, device, returns_val, weights_override=optimized_weights
+        )
         
-        # Aggregate Probabilities using Optimized Weights if available, else Config Weights
-        num_val = len(y_val)
-        ensemble_probs = np.zeros((num_val, 3))
-        
-        # Helper to get weight
-        def get_weight(name, default_weight):
-            if optimized_weights:
-                return optimized_weights.get(name, 0.0)
-            return default_weight
+        pf = challenger_metrics.get('profit_factor', 0)
+        sharpe = challenger_metrics.get('sharpe', 0)
+        worker_logger.info(f"Challenger Metrics: PF={pf:.2f}, Sharpe={sharpe:.4f}")
 
-        config_weights = config.ensemble_weights
-        
-        # Sklearn Models
-        if 'gb' in trained_models:
-            probs = trained_models['gb'].predict_proba(X_val)
-            w = get_weight('gb', config_weights.xgboost)
-            ensemble_probs += probs * w
-            
-        if 'technical' in trained_models:
-            probs = trained_models['technical'].predict_proba(X_val)
-            w = get_weight('technical', config_weights.technical_ensemble)
-            ensemble_probs += probs * w
-            
-        # NN Models (Alignment required)
-        valid_nn_indices = slice(seq_len - 1, None)
-        
-        if len(X_seq_val) > 0:
-            def add_nn_probs(model_name, default_weight):
-                if model_name in trained_models:
-                    model = trained_models[model_name]
-                    model.eval()
-                    with torch.no_grad():
-                        inputs = torch.FloatTensor(X_seq_val).to(device)
-                        probs = model(inputs).cpu().numpy()
-                        # Add to the slice of ensemble_probs
-                        target_len = len(ensemble_probs[valid_nn_indices])
-                        if len(probs) == target_len:
-                            w = get_weight(model_name, default_weight)
-                            ensemble_probs[valid_nn_indices] += probs * w
-            
-            add_nn_probs('lstm', config_weights.lstm)
-            add_nn_probs('attention', config_weights.attention)
+        # --- GATING & COMPARISON ---
+        # 1. Absolute Gates
+        if pf < config.training.min_profit_factor:
+            worker_logger.warning(f"Challenger rejected: PF {pf:.2f} < {config.training.min_profit_factor}")
+            return False
+        if sharpe < config.training.min_sharpe_ratio:
+            worker_logger.warning(f"Challenger rejected: Sharpe {sharpe:.4f} < {config.training.min_sharpe_ratio}")
+            return False
 
-        # Determine Final Predictions on the subset where all models could predict
-        eval_probs = ensemble_probs[valid_nn_indices]
-        final_preds = np.argmax(eval_probs, axis=1) # 0, 1, 2
-        
-        # Map to Signal: 0->-1 (Short), 1->0 (Hold), 2->1 (Long)
-        signals = np.zeros_like(final_preds)
-        signals[final_preds == 0] = -1
-        signals[final_preds == 2] = 1
-        
-        # Get Market Returns for the validation period
-        val_indices = common_index[split_idx:]
-        eval_indices = val_indices[valid_nn_indices]
-        
-        if len(eval_indices) != len(signals):
-            worker_logger.warning("Shape mismatch in validation. Skipping profitability check.")
-        else:
-            # Calculate Next-Candle Returns
-            full_returns = df['close'].pct_change().shift(-1)
-            eval_returns = full_returns.loc[eval_indices].fillna(0.0).values
+        # 2. Champion vs Challenger
+        if champion_metrics:
+            champ_sharpe = champion_metrics.get('sharpe', 0)
+            # Ensure we don't divide by zero or handle negative sharpe weirdly
+            # Logic: New Sharpe must be > Old Sharpe * (1 + threshold)
+            # If Old Sharpe is negative, any positive Sharpe is an improvement.
             
-            # Strategy Returns
-            strategy_returns = signals * eval_returns
+            improvement_needed = config.training.min_improvement_pct
             
-            # Metrics
-            total_return = np.sum(strategy_returns)
-            winning_returns = strategy_returns[strategy_returns > 0]
-            losing_returns = strategy_returns[strategy_returns < 0]
+            is_better = False
+            if champ_sharpe <= 0:
+                if sharpe > champ_sharpe + 0.05: # Arbitrary small bump to escape negative
+                    is_better = True
+            else:
+                if sharpe > champ_sharpe * (1 + improvement_needed):
+                    is_better = True
             
-            gross_profit = np.sum(winning_returns)
-            gross_loss = np.abs(np.sum(losing_returns))
-            
-            profit_factor = gross_profit / gross_loss if gross_loss > 0 else 999.0
-            
-            mean_ret = np.mean(strategy_returns)
-            std_ret = np.std(strategy_returns)
-            sharpe = mean_ret / std_ret if std_ret > 0 else 0.0
-            
-            metrics['ensemble'] = {
-                'profit_factor': float(profit_factor),
-                'sharpe': float(sharpe),
-                'total_return': float(total_return),
-                'win_rate': float(len(winning_returns) / len(strategy_returns)) if len(strategy_returns) > 0 else 0.0
-            }
-            
-            worker_logger.info(f"Validation Results: PF={profit_factor:.2f}, Sharpe={sharpe:.4f}, Ret={total_return:.4f}")
-            
-            # Check Thresholds
-            if profit_factor < config.training.min_profit_factor:
-                worker_logger.warning(f"Model rejected: Profit Factor {profit_factor:.2f} < {config.training.min_profit_factor}")
+            if not is_better:
+                worker_logger.warning(f"Challenger failed to beat Champion. Champ Sharpe: {champ_sharpe:.4f}, Challenger: {sharpe:.4f}")
                 return False
-                
-            if sharpe < config.training.min_sharpe_ratio:
-                worker_logger.warning(f"Model rejected: Sharpe {sharpe:.4f} < {config.training.min_sharpe_ratio}")
-                return False
+            else:
+                worker_logger.info(f"Challenger defeated Champion! ({sharpe:.4f} vs {champ_sharpe:.4f})")
 
-        # 6. Atomic Save Artifacts
+        # --- SAVE ARTIFACTS ---
         safe_symbol = symbol.replace('/', '_')
         final_dir = os.path.join(config.model_path, safe_symbol)
         temp_dir = os.path.join(config.model_path, f"{safe_symbol}_temp")
         
-        # Clean up any existing temp dir
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
+        if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
         os.makedirs(temp_dir, exist_ok=True)
         
         try:
-            # Save sklearn models
             for name, model in trained_models.items():
                 if name in ['lstm', 'attention']:
                     torch.save(model.state_dict(), os.path.join(temp_dir, f"{name}.pth"))
                 else:
                     joblib.dump(model, os.path.join(temp_dir, f"{name}.joblib"))
             
-            # Save Metadata
             meta = {
                 'timestamp': datetime.now().isoformat(),
-                'metrics': metrics,
+                'metrics': {'ensemble': challenger_metrics},
                 'feature_importance': feature_importance,
                 'feature_columns': config.feature_columns,
                 'num_features': num_features,
-                'optimized_weights': optimized_weights # Save the dynamic weights
+                'optimized_weights': optimized_weights
             }
             with open(os.path.join(temp_dir, "metadata.json"), 'w') as f:
                 json.dump(meta, f, indent=2)
             
-            # Atomic Swap
-            if os.path.exists(final_dir):
-                shutil.rmtree(final_dir)
-            
-            # Rename temp to final
+            if os.path.exists(final_dir): shutil.rmtree(final_dir)
             os.rename(temp_dir, final_dir)
             
-            worker_logger.info(f"Training complete for {symbol}. Artifacts saved atomically to {final_dir}")
+            worker_logger.info(f"Training complete. Artifacts saved to {final_dir}")
             return True
             
         except Exception as e:
-            worker_logger.error(f"Failed to save artifacts for {symbol}: {e}")
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
+            worker_logger.error(f"Failed to save artifacts: {e}")
+            if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
             return False
 
     except Exception as e:
@@ -509,11 +562,9 @@ class EnsembleLearner:
         return bool(self.symbol_models)
 
     def has_valid_model(self, symbol: str) -> bool:
-        """Checks if a valid model is currently loaded in memory for the symbol."""
         return symbol in self.symbol_models
 
     def get_last_training_time(self, symbol: str) -> Optional[datetime]:
-        """Checks the metadata file to find the last training timestamp."""
         try:
             safe_symbol = symbol.replace('/', '_')
             meta_path = os.path.join(self.config.model_path, safe_symbol, "metadata.json")
@@ -530,85 +581,17 @@ class EnsembleLearner:
         if not ML_AVAILABLE:
             return
 
-        safe_symbol = symbol.replace('/', '_')
-        load_dir = os.path.join(self.config.model_path, safe_symbol)
-        
-        if not os.path.exists(load_dir):
-            logger.warning(f"No model directory found for {symbol}")
-            return
-
         try:
-            meta_path = os.path.join(load_dir, "metadata.json")
-            if not os.path.exists(meta_path):
-                logger.warning(f"Metadata missing for {symbol}, cannot load models.")
-                return
-
-            # Load Metadata
-            with open(meta_path, 'r') as f:
-                meta = json.load(f)
-
-            # --- CONFIG CONSISTENCY CHECK ---
-            saved_features = meta.get('feature_columns', [])
-            current_features = self.config.feature_columns
+            loaded_data = _load_saved_models(symbol, self.config.model_path, self.config, self.device)
             
-            if saved_features != current_features:
-                logger.warning(
-                    f"Feature mismatch for {symbol}. "
-                    f"Saved: {len(saved_features)} features, Current: {len(current_features)} features. "
-                    "Model will be discarded to trigger retrain."
-                )
+            if loaded_data:
+                self.symbol_models[symbol] = loaded_data
+                logger.info(f"Models reloaded successfully for {symbol}")
+            else:
+                # If load failed (e.g. config mismatch), remove existing model to force retrain
                 if symbol in self.symbol_models:
                     del self.symbol_models[symbol]
-                return
-            
-            expected_num_features = FeatureProcessor.get_expected_feature_count(self.config)
-            saved_num_features = meta.get('num_features', len(saved_features))
-            
-            if expected_num_features != saved_num_features:
-                 logger.warning(
-                    f"Feature count mismatch for {symbol}. "
-                    f"Saved: {saved_num_features}, Expected: {expected_num_features}. "
-                    "Model will be discarded to trigger retrain."
-                )
-                 if symbol in self.symbol_models:
-                    del self.symbol_models[symbol]
-                 return
-            # --------------------------------
-
-            models = {}
-            # Load Sklearn Models
-            for name in ['gb', 'technical']:
-                path = os.path.join(load_dir, f"{name}.joblib")
-                if os.path.exists(path):
-                    models[name] = joblib.load(path)
-
-            # Load PyTorch Models
-            if 'lstm' in self.config.ensemble_weights.dict():
-                path = os.path.join(load_dir, "lstm.pth")
-                if os.path.exists(path):
-                    lstm = LSTMPredictor(expected_num_features, self.config.hyperparameters.lstm.hidden_dim, 
-                                         self.config.hyperparameters.lstm.num_layers, 
-                                         self.config.hyperparameters.lstm.dropout).to(self.device)
-                    lstm.load_state_dict(torch.load(path, map_location=self.device))
-                    lstm.eval()
-                    models['lstm'] = lstm
-
-            if 'attention' in self.config.ensemble_weights.dict():
-                path = os.path.join(load_dir, "attention.pth")
-                if os.path.exists(path):
-                    attn = AttentionNetwork(expected_num_features, self.config.hyperparameters.attention.hidden_dim,
-                                            self.config.hyperparameters.attention.num_layers,
-                                            self.config.hyperparameters.attention.nhead,
-                                            self.config.hyperparameters.attention.dropout).to(self.device)
-                    attn.load_state_dict(torch.load(path, map_location=self.device))
-                    attn.eval()
-                    models['attention'] = attn
-
-            self.symbol_models[symbol] = {
-                'models': models,
-                'meta': meta
-            }
-            logger.info(f"Models reloaded successfully for {symbol}")
+                logger.warning(f"Could not load valid models for {symbol} (possible config mismatch).")
 
         except Exception as e:
             logger.error(f"Failed to reload models for {symbol}: {e}")
@@ -716,14 +699,7 @@ class EnsembleLearner:
             if len(relevant_probs) > 1:
                 std_dev = np.std(relevant_probs)
                 penalty = std_dev * config_weights.disagreement_penalty
-                original_conf = confidence
                 confidence = max(0.0, confidence - penalty)
-                if penalty > 0.05:
-                    logger.debug(f"Confidence penalized for {symbol}", 
-                                 original=original_conf, 
-                                 penalty=penalty, 
-                                 std_dev=std_dev, 
-                                 final=confidence)
 
         # Extract top features from XGBoost if available
         top_features = {}
