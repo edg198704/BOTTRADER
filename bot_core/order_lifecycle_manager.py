@@ -181,6 +181,19 @@ class OrderLifecycleManager:
             price_improvement = market_price * self.config.chase_aggressiveness_pct
             new_price = market_price + price_improvement if side.upper() == 'BUY' else market_price - price_improvement
             
+            # --- SLIPPAGE PROTECTION CHECK ---
+            if initial_price and initial_price > 0:
+                slippage = abs(new_price - initial_price) / initial_price
+                if slippage > self.config.max_chase_slippage_pct:
+                    logger.warning("Chase aborted: Price deviated too far from initial limit.", 
+                                   symbol=symbol, 
+                                   initial=initial_price, 
+                                   new=new_price, 
+                                   slippage=slippage, 
+                                   limit=self.config.max_chase_slippage_pct)
+                    break
+            # ---------------------------------
+
             try:
                 # Construct deterministic clientOrderId if trade_id is available
                 extra_params = {}
