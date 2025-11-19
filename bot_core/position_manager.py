@@ -54,12 +54,15 @@ class PositionManager:
         self._initial_capital = initial_capital
         self._realized_pnl = 0.0
         self.alert_system = alert_system
+        # Lock to serialize DB access across async tasks to prevent SQLite locking errors
+        self._db_lock = asyncio.Lock()
         logger.info("PositionManager initialized and database table created.")
 
     async def initialize(self):
         """Calculates initial realized PnL and ensures portfolio state exists."""
-        self._realized_pnl = await self._run_in_executor(self._calculate_initial_realized_pnl_sync)
-        await self._run_in_executor(self._initialize_portfolio_state_sync)
+        async with self._db_lock:
+            self._realized_pnl = await self._run_in_executor(self._calculate_initial_realized_pnl_sync)
+            await self._run_in_executor(self._initialize_portfolio_state_sync)
         logger.info("PositionManager state initialized.", realized_pnl=self._realized_pnl)
 
     async def _run_in_executor(self, func, *args):
@@ -98,7 +101,8 @@ class PositionManager:
 
     async def get_portfolio_state(self) -> Optional[Dict[str, float]]:
         """Returns the persisted portfolio state (initial capital, peak equity)."""
-        return await self._run_in_executor(self._get_portfolio_state_sync)
+        async with self._db_lock:
+            return await self._run_in_executor(self._get_portfolio_state_sync)
 
     def _get_portfolio_state_sync(self) -> Optional[Dict[str, float]]:
         session = self.SessionLocal()
@@ -112,7 +116,8 @@ class PositionManager:
 
     async def update_portfolio_high_water_mark(self, new_peak: float):
         """Updates the peak equity in the database."""
-        await self._run_in_executor(self._update_portfolio_high_water_mark_sync, new_peak)
+        async with self._db_lock:
+            await self._run_in_executor(self._update_portfolio_high_water_mark_sync, new_peak)
 
     def _update_portfolio_high_water_mark_sync(self, new_peak: float):
         session = self.SessionLocal()
@@ -137,7 +142,8 @@ class PositionManager:
     # --- Pending Position Management (Two-Phase Commit) ---
 
     async def create_pending_position(self, symbol: str, side: str, order_id: str) -> Optional[Position]:
-        return await self._run_in_executor(self._create_pending_position_sync, symbol, side, order_id)
+        async with self._db_lock:
+            return await self._run_in_executor(self._create_pending_position_sync, symbol, side, order_id)
 
     def _create_pending_position_sync(self, symbol: str, side: str, order_id: str) -> Optional[Position]:
         session = self.SessionLocal()
@@ -175,7 +181,8 @@ class PositionManager:
             session.close()
 
     async def confirm_position_open(self, symbol: str, order_id: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float) -> Optional[Position]:
-        return await self._run_in_executor(self._confirm_position_open_sync, symbol, order_id, quantity, entry_price, stop_loss, take_profit)
+        async with self._db_lock:
+            return await self._run_in_executor(self._confirm_position_open_sync, symbol, order_id, quantity, entry_price, stop_loss, take_profit)
 
     def _confirm_position_open_sync(self, symbol: str, order_id: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float) -> Optional[Position]:
         session = self.SessionLocal()
@@ -219,7 +226,8 @@ class PositionManager:
 
     async def void_position(self, symbol: str, order_id: str):
         """Deletes a PENDING position if the order failed or was cancelled."""
-        await self._run_in_executor(self._void_position_sync, symbol, order_id)
+        async with self._db_lock:
+            await self._run_in_executor(self._void_position_sync, symbol, order_id)
 
     def _void_position_sync(self, symbol: str, order_id: str):
         session = self.SessionLocal()
@@ -241,7 +249,8 @@ class PositionManager:
             session.close()
 
     async def get_pending_positions(self) -> List[Position]:
-        return await self._run_in_executor(self._get_pending_positions_sync)
+        async with self._db_lock:
+            return await self._run_in_executor(self._get_pending_positions_sync)
 
     def _get_pending_positions_sync(self) -> List[Position]:
         session = self.SessionLocal()
@@ -254,9 +263,10 @@ class PositionManager:
 
     async def open_position(self, symbol: str, side: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float) -> Optional[Position]:
         """Legacy method for direct opening, kept for compatibility or manual overrides."""
-        return await self._run_in_executor(
-            self._open_position_sync, symbol, side, quantity, entry_price, stop_loss, take_profit
-        )
+        async with self._db_lock:
+            return await self._run_in_executor(
+                self._open_position_sync, symbol, side, quantity, entry_price, stop_loss, take_profit
+            )
 
     def _open_position_sync(self, symbol: str, side: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float) -> Optional[Position]:
         session = self.SessionLocal()
@@ -289,7 +299,8 @@ class PositionManager:
             session.close()
 
     async def close_position(self, symbol: str, close_price: float, reason: str = "Unknown") -> Optional[Position]:
-        position = await self._run_in_executor(self._close_position_sync, symbol, close_price, reason)
+        async with self._db_lock:
+            position = await self._run_in_executor(self._close_position_sync, symbol, close_price, reason)
         if position:
             self._realized_pnl += position.pnl
         return position
@@ -331,7 +342,8 @@ class PositionManager:
             session.close()
 
     async def manage_trailing_stop(self, pos: Position, current_price: float, rm_config: RiskManagementConfig) -> Position:
-        return await self._run_in_executor(self._manage_trailing_stop_sync, pos, current_price, rm_config)
+        async with self._db_lock:
+            return await self._run_in_executor(self._manage_trailing_stop_sync, pos, current_price, rm_config)
 
     def _manage_trailing_stop_sync(self, pos: Position, current_price: float, rm_config: RiskManagementConfig) -> Position:
         session = self.SessionLocal()
@@ -379,7 +391,8 @@ class PositionManager:
             session.close()
 
     async def get_daily_realized_pnl(self) -> float:
-        return await self._run_in_executor(self._calculate_daily_pnl_sync)
+        async with self._db_lock:
+            return await self._run_in_executor(self._calculate_daily_pnl_sync)
 
     def _calculate_daily_pnl_sync(self) -> float:
         session = self.SessionLocal()
@@ -394,7 +407,8 @@ class PositionManager:
             session.close()
 
     async def get_open_position(self, symbol: str) -> Optional[Position]:
-        return await self._run_in_executor(self._get_open_position_sync, symbol)
+        async with self._db_lock:
+            return await self._run_in_executor(self._get_open_position_sync, symbol)
 
     def _get_open_position_sync(self, symbol: str) -> Optional[Position]:
         session = self.SessionLocal()
@@ -404,7 +418,8 @@ class PositionManager:
             session.close()
 
     async def get_all_open_positions(self) -> List[Position]:
-        return await self._run_in_executor(self._get_all_open_positions_sync)
+        async with self._db_lock:
+            return await self._run_in_executor(self._get_all_open_positions_sync)
 
     def _get_all_open_positions_sync(self) -> List[Position]:
         session = self.SessionLocal()
@@ -414,7 +429,8 @@ class PositionManager:
             session.close()
 
     async def get_aggregated_open_positions(self) -> Dict[str, float]:
-        return await self._run_in_executor(self._get_aggregated_open_positions_sync)
+        async with self._db_lock:
+            return await self._run_in_executor(self._get_aggregated_open_positions_sync)
 
     def _get_aggregated_open_positions_sync(self) -> Dict[str, float]:
         session = self.SessionLocal()
