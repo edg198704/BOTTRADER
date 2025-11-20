@@ -145,6 +145,73 @@ def _create_fresh_models(config: AIEnsembleStrategyParams, num_features: int, de
     
     return models
 
+def _train_torch_model(model, X_train, y_train, X_val, y_val, config, device, class_weights=None):
+    """
+    Robust training loop for PyTorch models with Early Stopping and LR Scheduling.
+    """
+    if len(X_train) == 0 or len(X_val) == 0:
+        return model
+
+    # Hyperparameters
+    epochs = config.training.epochs
+    batch_size = config.training.batch_size
+    lr = config.training.learning_rate
+    patience = config.training.early_stopping_patience
+    
+    # Setup
+    train_tensor = TensorDataset(torch.FloatTensor(X_train).to(device), torch.LongTensor(y_train).to(device))
+    train_loader = DataLoader(train_tensor, batch_size=batch_size, shuffle=True)
+    
+    # Validation tensor (full batch for eval)
+    X_val_t = torch.FloatTensor(X_val).to(device)
+    y_val_t = torch.LongTensor(y_val).to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss(weight=class_weights) if class_weights is not None else nn.CrossEntropyLoss()
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=max(1, patience // 2))
+
+    best_val_loss = float('inf')
+    best_state = None
+    patience_counter = 0
+
+    for epoch in range(epochs):
+        # Training Phase
+        model.train()
+        train_loss = 0.0
+        for b_x, b_y in train_loader:
+            optimizer.zero_grad()
+            outputs = model(b_x)
+            loss = criterion(outputs, b_y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        
+        # Validation Phase
+        model.eval()
+        with torch.no_grad():
+            val_outputs = model(X_val_t)
+            val_loss = criterion(val_outputs, y_val_t).item()
+        
+        # Scheduler Step
+        scheduler.step(val_loss)
+
+        # Early Stopping Check
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = model.state_dict()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                # Early stopping triggered
+                break
+    
+    # Restore best model
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    
+    return model
+
 def _optimize_hyperparameters(model, X, y, param_dist, n_iter, logger_instance, fit_params=None):
     """Runs RandomizedSearchCV to find better hyperparameters."""
     try:
@@ -526,24 +593,14 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 
                 # PyTorch
                 X_seq_tr, y_seq_tr = FeatureProcessor.create_sequences(X_fold_train, y_fold_train, seq_len)
-                X_seq_val, _ = FeatureProcessor.create_sequences(X_fold_val, y_fold_val, seq_len)
+                X_seq_val, y_seq_val = FeatureProcessor.create_sequences(X_fold_val, y_fold_val, seq_len)
                 
                 if len(X_seq_tr) > 0 and len(X_seq_val) > 0:
-                    train_tensor = TensorDataset(torch.FloatTensor(X_seq_tr).to(device), torch.LongTensor(y_seq_tr).to(device))
-                    train_loader = DataLoader(train_tensor, batch_size=config.training.batch_size, shuffle=True)
-                    
                     for name in ['lstm', 'attention']:
                         model = fold_models[name]
-                        optimizer = optim.Adam(model.parameters(), lr=config.training.learning_rate)
-                        criterion = nn.CrossEntropyLoss()
-                        model.train()
-                        for _ in range(min(10, config.training.epochs)): # Reduced epochs for CV
-                            for b_x, b_y in train_loader:
-                                optimizer.zero_grad()
-                                outputs = model(b_x)
-                                loss = criterion(outputs, b_y)
-                                loss.backward()
-                                optimizer.step()
+                        # Use robust training loop even for CV, but with fewer epochs if desired
+                        # Here we use full config epochs but rely on early stopping to cut it short
+                        _train_torch_model(model, X_seq_tr, y_seq_tr, X_seq_val, y_seq_val, config, device)
                         
                         model.eval()
                         with torch.no_grad():
@@ -698,26 +755,45 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                     feature_importance[name] = dict(zip(active_feature_names, imps))
 
         # Train PyTorch
-        X_seq_dev, y_seq_dev = FeatureProcessor.create_sequences(X_dev, y_dev, seq_len)
-        if len(X_seq_dev) > 0:
-            train_tensor = TensorDataset(torch.FloatTensor(X_seq_dev).to(device), torch.LongTensor(y_seq_dev).to(device))
-            train_loader = DataLoader(train_tensor, batch_size=config.training.batch_size, shuffle=True)
+        # We need a validation set for early stopping. 
+        # We can use the last chunk of X_dev as internal validation.
+        val_size = int(len(X_dev) * 0.15) # 15% internal validation
+        if val_size > seq_len:
+            X_final_train = X_dev[:-val_size]
+            y_final_train = y_dev[:-val_size]
+            X_final_val = X_dev[-val_size:]
+            y_final_val = y_dev[-val_size:]
+            
+            X_seq_tr, y_seq_tr = FeatureProcessor.create_sequences(X_final_train, y_final_train, seq_len)
+            X_seq_val, y_seq_val = FeatureProcessor.create_sequences(X_final_val, y_final_val, seq_len)
             
             for name in ['lstm', 'attention']:
                 if name not in final_models: continue
                 model = final_models[name]
-                optimizer = optim.Adam(model.parameters(), lr=config.training.learning_rate)
-                criterion = nn.CrossEntropyLoss(weight=torch_weights) if torch_weights is not None else nn.CrossEntropyLoss()
-                
-                model.train()
-                for epoch in range(config.training.epochs):
-                    for batch_X, batch_y in train_loader:
-                        optimizer.zero_grad()
-                        outputs = model(batch_X)
-                        loss = criterion(outputs, batch_y)
-                        loss.backward()
-                        optimizer.step()
+                _train_torch_model(model, X_seq_tr, y_seq_tr, X_seq_val, y_seq_val, config, device, torch_weights)
                 trained_models[name] = model
+        else:
+            # Fallback if data too small: train without early stopping on full set
+            X_seq_dev, y_seq_dev = FeatureProcessor.create_sequences(X_dev, y_dev, seq_len)
+            if len(X_seq_dev) > 0:
+                train_tensor = TensorDataset(torch.FloatTensor(X_seq_dev).to(device), torch.LongTensor(y_seq_dev).to(device))
+                train_loader = DataLoader(train_tensor, batch_size=config.training.batch_size, shuffle=True)
+                
+                for name in ['lstm', 'attention']:
+                    if name not in final_models: continue
+                    model = final_models[name]
+                    optimizer = optim.Adam(model.parameters(), lr=config.training.learning_rate)
+                    criterion = nn.CrossEntropyLoss(weight=torch_weights) if torch_weights is not None else nn.CrossEntropyLoss()
+                    
+                    model.train()
+                    for epoch in range(config.training.epochs):
+                        for batch_X, batch_y in train_loader:
+                            optimizer.zero_grad()
+                            outputs = model(batch_X)
+                            loss = criterion(outputs, batch_y)
+                            loss.backward()
+                            optimizer.step()
+                    trained_models[name] = model
 
         # --- CHALLENGER EVALUATION (Using Test Set) ---
         challenger_metrics = _evaluate_ensemble(
