@@ -1,5 +1,6 @@
 import asyncio
 import time
+import json
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
 import pandas as pd
@@ -138,16 +139,37 @@ class TradingBot:
                 async def confirm_from_order(order_data):
                     filled_qty = order_data.get('filled', 0.0)
                     avg_price = order_data.get('average', 0.0)
-                    sl_pct = 0.05
-                    tp_pct = 0.05
-                    if pos.side == 'BUY':
-                        sl = avg_price * (1 - sl_pct)
-                        tp = avg_price * (1 + tp_pct)
-                    else:
-                        sl = avg_price * (1 + sl_pct)
-                        tp = avg_price * (1 - tp_pct)
                     
-                    logger.info("Recovered position from order.", symbol=pos.symbol, order_id=pos.order_id, filled=filled_qty)
+                    # --- Dynamic Risk Calculation for Recovery ---
+                    # Extract metadata to restore regime/confidence context
+                    meta = {}
+                    if pos.strategy_metadata:
+                        try:
+                            meta = json.loads(pos.strategy_metadata)
+                        except Exception:
+                            logger.warning("Failed to parse strategy metadata during reconciliation.", symbol=pos.symbol)
+                    
+                    regime = meta.get('regime')
+                    confidence = meta.get('confidence')
+                    
+                    # Fetch market data for ATR calculation
+                    df = self.data_handler.get_market_data(pos.symbol)
+                    
+                    # Recalculate SL/TP using RiskManager logic
+                    sl = self.risk_manager.calculate_stop_loss(pos.side, avg_price, df, market_regime=regime)
+                    
+                    # Get confidence threshold from config for dynamic TP scaling
+                    conf_thresh = getattr(self.config.strategy.params, 'confidence_threshold', None)
+                    
+                    tp = self.risk_manager.calculate_take_profit(
+                        pos.side, avg_price, sl, market_regime=regime, 
+                        confidence=confidence, confidence_threshold=conf_thresh
+                    )
+                    
+                    logger.info("Recovered position from order with dynamic risk params.", 
+                                symbol=pos.symbol, order_id=pos.order_id, filled=filled_qty, 
+                                sl=sl, tp=tp, regime=regime)
+                    
                     await self.position_manager.confirm_position_open(pos.symbol, pos.order_id, filled_qty, avg_price, sl, tp)
 
                 if status == 'FILLED':
