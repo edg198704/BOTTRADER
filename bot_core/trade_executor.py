@@ -208,8 +208,13 @@ class TradeExecutor:
         confidence = strategy_metadata.get('confidence')
         metrics = strategy_metadata.get('metrics') # Extract validation metrics for Kelly Criterion
         
-        # Try to get threshold from config if it exists for the current strategy
-        confidence_threshold = getattr(self.config.strategy.params, 'confidence_threshold', None)
+        # Use the effective threshold that was actually used for the decision (from metadata)
+        # This ensures risk scaling is consistent with the decision logic (max(ai, manager))
+        confidence_threshold = strategy_metadata.get('effective_threshold')
+        
+        # Fallback to config if metadata is missing (e.g. non-AI strategy)
+        if confidence_threshold is None:
+            confidence_threshold = getattr(self.config.strategy.params, 'confidence_threshold', None)
 
         # Pass symbol and active_positions for correlation check
         ideal_quantity = self.risk_manager.calculate_position_size(
