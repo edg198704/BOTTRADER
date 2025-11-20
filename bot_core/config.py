@@ -120,9 +120,15 @@ class AIFeatureEngineeringConfig(BaseModel):
     lag_features: List[str] = [] # List of column names to generate lags for
     lag_depth: int = 0 # Number of past periods to include as features
 
-    # --- Advanced Features (New) ---
+    # --- Advanced Features ---
     use_time_features: bool = False # Cyclical encoding of Hour/Day
     use_price_action_features: bool = False # Candle body/wick ratios
+
+    # --- Quantitative Features (New) ---
+    use_volatility_estimators: bool = False # Garman-Klass Volatility
+    use_frac_diff: bool = False # Fractional Differentiation
+    frac_diff_d: float = 0.4 # Differencing factor (0.0 = Raw, 1.0 = Returns)
+    frac_diff_thres: float = 1e-4 # Weight cutoff for FracDiff window
 
     # --- Feature Selection ---
     use_feature_selection: bool = True
