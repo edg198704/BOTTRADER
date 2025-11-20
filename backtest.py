@@ -106,7 +106,7 @@ async def run_backtest():
     order_sizer = OrderSizer()
     health_checker = HealthChecker()
     
-    position_monitor = PositionMonitor(config, position_manager, risk_manager, shared_latest_prices)
+    position_monitor = PositionMonitor(config, position_manager, risk_manager, data_handler, shared_latest_prices)
     
     order_lifecycle_manager = OrderLifecycleManager(exchange_api, config.execution, shared_latest_prices)
     
