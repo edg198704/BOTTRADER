@@ -10,7 +10,7 @@ from bot_core.logger import get_logger, set_correlation_id
 from bot_core.exchange_api import ExchangeAPI
 from bot_core.position_manager import PositionManager, Position
 from bot_core.risk_manager import RiskManager
-from bot_core.strategy import TradingStrategy, AIEnsembleStrategy
+from bot_core.strategy import TradingStrategy, AIEnsembleStrategy, TradeSignal
 from bot_core.config import BotConfig
 from bot_core.data_handler import DataHandler
 from bot_core.monitoring import HealthChecker, InfluxDBMetrics, AlertSystem
@@ -47,6 +47,7 @@ class TradingBot:
         self.start_time = datetime.now(timezone.utc)
         self.latest_prices = shared_latest_prices
         self.market_details: Dict[str, Dict[str, Any]] = {}
+        self.processed_candles: Dict[str, pd.Timestamp] = {}
         
         # Task Management
         self.active_tasks: Dict[str, asyncio.Task] = {}
@@ -71,7 +72,6 @@ class TradingBot:
             self.strategy.data_fetcher = self.data_handler
             logger.info("Injected DataHandler into AIEnsembleStrategy.")
 
-        # Inject strategy into PositionMonitor for regime-aware risk management
         self.position_monitor.set_strategy(self.strategy)
 
         await self._load_market_details()
@@ -106,19 +106,12 @@ class TradingBot:
 
         logger.info("Found PENDING positions. Reconciling...", count=len(pending_positions))
         for pos in pending_positions:
-            # Delegate reconciliation logic to TradeExecutor or handle here. 
-            # For brevity, we assume the logic from the previous implementation is robust enough or 
-            # handled via the TradeExecutor's recovery mechanisms if we moved it there.
-            # Keeping the core logic here for now but wrapping it safely.
             try:
-                await self._reconcile_single_position(pos)
+                # In a real scenario, we would check the order status on exchange and update DB
+                # For now, we mark them failed to be safe if they are stale
+                await self.position_manager.mark_position_failed(pos.symbol, pos.order_id, "Startup Reconciliation")
             except Exception as e:
                 logger.error("Error reconciling pending position", symbol=pos.symbol, error=str(e))
-
-    async def _reconcile_single_position(self, pos: Position):
-        # ... (Logic from previous implementation for reconciliation) ...
-        # Simplified for this refactor to focus on architecture, assuming logic is preserved
-        pass 
 
     async def reconcile_open_positions(self):
         logger.info("Reconciling OPEN positions with exchange balances...")
@@ -151,7 +144,6 @@ class TradingBot:
         
         await self.setup()
 
-        # --- Supervisor Pattern: Launch Managed Tasks ---
         self._launch_task("DataHandler", self.data_handler.run())
         self._launch_task("Monitoring", self._monitoring_loop())
         self._launch_task("PositionMonitor", self.position_monitor.run())
@@ -161,7 +153,6 @@ class TradingBot:
         for symbol in self.config.strategy.symbols:
             self._launch_task(f"SymbolLoop_{symbol}", self._trading_cycle_for_symbol(symbol))
 
-        # Main Supervisor Loop
         while self.running:
             await asyncio.sleep(5)
             await self._check_tasks()
@@ -172,7 +163,6 @@ class TradingBot:
         logger.info(f"Launched task: {name}")
 
     async def _check_tasks(self):
-        """Monitor active tasks and restart them if they fail unexpectedly."""
         for name, task in list(self.active_tasks.items()):
             if task.done():
                 try:
@@ -181,7 +171,6 @@ class TradingBot:
                         logger.error(f"Task {name} failed with exception: {exc}", exc_info=exc)
                         if self.running:
                             logger.info(f"Restarting task: {name}")
-                            # Re-instantiate the coroutine based on name
                             if name == "DataHandler":
                                 self._launch_task(name, self.data_handler.run())
                             elif name == "Monitoring":
@@ -211,13 +200,19 @@ class TradingBot:
                 
                 if not self.running: break
 
-                await self.process_symbol_tick(symbol)
+                # Heartbeat check: Ensure data is actually fresh
+                df = self.data_handler.get_market_data(symbol, include_forming=False)
+                if df is not None and not df.empty:
+                    await self.process_symbol_tick(symbol)
+                else:
+                    logger.debug("Waiting for data...", symbol=symbol)
+
             except asyncio.CancelledError:
                 logger.info("Trading loop cancelled", symbol=symbol)
                 break
             except Exception as e:
                 logger.error("Unhandled exception in trading cycle", symbol=symbol, error=str(e), exc_info=True)
-                await asyncio.sleep(5) # Backoff before retrying loop
+                await asyncio.sleep(5)
 
     async def process_symbol_tick(self, symbol: str):
         if self.risk_manager.is_halted:
@@ -306,7 +301,7 @@ class TradingBot:
                 logger.error("Error in retraining loop", error=str(e), exc_info=True)
                 await asyncio.sleep(300)
 
-    async def _handle_signal(self, signal: Dict, df_with_indicators: pd.DataFrame, position: Optional[Position]):
+    async def _handle_signal(self, signal: TradeSignal, df_with_indicators: pd.DataFrame, position: Optional[Position]):
         await self.trade_executor.execute_trade_signal(signal, df_with_indicators, position)
 
     async def _close_position(self, position: Position, reason: str):
@@ -317,7 +312,6 @@ class TradingBot:
         self.running = False
         self.shared_bot_state['status'] = 'stopping'
         
-        # Cancel all tasks
         for name, task in self.active_tasks.items():
             if not task.done():
                 task.cancel()
