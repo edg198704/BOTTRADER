@@ -5,6 +5,7 @@ from bot_core.logger import get_logger
 from bot_core.config import BotConfig
 from bot_core.position_manager import PositionManager, Position
 from bot_core.risk_manager import RiskManager
+from bot_core.data_handler import DataHandler
 
 logger = get_logger(__name__)
 
@@ -13,10 +14,11 @@ class PositionMonitor:
     Monitors all open positions for stop-loss, take-profit, and trailing stop updates.
     This component is responsible for triggering the closure of positions based on risk parameters.
     """
-    def __init__(self, config: BotConfig, position_manager: PositionManager, risk_manager: RiskManager, shared_latest_prices: Dict[str, float]):
+    def __init__(self, config: BotConfig, position_manager: PositionManager, risk_manager: RiskManager, data_handler: DataHandler, shared_latest_prices: Dict[str, float]):
         self.config = config
         self.position_manager = position_manager
         self.risk_manager = risk_manager
+        self.data_handler = data_handler
         self.latest_prices = shared_latest_prices
         self.running = False
         self._task: asyncio.Task = None
@@ -68,11 +70,20 @@ class PositionMonitor:
 
         # --- Trailing Stop Logic ---
         if self.config.risk_management.use_trailing_stop:
+            # Fetch ATR if configured for volatility-based trailing
+            atr_value = 0.0
+            if self.config.risk_management.use_atr_for_trailing:
+                df = self.data_handler.get_market_data(pos.symbol)
+                if df is not None and not df.empty:
+                    atr_col = self.config.risk_management.atr_column_name
+                    if atr_col in df.columns:
+                        atr_value = df[atr_col].iloc[-1]
+            
             # PositionManager handles the logic and DB updates.
             # The returned 'pos' object has the latest state.
             # Await async DB call
             pos = await self.position_manager.manage_trailing_stop(
-                pos, current_price, self.config.risk_management
+                pos, current_price, self.config.risk_management, atr=atr_value
             )
 
         # --- Time-Based / Stagnation Exit ---
