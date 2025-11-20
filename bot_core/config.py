@@ -107,6 +107,10 @@ class AITrainingConfig(BaseModel):
     use_class_weighting: bool = True
     # Calibration method: 'isotonic', 'sigmoid', or 'none'
     calibration_method: str = 'isotonic'
+    
+    # --- Threshold Optimization (New) ---
+    # If True, finds the optimal confidence threshold on validation data that maximizes Sharpe/PF
+    optimize_entry_threshold: bool = True
 
 class AILSTMConfig(BaseModel):
     hidden_dim: int = 64
