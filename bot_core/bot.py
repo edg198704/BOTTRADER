@@ -9,7 +9,7 @@ from bot_core.logger import get_logger, set_correlation_id
 from bot_core.exchange_api import ExchangeAPI
 from bot_core.position_manager import PositionManager, Position
 from bot_core.risk_manager import RiskManager
-from bot_core.strategy import TradingStrategy
+from bot_core.strategy import TradingStrategy, AIEnsembleStrategy
 from bot_core.config import BotConfig
 from bot_core.data_handler import DataHandler
 from bot_core.monitoring import HealthChecker, InfluxDBMetrics, AlertSystem
@@ -71,6 +71,12 @@ class TradingBot:
     async def setup(self):
         """Performs initial setup: loads market details and reconciles state. Separated for backtesting."""
         logger.info("Setting up TradingBot components...")
+        
+        # Inject DataHandler into Strategy if it's an AI strategy needing external data
+        if isinstance(self.strategy, AIEnsembleStrategy):
+            self.strategy.data_fetcher = self.data_handler
+            logger.info("Injected DataHandler into AIEnsembleStrategy.")
+
         await self._load_market_details()
         await self.reconcile_pending_positions()
         
