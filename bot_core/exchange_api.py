@@ -38,7 +38,7 @@ class ExchangeAPI(abc.ABC):
 
     @abc.abstractmethod
     async def get_ticker_data(self, symbol: str) -> Dict[str, Any]:
-        """Fetches current ticker data for a given symbol."""
+        """Fetches current ticker data (bid, ask, last) for a given symbol."""
         pass
 
     @abc.abstractmethod
@@ -126,7 +126,14 @@ class MockExchangeAPI(ExchangeAPI):
     async def get_ticker_data(self, symbol: str) -> Dict[str, Any]:
         logger.debug("Mock: Fetching ticker data", symbol=symbol)
         self.last_price += random.uniform(-100, 100)
-        return {"symbol": symbol, "lastPrice": str(self.last_price)}
+        # Simulate a spread
+        spread = self.last_price * 0.0005
+        return {
+            "symbol": symbol, 
+            "last": self.last_price,
+            "bid": self.last_price - (spread / 2),
+            "ask": self.last_price + (spread / 2)
+        }
 
     async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]:
         self.order_id_counter += 1
@@ -297,7 +304,14 @@ class BacktestExchangeAPI(ExchangeAPI):
     async def get_ticker_data(self, symbol: str) -> Dict[str, Any]:
         candle = self._get_current_candle(symbol)
         price = candle['close'] if candle is not None else 0.0
-        return {"symbol": symbol, "lastPrice": str(price)}
+        # Simulate a tight spread for backtesting to support bid/ask logic
+        spread = price * 0.0005 # 0.05% spread
+        return {
+            "symbol": symbol, 
+            "last": price,
+            "bid": price - (spread / 2),
+            "ask": price + (spread / 2)
+        }
 
     async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]:
         self.order_id_counter += 1
@@ -514,7 +528,12 @@ class CCXTExchangeAPI(ExchangeAPI):
     async def get_ticker_data(self, symbol: str) -> Dict[str, Any]:
         try:
             ticker = await self.exchange.fetch_ticker(symbol)
-            return {"symbol": symbol, "lastPrice": str(ticker['last'])}
+            return {
+                "symbol": symbol, 
+                "last": ticker.get('last'),
+                "bid": ticker.get('bid'),
+                "ask": ticker.get('ask')
+            }
         except (NetworkError, ExchangeError) as e:
             logger.error("Final attempt failed for get_ticker_data", symbol=symbol, error=str(e))
             raise
