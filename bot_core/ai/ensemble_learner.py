@@ -374,7 +374,7 @@ def _evaluate_ensemble(models: Dict[str, Any],
 def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrategyParams) -> bool:
     """
     Standalone function to train models in a separate process.
-    Implements Champion/Challenger logic and Probability Calibration.
+    Implements Walk-Forward Validation (Stacking) for robust weight optimization.
     """
     worker_logger = get_logger(f"trainer_{symbol}")
     worker_logger.info(f"Starting training task for {symbol} with {len(df)} records.")
@@ -421,25 +421,17 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         full_returns = df['close'].pct_change().shift(-1)
         market_returns = full_returns.loc[common_index].fillna(0.0).values
 
-        # --- DATA SPLITTING (Train / Calibration / Test) ---
-        # We need 3 sets to avoid leakage: Train models -> Calibrate on held-out -> Evaluate on held-out
-        # Config validation_split is treated as the Test set size.
+        # --- DATA SPLITTING (Dev / Test) ---
+        # Dev set is used for CV (Stacking) and Final Training
+        # Test set is strictly for Champion/Challenger evaluation
         test_split_idx = int(len(X) * (1 - config.training.validation_split))
         
-        X_temp, X_test = X[:test_split_idx], X[test_split_idx:]
-        y_temp, y_test = y[:test_split_idx], y[test_split_idx:]
+        X_dev, X_test = X[:test_split_idx], X[test_split_idx:]
+        y_dev, y_test = y[:test_split_idx], y[test_split_idx:]
         returns_test = market_returns[test_split_idx:]
-
-        # From the remaining temp data, take ~15% for calibration
-        # If val_split is 0.15, temp is 0.85. 0.15/0.85 ~= 0.176
-        calib_split_idx = int(len(X_temp) * (1 - 0.176))
         
-        X_train, X_calib = X_temp[:calib_split_idx], X_temp[calib_split_idx:]
-        y_train, y_calib = y_temp[:calib_split_idx], y_temp[calib_split_idx:]
-        
-        # Prepare Sequences
+        # Prepare Test Sequences
         seq_len = config.features.sequence_length
-        X_seq_calib, y_seq_calib = FeatureProcessor.create_sequences(X_calib, y_calib, seq_len)
         X_seq_test, y_seq_test = FeatureProcessor.create_sequences(X_test, y_test, seq_len)
 
         # --- CHAMPION EVALUATION ---
@@ -467,23 +459,146 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             except Exception as e:
                 worker_logger.warning(f"Could not evaluate champion: {e}")
 
-        # --- CHALLENGER TRAINING ---
+        # --- WALK-FORWARD VALIDATION (STACKING) ---
+        # Generate Out-Of-Sample predictions for X_dev to optimize weights
+        
+        oos_predictions = {} # model_name -> list of arrays
+        oos_indices = []
+        
+        # Only perform CV if we have enough data
+        use_cv = len(X_dev) > 500 and config.training.cv_splits > 1
+        
+        if use_cv:
+            worker_logger.info(f"Starting Walk-Forward Validation with {config.training.cv_splits} splits...")
+            tscv = TimeSeriesSplit(n_splits=config.training.cv_splits)
+            
+            for fold, (train_idx, val_idx) in enumerate(tscv.split(X_dev)):
+                X_fold_train, X_fold_val = X_dev[train_idx], X_dev[val_idx]
+                y_fold_train, y_fold_val = y_dev[train_idx], y_dev[val_idx]
+                
+                # Create fresh models for this fold (Fast training, no hyperparam opt)
+                fold_models = _create_fresh_models(config, num_features, device)
+                
+                # Train Fold Models
+                # Sklearn
+                for name in ['gb', 'technical']:
+                    fold_models[name].fit(X_fold_train, y_fold_train)
+                    preds = fold_models[name].predict_proba(X_fold_val)
+                    if name not in oos_predictions: oos_predictions[name] = []
+                    oos_predictions[name].append(preds)
+                
+                # PyTorch
+                X_seq_tr, y_seq_tr = FeatureProcessor.create_sequences(X_fold_train, y_fold_train, seq_len)
+                X_seq_val, _ = FeatureProcessor.create_sequences(X_fold_val, y_fold_val, seq_len)
+                
+                if len(X_seq_tr) > 0 and len(X_seq_val) > 0:
+                    train_tensor = TensorDataset(torch.FloatTensor(X_seq_tr).to(device), torch.LongTensor(y_seq_tr).to(device))
+                    train_loader = DataLoader(train_tensor, batch_size=config.training.batch_size, shuffle=True)
+                    
+                    for name in ['lstm', 'attention']:
+                        model = fold_models[name]
+                        optimizer = optim.Adam(model.parameters(), lr=config.training.learning_rate)
+                        criterion = nn.CrossEntropyLoss()
+                        model.train()
+                        for _ in range(min(10, config.training.epochs)): # Reduced epochs for CV
+                            for b_x, b_y in train_loader:
+                                optimizer.zero_grad()
+                                outputs = model(b_x)
+                                loss = criterion(outputs, b_y)
+                                loss.backward()
+                                optimizer.step()
+                        
+                        model.eval()
+                        with torch.no_grad():
+                            preds = model(torch.FloatTensor(X_seq_val).to(device)).cpu().numpy()
+                            if name not in oos_predictions: oos_predictions[name] = []
+                            oos_predictions[name].append(preds)
+                
+                # Store indices for alignment (adjust for sequence length loss if needed)
+                # Note: X_seq_val corresponds to X_fold_val[seq_len-1:]
+                # We align everything to the sequence-valid portion
+                valid_slice = slice(seq_len - 1, None)
+                oos_indices.append(val_idx[valid_slice])
+
+        # --- OPTIMIZE WEIGHTS & CALIBRATE ---
+        optimized_weights = {}
+        calibrator = None
+        
+        if use_cv and oos_indices:
+            try:
+                # Concatenate OOS predictions
+                combined_indices = np.concatenate(oos_indices)
+                y_oos = y_dev[combined_indices]
+                
+                combined_preds = {}
+                valid_models = []
+                for name, pred_list in oos_predictions.items():
+                    # Ensure we have predictions for all folds
+                    if len(pred_list) == len(oos_indices):
+                        # Slice each prediction array to match the sequence-valid portion
+                        # Sklearn preds are full length of val_idx, NN preds are already sliced
+                        # We need to slice Sklearn preds to match NN/indices
+                        sliced_list = []
+                        for i, p in enumerate(pred_list):
+                            if name in ['gb', 'technical']:
+                                sliced_list.append(p[seq_len-1:])
+                            else:
+                                sliced_list.append(p)
+                        
+                        combined_preds[name] = np.concatenate(sliced_list)
+                        valid_models.append(name)
+                
+                if combined_preds:
+                    # Optimize Weights on OOS data
+                    if config.ensemble_weights.auto_tune:
+                        optimized_weights = _optimize_ensemble_weights(combined_preds, y_oos)
+                    else:
+                        cw = config.ensemble_weights
+                        optimized_weights = {
+                            'gb': cw.xgboost, 'technical': cw.technical_ensemble,
+                            'lstm': cw.lstm, 'attention': cw.attention
+                        }
+                    
+                    # Fit Calibrator on OOS data
+                    if config.training.calibration_method != 'none':
+                        worker_logger.info(f"Calibrating ensemble using {config.training.calibration_method}...")
+                        pred_stack = np.array([combined_preds[name] for name in valid_models])
+                        weights = np.array([optimized_weights.get(name, 0.0) for name in valid_models])
+                        if weights.sum() > 0: weights /= weights.sum()
+                        ensemble_probs_oos = np.tensordot(weights, pred_stack, axes=([0],[0]))
+                        
+                        calibrator = MulticlassCalibrator(method=config.training.calibration_method)
+                        calibrator.fit(ensemble_probs_oos, y_oos)
+            except Exception as e:
+                worker_logger.error(f"CV Weight Optimization failed: {e}")
+
+        # Fallback if CV failed or not used
+        if not optimized_weights:
+             cw = config.ensemble_weights
+             optimized_weights = {
+                'gb': cw.xgboost, 'technical': cw.technical_ensemble,
+                'lstm': cw.lstm, 'attention': cw.attention
+            }
+
+        # --- FINAL TRAINING (Full Dev Set) ---
+        worker_logger.info("Training final models on full development set...")
+        final_models = _create_fresh_models(config, num_features, device)
+        trained_models = {}
+        feature_importance = {}
+        
+        # Weights for final training
         sample_weights = None
         torch_weights = None
         if config.training.use_class_weighting:
-            sample_weights = compute_sample_weight(class_weight='balanced', y=y_train)
-            unique_classes = np.unique(y_train)
-            class_weights = compute_class_weight(class_weight='balanced', classes=unique_classes, y=y_train)
+            sample_weights = compute_sample_weight(class_weight='balanced', y=y_dev)
+            unique_classes = np.unique(y_dev)
+            class_weights = compute_class_weight(class_weight='balanced', classes=unique_classes, y=y_dev)
             weight_map = {c: w for c, w in zip(unique_classes, class_weights)}
             final_weights = [weight_map.get(c, 1.0) for c in [0, 1, 2]]
             torch_weights = torch.FloatTensor(final_weights).to(device)
 
-        models = _create_fresh_models(config, num_features, device)
-        trained_models = {}
-        feature_importance = {}
-
         # Train Sklearn/XGBoost
-        for name, model in models.items():
+        for name, model in final_models.items():
             if name in ['lstm', 'attention']: continue
             fit_params = {}
             if name == 'gb' and sample_weights is not None:
@@ -491,9 +606,9 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
 
             if config.training.auto_tune_models and name == 'gb':
                 param_dist = {'n_estimators': [100, 200], 'max_depth': [3, 5, 7], 'learning_rate': [0.01, 0.1, 0.2]}
-                model = _optimize_hyperparameters(model, X_train, y_train, param_dist, config.training.n_iter_search, worker_logger, fit_params)
+                model = _optimize_hyperparameters(model, X_dev, y_dev, param_dist, config.training.n_iter_search, worker_logger, fit_params)
             else:
-                model.fit(X_train, y_train, **fit_params)
+                model.fit(X_dev, y_dev, **fit_params)
             
             trained_models[name] = model
             if hasattr(model, 'feature_importances_'):
@@ -502,14 +617,14 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                     feature_importance[name] = dict(zip(active_feature_names, imps))
 
         # Train PyTorch
-        X_seq_train, y_seq_train = FeatureProcessor.create_sequences(X_train, y_train, seq_len)
-        if len(X_seq_train) > 0:
-            train_tensor = TensorDataset(torch.FloatTensor(X_seq_train).to(device), torch.LongTensor(y_seq_train).to(device))
+        X_seq_dev, y_seq_dev = FeatureProcessor.create_sequences(X_dev, y_dev, seq_len)
+        if len(X_seq_dev) > 0:
+            train_tensor = TensorDataset(torch.FloatTensor(X_seq_dev).to(device), torch.LongTensor(y_seq_dev).to(device))
             train_loader = DataLoader(train_tensor, batch_size=config.training.batch_size, shuffle=True)
             
             for name in ['lstm', 'attention']:
-                if name not in models: continue
-                model = models[name]
+                if name not in final_models: continue
+                model = final_models[name]
                 optimizer = optim.Adam(model.parameters(), lr=config.training.learning_rate)
                 criterion = nn.CrossEntropyLoss(weight=torch_weights) if torch_weights is not None else nn.CrossEntropyLoss()
                 
@@ -522,92 +637,6 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                         loss.backward()
                         optimizer.step()
                 trained_models[name] = model
-
-        # --- OPTIMIZE WEIGHTS & CALIBRATE (Using Calibration Set) ---
-        optimized_weights = {}
-        regime_weights = {}
-        calibrator = None
-        
-        # Generate predictions on Calibration Set
-        calib_preds = {}
-        if 'gb' in trained_models: calib_preds['gb'] = trained_models['gb'].predict_proba(X_calib)
-        if 'technical' in trained_models: calib_preds['technical'] = trained_models['technical'].predict_proba(X_calib)
-        
-        if len(X_seq_calib) > 0:
-            valid_indices = slice(seq_len - 1, None)
-            for k in list(calib_preds.keys()): calib_preds[k] = calib_preds[k][valid_indices]
-            y_calib_aligned = y_calib[valid_indices]
-            for name in ['lstm', 'attention']:
-                if name in trained_models:
-                    model = trained_models[name]
-                    model.eval()
-                    with torch.no_grad():
-                        calib_preds[name] = model(torch.FloatTensor(X_seq_calib).to(device)).cpu().numpy()
-        else:
-            y_calib_aligned = y_calib
-
-        if calib_preds:
-            # 1. Global Weight Optimization
-            if config.ensemble_weights.auto_tune:
-                optimized_weights = _optimize_ensemble_weights(calib_preds, y_calib_aligned)
-            else:
-                cw = config.ensemble_weights
-                optimized_weights = {
-                    'gb': cw.xgboost, 'technical': cw.technical_ensemble,
-                    'lstm': cw.lstm, 'attention': cw.attention
-                }
-
-            # 2. Regime-Specific Weight Optimization (New)
-            if config.ensemble_weights.use_regime_specific_weights:
-                worker_logger.info("Optimizing weights per regime...")
-                try:
-                    # Reconstruct regime labels for the calibration set
-                    # We need to slice the original DF using the same indices as X_calib
-                    # X_calib corresponds to df_proc.loc[common_index][calib_split_idx:]
-                    # But wait, X_temp was [:test_split_idx], then X_calib was X_temp[calib_split_idx:]
-                    # So X_calib is from index [calib_split_idx : test_split_idx]
-                    
-                    calib_start_idx = calib_split_idx
-                    calib_end_idx = test_split_idx
-                    
-                    # Get the subset of the dataframe corresponding to calibration
-                    df_calib_subset = df.loc[common_index].iloc[calib_start_idx:calib_end_idx]
-                    
-                    # If we used sequences, we lose the first seq_len-1 rows of predictions
-                    if len(X_seq_calib) > 0:
-                        df_calib_subset = df_calib_subset.iloc[seq_len - 1:]
-                    
-                    if len(df_calib_subset) == len(y_calib_aligned):
-                        regime_detector = MarketRegimeDetector(config)
-                        regime_series = regime_detector.get_regime_series(df_calib_subset)
-                        
-                        unique_regimes = regime_series.unique()
-                        for regime in unique_regimes:
-                            mask = (regime_series == regime).values
-                            if np.sum(mask) > 20: # Minimum samples to optimize
-                                regime_preds = {k: v[mask] for k, v in calib_preds.items()}
-                                regime_y = y_calib_aligned[mask]
-                                r_weights = _optimize_ensemble_weights(regime_preds, regime_y)
-                                regime_weights[regime] = r_weights
-                                worker_logger.info(f"Optimized weights for {regime}: {r_weights}")
-                    else:
-                        worker_logger.warning("Calibration DF length mismatch, skipping regime optimization.")
-                except Exception as e:
-                    worker_logger.error(f"Regime weight optimization failed: {e}")
-
-            # 3. Fit Calibrator (on weighted ensemble output using GLOBAL weights)
-            if config.training.calibration_method != 'none':
-                worker_logger.info(f"Calibrating ensemble using {config.training.calibration_method}...")
-                model_names = list(calib_preds.keys())
-                pred_stack = np.array([calib_preds[name] for name in model_names])
-                weights = np.array([optimized_weights.get(name, 0.0) for name in model_names])
-                
-                if weights.sum() > 0: weights /= weights.sum()
-                
-                ensemble_probs_calib = np.tensordot(weights, pred_stack, axes=([0],[0]))
-                
-                calibrator = MulticlassCalibrator(method=config.training.calibration_method)
-                calibrator.fit(ensemble_probs_calib, y_calib_aligned)
 
         # --- CHALLENGER EVALUATION (Using Test Set) ---
         challenger_metrics = _evaluate_ensemble(
@@ -666,7 +695,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 'active_feature_columns': active_feature_names,
                 'num_features': num_features,
                 'optimized_weights': optimized_weights,
-                'regime_weights': regime_weights
+                # Regime weights not currently optimized in CV loop, can be added later
+                'regime_weights': {}
             }
             with open(os.path.join(temp_dir, "metadata.json"), 'w') as f:
                 json.dump(meta, f, indent=2)
