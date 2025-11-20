@@ -72,6 +72,9 @@ class MarketRegimeConfig(BaseModel):
     trend_percentile: float = 0.75 # Top 25% of absolute trend values define a trend
     volatility_percentile: float = 0.80 # Top 20% of volatility values define volatile regime
     
+    # --- Stability Settings ---
+    regime_confirmation_window: int = 3 # Number of candles to look back for regime voting
+
     # --- Dynamic Confidence Thresholds (Entry) ---
     bull_confidence_threshold: Optional[float] = None
     bear_confidence_threshold: Optional[float] = None
