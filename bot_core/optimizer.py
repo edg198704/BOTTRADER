@@ -5,7 +5,7 @@ import pandas as pd
 from typing import List, Dict, Any, Optional
 from bot_core.logger import get_logger
 from bot_core.config import BotConfig, OptimizerConfig
-from bot_core.position_manager import PositionManager, Position
+from bot_core.position_manager import PositionManager, Position, PositionStatus
 
 logger = get_logger(__name__)
 
@@ -16,6 +16,7 @@ class StrategyOptimizer:
     2. Reward-to-Risk Ratios (Exit Targets)
     3. ATR Stop Multipliers (Risk Width)
     4. Risk Per Trade % (Position Sizing via Realized Kelly)
+    5. Execution Parameters (Limit Offsets, Chase Aggressiveness)
     
     Adjustments are based on realized performance (Win Rate & Profit Factor) per market regime.
     """
@@ -67,6 +68,16 @@ class StrategyOptimizer:
                     if 'risk_per_trade_pct' in params:
                         regime_override.risk_per_trade_pct = params['risk_per_trade_pct']
                         updates += 1
+            
+            # 3. Restore Execution Parameters
+            exec_config = self.config.execution
+            exec_state = state.get('execution_params', {})
+            if 'limit_price_offset_pct' in exec_state:
+                exec_config.limit_price_offset_pct = exec_state['limit_price_offset_pct']
+                updates += 1
+            if 'chase_aggressiveness_pct' in exec_state:
+                exec_config.chase_aggressiveness_pct = exec_state['chase_aggressiveness_pct']
+                updates += 1
 
             if updates > 0:
                 logger.info(f"Restored {updates} optimized parameters from state file.", path=path)
@@ -79,11 +90,13 @@ class StrategyOptimizer:
         path = self._get_state_path()
         mr_config = self.config.strategy.params.market_regime
         rm_config = self.config.risk_management.regime_based_risk
+        exec_config = self.config.execution
         
         state = {
             'last_updated': str(pd.Timestamp.now()),
             'regime_thresholds': {},
-            'regime_risk_params': {}
+            'regime_risk_params': {},
+            'execution_params': {}
         }
         
         regimes = ['bull', 'bear', 'volatile', 'sideways']
@@ -110,6 +123,12 @@ class StrategyOptimizer:
                 if params:
                     state['regime_risk_params'][regime] = params
         
+        # Save Execution Params
+        state['execution_params'] = {
+            'limit_price_offset_pct': exec_config.limit_price_offset_pct,
+            'chase_aggressiveness_pct': exec_config.chase_aggressiveness_pct
+        }
+        
         try:
             with open(path, 'w') as f:
                 json.dump(state, f, indent=2)
@@ -131,6 +150,8 @@ class StrategyOptimizer:
         while self.running:
             try:
                 await self.optimize_strategy_parameters()
+                if self.opt_config.execution.enabled:
+                    await self.optimize_execution_parameters()
             except asyncio.CancelledError:
                 logger.info("StrategyOptimizer loop cancelled.")
                 break
@@ -307,6 +328,84 @@ class StrategyOptimizer:
                         regime_risk.risk_per_trade_pct = round(new_risk, 5)
                         any_changes = True
                         logger.info(f"Optimizer DECREASED {regime} Risk Size (Poor Perf).", old=current_risk, new=new_risk)
+
+        if any_changes:
+            self._save_state()
+
+    async def optimize_execution_parameters(self):
+        """Analyzes fill rates and slippage to optimize execution settings."""
+        logger.info("Running execution parameter optimization...")
+        
+        # Fetch recent terminal positions (CLOSED + FAILED)
+        history = await self.position_manager.get_recent_execution_history(limit=100)
+        if not history:
+            return
+
+        # 1. Calculate Fill Rate
+        # Fill Rate = (Closed + Open) / (Closed + Open + Failed)
+        # Note: Open positions are not in history list, but we can infer success from CLOSED vs FAILED
+        # Actually, we only care about entry success. 
+        # CLOSED positions were successfully entered. FAILED positions were not.
+        
+        successful_entries = [p for p in history if p.status == PositionStatus.CLOSED]
+        failed_entries = [p for p in history if p.status == PositionStatus.FAILED]
+        
+        total_attempts = len(successful_entries) + len(failed_entries)
+        if total_attempts < 10:
+            return
+            
+        fill_rate = len(successful_entries) / total_attempts
+        
+        # 2. Calculate Average Slippage (on successful entries)
+        slippage_values = [p.slippage_pct for p in successful_entries if p.slippage_pct is not None]
+        avg_slippage = sum(slippage_values) / len(slippage_values) if slippage_values else 0.0
+        
+        logger.info("Execution Stats", fill_rate=f"{fill_rate:.2%}", avg_slippage=f"{avg_slippage:.4%}")
+        
+        exec_config = self.config.execution
+        opt_exec = self.opt_config.execution
+        any_changes = False
+        
+        # --- Optimization Logic ---
+        
+        # A. Low Fill Rate -> Increase Aggressiveness
+        if fill_rate < opt_exec.target_fill_rate:
+            # 1. Increase Chase Aggressiveness
+            old_chase = exec_config.chase_aggressiveness_pct
+            new_chase = min(old_chase + opt_exec.chase_adjustment_step, opt_exec.max_chase_aggro)
+            if new_chase != old_chase:
+                exec_config.chase_aggressiveness_pct = new_chase
+                any_changes = True
+                logger.info("Optimizer INCREASED Chase Aggressiveness.", old=old_chase, new=new_chase, reason="Low Fill Rate")
+            
+            # 2. Make Limit Offset More Aggressive (Lower/Negative)
+            # Note: Lower offset = Higher Buy Price = More Aggressive
+            old_offset = exec_config.limit_price_offset_pct
+            new_offset = max(old_offset - opt_exec.offset_adjustment_step, opt_exec.min_limit_offset)
+            if new_offset != old_offset:
+                exec_config.limit_price_offset_pct = new_offset
+                any_changes = True
+                logger.info("Optimizer INCREASED Limit Aggressiveness (Lower Offset).", old=old_offset, new=new_offset, reason="Low Fill Rate")
+
+        # B. High Slippage -> Decrease Aggressiveness
+        # If we are paying too much spread, back off.
+        # Note: Slippage here is (Fill - Decision). High positive slippage on BUY means we paid way more than decision price.
+        if abs(avg_slippage) > opt_exec.max_slippage_tolerance:
+            # 1. Decrease Chase Aggressiveness
+            old_chase = exec_config.chase_aggressiveness_pct
+            new_chase = max(old_chase - opt_exec.chase_adjustment_step, opt_exec.min_chase_aggro)
+            if new_chase != old_chase:
+                exec_config.chase_aggressiveness_pct = new_chase
+                any_changes = True
+                logger.info("Optimizer DECREASED Chase Aggressiveness.", old=old_chase, new=new_chase, reason="High Slippage")
+
+            # 2. Make Limit Offset More Passive (Higher)
+            old_offset = exec_config.limit_price_offset_pct
+            new_offset = min(old_offset + opt_exec.offset_adjustment_step, opt_exec.max_limit_offset)
+            if new_offset != old_offset:
+                exec_config.limit_price_offset_pct = new_offset
+                any_changes = True
+                logger.info("Optimizer DECREASED Limit Aggressiveness (Higher Offset).", old=old_offset, new=new_offset, reason="High Slippage")
 
         if any_changes:
             self._save_state()
