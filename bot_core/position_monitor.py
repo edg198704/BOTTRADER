@@ -55,7 +55,7 @@ class PositionMonitor:
             except Exception as e:
                 logger.error("Error in position monitoring loop", error=str(e), exc_info=True)
             
-            await asyncio.sleep(5)
+            await asyncio.sleep(self.config.risk_management.monitor_interval_seconds)
 
     async def _check_position(self, pos: Position):
         """Checks a single position for TSL, SL, TP, and Stagnation triggers."""
