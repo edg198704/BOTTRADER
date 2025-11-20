@@ -145,6 +145,13 @@ class AIEnsembleStrategy(TradingStrategy):
         self._save_state()
         await self.ensemble_learner.close()
 
+    async def warmup(self, symbols: List[str]):
+        """
+        Pre-loads models into memory to avoid latency on the first tick.
+        """
+        logger.info("Warming up AI Ensemble Strategy...")
+        await self.ensemble_learner.warmup_models(symbols)
+
     def _save_state(self):
         """Persists runtime state to disk."""
         try:
