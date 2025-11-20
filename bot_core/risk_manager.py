@@ -287,14 +287,52 @@ class RiskManager:
         return True
 
     def calculate_stop_loss(self, side: str, entry_price: float, df_with_indicators: pd.DataFrame, market_regime: Optional[str] = None) -> float:
-        atr_col = 'ATRr_14' # Default ATR column name from pandas-ta
-        atr = df_with_indicators[atr_col].iloc[-1] if atr_col in df_with_indicators.columns and not df_with_indicators[atr_col].empty else 0
+        """
+        Calculates the stop loss price based on the configured method (ATR or SWING).
+        """
+        # 1. Determine ATR (used for both ATR-based SL and Swing Buffer)
+        atr_col = self.config.atr_column_name
+        atr = 0.0
+        if atr_col in df_with_indicators.columns and not df_with_indicators[atr_col].empty:
+            atr = df_with_indicators[atr_col].iloc[-1]
         
+        # 2. Swing-Based Stop Loss
+        if self.config.stop_loss_type == 'SWING':
+            lookback = self.config.swing_lookback
+            # Ensure we have enough data (lookback + 1 for safety)
+            if len(df_with_indicators) >= lookback:
+                # We look at the last 'lookback' closed candles.
+                # df_with_indicators typically includes the latest closed candle at -1.
+                window = df_with_indicators.iloc[-lookback:]
+                
+                buffer = atr * self.config.swing_buffer_atr_multiplier
+                
+                if side == 'BUY':
+                    swing_low = window['low'].min()
+                    sl_price = swing_low - buffer
+                    # Safety: SL must be below entry
+                    if sl_price >= entry_price:
+                        logger.warning("Swing Low SL is above entry, falling back to ATR.", swing=sl_price, entry=entry_price)
+                    else:
+                        return sl_price
+                else: # SELL
+                    swing_high = window['high'].max()
+                    sl_price = swing_high + buffer
+                    # Safety: SL must be above entry
+                    if sl_price <= entry_price:
+                        logger.warning("Swing High SL is below entry, falling back to ATR.", swing=sl_price, entry=entry_price)
+                    else:
+                        return sl_price
+            else:
+                logger.warning("Insufficient data for Swing SL, falling back to ATR.", available=len(df_with_indicators), required=lookback)
+
+        # 3. ATR-Based Stop Loss (Default / Fallback)
         atr_multiplier = self._get_regime_param('atr_stop_multiplier', market_regime)
 
         if atr > 0:
             stop_loss_offset = atr * atr_multiplier
         else:
+            # Final fallback if ATR is missing
             stop_loss_offset = entry_price * self.config.stop_loss_fallback_pct
 
         if side == 'BUY':
