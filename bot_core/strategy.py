@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import json
 import os
-import tempfile
 from typing import Dict, Any, Optional, List, Tuple, Literal
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import Executor
@@ -17,7 +16,7 @@ from bot_core.ai.ensemble_learner import EnsembleLearner, train_ensemble_task
 from bot_core.ai.regime_detector import MarketRegimeDetector
 from bot_core.ai.feature_processor import FeatureProcessor
 from bot_core.position_manager import Position
-from bot_core.utils import Clock
+from bot_core.utils import Clock, AtomicJsonStore
 
 logger = get_logger(__name__)
 
@@ -32,38 +31,6 @@ class TradeSignal(BaseModel):
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     strategy_name: str
     metadata: Dict[str, Any] = {}
-
-class AtomicStateWriter:
-    """Helper class to handle atomic JSON state persistence."""
-    def __init__(self, path: str):
-        self.path = path
-
-    def save(self, state: Dict[str, Any]):
-        try:
-            dir_name = os.path.dirname(self.path)
-            os.makedirs(dir_name, exist_ok=True)
-            
-            # Write to temp file first
-            with tempfile.NamedTemporaryFile('w', dir=dir_name, delete=False) as tf:
-                json.dump(state, tf, indent=2)
-                temp_name = tf.name
-            
-            # Atomic rename
-            os.replace(temp_name, self.path)
-        except Exception as e:
-            logger.error("Failed to save strategy state atomically", error=str(e))
-            if 'temp_name' in locals() and os.path.exists(temp_name):
-                os.remove(temp_name)
-
-    def load(self) -> Dict[str, Any]:
-        if not os.path.exists(self.path):
-            return {}
-        try:
-            with open(self.path, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error("Failed to load strategy state", error=str(e))
-            return {}
 
 class TradingStrategy(abc.ABC):
     def __init__(self, config: StrategyParamsBase):
@@ -170,7 +137,7 @@ class AIEnsembleStrategy(TradingStrategy):
         self.individual_model_logs: Dict[str, List[Tuple[datetime, Dict[str, Any]]]] = {}
         self.model_performance_stats: Dict[str, Dict[str, deque]] = {}
         
-        self.persistence = AtomicStateWriter(os.path.join(self.ai_config.model_path, "strategy_state.json"))
+        self.persistence = AtomicJsonStore(os.path.join(self.ai_config.model_path, "strategy_state.json"))
 
         try:
             self.ensemble_learner = EnsembleLearner(self.ai_config)
