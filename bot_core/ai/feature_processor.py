@@ -86,6 +86,66 @@ class FeatureProcessor:
         return df
 
     @staticmethod
+    def _add_volatility_features(df: pd.DataFrame) -> pd.DataFrame:
+        """Generates Garman-Klass Volatility Estimator."""
+        df = df.copy()
+        required = ['open', 'high', 'low', 'close']
+        if not all(col in df.columns for col in required):
+            return df
+
+        # Garman-Klass Volatility
+        # 0.5 * ln(High/Low)^2 - (2*ln(2)-1) * ln(Close/Open)^2
+        log_hl = np.log(df['high'] / df['low'])
+        log_co = np.log(df['close'] / df['open'])
+        
+        df['volatility_gk'] = np.sqrt(0.5 * log_hl**2 - (2 * np.log(2) - 1) * log_co**2)
+        
+        return df
+
+    @staticmethod
+    def _get_weights_ffd(d: float, thres: float, lim: int) -> np.ndarray:
+        """Calculates weights for Fractional Differentiation (Fixed Window)."""
+        w, k = [1.], 1
+        while True:
+            w_k = -w[-1] / k * (d - k + 1)
+            if abs(w_k) < thres or len(w) >= lim:
+                break
+            w.append(w_k)
+            k += 1
+        return np.array(w[::-1]).reshape(-1, 1)
+
+    @staticmethod
+    def _apply_frac_diff(df: pd.DataFrame, d: float, thres: float) -> pd.DataFrame:
+        """Applies Fractional Differentiation to the 'close' price."""
+        df = df.copy()
+        if 'close' not in df.columns:
+            return df
+
+        # Calculate weights
+        # Limit window size to avoid excessive data loss, but enough for convergence
+        # d=0.4 usually converges within ~500-1000 points
+        weights = FeatureProcessor._get_weights_ffd(d, thres, 2000)
+        width = len(weights)
+        
+        if len(df) < width:
+            # Not enough data to compute frac diff
+            df['close_frac'] = np.nan
+            return df
+
+        # Apply convolution
+        # We use numpy convolve. 'valid' mode returns N - W + 1 points.
+        # We need to pad the beginning with NaNs to maintain index alignment.
+        close_vals = df['close'].values
+        frac_diff = np.convolve(close_vals, weights.flatten(), mode='valid')
+        
+        # Pad with NaNs at the start
+        pad_len = len(close_vals) - len(frac_diff)
+        full_frac_diff = np.concatenate([np.full(pad_len, np.nan), frac_diff])
+        
+        df['close_frac'] = full_frac_diff
+        return df
+
+    @staticmethod
     def _stationarize_data(df: pd.DataFrame, cols_to_process: List[str]) -> pd.DataFrame:
         """
         Transforms non-stationary features (absolute prices, raw volume) into stationary ratios.
@@ -136,7 +196,7 @@ class FeatureProcessor:
     def process_data(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> pd.DataFrame:
         """
         Applies the full feature engineering pipeline:
-        1. Generate Time/Price Action features (if enabled).
+        1. Generate Time/Price Action/Quant features (if enabled).
         2. Stationarize features (Absolute -> Relative).
         3. Select base feature columns.
         4. Generates lagged features (if configured).
@@ -152,6 +212,16 @@ class FeatureProcessor:
         
         if config.features.use_price_action_features:
             df_processed = FeatureProcessor._add_price_action_features(df_processed)
+
+        if config.features.use_volatility_estimators:
+            df_processed = FeatureProcessor._add_volatility_features(df_processed)
+
+        if config.features.use_frac_diff:
+            df_processed = FeatureProcessor._apply_frac_diff(
+                df_processed, 
+                config.features.frac_diff_d, 
+                config.features.frac_diff_thres
+            )
 
         # 2. Stationarize Data (Transform absolute prices/volume to ratios)
         # We pass the list of intended features so we only transform what's needed
@@ -177,7 +247,7 @@ class FeatureProcessor:
                     for i in range(1, depth + 1):
                         subset[f"{col}_lag_{i}"] = subset[col].shift(i)
         
-        # 5. Drop NaNs (from lags and missing data)
+        # 5. Drop NaNs (from lags, frac diff, and missing data)
         subset.dropna(inplace=True)
         
         # 6. Normalize
