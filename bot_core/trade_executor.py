@@ -1,10 +1,11 @@
 import pandas as pd
 import uuid
+import asyncio
 from typing import Dict, Any, Optional
 
 from bot_core.logger import get_logger
 from bot_core.config import BotConfig
-from bot_core.exchange_api import ExchangeAPI, BotInsufficientFundsError, BotInvalidOrderError, BotExchangeError
+from bot_core.exchange_api import ExchangeAPI, BotInsufficientFundsError, BotInvalidOrderError
 from bot_core.position_manager import PositionManager, Position
 from bot_core.risk_manager import RiskManager
 from bot_core.order_sizer import OrderSizer
@@ -17,8 +18,7 @@ logger = get_logger(__name__)
 class TradeExecutor:
     """
     Handles the entire lifecycle of executing a trade, from signal to position management.
-    This class encapsulates the logic for risk checks, sizing, order placement,
-    and post-execution state updates.
+    Encapsulates risk checks, sizing, order placement, and post-execution state updates.
     """
     def __init__(self,
                  config: BotConfig,
@@ -41,146 +41,114 @@ class TradeExecutor:
         self.latest_prices = shared_latest_prices
         self.market_details = market_details
         self.data_handler = data_handler
+        
+        # Atomic locks per symbol to prevent overlapping execution logic
+        self._symbol_locks: Dict[str, asyncio.Lock] = {}
+        
         logger.info("TradeExecutor initialized.")
+
+    def _get_lock(self, symbol: str) -> asyncio.Lock:
+        if symbol not in self._symbol_locks:
+            self._symbol_locks[symbol] = asyncio.Lock()
+        return self._symbol_locks[symbol]
 
     async def execute_trade_signal(self, signal: Dict, df_with_indicators: pd.DataFrame, position: Optional[Position]):
         """
         Processes a trading signal to open or close a position.
+        Acquires a symbol-specific lock to ensure atomicity.
         """
-        action = signal.get('action')
         symbol = signal.get('symbol')
-        current_price = self.latest_prices.get(symbol)
-        market_regime = signal.get('regime')
-
-        if not all([action, symbol, current_price]):
-            logger.warning("Received invalid signal for execution", signal=signal)
+        if not symbol:
             return
 
-        # --- Handle Opening a New Position ---
-        if not position:
-            if action not in ['BUY', 'SELL']:
-                return  # Ignore other signals if no position is open
-            await self._execute_open_position(symbol, action, current_price, df_with_indicators, market_regime, signal)
-        
-        # --- Handle Closing an Existing Position ---
-        elif position:
-            is_close_long_signal = (action == 'SELL' or action == 'CLOSE') and position.side == 'BUY'
-            is_close_short_signal = (action == 'BUY' or action == 'CLOSE') and position.side == 'SELL'
+        async with self._get_lock(symbol):
+            action = signal.get('action')
+            current_price = self.latest_prices.get(symbol)
+            market_regime = signal.get('regime')
+
+            if not all([action, current_price]):
+                logger.warning("Received invalid signal for execution", signal=signal)
+                return
+
+            # --- Handle Opening a New Position ---
+            if not position:
+                if action not in ['BUY', 'SELL']:
+                    return
+                await self._execute_open_position(symbol, action, current_price, df_with_indicators, market_regime, signal)
             
-            if is_close_long_signal or is_close_short_signal:
-                await self.close_position(position, "Strategy Signal")
+            # --- Handle Closing an Existing Position ---
+            elif position:
+                is_close_long = (action == 'SELL' or action == 'CLOSE') and position.side == 'BUY'
+                is_close_short = (action == 'BUY' or action == 'CLOSE') and position.side == 'SELL'
+                
+                if is_close_long or is_close_short:
+                    await self.close_position(position, "Strategy Signal")
 
     def _calculate_or_extract_fee(self, order_state: Dict[str, Any], price: float, quantity: float) -> float:
         """Extracts fee from order state or estimates it based on config."""
-        # 1. Try to get explicit fee from exchange response
         if order_state and 'fee' in order_state and order_state['fee']:
             fee_data = order_state['fee']
-            # CCXT usually returns {'cost': float, 'currency': str}
             if 'cost' in fee_data and fee_data['cost'] is not None:
                 return float(fee_data['cost'])
         
-        # 2. Fallback: Estimate based on config
-        # We assume taker fee for market orders (which most closes are, or aggressive limits)
-        # For simplicity in estimation, we use taker fee as conservative estimate if unknown
+        # Fallback estimate
         fee_rate = self.config.exchange.taker_fee_pct
-        estimated_fee = price * quantity * fee_rate
-        return estimated_fee
+        return price * quantity * fee_rate
 
     def _calculate_limit_price(self, symbol: str, side: str, current_price: float, ticker: Dict[str, float], df: Optional[pd.DataFrame] = None) -> float:
-        """Calculates the limit price based on configuration (Fixed % or ATR-based)."""
         bid = ticker.get('bid')
         ask = ticker.get('ask')
         last = ticker.get('last', current_price)
 
-        # Determine Base Price
-        if side == 'BUY':
-            ref_price = bid if bid else last
-        else:
-            ref_price = ask if ask else last
-
-        # Determine Offset
+        ref_price = (bid if bid else last) if side == 'BUY' else (ask if ask else last)
         offset_val = 0.0
         
         if self.config.execution.limit_offset_type == 'ATR' and df is not None:
-            # Try to calculate ATR-based offset
             atr_col = self.config.risk_management.atr_column_name
             if atr_col in df.columns:
                 atr = df[atr_col].iloc[-1]
                 if atr > 0:
                     offset_val = atr * self.config.execution.limit_offset_atr_multiplier
-                    # Normalize to price for logging consistency
-                    pct_equiv = offset_val / ref_price
-                    logger.debug("Using ATR-based limit offset", symbol=symbol, atr=atr, offset=offset_val, pct=f"{pct_equiv:.4%}")
                 else:
-                    # Fallback if ATR is 0
                     offset_val = ref_price * self.config.execution.limit_price_offset_pct
             else:
-                # Fallback if column missing
                 offset_val = ref_price * self.config.execution.limit_price_offset_pct
         else:
-            # Fixed Percentage Offset
             offset_val = ref_price * self.config.execution.limit_price_offset_pct
 
-        # Apply Offset
         if side == 'BUY':
-            # Buy Limit = Price * (1 - offset)
-            limit_price = ref_price * (1 - self.config.execution.limit_price_offset_pct) 
-            if self.config.execution.limit_offset_type == 'ATR':
-                 limit_price = ref_price - offset_val
+            limit_price = ref_price - offset_val
         else:
-            # Sell Limit = Price * (1 + offset)
-            limit_price = ref_price * (1 + self.config.execution.limit_price_offset_pct)
-            if self.config.execution.limit_offset_type == 'ATR':
-                limit_price = ref_price + offset_val
+            limit_price = ref_price + offset_val
                 
         return limit_price
 
     async def _retry_entry_with_smart_balance(self, symbol: str, side: str, order_type: str, limit_price: float, trade_id: str, market_details: Dict) -> Optional[Dict]:
-        """
-        Attempts to retry an entry order by fetching the exact available balance and recalculating
-        the maximum feasible quantity. This handles cases where local fee estimation or dust
-        caused the initial order to exceed available funds.
-        """
         try:
-            # 1. Identify Asset to Check
             base_asset, quote_asset = symbol.split('/')
             target_asset = quote_asset if side == 'BUY' else base_asset
             
-            # 2. Fetch Balance
             balances = await self.exchange_api.get_balance()
             free_balance = balances.get(target_asset, {}).get('free', 0.0)
             
             if free_balance <= 0:
-                logger.warning("Smart Retry failed: Zero free balance.", asset=target_asset)
                 return None
 
-            # 3. Calculate Max Quantity
             new_qty = 0.0
             if side == 'BUY':
-                # For BUY, we need to account for fees if they are deducted from the cost (uncommon but possible)
-                # or simply ensure Cost < Balance. 
-                # Safe approach: Cost + Fee < Balance. 
-                # Approx Fee Rate
                 fee_rate = self.config.exchange.taker_fee_pct
                 max_cost = free_balance / (1 + fee_rate)
                 new_qty = max_cost / limit_price
             else:
-                # For SELL, we just sell what we have
                 new_qty = free_balance
 
-            # 4. Adjust for Precision/Limits
             adjusted_qty = self.order_sizer.adjust_order_quantity(symbol, new_qty, limit_price, market_details)
             
             if adjusted_qty <= 0:
-                logger.warning("Smart Retry failed: Adjusted quantity is zero/below limits.", raw_qty=new_qty)
                 return None
 
-            logger.info("Retrying entry with smart balance calculation.", 
-                        original_asset=target_asset, 
-                        balance=free_balance, 
-                        new_qty=adjusted_qty)
+            logger.info("Retrying entry with smart balance.", asset=target_asset, balance=free_balance, new_qty=adjusted_qty)
 
-            # 5. Place Order
             extra_params = {'clientOrderId': trade_id}
             if self.config.execution.post_only and order_type == 'LIMIT':
                 extra_params['postOnly'] = True
@@ -189,13 +157,11 @@ class TradeExecutor:
                 symbol, side, order_type, adjusted_qty, price=limit_price, 
                 extra_params=extra_params
             )
-
         except Exception as e:
-            logger.error("Smart Retry encountered an exception.", error=str(e))
+            logger.error("Smart Retry exception", error=str(e))
             return None
 
     async def _execute_open_position(self, symbol: str, side: str, current_price: float, df: pd.DataFrame, regime: Optional[str], signal: Dict):
-        # Await async DB call to get ALL active positions (OPEN + PENDING) for accurate risk check
         active_positions = await self.position_manager.get_all_active_positions()
         if not self.risk_manager.check_trade_allowed(symbol, active_positions):
             return
@@ -203,20 +169,14 @@ class TradeExecutor:
         portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, active_positions)
         stop_loss = self.risk_manager.calculate_stop_loss(side, current_price, df, market_regime=regime)
         
-        # Extract confidence and metrics data for risk scaling
         strategy_metadata = signal.get('strategy_metadata', {})
         confidence = strategy_metadata.get('confidence')
-        metrics = strategy_metadata.get('metrics') # Extract validation metrics for Kelly Criterion
-        
-        # Use the effective threshold that was actually used for the decision (from metadata)
-        # This ensures risk scaling is consistent with the decision logic (max(ai, manager))
+        metrics = strategy_metadata.get('metrics')
         confidence_threshold = strategy_metadata.get('effective_threshold')
         
-        # Fallback to config if metadata is missing (e.g. non-AI strategy)
         if confidence_threshold is None:
             confidence_threshold = getattr(self.config.strategy.params, 'confidence_threshold', None)
 
-        # Pass symbol and active_positions for correlation check
         ideal_quantity = self.risk_manager.calculate_position_size(
             symbol=symbol,
             portfolio_equity=portfolio_equity, 
@@ -226,50 +186,39 @@ class TradeExecutor:
             market_regime=regime,
             confidence=confidence,
             confidence_threshold=confidence_threshold,
-            model_metrics=metrics # Pass metrics to RiskManager
+            model_metrics=metrics
         )
         
         market_details = self.market_details.get(symbol)
         if not market_details:
-            logger.error("Cannot place order, market details not available for symbol.", symbol=symbol)
+            logger.error("Market details missing.", symbol=symbol)
             return
 
         final_quantity = self.order_sizer.adjust_order_quantity(symbol, ideal_quantity, current_price, market_details)
 
         if final_quantity <= 0:
-            logger.warning("Calculated position size is zero or less after adjustments. Aborting trade.", 
-                         symbol=symbol, ideal_quantity=ideal_quantity, final_quantity=final_quantity)
             return
 
         order_type = self.config.execution.default_order_type
         limit_price = None
         
         if order_type == 'LIMIT':
-            # Fetch fresh ticker data for precise execution
             try:
                 ticker = await self.exchange_api.get_ticker_data(symbol)
-            except Exception as e:
-                logger.warning("Failed to fetch ticker for execution, falling back to candle close.", error=str(e))
+            except Exception:
                 ticker = {'last': current_price}
-
             limit_price = self._calculate_limit_price(symbol, side, current_price, ticker, df)
 
-        # 1. Generate Trade ID (Idempotency Key & Group ID)
         trade_id = str(uuid.uuid4())
 
-        # 2. Record PENDING Position (Pre-Commit)
-        # We persist the intent BEFORE the network call to handle crashes gracefully.
-        # Pass current_price as decision_price for slippage tracking
         await self.position_manager.create_pending_position(
             symbol, side, trade_id, trade_id, 
             decision_price=current_price, 
             strategy_metadata=strategy_metadata
         )
 
-        # 3. Place Order (With Smart Retry)
         order_result = None
         try:
-            # Use trade_id as the initial clientOrderId
             extra_params = {'clientOrderId': trade_id}
             if self.config.execution.post_only and order_type == 'LIMIT':
                 extra_params['postOnly'] = True
@@ -279,43 +228,32 @@ class TradeExecutor:
                 extra_params=extra_params
             )
         except BotInsufficientFundsError:
-            # --- Smart Retry for Entry ---
-            logger.warning("Insufficient funds for entry. Attempting smart retry with balance check.", symbol=symbol)
             order_result = await self._retry_entry_with_smart_balance(
                 symbol, side, order_type, limit_price, trade_id, market_details
             )
-            
             if not order_result:
-                logger.error("Smart retry failed or produced invalid order.")
-                await self.position_manager.mark_position_failed(symbol, trade_id, "Insufficient Funds (Retry Failed)")
+                await self.position_manager.mark_position_failed(symbol, trade_id, "Insufficient Funds")
                 return
-
         except BotInvalidOrderError as e:
-            logger.error("Order rejected by exchange logic. Marking position failed.", error=str(e))
             await self.position_manager.mark_position_failed(symbol, trade_id, f"Invalid Order: {str(e)}")
             return
         except Exception as e:
-            logger.error("Critical error during order placement. Leaving PENDING position for reconciliation.", error=str(e))
+            logger.error("Order placement error", error=str(e))
             return
 
         if not order_result:
-            # Should be handled by except blocks, but safety check
             return
 
-        # 4. Update Order ID if Exchange returns a different one
         exchange_order_id = order_result.get('orderId')
         if exchange_order_id and exchange_order_id != trade_id:
-            logger.info("Updating PENDING position with Exchange Order ID", client_id=trade_id, exchange_id=exchange_order_id)
             await self.position_manager.update_pending_order_id(symbol, trade_id, exchange_order_id)
             current_order_id = exchange_order_id
         else:
             current_order_id = trade_id
 
-        # Define callback to update DB if order is replaced during chase
         async def _on_order_replace(old_id: str, new_id: str):
             await self.position_manager.update_pending_order_id(symbol, old_id, new_id)
 
-        # 5. Manage Order Lifecycle
         final_order_state = await self.order_lifecycle_manager.manage(
             initial_order=order_result, 
             symbol=symbol, 
@@ -324,301 +262,178 @@ class TradeExecutor:
             initial_price=limit_price,
             market_details=market_details,
             on_order_replace=_on_order_replace,
-            trade_id=trade_id # Pass trade_id for chase order generation
+            trade_id=trade_id
         )
         
         fill_quantity = final_order_state.get('filled', 0.0) if final_order_state else 0.0
         final_status = final_order_state.get('status') if final_order_state else 'UNKNOWN'
         
-        # 6. Confirm or Void Position (Two-Phase Commit End)
         if fill_quantity > 0:
             fill_price = final_order_state.get('average')
             if not fill_price or fill_price <= 0:
-                logger.critical("Order filled but average price is invalid. Cannot confirm position.", order_id=current_order_id, final_state=final_order_state)
-                # We leave it as PENDING so it can be reconciled manually or on restart.
                 return
 
-            # Calculate Fees
             fees = self._calculate_or_extract_fee(final_order_state, fill_price, fill_quantity)
-
-            # --- Net Quantity Adjustment ---
-            # If buying, and fee is in base asset, we receive less than fill_quantity.
-            # We must adjust the position size to match wallet reality.
             confirmed_quantity = fill_quantity
             
             if side == 'BUY':
-                # Check fee currency
                 fee_currency = None
                 if final_order_state.get('fee') and 'currency' in final_order_state['fee']:
                     fee_currency = final_order_state['fee']['currency']
                 
-                # Parse base asset from symbol (e.g. BTC/USDT -> BTC)
                 base_asset = symbol.split('/')[0]
-                
-                # If fee currency matches base asset, subtract fee from quantity
-                # Note: fees is the float cost.
                 if fee_currency == base_asset:
                     confirmed_quantity = max(0.0, fill_quantity - fees)
-                    logger.info("Adjusted position quantity for fees.", 
-                                original=fill_quantity, 
-                                fee=fees, 
-                                net=confirmed_quantity, 
-                                asset=base_asset)
 
-            logger.info("Order to open position was filled.", order_id=current_order_id, filled_qty=fill_quantity, net_qty=confirmed_quantity, fill_price=fill_price, fees=fees)
             final_stop_loss = self.risk_manager.calculate_stop_loss(side, fill_price, df, market_regime=regime)
             final_take_profit = self.risk_manager.calculate_take_profit(
-                side, 
-                fill_price, 
-                final_stop_loss, 
-                market_regime=regime,
-                confidence=confidence,
-                confidence_threshold=confidence_threshold
+                side, fill_price, final_stop_loss, market_regime=regime,
+                confidence=confidence, confidence_threshold=confidence_threshold
             )
             
-            await self.position_manager.confirm_position_open(symbol, current_order_id, confirmed_quantity, fill_price, final_stop_loss, final_take_profit, fees=fees)
+            await self.position_manager.confirm_position_open(
+                symbol, current_order_id, confirmed_quantity, fill_price, 
+                final_stop_loss, final_take_profit, fees=fees
+            )
         
         elif final_status == 'OPEN':
-            # CRITICAL: The order is still OPEN on the exchange (cancellation failed), but we stopped chasing.
-            logger.critical("Order is stuck in OPEN state after lifecycle management. Leaving position as PENDING.", 
-                            symbol=symbol, order_id=current_order_id)
+            logger.critical("Order stuck OPEN. Manual intervention required.", order_id=current_order_id)
             await self.alert_system.send_alert(
                 level='critical',
-                message=f"🚨 ZOMBIE ORDER RISK: Order {current_order_id} for {symbol} is stuck OPEN. Manual intervention required.",
-                details={'symbol': symbol, 'order_id': current_order_id, 'status': 'OPEN'}
+                message=f"🚨 ZOMBIE ORDER: {current_order_id} for {symbol} stuck OPEN.",
+                details={'symbol': symbol, 'order_id': current_order_id}
             )
-            
         else:
-            # Order is definitively dead (CANCELED, REJECTED, EXPIRED) and empty.
-            logger.error("Order to open position did not fill. Marking position failed.", order_id=current_order_id, final_status=final_status)
-            await self.position_manager.mark_position_failed(symbol, current_order_id, f"Order Lifecycle Failed: {final_status}")
-            
-            await self.alert_system.send_alert(
-                level='error',
-                message=f"🔴 Failed to open position for {symbol}. Order did not fill.",
-                details={'symbol': symbol, 'order_id': current_order_id, 'final_status': final_status}
-            )
+            await self.position_manager.mark_position_failed(symbol, current_order_id, f"Lifecycle Failed: {final_status}")
 
     async def close_position(self, position: Position, reason: str):
-        close_side = 'SELL' if position.side == 'BUY' else 'BUY'
-        
-        market_details = self.market_details.get(position.symbol)
-        current_price = self.latest_prices.get(position.symbol)
+        # Acquire lock to prevent concurrent closes (e.g. TSL and Signal triggering same time)
+        async with self._get_lock(position.symbol):
+            # Re-check status inside lock
+            fresh_pos = await self.position_manager.get_open_position(position.symbol)
+            if not fresh_pos:
+                return
 
-        if not market_details:
-            logger.error("Cannot close position, market details not available for symbol.", symbol=position.symbol)
-            close_quantity = position.quantity
-        else:
-            if not current_price:
-                logger.warning("Latest price not available for sizing close order, cost check will be skipped.", symbol=position.symbol)
-            close_quantity = self.order_sizer.adjust_order_quantity(
-                position.symbol, 
-                position.quantity, 
-                current_price or 0.0, # Pass 0 if price is unknown, sizer will skip cost check
-                market_details
-            )
+            close_side = 'SELL' if position.side == 'BUY' else 'BUY'
+            market_details = self.market_details.get(position.symbol)
+            current_price = self.latest_prices.get(position.symbol)
 
-        if close_quantity <= 0:
-            # --- DUST HANDLING FIX ---
-            # If the quantity is too small to trade, we must check if it's negligible dust.
-            # If value < $1.00 (arbitrary dust threshold), we force close it in DB to prevent infinite loops.
-            estimated_value = position.quantity * (current_price or 0.0)
-            if estimated_value < 1.0:
-                logger.warning("Position value is dust (below exchange limits). Forcing DB close.", 
-                               symbol=position.symbol, value=estimated_value, qty=position.quantity)
-                await self.position_manager.close_position(
-                    position.symbol, 
-                    current_price or position.entry_price, 
-                    f"{reason} (Dust Cleanup)"
+            if not market_details:
+                close_quantity = position.quantity
+            else:
+                close_quantity = self.order_sizer.adjust_order_quantity(
+                    position.symbol, position.quantity, current_price or 0.0, market_details
                 )
+
+            if close_quantity <= 0:
+                estimated_value = position.quantity * (current_price or 0.0)
+                if estimated_value < 1.0:
+                    await self.position_manager.close_position(position.symbol, current_price or position.entry_price, f"{reason} (Dust)")
                 return
-            else:
-                logger.error("Cannot close position, adjusted quantity is zero but value is significant.", 
-                             symbol=position.symbol, original_qty=position.quantity, value=estimated_value)
-                return
 
-        order_type = self.config.execution.default_order_type
-        limit_price = None
-        
-        if order_type == 'LIMIT':
-            # Fetch fresh ticker for close
-            try:
-                ticker = await self.exchange_api.get_ticker_data(position.symbol)
-            except Exception as e:
-                logger.warning("Failed to fetch ticker for close, falling back to candle close.", error=str(e))
-                ticker = {'last': current_price}
-
-            # Fetch DF for ATR calculation if needed
-            df = None
-            if self.config.execution.limit_offset_type == 'ATR':
-                df = self.data_handler.get_market_data(position.symbol)
+            order_type = self.config.execution.default_order_type
+            limit_price = None
             
-            limit_price = self._calculate_limit_price(position.symbol, close_side, current_price, ticker, df)
-        else:
-            order_type = 'MARKET'
-
-        order_result = None
-        used_quantity = close_quantity
-
-        try:
-            extra_params = {}
-            if self.config.execution.post_only and order_type == 'LIMIT':
-                extra_params['postOnly'] = True
-
-            order_result = await self.exchange_api.place_order(
-                position.symbol, close_side, order_type, close_quantity, price=limit_price, extra_params=extra_params
-            )
-        except BotInsufficientFundsError:
-            # --- Smart Retry Logic for Dust/Fees ---
-            logger.warning("Insufficient funds to close position. Attempting smart retry with actual wallet balance.", symbol=position.symbol)
-            try:
-                # 1. Fetch actual available balance
-                base_asset = position.symbol.split('/')[0]
-                balances = await self.exchange_api.get_balance()
-                available_balance = balances.get(base_asset, {}).get('total', 0.0)
-                
-                # 2. Check if balance is within tolerance (e.g., > 98% of tracked qty)
-                # This implies the discrepancy is likely due to fees or dust.
-                tolerance_threshold = position.quantity * 0.98
-                
-                if available_balance >= tolerance_threshold and available_balance < position.quantity:
-                    logger.info("Available balance is within tolerance. Retrying close with wallet balance.", 
-                                tracked=position.quantity, available=available_balance)
-                    
-                    # Adjust quantity to what we actually have
-                    used_quantity = self.order_sizer.adjust_order_quantity(
-                        position.symbol, available_balance, current_price or 0.0, market_details
-                    )
-                    
-                    if used_quantity > 0:
-                        extra_params = {}
-                        if self.config.execution.post_only and order_type == 'LIMIT':
-                            extra_params['postOnly'] = True
-
-                        order_result = await self.exchange_api.place_order(
-                            position.symbol, close_side, order_type, used_quantity, price=limit_price, extra_params=extra_params
-                        )
-                    else:
-                        logger.error("Adjusted wallet balance is too small to trade.", symbol=position.symbol)
-                else:
-                    logger.warning("Balance discrepancy too large or balance > qty. Proceeding to phantom check.", 
-                                   tracked=position.quantity, available=available_balance)
-            except Exception as retry_ex:
-                logger.error("Smart retry failed.", error=str(retry_ex))
-            
-            # If retry didn't produce an order, fall back to phantom handling
-            if not order_result:
-                # Before assuming phantom, check for open orders locking funds
+            if order_type == 'LIMIT':
                 try:
-                    open_orders = await self.exchange_api.fetch_open_orders(position.symbol)
-                    if open_orders:
-                        logger.warning("Insufficient funds to close, but open orders exist. Skipping phantom check.", count=len(open_orders))
-                        await self.alert_system.send_alert(
-                            level='warning',
-                            message=f"⚠️ Cannot close {position.symbol}: Insufficient funds and {len(open_orders)} open orders detected.",
-                            details={'symbol': position.symbol, 'open_orders': len(open_orders)}
-                        )
-                        return
-                except Exception as e:
-                    logger.error("Failed to fetch open orders during insufficient funds check.", error=str(e))
+                    ticker = await self.exchange_api.get_ticker_data(position.symbol)
+                except Exception:
+                    ticker = {'last': current_price}
+                
+                df = None
+                if self.config.execution.limit_offset_type == 'ATR':
+                    df = self.data_handler.get_market_data(position.symbol)
+                limit_price = self._calculate_limit_price(position.symbol, close_side, current_price, ticker, df)
+            else:
+                order_type = 'MARKET'
 
-                await self._handle_phantom_position(position)
+            order_result = None
+            used_quantity = close_quantity
+
+            try:
+                extra_params = {}
+                if self.config.execution.post_only and order_type == 'LIMIT':
+                    extra_params['postOnly'] = True
+
+                order_result = await self.exchange_api.place_order(
+                    position.symbol, close_side, order_type, close_quantity, price=limit_price, extra_params=extra_params
+                )
+            except BotInsufficientFundsError:
+                # Smart Retry for Close (Dust/Fee issues)
+                try:
+                    base_asset = position.symbol.split('/')[0]
+                    balances = await self.exchange_api.get_balance()
+                    available_balance = balances.get(base_asset, {}).get('total', 0.0)
+                    
+                    tolerance = position.quantity * 0.98
+                    if available_balance >= tolerance and available_balance < position.quantity:
+                        used_quantity = self.order_sizer.adjust_order_quantity(
+                            position.symbol, available_balance, current_price or 0.0, market_details
+                        )
+                        if used_quantity > 0:
+                            order_result = await self.exchange_api.place_order(
+                                position.symbol, close_side, order_type, used_quantity, price=limit_price, extra_params=extra_params
+                            )
+                    else:
+                        await self._handle_phantom_position(position)
+                        return
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.error("Close order failed", error=str(e))
                 return
 
-        except BotInvalidOrderError as e:
-            logger.error("Invalid order parameters for close.", error=str(e))
-            return
-        except Exception as e:
-            logger.error("Failed to place close order.", error=str(e))
-            return
+            if not (order_result and order_result.get('orderId')):
+                return
 
-        if not (order_result and order_result.get('orderId')):
-            logger.error("Failed to place close order.", symbol=position.symbol)
-            return
-
-        final_order_state = await self.order_lifecycle_manager.manage(
-            initial_order=order_result, 
-            symbol=position.symbol, 
-            side=close_side, 
-            quantity=used_quantity,
-            initial_price=limit_price,
-            market_details=market_details
-        )
-        
-        fill_quantity = final_order_state.get('filled', 0.0) if final_order_state else 0.0
-        
-        if fill_quantity > 0:
-            # Use the aggregated average price for PnL calculation
-            close_price = final_order_state['average']
-            
-            # Calculate Fees
-            fees = self._calculate_or_extract_fee(final_order_state, close_price, fill_quantity)
-            
-            # Check if full close (with tolerance for float precision)
-            # OR if we used the 'Smart Retry' quantity (meaning we sold everything we had)
-            is_full_close = fill_quantity >= (position.quantity * 0.999)
-            is_smart_retry_close = (used_quantity < position.quantity) and (fill_quantity >= (used_quantity * 0.999))
-
-            if is_full_close or is_smart_retry_close:
-                # We pass the actual filled quantity to ensure PnL is calculated on what was sold,
-                # but the position record is closed fully, effectively discarding any dust discrepancy.
-                closed_pos = await self.position_manager.close_position(position.symbol, close_price, reason, actual_filled_qty=fill_quantity, fees=fees)
-                if closed_pos:
-                    self.risk_manager.update_trade_outcome(closed_pos.symbol, closed_pos.pnl)
-            else:
-                # Partial fill handling
-                await self.position_manager.reduce_position(position.symbol, fill_quantity, close_price, reason, fees=fees)
-                
-        else:
-            final_status = final_order_state.get('status') if final_order_state else 'UNKNOWN'
-            logger.error("Failed to confirm close order fill. Position remains open.", order_id=order_result.get('orderId'), symbol=position.symbol, final_status=final_status)
-            await self.alert_system.send_alert(
-                level='critical',
-                message=f"🔥 FAILED TO CLOSE position for {position.symbol}. Manual intervention may be required.",
-                details={'symbol': position.symbol, 'order_id': order_result.get('orderId'), 'reason': reason, 'final_status': final_status}
+            final_order_state = await self.order_lifecycle_manager.manage(
+                initial_order=order_result, 
+                symbol=position.symbol, 
+                side=close_side, 
+                quantity=used_quantity,
+                initial_price=limit_price,
+                market_details=market_details
             )
+            
+            fill_quantity = final_order_state.get('filled', 0.0) if final_order_state else 0.0
+            
+            if fill_quantity > 0:
+                close_price = final_order_state['average']
+                fees = self._calculate_or_extract_fee(final_order_state, close_price, fill_quantity)
+                
+                is_full_close = fill_quantity >= (position.quantity * 0.999)
+                is_smart_retry_close = (used_quantity < position.quantity) and (fill_quantity >= (used_quantity * 0.999))
+
+                if is_full_close or is_smart_retry_close:
+                    closed_pos = await self.position_manager.close_position(position.symbol, close_price, reason, actual_filled_qty=fill_quantity, fees=fees)
+                    if closed_pos:
+                        self.risk_manager.update_trade_outcome(closed_pos.symbol, closed_pos.pnl)
+                else:
+                    await self.position_manager.reduce_position(position.symbol, fill_quantity, close_price, reason, fees=fees)
+            else:
+                final_status = final_order_state.get('status') if final_order_state else 'UNKNOWN'
+                await self.alert_system.send_alert(
+                    level='critical',
+                    message=f"🔥 FAILED TO CLOSE {position.symbol}.",
+                    details={'order_id': order_result.get('orderId'), 'status': final_status}
+                )
 
     async def _handle_phantom_position(self, position: Position):
-        """
-        Verifies if a position is truly missing from the exchange (phantom) and reconciles the DB.
-        """
         try:
             base_asset = position.symbol.split('/')[0]
             balances = await self.exchange_api.get_balance()
             asset_balance = balances.get(base_asset, {}).get('total', 0.0)
-            
-            # Check open orders that might be locking the balance
             open_orders = await self.exchange_api.fetch_open_orders(position.symbol)
             
-            # Logic: If we have significantly less than the position quantity AND no open orders locking it
-            # Then the position is likely already gone (sold externally or previous close update failed).
-            
-            # Tolerance for dust (e.g. 1% of position size)
             if asset_balance < (position.quantity * 0.01) and not open_orders:
-                logger.info("Confirmed phantom position (DB open, Exchange closed). Reconciling.", 
-                            db_qty=position.quantity, exchange_bal=asset_balance)
-                
-                # Estimate close price (Current market price) for PnL tracking purposes
+                logger.info("Confirmed phantom position. Reconciling.")
                 close_price = self.latest_prices.get(position.symbol, position.entry_price)
-                
-                await self.position_manager.close_position(
-                    position.symbol, 
-                    close_price, 
-                    reason="Phantom Reconciliation"
-                )
-                
-                await self.alert_system.send_alert(
-                    level='warning',
-                    message=f"⚠️ Auto-Reconciled Phantom Position for {position.symbol}",
-                    details={'db_qty': position.quantity, 'wallet_bal': asset_balance}
-                )
+                await self.position_manager.close_position(position.symbol, close_price, reason="Phantom Reconciliation")
             else:
-                logger.error("Insufficient funds error but wallet has balance or open orders. Manual check needed.",
-                             db_qty=position.quantity, exchange_bal=asset_balance, open_orders=len(open_orders))
                 await self.alert_system.send_alert(
                     level='critical',
-                    message=f"🚨 Insufficient Funds to close {position.symbol} but state is ambiguous.",
-                    details={'db_qty': position.quantity, 'wallet_bal': asset_balance, 'open_orders': len(open_orders)}
+                    message=f"🚨 Ambiguous Phantom State for {position.symbol}.",
+                    details={'db_qty': position.quantity, 'wallet': asset_balance}
                 )
         except Exception as e:
-            logger.error("Error during phantom position reconciliation", error=str(e))
+            logger.error("Phantom check failed", error=str(e))
