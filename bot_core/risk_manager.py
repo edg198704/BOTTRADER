@@ -249,16 +249,23 @@ class RiskManager:
         risk_amount_usd = portfolio_equity * final_risk_pct
         quantity = risk_amount_usd / risk_per_unit
         
-        # Cap the position size based on the max USD value allowed
+        # --- Dynamic Position Sizing Cap ---
+        # Calculate the max allowed size based on the percentage of the portfolio
+        max_quantity_by_pct = (portfolio_equity * self.config.max_position_size_portfolio_pct) / entry_price
+        
+        # Calculate the max allowed size based on the fixed USD cap
         max_quantity_by_usd_cap = self.config.max_position_size_usd / entry_price
         
-        final_quantity = min(quantity, max_quantity_by_usd_cap)
+        # The final cap is the stricter of the two
+        final_cap_quantity = min(max_quantity_by_pct, max_quantity_by_usd_cap)
+        
+        final_quantity = min(quantity, final_cap_quantity)
 
         if final_quantity < quantity:
-            logger.info("Position size capped by max_position_size_usd.",
+            logger.info("Position size capped.",
                         risk_based_qty=quantity,
                         capped_qty=final_quantity,
-                        max_usd=self.config.max_position_size_usd)
+                        cap_reason="Portfolio %" if max_quantity_by_pct < max_quantity_by_usd_cap else "Fixed USD")
 
         return final_quantity
 
