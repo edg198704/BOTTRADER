@@ -58,7 +58,12 @@ class ExchangeAPI(abc.ABC):
     
     @abc.abstractmethod
     async def fetch_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
-        """Fetches the status of a specific order."""
+        """Fetches the status of a specific order by Exchange ID."""
+        pass
+
+    @abc.abstractmethod
+    async def fetch_order_by_client_id(self, symbol: str, client_order_id: str) -> Optional[Dict[str, Any]]:
+        """Fetches an order using the client-side ID (useful for reconciliation)."""
         pass
 
     @abc.abstractmethod
@@ -230,6 +235,13 @@ class MockExchangeAPI(ExchangeAPI):
                     logger.warning("Mock: Insufficient balance for order", order_id=order_id)
         
         return order
+
+    async def fetch_order_by_client_id(self, symbol: str, client_order_id: str) -> Optional[Dict[str, Any]]:
+        # Mock implementation: iterate through all orders
+        for order in self.open_orders.values():
+            if order.get('clientOrderId') == client_order_id:
+                return order
+        return None
 
     async def fetch_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
         return [order for order in self.open_orders.values() if order['symbol'] == symbol and order['status'] == 'OPEN']
@@ -433,6 +445,12 @@ class BacktestExchangeAPI(ExchangeAPI):
                             order['fee'] = {'cost': fee, 'currency': quote}
 
         return order
+
+    async def fetch_order_by_client_id(self, symbol: str, client_order_id: str) -> Optional[Dict[str, Any]]:
+        for order in self.open_orders.values():
+            if order.get('clientOrderId') == client_order_id:
+                return order
+        return None
 
     async def fetch_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
         return [o for o in self.open_orders.values() if o['symbol'] == symbol and o['status'] == 'OPEN']
@@ -659,6 +677,48 @@ class CCXTExchangeAPI(ExchangeAPI):
         except (NetworkError, ExchangeError) as e:
             logger.error("Final attempt failed for fetch_order", order_id=order_id, error=str(e))
             raise
+
+    async def fetch_order_by_client_id(self, symbol: str, client_order_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Attempts to find an order by its clientOrderId. 
+        Since many exchanges don't support direct lookup by client ID, we search open orders first,
+        then closed orders if available.
+        """
+        try:
+            # 1. Search Open Orders
+            open_orders = await self.fetch_open_orders(symbol)
+            for order in open_orders:
+                if order.get('clientOrderId') == client_order_id:
+                    return order
+            
+            # 2. Search Closed/Recent Orders (if supported)
+            if self.exchange.has.get('fetchClosedOrders') or self.exchange.has.get('fetchOrders'):
+                # Fetch last 50 orders to check for recent fills
+                recent_orders = await self.exchange.fetch_orders(symbol, limit=50)
+                for order in recent_orders:
+                    if order.get('clientOrderId') == client_order_id:
+                        # Map status to our internal standard
+                        status_map = {
+                            'open': 'OPEN', 'closed': 'FILLED', 'canceled': 'CANCELED',
+                            'rejected': 'REJECTED', 'expired': 'EXPIRED'
+                        }
+                        return {
+                            'id': order.get('id'),
+                            'status': status_map.get(order.get('status'), 'UNKNOWN'),
+                            'filled': order.get('filled', 0.0),
+                            'average': order.get('average', 0.0),
+                            'symbol': order.get('symbol'),
+                            'price': order.get('price', 0.0),
+                            'side': order.get('side'),
+                            'type': order.get('type'),
+                            'clientOrderId': order.get('clientOrderId'),
+                            'fee': order.get('fee')
+                        }
+            
+            return None
+        except (NetworkError, ExchangeError) as e:
+            logger.error("Failed to fetch order by client ID", client_id=client_order_id, error=str(e))
+            return None
 
     async def fetch_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
         try:
