@@ -111,13 +111,24 @@ class OrderLifecycleManager:
                 # We just need to set current_order_id to None so we don't try to cancel it below
                 current_order_id = None 
 
-            market_price = self.latest_prices.get(symbol)
-            if not market_price:
-                logger.warning("Cannot check for order chasing, latest price is unavailable.", symbol=symbol)
-                continue
+            # Fetch fresh ticker for market check
+            try:
+                ticker = await self.exchange_api.get_ticker_data(symbol)
+                bid = ticker.get('bid')
+                ask = ticker.get('ask')
+                last = ticker.get('last')
+            except Exception as e:
+                logger.warning("Failed to fetch ticker for chase check.", error=str(e))
+                bid, ask, last = None, None, self.latest_prices.get(symbol)
 
-            is_behind_market = (side.upper() == 'BUY' and market_price > current_order_price) or \
-                               (side.upper() == 'SELL' and market_price < current_order_price)
+            # Determine reference market price for comparison
+            # If Buying, we compare against Best Bid (are we top of book?) or Last
+            if side.upper() == 'BUY':
+                market_ref = bid if bid else last
+                is_behind_market = market_ref > current_order_price if market_ref else False
+            else:
+                market_ref = ask if ask else last
+                is_behind_market = market_ref < current_order_price if market_ref else False
 
             if not is_behind_market and status == 'OPEN':
                 logger.debug("Order is still competitive, not chasing.", order_id=current_order_id)
@@ -178,8 +189,17 @@ class OrderLifecycleManager:
                 break
 
             # 4. Place new order
-            price_improvement = market_price * self.config.chase_aggressiveness_pct
-            new_price = market_price + price_improvement if side.upper() == 'BUY' else market_price - price_improvement
+            # Calculate new price based on Order Book if available
+            price_improvement = (last or 0.0) * self.config.chase_aggressiveness_pct
+            
+            if side.upper() == 'BUY':
+                # Target Best Bid + Improvement
+                base_price = bid if bid else (last or current_order_price)
+                new_price = base_price + price_improvement
+            else:
+                # Target Best Ask - Improvement
+                base_price = ask if ask else (last or current_order_price)
+                new_price = base_price - price_improvement
             
             # --- SLIPPAGE PROTECTION CHECK ---
             if initial_price and initial_price > 0:
