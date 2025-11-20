@@ -4,7 +4,7 @@ from datetime import datetime
 
 from bot_core.config import RiskManagementConfig
 from bot_core.logger import get_logger
-from bot_core.position_manager import Position
+from bot_core.position_manager import Position, PositionStatus
 from bot_core.utils import Clock
 
 if TYPE_CHECKING:
@@ -252,6 +252,39 @@ class RiskManager:
         final_risk_pct = adjusted_risk_pct * correlation_scaling * confidence_scaling
 
         risk_amount_usd = portfolio_equity * final_risk_pct
+        
+        # --- Portfolio Risk Cap (New) ---
+        # Ensures total open risk does not exceed max_portfolio_risk_pct
+        if self.config.max_portfolio_risk_pct > 0:
+            current_portfolio_risk = 0.0
+            for pos in open_positions:
+                # Only count confirmed OPEN positions with valid SL
+                # We check against PositionStatus.OPEN (or string 'OPEN' if enum comparison fails)
+                if pos.status == PositionStatus.OPEN and pos.stop_loss_price is not None and pos.quantity > 0:
+                    # Calculate risk for this position: Capital at Risk = abs(Entry - SL) * Qty
+                    # If SL is better than Entry (Locked Profit), we consider risk to be 0 for portfolio heat.
+                    
+                    p_risk = 0.0
+                    if pos.side == 'BUY':
+                        if pos.stop_loss_price < pos.entry_price:
+                            p_risk = (pos.entry_price - pos.stop_loss_price) * pos.quantity
+                    else: # SELL
+                        if pos.stop_loss_price > pos.entry_price:
+                            p_risk = (pos.stop_loss_price - pos.entry_price) * pos.quantity
+                    
+                    current_portfolio_risk += p_risk
+            
+            max_allowed_portfolio_risk = portfolio_equity * self.config.max_portfolio_risk_pct
+            remaining_risk_budget = max(0.0, max_allowed_portfolio_risk - current_portfolio_risk)
+            
+            if risk_amount_usd > remaining_risk_budget:
+                logger.info("Capping position size due to Portfolio Risk Limit.", 
+                            current_risk=current_portfolio_risk, 
+                            max_risk=max_allowed_portfolio_risk, 
+                            requested_risk=risk_amount_usd,
+                            capped_risk=remaining_risk_budget)
+                risk_amount_usd = remaining_risk_budget
+
         quantity = risk_amount_usd / risk_per_unit
         
         # --- Dynamic Position Sizing Cap ---
@@ -287,6 +320,7 @@ class RiskManager:
             if final_quantity == max_quantity_by_pct: reasons.append("Portfolio %")
             if final_quantity == max_quantity_by_usd_cap: reasons.append("Fixed USD")
             if final_quantity == liquidity_cap_quantity: reasons.append("Liquidity")
+            if risk_amount_usd < (portfolio_equity * final_risk_pct): reasons.append("Portfolio Risk Cap")
 
             logger.info("Position size capped.",
                         risk_based_qty=quantity,
