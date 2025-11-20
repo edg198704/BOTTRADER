@@ -20,6 +20,8 @@ class DataHandler:
     Maintains two buffers:
     1. _raw_buffers: Long-term storage of raw OHLCV data (for AI training).
     2. _dataframes: Short-term window with calculated indicators (for Strategy analysis).
+    
+    Architecture: Uses independent async loops per symbol to prevent blocking.
     """
     def __init__(self, exchange_api: ExchangeAPI, config: BotConfig, shared_latest_prices: Dict[str, float]):
         self.exchange_api = exchange_api
@@ -70,7 +72,9 @@ class DataHandler:
         
         self._shared_latest_prices = shared_latest_prices
         self._running = False
-        self._update_task: Optional[asyncio.Task] = None
+        
+        # Task Management
+        self._symbol_tasks: Dict[str, asyncio.Task] = {}
         self._ticker_task: Optional[asyncio.Task] = None
         self._save_task: Optional[asyncio.Task] = None
         
@@ -98,7 +102,7 @@ class DataHandler:
         logger.info("DataHandler initialized.", 
                     cache_dir=self.cache_dir, 
                     analysis_window=self.analysis_window,
-                    max_training_buffer=self.max_training_buffer,
+                    max_training_buffer=self.max_training_buffer, 
                     history_limit=self.history_limit)
 
     async def initialize_data(self):
@@ -146,16 +150,24 @@ class DataHandler:
         if self._running:
             return
         self._running = True
-        self._update_task = asyncio.create_task(self._update_loop())
+        
+        # Launch independent maintenance loop for each symbol
+        for symbol in self.symbols:
+            self._symbol_tasks[symbol] = asyncio.create_task(self._maintain_symbol_data(symbol))
+            
         self._ticker_task = asyncio.create_task(self._ticker_loop())
         self._save_task = asyncio.create_task(self._auto_save_loop())
-        logger.info("DataHandler update, ticker, and auto-save loops started.")
+        logger.info("DataHandler started with independent symbol loops.")
 
     async def stop(self):
         """Stops the background loops and saves cache."""
         self._running = False
-        if self._update_task and not self._update_task.done():
-            self._update_task.cancel()
+        
+        # Cancel all symbol tasks
+        for task in self._symbol_tasks.values():
+            if not task.done():
+                task.cancel()
+        
         if self._ticker_task and not self._ticker_task.done():
             self._ticker_task.cancel()
         if self._save_task and not self._save_task.done():
@@ -169,17 +181,17 @@ class DataHandler:
         self._executor.shutdown(wait=True)
         logger.info("DataHandler stopped and executor shutdown.")
 
-    async def _update_loop(self):
-        """Loop for fetching OHLCV candles and updating indicators."""
+    async def _maintain_symbol_data(self, symbol: str):
+        """Independent loop to maintain data for a single symbol."""
+        logger.info(f"Starting data maintenance loop for {symbol}")
         while self._running:
             try:
-                tasks = [self.update_symbol_data(symbol) for symbol in self.symbols]
-                await asyncio.gather(*tasks)
+                await self.update_symbol_data(symbol)
             except asyncio.CancelledError:
-                logger.info("Data update loop cancelled.")
+                logger.info(f"Data loop cancelled for {symbol}")
                 break
             except Exception as e:
-                logger.error("Error in data update loop", error=str(e), exc_info=True)
+                logger.error(f"Error in data loop for {symbol}", error=str(e))
             
             await asyncio.sleep(self.update_interval)
 
