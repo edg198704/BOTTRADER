@@ -255,7 +255,12 @@ class AIEnsembleStrategy(TradingStrategy):
                 return regime_config.sideways_exit_threshold
             return base
         else:
-            base = optimized_base if optimized_base is not None else self.ai_config.confidence_threshold
+            # If we have an optimized base (which is now regime-specific from the learner),
+            # we prioritize it unless the config explicitly disables optimization.
+            if optimized_base is not None and self.ai_config.training.optimize_entry_threshold:
+                return optimized_base
+
+            base = self.ai_config.confidence_threshold
             
             if regime == 'bull' and regime_config.bull_confidence_threshold is not None:
                 return regime_config.bull_confidence_threshold
