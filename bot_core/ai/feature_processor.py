@@ -43,6 +43,49 @@ class FeatureProcessor:
         return cols
 
     @staticmethod
+    def _add_time_features(df: pd.DataFrame) -> pd.DataFrame:
+        """Generates cyclical time features (Sin/Cos) for Hour and Day of Week."""
+        df = df.copy()
+        if 'timestamp' in df.columns:
+            # If timestamp is a column
+            dt_series = df['timestamp']
+        else:
+            # If timestamp is the index
+            dt_series = df.index.to_series()
+
+        # Hour of Day (0-23)
+        df['time_hour_sin'] = np.sin(2 * np.pi * dt_series.dt.hour / 24)
+        df['time_hour_cos'] = np.cos(2 * np.pi * dt_series.dt.hour / 24)
+        
+        # Day of Week (0-6)
+        df['time_dow_sin'] = np.sin(2 * np.pi * dt_series.dt.dayofweek / 7)
+        df['time_dow_cos'] = np.cos(2 * np.pi * dt_series.dt.dayofweek / 7)
+        
+        return df
+
+    @staticmethod
+    def _add_price_action_features(df: pd.DataFrame) -> pd.DataFrame:
+        """Generates microstructure features: Body Size, Upper Wick, Lower Wick."""
+        df = df.copy()
+        required = ['open', 'high', 'low', 'close']
+        if not all(col in df.columns for col in required):
+            return df
+
+        # Avoid division by zero
+        close_safe = df['close'].replace(0, 1.0)
+
+        # Body Size: Absolute difference between Open and Close, relative to Close
+        df['pa_body_size'] = (df['close'] - df['open']).abs() / close_safe
+        
+        # Upper Wick: High - Max(Open, Close)
+        df['pa_upper_wick'] = (df['high'] - df[['open', 'close']].max(axis=1)) / close_safe
+        
+        # Lower Wick: Min(Open, Close) - Low
+        df['pa_lower_wick'] = (df[['open', 'close']].min(axis=1) - df['low']) / close_safe
+        
+        return df
+
+    @staticmethod
     def _stationarize_data(df: pd.DataFrame, cols_to_process: List[str]) -> pd.DataFrame:
         """
         Transforms non-stationary features (absolute prices, raw volume) into stationary ratios.
@@ -93,18 +136,28 @@ class FeatureProcessor:
     def process_data(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> pd.DataFrame:
         """
         Applies the full feature engineering pipeline:
-        1. Stationarize features (Absolute -> Relative).
-        2. Select base feature columns.
-        3. Generates lagged features (if configured).
-        4. Drops NaNs introduced by lags.
-        5. Applies Z-score normalization.
-        6. Enforces column order matching get_feature_names.
+        1. Generate Time/Price Action features (if enabled).
+        2. Stationarize features (Absolute -> Relative).
+        3. Select base feature columns.
+        4. Generates lagged features (if configured).
+        5. Drops NaNs introduced by lags.
+        6. Applies Z-score normalization.
+        7. Enforces column order matching get_feature_names.
         """
-        # 1. Stationarize Data (Transform absolute prices/volume to ratios)
-        # We pass the list of intended features so we only transform what's needed
-        df_stationary = FeatureProcessor._stationarize_data(df, config.feature_columns)
+        df_processed = df.copy()
 
-        # 2. Select Base Columns
+        # 1. Generate Advanced Features (Before stationarization/selection)
+        if config.features.use_time_features:
+            df_processed = FeatureProcessor._add_time_features(df_processed)
+        
+        if config.features.use_price_action_features:
+            df_processed = FeatureProcessor._add_price_action_features(df_processed)
+
+        # 2. Stationarize Data (Transform absolute prices/volume to ratios)
+        # We pass the list of intended features so we only transform what's needed
+        df_stationary = FeatureProcessor._stationarize_data(df_processed, config.feature_columns)
+
+        # 3. Select Base Columns
         cols = config.feature_columns
         valid_cols = [c for c in cols if c in df_stationary.columns]
         
@@ -114,7 +167,7 @@ class FeatureProcessor:
         
         subset = df_stationary[valid_cols].copy()
         
-        # 3. Generate Lags
+        # 4. Generate Lags
         lags = config.features.lag_features
         depth = config.features.lag_depth
         
@@ -124,10 +177,10 @@ class FeatureProcessor:
                     for i in range(1, depth + 1):
                         subset[f"{col}_lag_{i}"] = subset[col].shift(i)
         
-        # 4. Drop NaNs (from lags and missing data)
+        # 5. Drop NaNs (from lags and missing data)
         subset.dropna(inplace=True)
         
-        # 5. Normalize
+        # 6. Normalize
         window = config.features.normalization_window
         rolling_mean = subset.rolling(window=window).mean()
         rolling_std = subset.rolling(window=window).std()
@@ -138,7 +191,7 @@ class FeatureProcessor:
         # Rolling normalization introduces NaNs at the start of the window
         normalized.dropna(inplace=True)
         
-        # 6. Enforce Column Order
+        # 7. Enforce Column Order
         # Ensure the output DataFrame has columns in the exact order expected by the model
         expected_cols = FeatureProcessor.get_feature_names(config)
         # Filter expected cols to those present (handling potential missing base cols gracefully)
