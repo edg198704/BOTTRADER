@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional
@@ -17,6 +18,7 @@ logger = get_logger(__name__)
 class DataHandler:
     """
     Manages market data lifecycle and acts as the primary Event Producer for the system.
+    Implements a drift-correcting polling loop for precise data fetching.
     """
     def __init__(self, exchange_api: ExchangeAPI, config: BotConfig, shared_latest_prices: Dict[str, float], event_bus: Optional[EventBus] = None):
         self.exchange_api = exchange_api
@@ -132,6 +134,11 @@ class DataHandler:
         logger.info("DataHandler stopped.")
 
     async def _maintain_symbol_data(self, symbol: str):
+        """
+        Continuously updates data for a symbol using a drift-correcting loop.
+        """
+        next_tick = time.time()
+        
         while self._running:
             try:
                 await self.update_symbol_data(symbol)
@@ -139,7 +146,21 @@ class DataHandler:
                 break
             except Exception as e:
                 logger.error(f"Error in data loop for {symbol}", error=str(e))
-            await asyncio.sleep(self.update_interval)
+            
+            # Drift correction logic
+            now = time.time()
+            next_tick += self.update_interval
+            
+            # If we are lagging significantly (more than one interval), reset the clock
+            if next_tick < now:
+                next_tick = now + self.update_interval
+            
+            sleep_duration = next_tick - now
+            if sleep_duration > 0:
+                await asyncio.sleep(sleep_duration)
+            else:
+                # Yield control briefly if we are running hot
+                await asyncio.sleep(0.01)
 
     async def _ticker_loop(self):
         while self._running:
@@ -243,6 +264,7 @@ class DataHandler:
                 self._last_emitted_candle_ts[symbol] = last_closed_ts
                 if self.event_bus:
                     # Publish event to the bus (non-blocking by default in bus implementation)
+                    # We pass the closed_df explicitly to ensure the consumer sees exactly what triggered the event
                     await self.event_bus.publish(MarketDataEvent(symbol=symbol, data=closed_df))
 
     async def _calculate_indicators_async(self, df: pd.DataFrame) -> pd.DataFrame:
