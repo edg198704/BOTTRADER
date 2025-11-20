@@ -207,6 +207,18 @@ class AIEnsembleStrategy(TradingStrategy):
         active_weights = prediction.get('active_weights')
         top_features = prediction.get('top_features')
         metrics = prediction.get('metrics')
+        is_anomaly = prediction.get('is_anomaly', False)
+        anomaly_score = prediction.get('anomaly_score', 0.0)
+
+        # --- DRIFT DETECTION CHECK ---
+        if is_anomaly:
+            if self.ai_config.drift.block_trade:
+                logger.warning("Drift detected (Anomaly). Blocking trade.", symbol=symbol, score=anomaly_score)
+                return None
+            else:
+                penalty = self.ai_config.drift.confidence_penalty
+                confidence = max(0.0, confidence - penalty)
+                logger.info("Drift detected. Penalizing confidence.", symbol=symbol, penalty=penalty, new_conf=confidence, score=anomaly_score)
 
         # Log prediction for future evaluation
         if self.ai_config.performance.enabled and action:
@@ -243,7 +255,8 @@ class AIEnsembleStrategy(TradingStrategy):
             'model_type': prediction.get('model_type'),
             'active_weights': active_weights,
             'top_features': top_features,
-            'metrics': metrics
+            'metrics': metrics,
+            'is_anomaly': is_anomaly
         }
 
         # NOTE: We explicitly pass 'regime' at the top level so RiskManager can see it.
