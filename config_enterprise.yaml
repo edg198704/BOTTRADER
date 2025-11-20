@@ -89,7 +89,8 @@ strategy:
     # NOTE: Replaced raw 'close' with 'log_return' for stationarity.
     # ADDED: regime_trend, regime_volatility, and regime_efficiency to give the AI context about the market state.
     # NEW: Added '1h_rsi' to leverage Multi-Timeframe context.
-    feature_columns: ['log_return', 'rsi', '1h_rsi', 'macd', 'volume', 'bb_upper', 'bb_lower', 'regime_trend', 'regime_volatility', 'regime_efficiency']
+    # NEW: Added 'time_hour_sin', 'time_hour_cos', 'pa_body_size' for advanced feature engineering.
+    feature_columns: ['log_return', 'rsi', '1h_rsi', 'macd', 'volume', 'bb_upper', 'bb_lower', 'regime_trend', 'regime_volatility', 'regime_efficiency', 'time_hour_sin', 'time_hour_cos', 'pa_body_size']
     confidence_threshold: 0.65 # Base threshold for ENTRIES
     exit_confidence_threshold: 0.55 # Base threshold for EXITS (Lower = easier to exit)
     model_path: "models/ensemble"
@@ -122,6 +123,10 @@ strategy:
       # Automatically generate lagged versions of these features to capture rate-of-change
       lag_features: ["log_return", "rsi"]
       lag_depth: 3 # Generate lag_1, lag_2, lag_3 for each feature above
+      
+      # --- Advanced Features (New) ---
+      use_time_features: true
+      use_price_action_features: true
 
     # --- Model Training Parameters ---
     training:
