@@ -40,6 +40,15 @@ def validate_config(config: BotConfig):
         try:
             rename_map = generate_indicator_rename_map(config.strategy.indicators)
             generated_columns = set(rename_map.values())
+            
+            # NEW: Add HTF columns to validation set
+            if config.strategy.secondary_timeframes:
+                htf_cols = set()
+                for tf in config.strategy.secondary_timeframes:
+                    for col in generated_columns:
+                        htf_cols.add(f"{tf}_{col}")
+                generated_columns.update(htf_cols)
+                
         except ValueError as e:
             # If map generation fails (e.g., missing alias for SMA), it's a critical config error.
             logger.critical(f"Configuration error in indicators: {e}")
