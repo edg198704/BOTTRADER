@@ -284,6 +284,11 @@ risk_management:
   use_kelly_criterion: false # Set to true to enable
   kelly_fraction: 0.5 # Use Half-Kelly for safety
 
+  # --- Liquidity Constraints (New) ---
+  # Prevents trading too large relative to market volume.
+  max_volume_participation_pct: 0.01 # Limit trade to 1% of average volume
+  volume_lookback_periods: 20 # Calculate average volume over last 20 candles
+
   regime_based_risk:
     # Override default risk parameters based on the detected market regime.
     # If a parameter is not set here, the default value above will be used.
