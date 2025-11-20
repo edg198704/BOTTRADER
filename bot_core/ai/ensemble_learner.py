@@ -422,6 +422,103 @@ class EnsembleLearner:
             logger.error(f"Rollback failed for {symbol}: {e}")
             return False
 
+    def _prepare_features(self, df: pd.DataFrame, symbol: str, leader_df: Optional[pd.DataFrame]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], List[str]]:
+        """Prepares features for inference."""
+        entry = self.symbol_models.get(symbol)
+        if not entry: return None, None, []
+        
+        meta = entry['meta']
+        df_proc = FeatureProcessor.process_data(df, self.config, leader_df=leader_df)
+        active_features = meta.get('active_feature_columns', meta.get('feature_columns'))
+        
+        if not set(active_features).issubset(set(df_proc.columns)):
+            logger.error(f"Inference failed: Missing features for {symbol}. Model expects {active_features}")
+            return None, None, []
+            
+        df_proc = df_proc[active_features]
+        X = df_proc.iloc[-1:].values
+        X = InputSanitizer.sanitize(X)
+        
+        seq_len = self.config.features.sequence_length
+        if len(df_proc) >= seq_len:
+            X_seq = df_proc.iloc[-seq_len:].values.reshape(1, seq_len, -1)
+            X_seq = InputSanitizer.sanitize(X_seq)
+        else:
+            X_seq = None
+            
+        return X, X_seq, active_features
+
+    def _get_model_votes(self, models: Dict[str, Any], X: np.ndarray, X_seq: Optional[np.ndarray], 
+                         config_weights: Any, active_weight_map: Dict[str, float]) -> Tuple[Dict[str, float], List[Tuple[float, np.ndarray]], Dict[str, Any]]:
+        """Aggregates predictions from all ensemble models."""
+        votes = {'buy': 0.0, 'sell': 0.0, 'hold': 0.0}
+        model_predictions = []
+        individual_preds = {}
+        
+        def get_weight(name, default_weight):
+            if active_weight_map:
+                return active_weight_map.get(name, 0.0)
+            return default_weight
+
+        # 1. XGBoost
+        if 'gb' in models:
+            try:
+                probs = models['gb'].predict_proba(X)[0]
+                w = get_weight('gb', config_weights.xgboost)
+                votes['sell'] += probs[0] * w
+                votes['hold'] += probs[1] * w
+                votes['buy'] += probs[2] * w
+                model_predictions.append((w, probs))
+                individual_preds['gb'] = probs
+            except Exception as e:
+                logger.warning(f"GB inference failed: {e}")
+
+        # 2. Technical Ensemble
+        if 'technical' in models:
+            try:
+                probs = models['technical'].predict_proba(X)[0]
+                w = get_weight('technical', config_weights.technical_ensemble)
+                votes['sell'] += probs[0] * w
+                votes['hold'] += probs[1] * w
+                votes['buy'] += probs[2] * w
+                model_predictions.append((w, probs))
+                individual_preds['technical'] = probs
+            except Exception as e:
+                logger.warning(f"Technical inference failed: {e}")
+
+        # 3. Deep Learning (LSTM/Attention)
+        if X_seq is not None:
+            with torch.no_grad():
+                tensor_in = torch.FloatTensor(X_seq).to(self.device)
+                
+                if 'lstm' in models:
+                    try:
+                        logits = models['lstm'](tensor_in)
+                        probs = F.softmax(logits, dim=1).cpu().numpy()[0]
+                        w = get_weight('lstm', config_weights.lstm)
+                        votes['sell'] += probs[0] * w
+                        votes['hold'] += probs[1] * w
+                        votes['buy'] += probs[2] * w
+                        model_predictions.append((w, probs))
+                        individual_preds['lstm'] = probs
+                    except Exception as e:
+                        logger.warning(f"LSTM inference failed: {e}")
+                    
+                if 'attention' in models:
+                    try:
+                        logits = models['attention'](tensor_in)
+                        probs = F.softmax(logits, dim=1).cpu().numpy()[0]
+                        w = get_weight('attention', config_weights.attention)
+                        votes['sell'] += probs[0] * w
+                        votes['hold'] += probs[1] * w
+                        votes['buy'] += probs[2] * w
+                        model_predictions.append((w, probs))
+                        individual_preds['attention'] = probs
+                    except Exception as e:
+                        logger.warning(f"Attention inference failed: {e}")
+
+        return votes, model_predictions, individual_preds
+
     def _predict_sync(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None, leader_df: Optional[pd.DataFrame] = None, custom_weights: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
         entry = self.symbol_models.get(symbol)
         if not entry:
@@ -434,17 +531,12 @@ class EnsembleLearner:
         meta_model = entry.get('meta_model')
         
         try:
-            df_proc = FeatureProcessor.process_data(df, self.config, leader_df=leader_df)
-            active_features = meta.get('active_feature_columns', meta.get('feature_columns'))
-            
-            if not set(active_features).issubset(set(df_proc.columns)):
-                logger.error(f"Inference failed: Missing features for {symbol}. Model expects {active_features}")
+            # 1. Feature Preparation
+            X, X_seq, active_features = self._prepare_features(df, symbol, leader_df)
+            if X is None:
                 return {}
-                
-            df_proc = df_proc[active_features]
-            X = df_proc.iloc[-1:].values
-            X = InputSanitizer.sanitize(X)
-            
+
+            # 2. Drift Detection
             is_anomaly = False
             anomaly_score = 0.0
             if drift_detector and self.config.drift.enabled:
@@ -455,16 +547,8 @@ class EnsembleLearner:
                 except Exception as e:
                     logger.error(f"Drift detection failed: {e}")
 
-            seq_len = self.config.features.sequence_length
-            if len(df_proc) >= seq_len:
-                X_seq = df_proc.iloc[-seq_len:].values.reshape(1, seq_len, -1)
-                X_seq = InputSanitizer.sanitize(X_seq)
-            else:
-                X_seq = None
-
-            votes = {'buy': 0.0, 'sell': 0.0, 'hold': 0.0}
+            # 3. Weight Resolution
             config_weights = self.config.ensemble_weights
-            
             optimized_weights = meta.get('optimized_weights')
             regime_weights = meta.get('regime_weights', {})
             
@@ -475,80 +559,18 @@ class EnsembleLearner:
                 active_weight_map = regime_weights[regime]
             elif config_weights.auto_tune and optimized_weights:
                 active_weight_map = optimized_weights
-            
-            def get_weight(name, default_weight):
-                if active_weight_map:
-                    return active_weight_map.get(name, 0.0)
-                return default_weight
 
-            model_predictions = []
-            individual_preds = {}
-            
-            # --- Partial Ensemble Tolerance ---
-            # If one model fails, we continue with the others.
-            
-            if 'gb' in models:
-                try:
-                    probs = models['gb'].predict_proba(X)[0]
-                    w = get_weight('gb', config_weights.xgboost)
-                    votes['sell'] += probs[0] * w
-                    votes['hold'] += probs[1] * w
-                    votes['buy'] += probs[2] * w
-                    model_predictions.append((w, probs))
-                    individual_preds['gb'] = probs
-                except Exception as e:
-                    logger.warning(f"GB inference failed for {symbol}: {e}")
-
-            if 'technical' in models:
-                try:
-                    probs = models['technical'].predict_proba(X)[0]
-                    w = get_weight('technical', config_weights.technical_ensemble)
-                    votes['sell'] += probs[0] * w
-                    votes['hold'] += probs[1] * w
-                    votes['buy'] += probs[2] * w
-                    model_predictions.append((w, probs))
-                    individual_preds['technical'] = probs
-                except Exception as e:
-                    logger.warning(f"Technical inference failed for {symbol}: {e}")
-
-            if X_seq is not None:
-                with torch.no_grad():
-                    tensor_in = torch.FloatTensor(X_seq).to(self.device)
-                    
-                    if 'lstm' in models:
-                        try:
-                            logits = models['lstm'](tensor_in)
-                            probs = F.softmax(logits, dim=1).cpu().numpy()[0]
-                            w = get_weight('lstm', config_weights.lstm)
-                            votes['sell'] += probs[0] * w
-                            votes['hold'] += probs[1] * w
-                            votes['buy'] += probs[2] * w
-                            model_predictions.append((w, probs))
-                            individual_preds['lstm'] = probs
-                        except Exception as e:
-                            logger.warning(f"LSTM inference failed for {symbol}: {e}")
-                        
-                    if 'attention' in models:
-                        try:
-                            logits = models['attention'](tensor_in)
-                            probs = F.softmax(logits, dim=1).cpu().numpy()[0]
-                            w = get_weight('attention', config_weights.attention)
-                            votes['sell'] += probs[0] * w
-                            votes['hold'] += probs[1] * w
-                            votes['buy'] += probs[2] * w
-                            model_predictions.append((w, probs))
-                            individual_preds['attention'] = probs
-                        except Exception as e:
-                            logger.warning(f"Attention inference failed for {symbol}: {e}")
+            # 4. Model Inference & Voting
+            votes, model_predictions, individual_preds = self._get_model_votes(models, X, X_seq, config_weights, active_weight_map)
 
             total_weight = sum(votes.values())
             if total_weight > 0:
                 for k in votes:
                     votes[k] /= total_weight
             else:
-                # Fallback if all models failed
                 return {'action': 'hold', 'confidence': 0.0}
 
+            # 5. Calibration
             if calibrator:
                 try:
                     raw_probs = np.array([[votes['sell'], votes['hold'], votes['buy']]])
@@ -562,6 +584,7 @@ class EnsembleLearner:
             best_action = max(votes, key=votes.get)
             confidence = votes[best_action]
 
+            # 6. Disagreement Penalty
             if model_predictions and config_weights.disagreement_penalty > 0:
                 action_map = {'sell': 0, 'hold': 1, 'buy': 2}
                 best_action_idx = action_map[best_action]
@@ -571,7 +594,7 @@ class EnsembleLearner:
                     penalty = std_dev * config_weights.disagreement_penalty
                     confidence = max(0.0, confidence - penalty)
 
-            # --- Meta-Labeling Inference ---
+            # 7. Meta-Labeling
             meta_prob = None
             if meta_model and self.config.meta_labeling.enabled and best_action != 'hold':
                 try:
@@ -589,6 +612,7 @@ class EnsembleLearner:
                 except Exception as e:
                     logger.error(f"Meta-model inference failed: {e}")
 
+            # 8. Feature Importance Extraction
             top_features = {}
             if 'gb' in models and hasattr(models['gb'], 'feature_importances_'):
                 imps = models['gb'].feature_importances_
