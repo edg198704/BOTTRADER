@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import json
 import os
+import tempfile
 from typing import Dict, Any, Optional, List, Tuple, Literal
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import Executor
@@ -32,18 +33,27 @@ class TradeSignal(BaseModel):
     strategy_name: str
     metadata: Dict[str, Any] = {}
 
-class StrategyPersistence:
-    """Helper class to handle JSON state persistence for strategies."""
+class AtomicStateWriter:
+    """Helper class to handle atomic JSON state persistence."""
     def __init__(self, path: str):
         self.path = path
 
     def save(self, state: Dict[str, Any]):
         try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            with open(self.path, 'w') as f:
-                json.dump(state, f, indent=2)
+            dir_name = os.path.dirname(self.path)
+            os.makedirs(dir_name, exist_ok=True)
+            
+            # Write to temp file first
+            with tempfile.NamedTemporaryFile('w', dir=dir_name, delete=False) as tf:
+                json.dump(state, tf, indent=2)
+                temp_name = tf.name
+            
+            # Atomic rename
+            os.replace(temp_name, self.path)
         except Exception as e:
-            logger.error("Failed to save strategy state", error=str(e))
+            logger.error("Failed to save strategy state atomically", error=str(e))
+            if 'temp_name' in locals() and os.path.exists(temp_name):
+                os.remove(temp_name)
 
     def load(self) -> Dict[str, Any]:
         if not os.path.exists(self.path):
@@ -62,35 +72,28 @@ class TradingStrategy(abc.ABC):
 
     @abc.abstractmethod
     async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[TradeSignal]:
-        """Analyzes market data and returns a TradeSignal or None."""
         pass
 
     @abc.abstractmethod
     async def retrain(self, symbol: str, df: pd.DataFrame, executor: Executor):
-        """Triggers the retraining of the strategy's underlying models."""
         pass
 
     @abc.abstractmethod
     def needs_retraining(self, symbol: str) -> bool:
-        """Checks if the strategy needs to be retrained."""
         pass
 
     @abc.abstractmethod
     def get_training_data_limit(self) -> int:
-        """Returns the number of historical candles needed for training."""
         pass
 
     @abc.abstractmethod
     def get_latest_regime(self, symbol: str) -> Optional[str]:
-        """Returns the last detected market regime for the symbol."""
         pass
 
     async def close(self):
-        """Clean up strategy resources."""
         pass
 
     async def warmup(self, symbols: List[str]):
-        """Optional warmup hook."""
         pass
 
 class SimpleMACrossoverStrategy(TradingStrategy):
@@ -114,9 +117,7 @@ class SimpleMACrossoverStrategy(TradingStrategy):
         is_bullish_cross = last_row[self.fast_ma_col] > last_row[self.slow_ma_col] and prev_row[self.fast_ma_col] <= prev_row[self.slow_ma_col]
         is_bearish_cross = last_row[self.fast_ma_col] < last_row[self.slow_ma_col] and prev_row[self.fast_ma_col] >= prev_row[self.slow_ma_col]
 
-        signal = None
         action = None
-
         if position:
             if position.side == 'BUY' and is_bearish_cross:
                 action = 'SELL'
@@ -169,7 +170,7 @@ class AIEnsembleStrategy(TradingStrategy):
         self.individual_model_logs: Dict[str, List[Tuple[datetime, Dict[str, Any]]]] = {}
         self.model_performance_stats: Dict[str, Dict[str, deque]] = {}
         
-        self.persistence = StrategyPersistence(os.path.join(self.ai_config.model_path, "strategy_state.json"))
+        self.persistence = AtomicStateWriter(os.path.join(self.ai_config.model_path, "strategy_state.json"))
 
         try:
             self.ensemble_learner = EnsembleLearner(self.ai_config)
@@ -189,15 +190,16 @@ class AIEnsembleStrategy(TradingStrategy):
         await self.ensemble_learner.warmup_models(symbols)
 
     def _save_state(self):
+        # Convert deques and numpy types to standard python types for JSON serialization
         state = {
             'last_retrained_at': {k: v.isoformat() for k, v in self.last_retrained_at.items()},
             'last_signal_time': {k: v.isoformat() for k, v in self.last_signal_time.items()},
             'force_retrain_flags': self.force_retrain_flags,
             'drift_counters': self.drift_counters,
             'accuracy_history': {k: list(v) for k, v in self.accuracy_history.items()},
-            'prediction_logs': {k: [(ts.isoformat(), p) for ts, p in v] for k, v in self.prediction_logs.items()},
+            'prediction_logs': {k: [(ts.isoformat(), int(p)) for ts, p in v] for k, v in self.prediction_logs.items()},
             'individual_model_logs': {
-                k: [(ts.isoformat(), {m: p.tolist() if isinstance(p, np.ndarray) else p for m, p in preds.items()}) 
+                k: [(ts.isoformat(), {m: p.tolist() if isinstance(p, np.ndarray) else float(p) for m, p in preds.items()}) 
                     for ts, preds in v[-50:]] 
                 for k, v in self.individual_model_logs.items()
             },
@@ -246,7 +248,7 @@ class AIEnsembleStrategy(TradingStrategy):
         last_sig = self.last_signal_time.get(symbol)
         if not last_sig:
             return False
-        seconds_per_candle = 300 
+        seconds_per_candle = 300 # Assuming 5m candles, ideally fetch from config
         cooldown_seconds = self.ai_config.signal_cooldown_candles * seconds_per_candle
         time_since = Clock.now() - last_sig
         return time_since.total_seconds() < cooldown_seconds
@@ -361,18 +363,19 @@ class AIEnsembleStrategy(TradingStrategy):
         if confidence < required_threshold:
             return None
 
+        # Ensure metadata is JSON serializable
         strategy_metadata = {
             'model_version': prediction.get('model_version'),
-            'confidence': confidence,
-            'effective_threshold': required_threshold,
+            'confidence': float(confidence),
+            'effective_threshold': float(required_threshold),
             'regime': regime,
-            'regime_confidence': regime_result.get('confidence'),
+            'regime_confidence': float(regime_result.get('confidence', 0.0)),
             'model_type': prediction.get('model_type'),
-            'active_weights': prediction.get('active_weights'),
-            'top_features': prediction.get('top_features'),
+            'active_weights': {k: float(v) for k, v in prediction.get('active_weights', {}).items()},
+            'top_features': {k: float(v) for k, v in prediction.get('top_features', {}).items()},
             'metrics': prediction.get('metrics'),
             'is_anomaly': is_anomaly,
-            'optimized_threshold': prediction.get('optimized_threshold')
+            'optimized_threshold': float(prediction.get('optimized_threshold')) if prediction.get('optimized_threshold') else None
         }
 
         final_action = None
