@@ -26,7 +26,7 @@ try:
     from sklearn.ensemble import VotingClassifier, RandomForestClassifier, IsolationForest
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import precision_score, classification_report, log_loss
-    from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
+    from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit, cross_val_predict
     from sklearn.utils.class_weight import compute_class_weight, compute_sample_weight
     from sklearn.isotonic import IsotonicRegression
     from xgboost import XGBClassifier
@@ -52,6 +52,7 @@ except ImportError:
     def minimize(*args, **kwargs): return None
     def skew(*args, **kwargs): return 0.0
     def kurtosis(*args, **kwargs): return 0.0
+    def cross_val_predict(*args, **kwargs): return []
     class norm: 
         @staticmethod
         def cdf(x): return 0.5
@@ -360,6 +361,11 @@ def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyP
         drift_path = os.path.join(load_dir, "drift_detector.joblib")
         if os.path.exists(drift_path):
             drift_detector = joblib.load(drift_path)
+            
+        meta_model = None
+        meta_path = os.path.join(load_dir, "meta_model.joblib")
+        if os.path.exists(meta_path):
+            meta_model = joblib.load(meta_path)
 
         if 'lstm' in config.ensemble_weights.dict():
             path = os.path.join(load_dir, "lstm.pth")
@@ -386,6 +392,7 @@ def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyP
             'models': models,
             'calibrator': calibrator,
             'drift_detector': drift_detector,
+            'meta_model': meta_model,
             'meta': meta
         }
     except Exception:
@@ -427,7 +434,8 @@ def _evaluate_ensemble(models: Dict[str, Any],
                        market_returns: np.ndarray, 
                        weights_override: Optional[Dict[str, float]] = None,
                        calibrator: Optional[MulticlassCalibrator] = None,
-                       threshold_override: Optional[float] = None) -> Dict[str, Any]:
+                       threshold_override: Optional[float] = None,
+                       meta_model: Optional[Any] = None) -> Dict[str, Any]:
     
     seq_len = config.features.sequence_length
     num_samples = len(y)
@@ -483,6 +491,27 @@ def _evaluate_ensemble(models: Dict[str, Any],
     signals[eval_probs[:, 2] > threshold] = 1
     signals[eval_probs[:, 0] > threshold] = -1
     
+    # --- Meta-Labeling Filter ---
+    if meta_model and config.meta_labeling.enabled:
+        # Prepare Meta Features: X + (Optional) Confidence
+        X_eval = X[valid_nn_indices]
+        if config.meta_labeling.use_primary_confidence_feature:
+            # Max probability as confidence proxy
+            confidences = np.max(eval_probs, axis=1).reshape(-1, 1)
+            X_meta = np.hstack([X_eval, confidences])
+        else:
+            X_meta = X_eval
+            
+        meta_probs = meta_model.predict_proba(X_meta)[:, 1] # Prob of success (Class 1)
+        
+        # Filter trades where meta-prob is too low
+        # We only filter active signals (1 or -1)
+        active_mask = (signals != 0)
+        low_prob_mask = (meta_probs < config.meta_labeling.probability_threshold)
+        
+        # Set signal to 0 (Hold) if meta model is not confident
+        signals[active_mask & low_prob_mask] = 0
+
     eval_returns = market_returns[valid_nn_indices]
     
     if len(eval_returns) != len(signals):
@@ -596,6 +625,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             champion_weights = champion_data['meta'].get('optimized_weights')
             champion_calibrator = champion_data.get('calibrator')
             champion_threshold = champion_data['meta'].get('optimized_threshold')
+            champion_meta_model = champion_data.get('meta_model')
             champ_features = champion_data['meta'].get('active_feature_columns', champion_data['meta'].get('feature_columns'))
             
             try:
@@ -608,7 +638,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                     champion_metrics = _evaluate_ensemble(
                         champion_models, X_champ_test, y_test, X_champ_seq_test, y_champ_seq_test, 
                         config, device, returns_test, weights_override=champion_weights, 
-                        calibrator=champion_calibrator, threshold_override=champion_threshold
+                        calibrator=champion_calibrator, threshold_override=champion_threshold,
+                        meta_model=champion_meta_model
                     )
                     worker_logger.info(f"Champion Metrics: PF={champion_metrics.get('profit_factor', 0):.2f}, Sharpe={champion_metrics.get('sharpe', 0):.4f}, PSR={champion_metrics.get('psr', 0):.4f}")
             except Exception as e:
@@ -663,6 +694,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         calibrator = None
         optimized_threshold = None
         regime_thresholds = {}
+        ensemble_probs_oos = None
+        y_oos = None
         
         if use_cv and oos_indices:
             try:
@@ -746,6 +779,60 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 'gb': cw.xgboost, 'technical': cw.technical_ensemble,
                 'lstm': cw.lstm, 'attention': cw.attention
             }
+
+        # --- META-LABELING TRAINING ---
+        meta_model = None
+        if config.meta_labeling.enabled and ensemble_probs_oos is not None and y_oos is not None:
+            try:
+                worker_logger.info("Training Meta-Model for Trade Filtering...")
+                # 1. Define Meta-Target: 1 if trade would be profitable, 0 otherwise
+                # We use the OOS returns to determine this.
+                # If Primary says BUY (Class 2) and Return > 0 -> Meta 1
+                # If Primary says SELL (Class 0) and Return < 0 -> Meta 1
+                # Else Meta 0
+                
+                # Get primary predictions based on optimized threshold
+                thresh = optimized_threshold if optimized_threshold else 0.5
+                primary_signals = np.zeros(len(y_oos))
+                primary_signals[ensemble_probs_oos[:, 2] > thresh] = 1 # Buy
+                primary_signals[ensemble_probs_oos[:, 0] > thresh] = -1 # Sell
+                
+                # Calculate trade outcomes
+                trade_returns = primary_signals * returns_oos
+                
+                # Meta Target: 1 if profitable trade, 0 if loss or no trade
+                # We only care about filtering the *active* signals.
+                active_mask = (primary_signals != 0)
+                
+                if np.sum(active_mask) > 50: # Only train if we have enough signals
+                    y_meta = (trade_returns > 0).astype(int)
+                    y_meta = y_meta[active_mask]
+                    
+                    # 2. Prepare Meta-Features
+                    # X_meta = Original Features + (Optional) Primary Confidence
+                    X_oos_aligned = X_dev[combined_indices]
+                    X_meta_train = X_oos_aligned[active_mask]
+                    
+                    if config.meta_labeling.use_primary_confidence_feature:
+                        # Use the max probability as a confidence proxy
+                        confidences = np.max(ensemble_probs_oos[active_mask], axis=1).reshape(-1, 1)
+                        X_meta_train = np.hstack([X_meta_train, confidences])
+                    
+                    # 3. Train Meta-Model
+                    meta_clf = RandomForestClassifier(
+                        n_estimators=config.meta_labeling.n_estimators,
+                        max_depth=config.meta_labeling.max_depth,
+                        class_weight='balanced',
+                        random_state=42
+                    )
+                    meta_clf.fit(X_meta_train, y_meta)
+                    meta_model = meta_clf
+                    worker_logger.info("Meta-Model trained successfully.")
+                else:
+                    worker_logger.warning("Insufficient active signals for Meta-Model training.")
+
+            except Exception as e:
+                worker_logger.error(f"Meta-Model training failed: {e}", exc_info=True)
 
         # --- FINAL TRAINING (Full Dev Set) ---
         worker_logger.info("Training final models on full development set...")
@@ -841,7 +928,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         challenger_metrics = _evaluate_ensemble(
             trained_models, X_test, y_test, X_seq_test, y_seq_test, 
             config, device, returns_test, weights_override=optimized_weights, 
-            calibrator=calibrator, threshold_override=optimized_threshold
+            calibrator=calibrator, threshold_override=optimized_threshold,
+            meta_model=meta_model
         )
         
         pf = challenger_metrics.get('profit_factor', 0)
@@ -904,6 +992,9 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             
             if drift_detector:
                 joblib.dump(drift_detector, os.path.join(temp_dir, "drift_detector.joblib"))
+                
+            if meta_model:
+                joblib.dump(meta_model, os.path.join(temp_dir, "meta_model.joblib"))
 
             meta = {
                 'timestamp': datetime.now().isoformat(),
@@ -1042,6 +1133,7 @@ class EnsembleLearner:
         meta = entry['meta']
         calibrator = entry.get('calibrator')
         drift_detector = entry.get('drift_detector')
+        meta_model = entry.get('meta_model')
         
         df_proc = FeatureProcessor.process_data(df, self.config, leader_df=leader_df)
         active_features = meta.get('active_feature_columns', meta.get('feature_columns'))
@@ -1163,6 +1255,27 @@ class EnsembleLearner:
                 penalty = std_dev * config_weights.disagreement_penalty
                 confidence = max(0.0, confidence - penalty)
 
+        # --- Meta-Labeling Inference ---
+        meta_prob = None
+        if meta_model and self.config.meta_labeling.enabled and best_action != 'hold':
+            try:
+                X_meta = X
+                if self.config.meta_labeling.use_primary_confidence_feature:
+                    # Append confidence score to features
+                    # Note: We use the raw confidence before penalty for consistency with training
+                    raw_conf = votes[best_action]
+                    X_meta = np.hstack([X, np.array([[raw_conf]])])
+                
+                meta_probs = meta_model.predict_proba(X_meta)[0]
+                meta_prob = meta_probs[1] # Probability of success (Class 1)
+                
+                if meta_prob < self.config.meta_labeling.probability_threshold:
+                    # Meta model says this trade is low probability -> Filter it
+                    best_action = 'hold'
+                    confidence = 0.0 # Nullify confidence
+            except Exception as e:
+                logger.error(f"Meta-model inference failed: {e}")
+
         top_features = {}
         if 'gb' in models and hasattr(models['gb'], 'feature_importances_'):
             imps = models['gb'].feature_importances_
@@ -1190,7 +1303,8 @@ class EnsembleLearner:
             'is_anomaly': is_anomaly,
             'anomaly_score': float(anomaly_score),
             'optimized_threshold': optimized_threshold,
-            'individual_predictions': individual_preds
+            'individual_predictions': individual_preds,
+            'meta_probability': float(meta_prob) if meta_prob is not None else None
         }
 
     async def predict(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None, leader_df: Optional[pd.DataFrame] = None, custom_weights: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
