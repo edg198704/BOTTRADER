@@ -180,8 +180,16 @@ async def main():
     # --- Setup shared state and graceful shutdown ---
     shared_bot_state['stop_bot_callback'] = bot.stop
     loop = asyncio.get_running_loop()
+    
+    # Create a future to signal shutdown
+    stop_event = asyncio.Event()
+
+    def signal_handler():
+        logger.info("Signal received, initiating shutdown...")
+        stop_event.set()
+
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(bot.stop()))
+        loop.add_signal_handler(sig, signal_handler)
 
     # --- Initialize and run components ---
     # 1. Initialize PositionManager (loads PnL and ensures PortfolioState exists)
@@ -199,15 +207,31 @@ async def main():
         logger.info("Telegram alert handler registered.")
 
     try:
+        # Run both the trading bot and the telegram bot concurrently
         bot_task = asyncio.create_task(bot.run())
         telegram_task = asyncio.create_task(telegram_bot.run())
-        await asyncio.gather(bot_task, telegram_task)
+        
+        # Wait until a stop signal is received
+        await stop_event.wait()
+        
+        # Initiate graceful shutdown
+        logger.info("Stop event received. Stopping services...")
+        await bot.stop()
+        await telegram_bot.stop()
+        
+        # Wait for tasks to finish
+        await asyncio.gather(bot_task, telegram_task, return_exceptions=True)
+        
     except asyncio.CancelledError:
         logger.info("Main task cancelled.")
+    except Exception as e:
+        logger.critical("Unexpected error in main loop", error=str(e), exc_info=True)
     finally:
         logger.info("Shutting down all components.")
+        # Ensure stop is called if we exit due to exception
+        if bot.running:
+            await bot.stop()
         await telegram_bot.stop()
-        # The bot.stop() is already called by the signal handler
 
 def get_exchange_api(config: BotConfig) -> ExchangeAPI:
     if config.exchange.name == "MockExchange":
