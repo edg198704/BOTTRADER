@@ -1,4 +1,4 @@
-from typing import List, Optional, Any, Dict, TYPE_CHECKING
+from typing import List, Optional, Any, Dict, TYPE_CHECKING, Tuple
 import pandas as pd
 from datetime import datetime, timedelta
 
@@ -25,20 +25,17 @@ class RiskManager:
         self.daily_loss_halted = False
         self.initial_capital = None 
         self.peak_portfolio_value = None
-        self.current_drawdown = 0.0 # Track current drawdown state
+        self.current_drawdown = 0.0
         
-        # Flags for emergency liquidation
         self.liquidation_needed = False
         self.liquidation_triggered = False
         
-        # Symbol-Specific Risk Tracking
         self.symbol_consecutive_losses: Dict[str, int] = {}
         self.symbol_cooldowns: Dict[str, datetime] = {}
         
         logger.info("RiskManager initialized.")
 
     async def initialize(self):
-        """Loads the initial capital and peak portfolio value from the persistent store."""
         state = await self.position_manager.get_portfolio_state()
         if state:
             self.initial_capital = state['initial_capital']
@@ -51,11 +48,9 @@ class RiskManager:
 
     @property
     def is_halted(self) -> bool:
-        """Returns True if any risk halt condition is met."""
         return self.circuit_breaker_halted or self.daily_loss_halted
 
     def update_trade_outcome(self, symbol: str, pnl: float):
-        """Updates consecutive loss counters based on realized PnL."""
         if pnl < 0:
             self.symbol_consecutive_losses[symbol] = self.symbol_consecutive_losses.get(symbol, 0) + 1
             logger.info(f"Recorded loss for {symbol}. Consecutive: {self.symbol_consecutive_losses[symbol]}")
@@ -80,19 +75,15 @@ class RiskManager:
                 logger.info(f"Recorded win for {symbol}. Consecutive losses reset.")
 
     async def update_portfolio_risk(self, portfolio_value: float, daily_realized_pnl: float):
-        # Initialize on first run if DB was empty or initialize wasn't called
         if self.peak_portfolio_value is None:
             self.peak_portfolio_value = portfolio_value
         if self.initial_capital is None:
             self.initial_capital = portfolio_value
 
-        # 1. Check Circuit Breaker based on drawdown from High Water Mark
         if portfolio_value > self.peak_portfolio_value:
             self.peak_portfolio_value = portfolio_value
-            # Persist the new high water mark
             await self.position_manager.update_portfolio_high_water_mark(portfolio_value)
 
-        # Calculate Drawdown (Negative Float, e.g., -0.05)
         self.current_drawdown = (portfolio_value - self.peak_portfolio_value) / self.peak_portfolio_value if self.peak_portfolio_value > 0 else 0.0
 
         if self.current_drawdown < self.config.circuit_breaker_threshold:
@@ -109,7 +100,6 @@ class RiskManager:
                 if self.alert_system:
                     await self.alert_system.send_alert(level='critical', message=message, details=details)
                 
-                # Trigger Liquidation if configured
                 if self.config.close_positions_on_halt and not self.liquidation_triggered:
                     self.liquidation_needed = True
                     self.liquidation_triggered = True
@@ -117,13 +107,10 @@ class RiskManager:
 
         else:
             if self.circuit_breaker_halted:
-                # Note: A manual resume process is safer. This is a simple auto-resume for now.
                 self.circuit_breaker_halted = False
-                self.liquidation_triggered = False # Reset trigger so it can fire again if needed
+                self.liquidation_triggered = False
                 logger.info("Trading resumed as portfolio recovered from drawdown.")
 
-        # 2. Check Max Daily Loss
-        # Note: daily_realized_pnl will be negative for a loss.
         if self.config.max_daily_loss_usd > 0 and daily_realized_pnl < -self.config.max_daily_loss_usd:
             if not self.daily_loss_halted:
                 self.daily_loss_halted = True
@@ -136,23 +123,81 @@ class RiskManager:
                 if self.alert_system:
                     await self.alert_system.send_alert(level='critical', message=message, details=details)
                 
-                # Trigger Liquidation if configured
                 if self.config.close_positions_on_halt and not self.liquidation_triggered:
                     self.liquidation_needed = True
                     self.liquidation_triggered = True
                     logger.warning("Emergency liquidation triggered by Max Daily Loss.")
 
     def _get_regime_param(self, param_name: str, regime: Optional[str]) -> Any:
-        """Gets a risk parameter, using a regime-specific value if available, otherwise the default."""
         default_value = getattr(self.config, param_name)
         if regime and hasattr(self.config.regime_based_risk, regime):
             regime_config = getattr(self.config.regime_based_risk, regime)
             if hasattr(regime_config, param_name):
                 override_value = getattr(regime_config, param_name)
                 if override_value is not None:
-                    logger.debug(f"Using regime-based risk parameter.", parameter=param_name, regime=regime, value=override_value)
                     return override_value
         return default_value
+
+    def calculate_dynamic_trailing_stop(self, pos: Position, current_price: float, atr: Optional[float], market_regime: Optional[str]) -> Tuple[Optional[float], Optional[float], bool]:
+        """
+        Calculates the new stop loss and reference price based on the current market regime.
+        Returns (new_stop_price, new_ref_price, activated_flag) or (None, None, False) if no update needed.
+        """
+        # 1. Determine Activation
+        activated = pos.trailing_stop_active
+        if not activated:
+            activation_pct = self._get_regime_param('trailing_stop_activation_pct', market_regime)
+            if pos.side == 'BUY':
+                activation_price = pos.entry_price * (1 + activation_pct)
+                if current_price >= activation_price:
+                    activated = True
+            elif pos.side == 'SELL':
+                activation_price = pos.entry_price * (1 - activation_pct)
+                if current_price <= activation_price:
+                    activated = True
+        
+        # Update Reference Price (High Water Mark)
+        new_ref_price = pos.trailing_ref_price
+        if pos.side == 'BUY':
+            new_ref_price = max(pos.trailing_ref_price, current_price)
+        else:
+            new_ref_price = min(pos.trailing_ref_price, current_price)
+
+        if not activated:
+            # If not active yet, we just update the ref price if it improved
+            if new_ref_price != pos.trailing_ref_price:
+                return None, new_ref_price, False
+            return None, None, False
+
+        # 2. Calculate Trailing Distance (Regime Aware)
+        use_atr = self._get_regime_param('use_atr_for_trailing', market_regime)
+        
+        trailing_dist = 0.0
+        if use_atr and atr is not None and atr > 0:
+            multiplier = self._get_regime_param('atr_trailing_multiplier', market_regime)
+            trailing_dist = atr * multiplier
+        else:
+            pct = self._get_regime_param('trailing_stop_pct', market_regime)
+            trailing_dist = new_ref_price * pct
+
+        # 3. Calculate New Stop
+        new_stop_price = pos.stop_loss_price
+        if pos.side == 'BUY':
+            potential_stop = new_ref_price - trailing_dist
+            # Only move UP
+            if potential_stop > pos.stop_loss_price:
+                new_stop_price = potential_stop
+        else:
+            potential_stop = new_ref_price + trailing_dist
+            # Only move DOWN
+            if potential_stop < pos.stop_loss_price:
+                new_stop_price = potential_stop
+        
+        # Return update if changed
+        if new_stop_price != pos.stop_loss_price or new_ref_price != pos.trailing_ref_price or activated != pos.trailing_stop_active:
+            return new_stop_price, new_ref_price, activated
+        
+        return None, None, False
 
     def calculate_position_size(self, 
                                 symbol: str, 
@@ -164,7 +209,6 @@ class RiskManager:
                                 confidence: Optional[float] = None,
                                 confidence_threshold: Optional[float] = None,
                                 model_metrics: Optional[Dict[str, Any]] = None) -> float:
-        """Calculates position size in asset quantity based on risk, correlation, confidence, liquidity, and optionally Kelly Criterion."""
         if entry_price <= 0 or stop_loss_price <= 0:
             logger.warning("Cannot calculate position size with zero or negative prices.", entry=entry_price, sl=stop_loss_price)
             return 0.0
@@ -174,43 +218,25 @@ class RiskManager:
             logger.warning("Risk per unit is zero, cannot calculate position size. Check stop-loss logic.")
             return 0.0
 
-        # --- Base Risk Calculation ---
-        # Fetch base risk, potentially optimized by StrategyOptimizer
         base_risk_pct = self._get_regime_param('risk_per_trade_pct', market_regime)
-        
-        # Safety floor to prevent 0% risk unless explicitly halted
         base_risk_pct = max(0.001, base_risk_pct)
         
-        # --- Kelly Criterion Logic (Validation-Based) ---
-        # Note: This uses Model Validation metrics. The Optimizer uses Realized metrics to tune base_risk_pct.
         kelly_risk_pct = None
         if self.config.use_kelly_criterion and model_metrics:
-            # Extract metrics from the model's validation performance
-            # Note: 'ensemble' key is used in ensemble_learner.py
             ensemble_metrics = model_metrics.get('ensemble', model_metrics)
-            
             win_rate = ensemble_metrics.get('win_rate')
             profit_factor = ensemble_metrics.get('profit_factor')
             
             if win_rate is not None and profit_factor is not None and win_rate > 0:
-                # Calculate Win/Loss Ratio (R) from Profit Factor
-                # PF = (WinRate * AvgWin) / ((1-WinRate) * AvgLoss)
-                # R = AvgWin/AvgLoss = PF * (1-WinRate) / WinRate
                 if win_rate < 1.0:
                     r_ratio = profit_factor * (1.0 - win_rate) / win_rate
                 else:
-                    r_ratio = 999.0 # Infinite R if 100% win rate
+                    r_ratio = 999.0
                 
                 if r_ratio > 0:
-                    # Kelly Formula: f* = W - (1-W)/R
                     raw_kelly = win_rate - (1.0 - win_rate) / r_ratio
-                    
-                    # Apply Fraction (Safety)
                     kelly_risk_pct = raw_kelly * self.config.kelly_fraction
-                    
-                    # Ensure non-negative
                     kelly_risk_pct = max(0.0, kelly_risk_pct)
-                    
                     logger.info("Kelly Criterion calculated (Validation)", 
                                 symbol=symbol, 
                                 win_rate=win_rate, 
@@ -218,19 +244,13 @@ class RiskManager:
                                 raw_kelly=raw_kelly, 
                                 final_kelly_risk=kelly_risk_pct)
         
-        # Determine starting risk percentage
         if kelly_risk_pct is not None:
-            # Use Kelly, but cap it at a hard safety limit (e.g. 5x base risk or a fixed 5%)
-            # Here we use a hard cap of 0.05 (5%) or the user's base risk, whichever is higher, to allow scaling up
-            # but preventing catastrophic bets.
             safety_cap = max(0.05, base_risk_pct * 5.0)
             risk_pct = min(kelly_risk_pct, safety_cap)
             logger.info("Using Kelly-based risk", symbol=symbol, kelly=kelly_risk_pct, capped=risk_pct)
         else:
             risk_pct = base_risk_pct
 
-        # --- Drawdown Scaling ---
-        # Reduce risk as drawdown increases to preserve capital.
         drawdown_scaling = max(0.2, 1.0 + self.current_drawdown)
         adjusted_risk_pct = risk_pct * drawdown_scaling
         
@@ -240,14 +260,13 @@ class RiskManager:
                         original_risk=risk_pct, 
                         adjusted_risk=adjusted_risk_pct)
 
-        # --- Correlation Scaling ---
         correlation_scaling = 1.0
         if self.config.correlation.enabled:
             max_corr = 0.0
             correlated_symbol = None
             for pos in open_positions:
                 if pos.symbol == symbol:
-                    continue # Should not happen for new trades, but safe check
+                    continue
                 
                 corr = self.data_handler.get_correlation(symbol, pos.symbol, self.config.correlation.lookback_periods)
                 if corr > max_corr:
@@ -262,8 +281,6 @@ class RiskManager:
                             correlation=f"{max_corr:.2f}", 
                             penalty=correlation_scaling)
 
-        # --- Confidence Scaling ---
-        # Only apply confidence scaling if we are NOT using Kelly (Kelly already accounts for edge)
         confidence_scaling = 1.0
         if kelly_risk_pct is None and (self.config.confidence_scaling_factor > 0 and 
             confidence is not None and 
@@ -271,36 +288,25 @@ class RiskManager:
             confidence > confidence_threshold):
             
             surplus = confidence - confidence_threshold
-            # e.g., surplus 0.10 (75% vs 65%), factor 5.0 -> +0.5 -> 1.5x risk
             raw_scaling = 1.0 + (surplus * self.config.confidence_scaling_factor)
             confidence_scaling = min(raw_scaling, self.config.max_confidence_risk_multiplier)
             
             logger.info("Risk scaled by confidence", symbol=symbol, confidence=confidence, scaling=confidence_scaling)
 
-        # Apply all scalings
         final_risk_pct = adjusted_risk_pct * correlation_scaling * confidence_scaling
-
         risk_amount_usd = portfolio_equity * final_risk_pct
         
-        # --- Portfolio Risk Cap (New) ---
-        # Ensures total open risk does not exceed max_portfolio_risk_pct
         if self.config.max_portfolio_risk_pct > 0:
             current_portfolio_risk = 0.0
             for pos in open_positions:
-                # Only count confirmed OPEN positions with valid SL
-                # We check against PositionStatus.OPEN (or string 'OPEN' if enum comparison fails)
                 if pos.status == PositionStatus.OPEN and pos.stop_loss_price is not None and pos.quantity > 0:
-                    # Calculate risk for this position: Capital at Risk = abs(Entry - SL) * Qty
-                    # If SL is better than Entry (Locked Profit), we consider risk to be 0 for portfolio heat.
-                    
                     p_risk = 0.0
                     if pos.side == 'BUY':
                         if pos.stop_loss_price < pos.entry_price:
                             p_risk = (pos.entry_price - pos.stop_loss_price) * pos.quantity
-                    else: # SELL
+                    else:
                         if pos.stop_loss_price > pos.entry_price:
                             p_risk = (pos.stop_loss_price - pos.entry_price) * pos.quantity
-                    
                     current_portfolio_risk += p_risk
             
             max_allowed_portfolio_risk = portfolio_equity * self.config.max_portfolio_risk_pct
@@ -316,32 +322,20 @@ class RiskManager:
 
         quantity = risk_amount_usd / risk_per_unit
         
-        # --- Dynamic Position Sizing Cap ---
-        # Calculate the max allowed size based on the percentage of the portfolio
         max_quantity_by_pct = (portfolio_equity * self.config.max_position_size_portfolio_pct) / entry_price
-        
-        # Calculate the max allowed size based on the fixed USD cap
         max_quantity_by_usd_cap = self.config.max_position_size_usd / entry_price
 
-        # --- Liquidity Constraint (New) ---
-        # Calculate max allowed size based on recent market volume
         liquidity_cap_quantity = float('inf')
         if self.config.max_volume_participation_pct > 0:
             df = self.data_handler.get_market_data(symbol)
             if df is not None and not df.empty and 'volume' in df.columns:
-                # Calculate Average Volume over lookback
                 lookback = self.config.volume_lookback_periods
-                # Use tail to get recent data
                 recent_vol = df['volume'].iloc[-lookback:]
                 avg_vol = recent_vol.mean()
-                
                 if avg_vol > 0:
                     liquidity_cap_quantity = avg_vol * self.config.max_volume_participation_pct
                     logger.debug("Liquidity cap calculated", symbol=symbol, avg_vol=avg_vol, cap=liquidity_cap_quantity)
-                else:
-                    logger.warning("Average volume is zero, skipping liquidity cap.", symbol=symbol)
         
-        # The final cap is the stricter of all constraints
         final_quantity = min(quantity, max_quantity_by_pct, max_quantity_by_usd_cap, liquidity_cap_quantity)
 
         if final_quantity < quantity:
@@ -364,13 +358,11 @@ class RiskManager:
             logger.warning(f"Trade rejected: Trading is halted by {reason}.", symbol=symbol)
             return False
         
-        # Check Symbol Cooldown
         if symbol in self.symbol_cooldowns:
             if Clock.now() < self.symbol_cooldowns[symbol]:
                 logger.warning(f"Trade rejected: {symbol} is in cooldown until {self.symbol_cooldowns[symbol]}")
                 return False
             else:
-                # Cooldown expired
                 del self.symbol_cooldowns[symbol]
                 self.symbol_consecutive_losses[symbol] = 0
                 logger.info(f"Cooldown expired for {symbol}. Resuming trading.")
@@ -382,38 +374,27 @@ class RiskManager:
         return True
 
     def calculate_stop_loss(self, side: str, entry_price: float, df_with_indicators: pd.DataFrame, market_regime: Optional[str] = None) -> float:
-        """
-        Calculates the stop loss price based on the configured method (ATR or SWING).
-        """
-        # 1. Determine ATR (used for both ATR-based SL and Swing Buffer)
         atr_col = self.config.atr_column_name
         atr = 0.0
         if atr_col in df_with_indicators.columns and not df_with_indicators[atr_col].empty:
             atr = df_with_indicators[atr_col].iloc[-1]
         
-        # 2. Swing-Based Stop Loss
         if self.config.stop_loss_type == 'SWING':
             lookback = self.config.swing_lookback
-            # Ensure we have enough data (lookback + 1 for safety)
             if len(df_with_indicators) >= lookback:
-                # We look at the last 'lookback' closed candles.
-                # df_with_indicators typically includes the latest closed candle at -1.
                 window = df_with_indicators.iloc[-lookback:]
-                
                 buffer = atr * self.config.swing_buffer_atr_multiplier
                 
                 if side == 'BUY':
                     swing_low = window['low'].min()
                     sl_price = swing_low - buffer
-                    # Safety: SL must be below entry
                     if sl_price >= entry_price:
                         logger.warning("Swing Low SL is above entry, falling back to ATR.", swing=sl_price, entry=entry_price)
                     else:
                         return sl_price
-                else: # SELL
+                else:
                     swing_high = window['high'].max()
                     sl_price = swing_high + buffer
-                    # Safety: SL must be above entry
                     if sl_price <= entry_price:
                         logger.warning("Swing High SL is below entry, falling back to ATR.", swing=sl_price, entry=entry_price)
                     else:
@@ -421,18 +402,16 @@ class RiskManager:
             else:
                 logger.warning("Insufficient data for Swing SL, falling back to ATR.", available=len(df_with_indicators), required=lookback)
 
-        # 3. ATR-Based Stop Loss (Default / Fallback)
         atr_multiplier = self._get_regime_param('atr_stop_multiplier', market_regime)
 
         if atr > 0:
             stop_loss_offset = atr * atr_multiplier
         else:
-            # Final fallback if ATR is missing
             stop_loss_offset = entry_price * self.config.stop_loss_fallback_pct
 
         if side == 'BUY':
             return entry_price - stop_loss_offset
-        else: # SELL
+        else:
             return entry_price + stop_loss_offset
 
     def calculate_take_profit(self, 
@@ -445,7 +424,6 @@ class RiskManager:
         risk_per_unit = abs(entry_price - stop_loss_price)
         base_rr_ratio = self._get_regime_param('reward_to_risk_ratio', market_regime)
         
-        # Confidence Scaling for Reward
         rr_multiplier = 1.0
         if (self.config.confidence_rr_scaling_factor > 0 and 
             confidence is not None and 
@@ -453,7 +431,6 @@ class RiskManager:
             confidence > confidence_threshold):
             
             surplus = confidence - confidence_threshold
-            # e.g. surplus 0.1, factor 5.0 -> +0.5 -> 1.5x RR
             raw_scaling = 1.0 + (surplus * self.config.confidence_rr_scaling_factor)
             rr_multiplier = min(raw_scaling, self.config.max_confidence_rr_multiplier)
             
@@ -467,19 +444,16 @@ class RiskManager:
 
         if side == 'BUY':
             return entry_price + profit_target
-        else: # SELL
+        else:
             return entry_price - profit_target
 
     def check_time_based_exit(self, position: Position, current_price: float) -> bool:
-        """Checks if a position has been open too long without sufficient profit."""
         cfg = self.config.time_based_exit
         if not cfg.enabled: return False
         
-        # Use Clock.now() for time abstraction
         now = Clock.now()
         duration = now - position.open_timestamp
         if duration.total_seconds() > (cfg.max_hold_time_hours * 3600):
-            # Calculate PnL %
             pnl_pct = (current_price - position.entry_price) / position.entry_price
             if position.side == 'SELL':
                 pnl_pct = -pnl_pct
