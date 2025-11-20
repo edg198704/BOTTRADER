@@ -77,6 +77,7 @@ class AITrainingConfig(BaseModel):
     learning_rate: float = 0.001
     early_stopping_patience: int = 5
     validation_split: float = Field(0.15, ge=0.0, lt=1.0)
+    cv_splits: int = 5 # Number of folds for Walk-Forward Validation
     min_precision_threshold: float = Field(0.5, ge=0.0, le=1.0)
     # --- Profitability Gates ---
     min_profit_factor: float = 1.05 # Require positive expectancy (Gross Profit / Gross Loss)
@@ -286,7 +287,6 @@ class OptimizerConfig(BaseModel):
     adjustment_step: float = 0.02
     max_threshold_cap: float = 0.90
     min_threshold_floor: float = 0.55
-    state_file_path: str = "optimizer_state.json"
 
 # --- Top-Level Bot Config ---
 
