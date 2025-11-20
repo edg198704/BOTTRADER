@@ -135,7 +135,7 @@ class RiskManager:
                                 confidence: Optional[float] = None,
                                 confidence_threshold: Optional[float] = None,
                                 model_metrics: Optional[Dict[str, Any]] = None) -> float:
-        """Calculates position size in asset quantity based on risk, correlation, confidence, and optionally Kelly Criterion."""
+        """Calculates position size in asset quantity based on risk, correlation, confidence, liquidity, and optionally Kelly Criterion."""
         if entry_price <= 0 or stop_loss_price <= 0:
             logger.warning("Cannot calculate position size with zero or negative prices.", entry=entry_price, sl=stop_loss_price)
             return 0.0
@@ -260,17 +260,38 @@ class RiskManager:
         
         # Calculate the max allowed size based on the fixed USD cap
         max_quantity_by_usd_cap = self.config.max_position_size_usd / entry_price
+
+        # --- Liquidity Constraint (New) ---
+        # Calculate max allowed size based on recent market volume
+        liquidity_cap_quantity = float('inf')
+        if self.config.max_volume_participation_pct > 0:
+            df = self.data_handler.get_market_data(symbol)
+            if df is not None and not df.empty and 'volume' in df.columns:
+                # Calculate Average Volume over lookback
+                lookback = self.config.volume_lookback_periods
+                # Use tail to get recent data
+                recent_vol = df['volume'].iloc[-lookback:]
+                avg_vol = recent_vol.mean()
+                
+                if avg_vol > 0:
+                    liquidity_cap_quantity = avg_vol * self.config.max_volume_participation_pct
+                    logger.debug("Liquidity cap calculated", symbol=symbol, avg_vol=avg_vol, cap=liquidity_cap_quantity)
+                else:
+                    logger.warning("Average volume is zero, skipping liquidity cap.", symbol=symbol)
         
-        # The final cap is the stricter of the two
-        final_cap_quantity = min(max_quantity_by_pct, max_quantity_by_usd_cap)
-        
-        final_quantity = min(quantity, final_cap_quantity)
+        # The final cap is the stricter of all constraints
+        final_quantity = min(quantity, max_quantity_by_pct, max_quantity_by_usd_cap, liquidity_cap_quantity)
 
         if final_quantity < quantity:
+            reasons = []
+            if final_quantity == max_quantity_by_pct: reasons.append("Portfolio %")
+            if final_quantity == max_quantity_by_usd_cap: reasons.append("Fixed USD")
+            if final_quantity == liquidity_cap_quantity: reasons.append("Liquidity")
+
             logger.info("Position size capped.",
                         risk_based_qty=quantity,
                         capped_qty=final_quantity,
-                        cap_reason="Portfolio %" if max_quantity_by_pct < max_quantity_by_usd_cap else "Fixed USD")
+                        cap_reason=", ".join(reasons))
 
         return final_quantity
 
