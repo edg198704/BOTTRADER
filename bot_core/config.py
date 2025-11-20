@@ -253,8 +253,10 @@ class BreakevenConfig(BaseModel):
 
 class RiskManagementConfig(BaseModel):
     max_position_size_usd: float
-    # New: Cap position size as a percentage of total portfolio equity
-    max_position_size_portfolio_pct: float = 1.0 # Default 100% (no effective cap unless set lower)
+    # Cap position size as a percentage of total portfolio equity
+    max_position_size_portfolio_pct: float = 1.0 
+    # Cap total portfolio risk (Sum of Open Risk) as a percentage of equity
+    max_portfolio_risk_pct: float = 0.05 # Default 5% total capital at risk
     max_daily_loss_usd: float
     max_open_positions: int
     circuit_breaker_threshold: float
