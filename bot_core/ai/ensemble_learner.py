@@ -47,7 +47,8 @@ except ImportError:
     def compute_sample_weight(*args, **kwargs): return []
     class nn:
         class Module: pass
-    class optim: pass
+    class optim:
+        class lr_scheduler: pass
     class TensorDataset: pass
     class DataLoader: pass
 
@@ -201,6 +202,59 @@ def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.nd
             best_weights = {name: float(w[i]) for i, name in enumerate(model_names)}
             
     return best_weights
+
+def _train_torch_model(model, train_loader, val_loader, config, device, logger_instance, class_weights=None):
+    """Trains a PyTorch model with Early Stopping and Learning Rate Scheduling."""
+    optimizer = optim.Adam(model.parameters(), lr=config.training.learning_rate)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=config.training.scheduler_factor, 
+        patience=config.training.scheduler_patience, verbose=False
+    )
+    criterion = nn.CrossEntropyLoss(weight=class_weights) if class_weights is not None else nn.CrossEntropyLoss()
+    
+    best_loss = float('inf')
+    patience_counter = 0
+    best_state = None
+    
+    for epoch in range(config.training.epochs):
+        model.train()
+        train_loss = 0.0
+        for X_batch, y_batch in train_loader:
+            optimizer.zero_grad()
+            out = model(X_batch)
+            loss = criterion(out, y_batch)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+            
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                out = model(X_batch)
+                loss = criterion(out, y_batch)
+                val_loss += loss.item()
+        
+        if len(val_loader) > 0:
+            val_loss /= len(val_loader)
+        else:
+            val_loss = train_loss # Fallback if no validation data
+
+        scheduler.step(val_loss)
+        
+        if val_loss < best_loss:
+            best_loss = val_loss
+            patience_counter = 0
+            best_state = model.state_dict()
+        else:
+            patience_counter += 1
+            if patience_counter >= config.training.early_stopping_patience:
+                # logger_instance.debug(f"Early stopping at epoch {epoch}")
+                break
+                
+    if best_state:
+        model.load_state_dict(best_state)
+    return model
 
 def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyParams, device) -> Optional[Dict[str, Any]]:
     """
@@ -580,8 +634,23 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 'lstm': cw.lstm, 'attention': cw.attention
             }
 
-        # --- FINAL TRAINING (Full Dev Set) ---
-        worker_logger.info("Training final models on full development set...")
+        # --- FINAL TRAINING (Full Dev Set with Internal Validation) ---
+        worker_logger.info("Training final models on development set with early stopping...")
+        
+        # Create an internal split of X_dev for Early Stopping
+        # Use last 10% of Dev set for validation
+        val_size = int(len(X_dev) * 0.1)
+        if val_size < 50: val_size = 0 # Skip if too small
+        
+        if val_size > 0:
+            X_train_final = X_dev[:-val_size]
+            y_train_final = y_dev[:-val_size]
+            X_val_final = X_dev[-val_size:]
+            y_val_final = y_dev[-val_size:]
+        else:
+            X_train_final, y_train_final = X_dev, y_dev
+            X_val_final, y_val_final = None, None
+
         final_models = _create_fresh_models(config, num_features, device)
         trained_models = {}
         feature_importance = {}
@@ -590,9 +659,9 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         sample_weights = None
         torch_weights = None
         if config.training.use_class_weighting:
-            sample_weights = compute_sample_weight(class_weight='balanced', y=y_dev)
-            unique_classes = np.unique(y_dev)
-            class_weights = compute_class_weight(class_weight='balanced', classes=unique_classes, y=y_dev)
+            sample_weights = compute_sample_weight(class_weight='balanced', y=y_train_final)
+            unique_classes = np.unique(y_train_final)
+            class_weights = compute_class_weight(class_weight='balanced', classes=unique_classes, y=y_train_final)
             weight_map = {c: w for c, w in zip(unique_classes, class_weights)}
             final_weights = [weight_map.get(c, 1.0) for c in [0, 1, 2]]
             torch_weights = torch.FloatTensor(final_weights).to(device)
@@ -601,14 +670,20 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         for name, model in final_models.items():
             if name in ['lstm', 'attention']: continue
             fit_params = {}
-            if name == 'gb' and sample_weights is not None:
-                fit_params['sample_weight'] = sample_weights
+            if name == 'gb':
+                if sample_weights is not None:
+                    fit_params['sample_weight'] = sample_weights
+                # Use Early Stopping for XGBoost
+                if X_val_final is not None:
+                    fit_params['eval_set'] = [(X_val_final, y_val_final)]
+                    fit_params['early_stopping_rounds'] = config.training.early_stopping_patience
+                    fit_params['verbose'] = False
 
             if config.training.auto_tune_models and name == 'gb':
                 param_dist = {'n_estimators': [100, 200], 'max_depth': [3, 5, 7], 'learning_rate': [0.01, 0.1, 0.2]}
-                model = _optimize_hyperparameters(model, X_dev, y_dev, param_dist, config.training.n_iter_search, worker_logger, fit_params)
+                model = _optimize_hyperparameters(model, X_train_final, y_train_final, param_dist, config.training.n_iter_search, worker_logger, fit_params)
             else:
-                model.fit(X_dev, y_dev, **fit_params)
+                model.fit(X_train_final, y_train_final, **fit_params)
             
             trained_models[name] = model
             if hasattr(model, 'feature_importances_'):
@@ -617,25 +692,24 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                     feature_importance[name] = dict(zip(active_feature_names, imps))
 
         # Train PyTorch
-        X_seq_dev, y_seq_dev = FeatureProcessor.create_sequences(X_dev, y_dev, seq_len)
-        if len(X_seq_dev) > 0:
-            train_tensor = TensorDataset(torch.FloatTensor(X_seq_dev).to(device), torch.LongTensor(y_seq_dev).to(device))
+        X_seq_tr, y_seq_tr = FeatureProcessor.create_sequences(X_train_final, y_train_final, seq_len)
+        
+        if len(X_seq_tr) > 0:
+            train_tensor = TensorDataset(torch.FloatTensor(X_seq_tr).to(device), torch.LongTensor(y_seq_tr).to(device))
             train_loader = DataLoader(train_tensor, batch_size=config.training.batch_size, shuffle=True)
+            
+            val_loader = []
+            if X_val_final is not None:
+                X_seq_val, y_seq_val = FeatureProcessor.create_sequences(X_val_final, y_val_final, seq_len)
+                if len(X_seq_val) > 0:
+                    val_tensor = TensorDataset(torch.FloatTensor(X_seq_val).to(device), torch.LongTensor(y_seq_val).to(device))
+                    val_loader = DataLoader(val_tensor, batch_size=config.training.batch_size, shuffle=False)
             
             for name in ['lstm', 'attention']:
                 if name not in final_models: continue
                 model = final_models[name]
-                optimizer = optim.Adam(model.parameters(), lr=config.training.learning_rate)
-                criterion = nn.CrossEntropyLoss(weight=torch_weights) if torch_weights is not None else nn.CrossEntropyLoss()
-                
-                model.train()
-                for epoch in range(config.training.epochs):
-                    for batch_X, batch_y in train_loader:
-                        optimizer.zero_grad()
-                        outputs = model(batch_X)
-                        loss = criterion(outputs, batch_y)
-                        loss.backward()
-                        optimizer.step()
+                # Use helper to train with Early Stopping & Scheduler
+                model = _train_torch_model(model, train_loader, val_loader, config, device, worker_logger, class_weights=torch_weights)
                 trained_models[name] = model
 
         # --- CHALLENGER EVALUATION (Using Test Set) ---
