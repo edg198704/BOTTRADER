@@ -323,6 +323,16 @@ class AIEnsembleStrategy(TradingStrategy):
 
         regime_result = await self.regime_detector.detect_regime(symbol, df_enriched)
         regime = regime_result.get('regime')
+        
+        # --- Regime Shift Detection ---
+        prev_regime = self.last_detected_regime.get(symbol)
+        if prev_regime and prev_regime != regime:
+            logger.info("Market regime shift detected.", symbol=symbol, old=prev_regime, new=regime)
+            # Trigger proactive retrain if not recently retrained
+            # We use the force flag to bypass the standard interval check in needs_retraining
+            self.force_retrain_flags[symbol] = True
+            logger.info("Triggering proactive retrain due to regime shift.", symbol=symbol)
+
         self.last_detected_regime[symbol] = regime
 
         if self.ai_config.use_regime_filter:
