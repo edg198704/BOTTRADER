@@ -107,6 +107,12 @@ class AITrainingConfig(BaseModel):
     n_iter_search: int = 10
     # --- Data Handling ---
     use_class_weighting: bool = True
+    # Sample Weighting Mode: 
+    # 'balanced': Inverse class frequency
+    # 'return_based': Weight = |LogReturn|
+    # 'hybrid': Weight = Balanced * |LogReturn|
+    sample_weighting_mode: Literal['balanced', 'return_based', 'hybrid', 'none'] = 'balanced'
+    
     # Calibration method: 'isotonic', 'sigmoid', or 'none'
     calibration_method: str = 'isotonic'
     
@@ -228,7 +234,11 @@ class ExchangeConfig(BaseModel):
 
 class ExecutionConfig(BaseModel):
     default_order_type: str
+    # Offset Type: 'FIXED' (Percentage) or 'ATR' (Volatility Based)
+    limit_offset_type: Literal['FIXED', 'ATR'] = 'FIXED'
     limit_price_offset_pct: float
+    limit_offset_atr_multiplier: float = 1.0
+    
     order_fill_timeout_seconds: int
     use_order_chasing: bool
     chase_interval_seconds: int
