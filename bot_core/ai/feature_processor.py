@@ -30,6 +30,11 @@ class FeatureProcessor:
         # Start with base feature columns in the order defined in config
         cols = list(config.feature_columns)
         
+        # Add Market Leader features if enabled
+        if config.features.use_leader_features:
+            cols.append("leader_log_return")
+            cols.append("leader_rsi")
+
         # Add lag features in the exact order they are generated
         lags = config.features.lag_features
         depth = config.features.lag_depth
@@ -193,16 +198,17 @@ class FeatureProcessor:
         return df_trans
 
     @staticmethod
-    def process_data(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> pd.DataFrame:
+    def process_data(df: pd.DataFrame, config: AIEnsembleStrategyParams, leader_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         """
         Applies the full feature engineering pipeline:
         1. Generate Time/Price Action/Quant features (if enabled).
-        2. Stationarize features (Absolute -> Relative).
-        3. Select base feature columns.
-        4. Generates lagged features (if configured).
-        5. Drops NaNs introduced by lags.
-        6. Applies Z-score normalization.
-        7. Enforces column order matching get_feature_names.
+        2. Merge Market Leader features (if enabled and provided).
+        3. Stationarize features (Absolute -> Relative).
+        4. Select base feature columns.
+        5. Generates lagged features (if configured).
+        6. Drops NaNs introduced by lags.
+        7. Applies Z-score normalization.
+        8. Enforces column order matching get_feature_names.
         """
         df_processed = df.copy()
 
@@ -223,21 +229,53 @@ class FeatureProcessor:
                 config.features.frac_diff_thres
             )
 
-        # 2. Stationarize Data (Transform absolute prices/volume to ratios)
+        # 2. Merge Market Leader Features (New)
+        if config.features.use_leader_features and leader_df is not None and not leader_df.empty:
+            try:
+                # Extract relevant columns from leader
+                leader_feats = pd.DataFrame(index=leader_df.index)
+                
+                # Calculate Log Return for Leader
+                if 'close' in leader_df.columns:
+                    leader_feats['leader_log_return'] = np.log(leader_df['close'] / leader_df['close'].shift(1))
+                
+                # Extract RSI if available (DataHandler calculates it)
+                if 'rsi' in leader_df.columns:
+                    leader_feats['leader_rsi'] = leader_df['rsi']
+                
+                # Merge onto main DF
+                # We use join with forward fill to handle slight timestamp mismatches
+                # (e.g. leader candle closed 100ms before/after)
+                df_processed = df_processed.join(leader_feats, how='left')
+                
+                # Forward fill any gaps in leader data (up to a limit)
+                df_processed[['leader_log_return', 'leader_rsi']] = df_processed[['leader_log_return', 'leader_rsi']].ffill(limit=5)
+                
+            except Exception as e:
+                logger.warning(f"Failed to merge market leader features: {e}")
+
+        # 3. Stationarize Data (Transform absolute prices/volume to ratios)
         # We pass the list of intended features so we only transform what's needed
         df_stationary = FeatureProcessor._stationarize_data(df_processed, config.feature_columns)
 
-        # 3. Select Base Columns
-        cols = config.feature_columns
+        # 4. Select Base Columns
+        # We need to include leader columns in the selection list if they are generated
+        cols = list(config.feature_columns)
+        if config.features.use_leader_features:
+            cols.append("leader_log_return")
+            cols.append("leader_rsi")
+
         valid_cols = [c for c in cols if c in df_stationary.columns]
         
         if len(valid_cols) != len(cols):
             missing = set(cols) - set(valid_cols)
-            logger.warning("Missing columns during processing", missing=missing)
+            # Only warn if missing columns are not leader columns (which might be missing if leader_df is None)
+            if not (missing.issubset({'leader_log_return', 'leader_rsi'})):
+                logger.warning("Missing columns during processing", missing=missing)
         
         subset = df_stationary[valid_cols].copy()
         
-        # 4. Generate Lags
+        # 5. Generate Lags
         lags = config.features.lag_features
         depth = config.features.lag_depth
         
@@ -247,10 +285,10 @@ class FeatureProcessor:
                     for i in range(1, depth + 1):
                         subset[f"{col}_lag_{i}"] = subset[col].shift(i)
         
-        # 5. Drop NaNs (from lags, frac diff, and missing data)
+        # 6. Drop NaNs (from lags, frac diff, and missing data)
         subset.dropna(inplace=True)
         
-        # 6. Normalize
+        # 7. Normalize
         window = config.features.normalization_window
         rolling_mean = subset.rolling(window=window).mean()
         rolling_std = subset.rolling(window=window).std()
@@ -261,7 +299,7 @@ class FeatureProcessor:
         # Rolling normalization introduces NaNs at the start of the window
         normalized.dropna(inplace=True)
         
-        # 7. Enforce Column Order
+        # 8. Enforce Column Order
         # Ensure the output DataFrame has columns in the exact order expected by the model
         expected_cols = FeatureProcessor.get_feature_names(config)
         # Filter expected cols to those present (handling potential missing base cols gracefully)
