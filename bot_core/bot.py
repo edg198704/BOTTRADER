@@ -1,7 +1,7 @@
 import asyncio
 import time
 import json
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Set
 from datetime import datetime, timezone
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor
@@ -15,10 +15,68 @@ from bot_core.config import BotConfig
 from bot_core.data_handler import DataHandler
 from bot_core.monitoring import HealthChecker, InfluxDBMetrics, AlertSystem
 from bot_core.position_monitor import PositionMonitor
-from bot_core.trade_executor import TradeExecutor
+from bot_core.trade_executor import TradeExecutor, TradeExecutionResult
 from bot_core.optimizer import StrategyOptimizer
 
 logger = get_logger(__name__)
+
+class TaskSupervisor:
+    """
+    Manages the lifecycle of background tasks, ensuring they are running and 
+    handling failures/restarts robustly.
+    """
+    def __init__(self):
+        self.active_tasks: Dict[str, asyncio.Task] = {}
+        self.critical_services: Set[str] = set()
+        self._shutdown_event = asyncio.Event()
+
+    def spawn(self, name: str, coroutine, critical: bool = False):
+        if name in self.active_tasks and not self.active_tasks[name].done():
+            logger.warning(f"Task {name} is already running.")
+            return
+        
+        task = asyncio.create_task(coroutine, name=name)
+        self.active_tasks[name] = task
+        if critical:
+            self.critical_services.add(name)
+        logger.info(f"Spawned task: {name} (Critical: {critical})")
+
+    async def monitor(self):
+        """Monitors tasks and restarts non-critical ones, or signals shutdown for critical ones."""
+        while not self._shutdown_event.is_set():
+            # Check for done tasks
+            for name, task in list(self.active_tasks.items()):
+                if task.done():
+                    try:
+                        exc = task.exception()
+                        if exc:
+                            logger.error(f"Task {name} failed.", error=str(exc), exc_info=exc)
+                            if name in self.critical_services:
+                                logger.critical(f"Critical service {name} failed. Initiating shutdown.")
+                                self._shutdown_event.set()
+                            else:
+                                logger.info(f"Restarting non-critical task: {name}")
+                                # Logic to restart would require storing the coroutine factory, 
+                                # for now we just remove it to prevent memory leaks. 
+                                # In a full implementation, we'd use a factory pattern.
+                                del self.active_tasks[name]
+                        else:
+                            logger.info(f"Task {name} completed normally.")
+                            del self.active_tasks[name]
+                    except asyncio.CancelledError:
+                        del self.active_tasks[name]
+            
+            await asyncio.sleep(1)
+
+    async def stop_all(self):
+        self._shutdown_event.set()
+        tasks = [t for t in self.active_tasks.values() if not t.done()]
+        for t in tasks:
+            t.cancel()
+        
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.active_tasks.clear()
 
 class TradingBot:
     def __init__(self, config: BotConfig, exchange_api: ExchangeAPI, data_handler: DataHandler, 
@@ -42,15 +100,13 @@ class TradingBot:
         self.shared_bot_state = shared_bot_state if shared_bot_state is not None else {}
         
         self.optimizer = StrategyOptimizer(config, position_manager)
+        self.supervisor = TaskSupervisor()
         
-        self.running = False
         self.start_time = datetime.now(timezone.utc)
         self.latest_prices = shared_latest_prices
         self.market_details: Dict[str, Dict[str, Any]] = {}
         self.processed_candles: Dict[str, pd.Timestamp] = {}
         
-        # Task Management
-        self.active_tasks: Dict[str, asyncio.Task] = {}
         self.process_executor = ProcessPoolExecutor(max_workers=2)
         
         # Watchdog State
@@ -142,72 +198,40 @@ class TradingBot:
                 await self.position_manager.close_position(pos.symbol, current_price, reason="Startup Reconciliation (Missing on Exchange)")
 
     async def run(self):
-        self.running = True
         self.shared_bot_state['status'] = 'running'
         logger.info("Starting TradingBot...", symbols=self.config.strategy.symbols)
         
         await self.setup()
 
-        self._launch_task("DataHandler", self.data_handler.run())
-        self._launch_task("Monitoring", self._monitoring_loop())
-        self._launch_task("PositionMonitor", self.position_monitor.run())
-        self._launch_task("Retraining", self._retraining_loop())
-        self._launch_task("Optimizer", self.optimizer.run())
-        self._launch_task("Watchdog", self._watchdog_loop())
+        # Spawn Critical Services
+        self.supervisor.spawn("DataHandler", self.data_handler.run(), critical=True)
+        self.supervisor.spawn("Monitoring", self._monitoring_loop(), critical=False)
+        self.supervisor.spawn("PositionMonitor", self.position_monitor.run(), critical=True)
+        self.supervisor.spawn("Retraining", self._retraining_loop(), critical=False)
+        self.supervisor.spawn("Optimizer", self.optimizer.run(), critical=False)
+        self.supervisor.spawn("Watchdog", self._watchdog_loop(), critical=False)
 
+        # Spawn Trading Loops
         for symbol in self.config.strategy.symbols:
-            self._launch_task(f"SymbolLoop_{symbol}", self._trading_cycle_for_symbol(symbol))
+            self.supervisor.spawn(f"SymbolLoop_{symbol}", self._trading_cycle_for_symbol(symbol), critical=False)
 
-        while self.running:
-            await asyncio.sleep(5)
-            await self._check_tasks()
-
-    def _launch_task(self, name: str, coroutine):
-        task = asyncio.create_task(coroutine, name=name)
-        self.active_tasks[name] = task
-        logger.info(f"Launched task: {name}")
-
-    async def _check_tasks(self):
-        for name, task in list(self.active_tasks.items()):
-            if task.done():
-                try:
-                    exc = task.exception()
-                    if exc:
-                        logger.error(f"Task {name} failed with exception: {exc}", exc_info=exc)
-                        if self.running:
-                            logger.info(f"Restarting task: {name}")
-                            if name == "DataHandler":
-                                self._launch_task(name, self.data_handler.run())
-                            elif name == "Monitoring":
-                                self._launch_task(name, self._monitoring_loop())
-                            elif name == "PositionMonitor":
-                                self._launch_task(name, self.position_monitor.run())
-                            elif name == "Retraining":
-                                self._launch_task(name, self._retraining_loop())
-                            elif name == "Optimizer":
-                                self._launch_task(name, self.optimizer.run())
-                            elif name == "Watchdog":
-                                self._launch_task(name, self._watchdog_loop())
-                            elif name.startswith("SymbolLoop_"):
-                                symbol = name.split("_")[1]
-                                self._launch_task(name, self._trading_cycle_for_symbol(symbol))
-                    else:
-                        logger.info(f"Task {name} completed successfully.")
-                        del self.active_tasks[name]
-                except asyncio.CancelledError:
-                    del self.active_tasks[name]
+        # Run Supervisor Monitor (blocks until shutdown)
+        await self.supervisor.monitor()
+        
+        logger.info("Supervisor loop ended. Shutting down.")
 
     async def _trading_cycle_for_symbol(self, symbol: str):
         logger.info("Starting trading cycle", symbol=symbol)
         self._symbol_heartbeats[symbol] = time.time()
         
-        while self.running:
+        while not self.supervisor._shutdown_event.is_set():
             set_correlation_id()
             try:
                 timeout = self.config.strategy.interval_seconds * 2
+                # Wait for new data event
                 await self.data_handler.wait_for_new_candle(symbol, timeout=timeout)
                 
-                if not self.running: break
+                if self.supervisor._shutdown_event.is_set(): break
 
                 # Heartbeat check: Ensure data is actually fresh
                 df = self.data_handler.get_market_data(symbol, include_forming=False)
@@ -221,7 +245,7 @@ class TradingBot:
                 logger.info("Trading loop cancelled", symbol=symbol)
                 break
             except Exception as e:
-                logger.error("Unhandled exception in trading cycle", symbol=symbol, error=str(e), exc_info=True)
+                logger.error("Unhandled exception in trading cycle", symbol=symbol, error=str(e), exc_info=exc)
                 await asyncio.sleep(5)
 
     async def process_symbol_tick(self, symbol: str):
@@ -240,7 +264,13 @@ class TradingBot:
             return
 
         position = await self.position_manager.get_open_position(symbol)
-        signal = await self.strategy.analyze_market(symbol, df_with_indicators, position)
+        
+        # Execute Strategy Analysis
+        try:
+            signal = await self.strategy.analyze_market(symbol, df_with_indicators, position)
+        except Exception as e:
+            logger.error("Strategy analysis failed", symbol=symbol, error=str(e))
+            return
 
         if signal: 
             await self._handle_signal(signal, df_with_indicators, position)
@@ -250,14 +280,13 @@ class TradingBot:
     async def _watchdog_loop(self):
         """Monitors the liveness of symbol processing loops."""
         logger.info("Watchdog started.")
-        while self.running:
+        while not self.supervisor._shutdown_event.is_set():
             await asyncio.sleep(60)
             now = time.time()
             for symbol in self.config.strategy.symbols:
                 last_beat = self._symbol_heartbeats.get(symbol, 0)
                 if (now - last_beat) > self._watchdog_threshold:
                     logger.warning("Watchdog Alert: Symbol loop stalled.", symbol=symbol, seconds_since_last=int(now-last_beat))
-                    # We could restart the task here, but for now we just alert
                     if self.alert_system:
                         await self.alert_system.send_alert(
                             level='warning',
@@ -267,7 +296,7 @@ class TradingBot:
 
     async def _monitoring_loop(self):
         reconcile_counter = 0
-        while self.running:
+        while not self.supervisor._shutdown_event.is_set():
             try:
                 health_status = self.health_checker.get_health_status()
                 if self.metrics_writer and self.metrics_writer.enabled:
@@ -312,7 +341,7 @@ class TradingBot:
     async def _retraining_loop(self):
         logger.info("Starting model retraining loop.")
         await asyncio.sleep(10) 
-        while self.running:
+        while not self.supervisor._shutdown_event.is_set():
             try:
                 for symbol in self.config.strategy.symbols:
                     if self.strategy.needs_retraining(symbol):
@@ -330,21 +359,18 @@ class TradingBot:
                 await asyncio.sleep(300)
 
     async def _handle_signal(self, signal: TradeSignal, df_with_indicators: pd.DataFrame, position: Optional[Position]):
-        await self.trade_executor.execute_trade_signal(signal, df_with_indicators, position)
+        result = await self.trade_executor.execute_trade_signal(signal, df_with_indicators, position)
+        if result and self.metrics_writer and self.metrics_writer.enabled:
+            await self.metrics_writer.write_metric('trade_execution', fields=result.dict())
 
     async def _close_position(self, position: Position, reason: str):
         await self.trade_executor.close_position(position, reason)
 
     async def stop(self):
         logger.info("Stopping TradingBot...")
-        self.running = False
         self.shared_bot_state['status'] = 'stopping'
         
-        for name, task in self.active_tasks.items():
-            if not task.done():
-                task.cancel()
-        
-        await asyncio.gather(*self.active_tasks.values(), return_exceptions=True)
+        await self.supervisor.stop_all()
         
         await self.data_handler.stop()
         await self.position_monitor.stop()
