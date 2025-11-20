@@ -45,6 +45,10 @@ class TradingStrategy(abc.ABC):
         """Clean up strategy resources."""
         pass
 
+    async def warmup(self, symbols: List[str]):
+        """Optional warmup hook."""
+        pass
+
 class SimpleMACrossoverStrategy(TradingStrategy):
     def __init__(self, config: SimpleMACrossoverStrategyParams):
         super().__init__(config)
@@ -106,6 +110,16 @@ class AIEnsembleStrategy(TradingStrategy):
         self.accuracy_history: Dict[str, deque] = {}
         # Map: symbol -> bool
         self.force_retrain_flags: Dict[str, bool] = {}
+        
+        # Reference to DataHandler (injected via property or method if needed, but usually accessed via bot)
+        # Since Strategy is initialized before DataHandler in bot.py, we need a way to access data.
+        # However, analyze_market receives 'df'. For leader data, we need to fetch it.
+        # We will assume the caller (Bot) passes a way to get leader data, OR we rely on the fact that
+        # we can't easily access DataHandler here without circular deps.
+        # SOLUTION: We will modify analyze_market signature in the future or use a workaround.
+        # Actually, we can't easily change the signature of analyze_market without changing Bot.
+        # BUT, we can use a hack: The Bot instance sets a reference to itself on the strategy after init.
+        self.data_fetcher = None # Will be set by Bot
 
         try:
             self.ensemble_learner = EnsembleLearner(self.ai_config)
@@ -171,35 +185,36 @@ class AIEnsembleStrategy(TradingStrategy):
             self._monitor_performance(symbol, df)
 
         # --- Performance Circuit Breaker ---
-        # If the model is flagged for forced retraining due to poor accuracy, 
-        # we block new entries but allow exits to protect capital.
         if position is None and self.force_retrain_flags.get(symbol, False):
             logger.warning("Skipping entry signal due to poor model performance (Circuit Breaker Active).", symbol=symbol)
             return None
 
         # 2. Enrich Data with Regime Features
-        # This injects 'regime_trend' and 'regime_volatility' into the DF so the model can use them
         df_enriched = self.regime_detector.add_regime_features(df)
 
-        # 3. Detect Regime (Optimized: uses the columns we just added)
+        # 3. Detect Regime
         regime_result = await self.regime_detector.detect_regime(symbol, df_enriched)
         regime = regime_result.get('regime')
 
         if self.ai_config.use_regime_filter:
             if regime in ['sideways', 'unknown']:
-                # Check if we have a specific threshold for sideways to allow trading
                 if not (regime == 'sideways' and self.ai_config.market_regime.sideways_confidence_threshold is not None):
                     logger.debug("Market regime is sideways or unknown, holding position.", regime=regime, symbol=symbol)
                     return None
 
-        # Check Cooldown ONLY if we are looking to enter (position is None)
+        # Check Cooldown
         if position is None and self._in_cooldown(symbol):
             logger.debug("Signal ignored due to cooldown.", symbol=symbol)
             return None
 
-        # 4. Predict using Enriched Data
-        # PASS REGIME TO PREDICT FOR REGIME-SPECIFIC WEIGHTS
-        prediction = await self.ensemble_learner.predict(df_enriched, symbol, regime=regime)
+        # 4. Fetch Market Leader Data (if configured)
+        leader_df = None
+        if self.ai_config.market_leader_symbol and self.data_fetcher:
+            # Use the injected data fetcher (DataHandler)
+            leader_df = self.data_fetcher.get_market_data(self.ai_config.market_leader_symbol)
+
+        # 5. Predict using Enriched Data + Leader Data
+        prediction = await self.ensemble_learner.predict(df_enriched, symbol, regime=regime, leader_df=leader_df)
         
         action = prediction.get('action')
         confidence = prediction.get('confidence', 0.0)
@@ -220,7 +235,7 @@ class AIEnsembleStrategy(TradingStrategy):
                 confidence = max(0.0, confidence - penalty)
                 logger.info("Drift detected. Penalizing confidence.", symbol=symbol, penalty=penalty, new_conf=confidence, score=anomaly_score)
 
-        # Log prediction for future evaluation
+        # Log prediction
         if self.ai_config.performance.enabled and action:
             action_map = {'sell': 0, 'hold': 1, 'buy': 2}
             pred_int = action_map.get(action, 1)
@@ -233,7 +248,6 @@ class AIEnsembleStrategy(TradingStrategy):
         logger.debug("AI prediction received", symbol=symbol, **prediction)
 
         # --- Dynamic Threshold Check (Asymmetric) ---
-        # Determine if this is an exit signal based on current position
         is_exit = False
         if position:
             if (position.side == 'BUY' and action == 'sell') or \
@@ -246,7 +260,7 @@ class AIEnsembleStrategy(TradingStrategy):
             logger.debug("Confidence below threshold", symbol=symbol, confidence=confidence, required=required_threshold, regime=regime, is_exit=is_exit)
             return None
 
-        # Construct metadata for the signal
+        # Construct metadata
         strategy_metadata = {
             'model_version': model_version,
             'confidence': confidence,
@@ -259,7 +273,6 @@ class AIEnsembleStrategy(TradingStrategy):
             'is_anomaly': is_anomaly
         }
 
-        # NOTE: We explicitly pass 'regime' at the top level so RiskManager can see it.
         signal = {
             'symbol': symbol,
             'regime': regime,
@@ -288,7 +301,6 @@ class AIEnsembleStrategy(TradingStrategy):
                 signal_generated = True
 
         if signal_generated:
-            # Update last signal time to enforce cooldown on next check
             self.last_signal_time[symbol] = Clock.now()
             return signal
 
@@ -300,18 +312,12 @@ class AIEnsembleStrategy(TradingStrategy):
         if not logs:
             return
 
-        # We only need to evaluate predictions that are older than the labeling horizon
         horizon = self.ai_config.features.labeling_horizon
-        
-        # Use FeatureProcessor to generate ground truth labels for the recent history
-        # We take a slice large enough to cover the oldest unevaluated prediction + horizon
-        # But for efficiency, we just take the last 200 rows
         eval_df = df.tail(200)
         if len(eval_df) < horizon + 1:
             return
 
         try:
-            # Generate actual labels (0, 1, 2) based on future price movement
             actual_labels = FeatureProcessor.create_labels(eval_df, self.ai_config)
         except Exception as e:
             logger.error("Failed to generate labels for performance monitoring", error=str(e))
@@ -326,24 +332,19 @@ class AIEnsembleStrategy(TradingStrategy):
         for ts, pred_int in logs:
             if ts in actual_labels.index:
                 actual = actual_labels.loc[ts]
-                # Check if actual is valid (not NaN due to horizon)
                 if not np.isnan(actual):
                     is_correct = 1 if int(actual) == pred_int else 0
                     self.accuracy_history[symbol].append(is_correct)
                     evaluated_count += 1
                 else:
-                    # Horizon not reached yet
                     remaining_logs.append((ts, pred_int))
             else:
-                # Timestamp fell out of the evaluation window or mismatch
-                # If it's very old, discard. If recent, keep.
                 if ts > df.index[0]:
                     remaining_logs.append((ts, pred_int))
         
         self.prediction_logs[symbol] = remaining_logs
 
-        # Check accuracy threshold
-        if len(self.accuracy_history[symbol]) >= 10: # Minimum samples to judge
+        if len(self.accuracy_history[symbol]) >= 10:
             accuracy = sum(self.accuracy_history[symbol]) / len(self.accuracy_history[symbol])
             if accuracy < self.ai_config.performance.min_accuracy:
                 if not self.force_retrain_flags.get(symbol, False):
@@ -357,8 +358,19 @@ class AIEnsembleStrategy(TradingStrategy):
         
         loop = asyncio.get_running_loop()
         try:
-            # Enrich Data with Regime Features before sending to worker
+            # Enrich Data with Regime Features
             df_enriched = self.regime_detector.add_regime_features(df)
+            
+            # Fetch Leader Data for Training
+            leader_df = None
+            if self.ai_config.market_leader_symbol and self.data_fetcher:
+                # We need full history for training, so we ask DataHandler for it
+                # Note: This is an async call, but we are in an async method.
+                # However, data_fetcher is the DataHandler instance.
+                # We need to fetch the leader history corresponding to 'df'.
+                # Since 'df' is fetched via fetch_full_history_for_symbol, we should do the same for leader.
+                limit = len(df)
+                leader_df = await self.data_fetcher.fetch_full_history_for_symbol(self.ai_config.market_leader_symbol, limit)
 
             # Offload the heavy training task to a separate process
             success = await loop.run_in_executor(
@@ -366,18 +378,18 @@ class AIEnsembleStrategy(TradingStrategy):
                 train_ensemble_task, 
                 symbol, 
                 df_enriched, 
-                self.ai_config
+                self.ai_config,
+                leader_df # Pass leader data
             )
             
             if success:
                 self.last_retrained_at[symbol] = Clock.now()
-                # Reset performance metrics for the new model
                 self.force_retrain_flags[symbol] = False
                 self.prediction_logs[symbol] = []
                 if symbol in self.accuracy_history:
                     self.accuracy_history[symbol].clear()
                 
-                logger.info("Model training successful. Reloading models and resetting performance stats.", symbol=symbol)
+                logger.info("Model training successful. Reloading models.", symbol=symbol)
                 await self.ensemble_learner.reload_models(symbol)
             else:
                 logger.warning("Model training failed or rejected.", symbol=symbol)
@@ -386,33 +398,26 @@ class AIEnsembleStrategy(TradingStrategy):
             logger.error("Error during async model retraining", symbol=symbol, error=str(e))
 
     def needs_retraining(self, symbol: str) -> bool:
-        # 0. Check if we even have a valid model loaded
-        # This handles the case where config changed and old models were rejected
         if not self.ensemble_learner.has_valid_model(symbol):
-            logger.info(f"No valid model found for {symbol} (or feature mismatch). Retraining required.")
+            logger.info(f"No valid model found for {symbol}. Retraining required.")
             return True
 
-        # 1. Check forced retrain flag (Performance based)
         if self.force_retrain_flags.get(symbol, False):
             return True
 
-        # 2. Check scheduled retrain
         if self.ai_config.retrain_interval_hours <= 0:
             return False
         
-        # Sync with learner state if local state is empty (e.g. after restart)
         if symbol not in self.last_retrained_at:
             last_train_time = self.ensemble_learner.get_last_training_time(symbol)
             if last_train_time:
                 self.last_retrained_at[symbol] = last_train_time
-                logger.info("Synced last training time from loaded model.", symbol=symbol, timestamp=last_train_time)
             else:
-                # If learner has no record, we must train.
                 return True
         
         last_retrained = self.last_retrained_at.get(symbol)
-        time_since_retrain = Clock.now() - last_retrained
-        return time_since_retrain >= timedelta(hours=self.ai_config.retrain_interval_hours)
+        time_since = Clock.now() - last_retrained
+        return time_since >= timedelta(hours=self.ai_config.retrain_interval_hours)
 
     def get_training_data_limit(self) -> int:
         return self.ai_config.training_data_limit
