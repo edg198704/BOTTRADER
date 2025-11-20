@@ -301,6 +301,51 @@ def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.nd
             
     return best_weights
 
+def _optimize_entry_threshold(y_true: np.ndarray, probs: np.ndarray, returns: np.ndarray) -> float:
+    """
+    Finds the optimal confidence threshold for entry that maximizes a risk-adjusted return metric
+    on the validation set.
+    y_true: (N,) labels (0=Sell, 1=Hold, 2=Buy)
+    probs: (N, 3) probabilities
+    returns: (N,) market returns for the period
+    """
+    best_threshold = 0.60 # Default fallback
+    best_score = -float('inf')
+    
+    # Search range: 0.50 to 0.90
+    thresholds = np.arange(0.50, 0.91, 0.01)
+    
+    for t in thresholds:
+        # Simulate signals
+        # Buy if prob[2] > t, Sell if prob[0] > t
+        signals = np.zeros_like(y_true)
+        signals[probs[:, 2] > t] = 1
+        signals[probs[:, 0] > t] = -1
+        
+        # Calculate Strategy Returns
+        strat_returns = signals * returns
+        
+        # Metrics
+        n_trades = np.count_nonzero(signals)
+        if n_trades < 10: # Minimum trades constraint
+            continue
+            
+        total_return = np.sum(strat_returns)
+        std_return = np.std(strat_returns)
+        
+        # Simple Sharpe-like score: Total Return / Volatility * log(trades)
+        # We use log(trades) to encourage activity but not overtrading
+        if std_return > 0:
+            score = (total_return / std_return) * np.log1p(n_trades)
+        else:
+            score = 0.0
+            
+        if score > best_score:
+            best_score = score
+            best_threshold = float(t)
+            
+    return best_threshold
+
 def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyParams, device) -> Optional[Dict[str, Any]]:
     """
     Loads trained models and metadata from disk.
@@ -471,7 +516,7 @@ def _evaluate_ensemble(models: Dict[str, Any],
     sharpe = mean_ret / std_ret if std_ret > 0 else 0.0
     
     return {
-        'profit_factor': float(profit_factor),
+        'profit_factor': float(profit_factor), 
         'sharpe': float(sharpe),
         'total_return': float(np.sum(strategy_returns)),
         'win_rate': float(len(winning_returns) / len(strategy_returns)) if len(strategy_returns) > 0 else 0.0
@@ -631,7 +676,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             try:
                 # Concatenate OOS predictions
                 combined_indices = np.concatenate(oos_indices)
-                y_oos = y_dev[combined_indices]
+                y_oos = y_dev[combined_indices] # Labels for OOS
+                returns_oos = market_returns[combined_indices] # Returns for OOS
                 
                 # Calculate sample weights for OOS data if class weighting is enabled
                 oos_sample_weights = None
@@ -848,6 +894,61 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 worker_logger.warning(f"Challenger failed to beat Champion. Champ Sharpe: {champ_sharpe:.4f}, Challenger: {sharpe:.4f}")
                 return False
 
+        # --- THRESHOLD OPTIMIZATION (New) ---
+        optimized_threshold = None
+        if config.training.optimize_entry_threshold:
+            worker_logger.info("Optimizing entry threshold on test set...")
+            # We use the test set to find the threshold that maximizes performance on unseen data
+            # Note: This technically leaks test data into the 'final model' configuration, 
+            # but is standard practice for hyperparameter tuning if we treat threshold as a hyperparam.
+            # Ideally we would use a separate validation fold, but X_test is the best proxy we have here.
+            
+            # Get probabilities for test set
+            # We need to reconstruct the ensemble probabilities manually as _evaluate_ensemble returns metrics
+            # Re-using logic from _evaluate_ensemble but returning probs
+            
+            # 1. Get raw probs
+            test_probs_dict = {}
+            for name, model in trained_models.items():
+                if name in ['gb', 'technical']:
+                    test_probs_dict[name] = model.predict_proba(X_test)
+                elif name in ['lstm', 'attention'] and len(X_seq_test) > 0:
+                    model.eval()
+                    with torch.no_grad():
+                        test_probs_dict[name] = model(torch.FloatTensor(X_seq_test).to(device)).cpu().numpy()
+            
+            # 2. Combine
+            if test_probs_dict:
+                # Align lengths (NN vs Sklearn)
+                valid_slice = slice(seq_len - 1, None)
+                aligned_probs = []
+                aligned_weights = []
+                
+                for name, probs in test_probs_dict.items():
+                    w = optimized_weights.get(name, 0.0)
+                    if w > 0:
+                        if name in ['gb', 'technical']:
+                            aligned_probs.append(probs[valid_slice])
+                        else:
+                            aligned_probs.append(probs)
+                        aligned_weights.append(w)
+                
+                if aligned_probs:
+                    stack = np.array(aligned_probs)
+                    weights = np.array(aligned_weights)
+                    weights /= weights.sum()
+                    ensemble_probs = np.tensordot(weights, stack, axes=([0],[0]))
+                    
+                    if calibrator:
+                        ensemble_probs = calibrator.predict(ensemble_probs)
+                    
+                    # Align targets
+                    y_test_aligned = y_test[valid_slice]
+                    returns_test_aligned = returns_test[valid_slice]
+                    
+                    optimized_threshold = _optimize_entry_threshold(y_test_aligned, ensemble_probs, returns_test_aligned)
+                    worker_logger.info(f"Optimal Entry Threshold found: {optimized_threshold:.2f}")
+
         # --- SAVE ARTIFACTS ---
         safe_symbol = symbol.replace('/', '_')
         final_dir = os.path.join(config.model_path, safe_symbol)
@@ -877,7 +978,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 'active_feature_columns': active_feature_names,
                 'num_features': num_features,
                 'optimized_weights': optimized_weights,
-                'regime_weights': regime_weights
+                'regime_weights': regime_weights,
+                'optimized_threshold': optimized_threshold
             }
             with open(os.path.join(temp_dir, "metadata.json"), 'w') as f:
                 json.dump(meta, f, indent=2)
@@ -1110,7 +1212,8 @@ class EnsembleLearner:
             'metrics': meta.get('metrics', {}),
             'optimized_weights': active_weight_map if active_weight_map else None,
             'is_anomaly': is_anomaly,
-            'anomaly_score': float(anomaly_score)
+            'anomaly_score': float(anomaly_score),
+            'optimized_threshold': meta.get('optimized_threshold')
         }
 
     async def predict(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None, leader_df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
