@@ -263,8 +263,6 @@ class DataHandler:
             if last_emitted is None or last_closed_ts > last_emitted:
                 self._last_emitted_candle_ts[symbol] = last_closed_ts
                 if self.event_bus:
-                    # Publish event to the bus (non-blocking by default in bus implementation)
-                    # We pass the closed_df explicitly to ensure the consumer sees exactly what triggered the event
                     await self.event_bus.publish(MarketDataEvent(symbol=symbol, data=closed_df))
 
     async def _calculate_indicators_async(self, df: pd.DataFrame) -> pd.DataFrame:
