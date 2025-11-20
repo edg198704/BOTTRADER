@@ -115,8 +115,8 @@ class TradingBot:
         logger.info("Found PENDING positions. Reconciling...", count=len(pending_positions))
         for pos in pending_positions:
             if not pos.order_id:
-                logger.warning("Pending position has no Order ID. Voiding.", symbol=pos.symbol)
-                await self.position_manager.void_position(pos.symbol, pos.order_id)
+                logger.warning("Pending position has no Order ID. Marking failed.", symbol=pos.symbol)
+                await self.position_manager.mark_position_failed(pos.symbol, pos.order_id, "Reconciliation: Missing Order ID")
                 continue
 
             try:
@@ -142,8 +142,8 @@ class TradingBot:
                             break
 
                 if not order:
-                    logger.warning("Order not found on exchange (ID or ClientID). Voiding pending position.", symbol=pos.symbol, order_id=pos.order_id)
-                    await self.position_manager.void_position(pos.symbol, pos.order_id)
+                    logger.warning("Order not found on exchange (ID or ClientID). Marking failed.", symbol=pos.symbol, order_id=pos.order_id)
+                    await self.position_manager.mark_position_failed(pos.symbol, pos.order_id, "Reconciliation: Order Not Found")
                     continue
 
                 status = order.get('status')
@@ -196,7 +196,7 @@ class TradingBot:
                                     if cancelled_order and cancelled_order.get('filled', 0.0) > 0:
                                         await confirm_from_order(cancelled_order)
                                     else:
-                                        await self.position_manager.void_position(pos.symbol, o['id'])
+                                        await self.position_manager.mark_position_failed(pos.symbol, o['id'], "Reconciliation: Zombie Chase Cancelled Empty")
                                     break
                             
                             # 2. Check Recent History (Deep Scan) if not found in Open
@@ -223,15 +223,15 @@ class TradingBot:
                                                 if cancelled_order and cancelled_order.get('filled', 0.0) > 0:
                                                     await confirm_from_order(cancelled_order)
                                                 else:
-                                                    await self.position_manager.void_position(pos.symbol, o['id'])
+                                                    await self.position_manager.mark_position_failed(pos.symbol, o['id'], "Reconciliation: Zombie Chase History Cancelled")
                                                 zombie_recovered = True
                                                 break
                                 except Exception as e:
                                     logger.error("Failed deep zombie scan", error=str(e))
                         
                         if not zombie_recovered:
-                            logger.info("Pending position order was terminal and empty. Voiding.", symbol=pos.symbol, status=status)
-                            await self.position_manager.void_position(pos.symbol, pos.order_id)
+                            logger.info("Pending position order was terminal and empty. Marking failed.", symbol=pos.symbol, status=status)
+                            await self.position_manager.mark_position_failed(pos.symbol, pos.order_id, f"Reconciliation: Terminal {status}")
                 
                 elif status == 'OPEN':
                     logger.info("Pending position order is still OPEN. Cancelling...", symbol=pos.symbol)
@@ -242,8 +242,8 @@ class TradingBot:
                             logger.info("Cancelled order had partial fills. Confirming position.", symbol=pos.symbol)
                             await confirm_from_order(cancelled_order)
                     else:
-                            logger.info("Cancelled order was empty. Voiding position.", symbol=pos.symbol)
-                            await self.position_manager.void_position(pos.symbol, pos.order_id)
+                            logger.info("Cancelled order was empty. Marking failed.", symbol=pos.symbol)
+                            await self.position_manager.mark_position_failed(pos.symbol, pos.order_id, "Reconciliation: Cancelled Open")
 
             except Exception as e:
                 logger.error("Error reconciling pending position", symbol=pos.symbol, error=str(e))
