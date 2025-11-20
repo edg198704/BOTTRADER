@@ -288,11 +288,26 @@ class OptimizerConfig(BaseModel):
     interval_hours: int = 24
     lookback_trades: int = 100
     min_trades_for_adjustment: int = 10
+    state_file_path: str = "optimizer_state.json"
+    
+    # --- Performance Targets ---
     min_profit_factor: float = 1.0
     high_performance_pf: float = 1.5
+    
+    # --- Confidence Optimization ---
     adjustment_step: float = 0.02
     max_threshold_cap: float = 0.90
     min_threshold_floor: float = 0.55
+    
+    # --- Risk Parameter Optimization (New) ---
+    optimize_risk_params: bool = True
+    risk_adjustment_step: float = 0.1 # Step for R:R and ATR Multiplier
+    
+    # Bounds
+    min_reward_to_risk: float = 1.0
+    max_reward_to_risk: float = 3.0
+    min_atr_multiplier: float = 1.5
+    max_atr_multiplier: float = 4.0
 
 # --- Top-Level Bot Config ---
 
