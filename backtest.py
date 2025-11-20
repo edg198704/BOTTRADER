@@ -113,7 +113,8 @@ async def run_backtest():
     trade_executor = TradeExecutor(
         config, exchange_api, position_manager, risk_manager, order_sizer, 
         order_lifecycle_manager, alert_system, shared_latest_prices, 
-        market_details={} # Will be loaded in setup
+        market_details={}, # Will be loaded in setup
+        data_handler=data_handler # Injected for ATR calculation
     )
 
     bot = TradingBot(
