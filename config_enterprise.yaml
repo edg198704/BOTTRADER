@@ -125,6 +125,7 @@ strategy:
       learning_rate: 0.001
       early_stopping_patience: 5 # Stop training if validation loss doesn't improve for this many epochs
       validation_split: 0.15 # Percentage of training data to use for validation
+      cv_splits: 5 # Number of folds for Walk-Forward Validation (Stacking)
       min_precision_threshold: 0.55 # Require at least 55% precision on validation set to accept new model
       min_profit_factor: 1.05 # Require positive expectancy
       min_sharpe_ratio: 0.05 # Require positive risk-adjusted return
@@ -285,7 +286,6 @@ optimizer:
   adjustment_step: 0.02 # Change threshold by 2% per run
   max_threshold_cap: 0.90 # Never go above 90% confidence req
   min_threshold_floor: 0.55 # Never go below 55% confidence req
-  state_file_path: "optimizer_state.json" # File to persist learned thresholds
 
 backtest:
   enabled: true
