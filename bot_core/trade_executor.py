@@ -247,7 +247,31 @@ class TradeExecutor:
             # Calculate Fees
             fees = self._calculate_or_extract_fee(final_order_state, fill_price, fill_quantity)
 
-            logger.info("Order to open position was filled.", order_id=current_order_id, filled_qty=fill_quantity, fill_price=fill_price, fees=fees)
+            # --- Net Quantity Adjustment ---
+            # If buying, and fee is in base asset, we receive less than fill_quantity.
+            # We must adjust the position size to match wallet reality.
+            confirmed_quantity = fill_quantity
+            
+            if side == 'BUY':
+                # Check fee currency
+                fee_currency = None
+                if final_order_state.get('fee') and 'currency' in final_order_state['fee']:
+                    fee_currency = final_order_state['fee']['currency']
+                
+                # Parse base asset from symbol (e.g. BTC/USDT -> BTC)
+                base_asset = symbol.split('/')[0]
+                
+                # If fee currency matches base asset, subtract fee from quantity
+                # Note: fees is the float cost.
+                if fee_currency == base_asset:
+                    confirmed_quantity = max(0.0, fill_quantity - fees)
+                    logger.info("Adjusted position quantity for fees.", 
+                                original=fill_quantity, 
+                                fee=fees, 
+                                net=confirmed_quantity, 
+                                asset=base_asset)
+
+            logger.info("Order to open position was filled.", order_id=current_order_id, filled_qty=fill_quantity, net_qty=confirmed_quantity, fill_price=fill_price, fees=fees)
             final_stop_loss = self.risk_manager.calculate_stop_loss(side, fill_price, df, market_regime=regime)
             final_take_profit = self.risk_manager.calculate_take_profit(
                 side, 
@@ -258,7 +282,7 @@ class TradeExecutor:
                 confidence_threshold=confidence_threshold
             )
             
-            await self.position_manager.confirm_position_open(symbol, current_order_id, fill_quantity, fill_price, final_stop_loss, final_take_profit, fees=fees)
+            await self.position_manager.confirm_position_open(symbol, current_order_id, confirmed_quantity, fill_price, final_stop_loss, final_take_profit, fees=fees)
         
         elif final_status == 'OPEN':
             # CRITICAL: The order is still OPEN on the exchange (cancellation failed), but we stopped chasing.
