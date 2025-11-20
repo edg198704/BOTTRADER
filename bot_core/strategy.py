@@ -110,6 +110,8 @@ class AIEnsembleStrategy(TradingStrategy):
         self.accuracy_history: Dict[str, deque] = {}
         # Map: symbol -> bool
         self.force_retrain_flags: Dict[str, bool] = {}
+        # Map: symbol -> int (consecutive anomalies)
+        self.drift_counters: Dict[str, int] = {}
         
         # Reference to DataHandler (injected via property or method if needed, but usually accessed via bot)
         self.data_fetcher = None # Will be set by Bot
@@ -177,7 +179,7 @@ class AIEnsembleStrategy(TradingStrategy):
 
         # 1. Monitor Performance of past predictions
         if self.ai_config.performance.enabled:
-            self._monitor_performance(symbol, df)
+            await self._monitor_performance(symbol, df)
 
         # --- Performance Circuit Breaker ---
         if position is None and self.force_retrain_flags.get(symbol, False):
@@ -223,6 +225,15 @@ class AIEnsembleStrategy(TradingStrategy):
 
         # --- DRIFT DETECTION CHECK ---
         if is_anomaly:
+            # Increment drift counter
+            self.drift_counters[symbol] = self.drift_counters.get(symbol, 0) + 1
+            
+            # Check if we need to trigger a retrain due to sustained drift
+            if self.drift_counters[symbol] >= self.ai_config.drift.max_consecutive_anomalies:
+                logger.warning("Sustained data drift detected. Forcing retrain.", symbol=symbol, count=self.drift_counters[symbol])
+                self.force_retrain_flags[symbol] = True
+                self.drift_counters[symbol] = 0 # Reset counter
+            
             if self.ai_config.drift.block_trade:
                 logger.warning("Drift detected (Anomaly). Blocking trade.", symbol=symbol, score=anomaly_score)
                 return None
@@ -230,6 +241,9 @@ class AIEnsembleStrategy(TradingStrategy):
                 penalty = self.ai_config.drift.confidence_penalty
                 confidence = max(0.0, confidence - penalty)
                 logger.info("Drift detected. Penalizing confidence.", symbol=symbol, penalty=penalty, new_conf=confidence, score=anomaly_score)
+        else:
+            # Reset drift counter if normal
+            self.drift_counters[symbol] = 0
 
         # Log prediction
         if self.ai_config.performance.enabled and action:
@@ -304,7 +318,7 @@ class AIEnsembleStrategy(TradingStrategy):
 
         return None
 
-    def _monitor_performance(self, symbol: str, df: pd.DataFrame):
+    async def _monitor_performance(self, symbol: str, df: pd.DataFrame):
         """Evaluates past predictions against realized market moves."""
         logs = self.prediction_logs.get(symbol, [])
         if not logs:
@@ -344,6 +358,19 @@ class AIEnsembleStrategy(TradingStrategy):
 
         if len(self.accuracy_history[symbol]) >= 10:
             accuracy = sum(self.accuracy_history[symbol]) / len(self.accuracy_history[symbol])
+            
+            # --- CRITICAL FAILURE CHECK (ROLLBACK) ---
+            if self.ai_config.performance.auto_rollback and accuracy < self.ai_config.performance.critical_accuracy_threshold:
+                logger.critical("Model accuracy CRITICAL. Initiating ROLLBACK.", symbol=symbol, accuracy=f"{accuracy:.2%}")
+                success = await self.ensemble_learner.rollback_model(symbol)
+                if success:
+                    # Clear history as we are now on a different model
+                    self.accuracy_history[symbol].clear()
+                    self.prediction_logs[symbol] = []
+                    self.force_retrain_flags[symbol] = False # Clear flag if it was set
+                    return
+
+            # --- STANDARD FAILURE CHECK (RETRAIN) ---
             if accuracy < self.ai_config.performance.min_accuracy:
                 if not self.force_retrain_flags.get(symbol, False):
                     logger.warning("Model accuracy dropped below threshold. Forcing retrain and blocking entries.", 
@@ -383,6 +410,7 @@ class AIEnsembleStrategy(TradingStrategy):
             if success:
                 self.last_retrained_at[symbol] = Clock.now()
                 self.force_retrain_flags[symbol] = False
+                self.drift_counters[symbol] = 0
                 self.prediction_logs[symbol] = []
                 if symbol in self.accuracy_history:
                     self.accuracy_history[symbol].clear()
