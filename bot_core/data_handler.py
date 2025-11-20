@@ -71,6 +71,7 @@ class DataHandler:
         self._shared_latest_prices = shared_latest_prices
         self._running = False
         self._update_task: Optional[asyncio.Task] = None
+        self._ticker_task: Optional[asyncio.Task] = None
         self._save_task: Optional[asyncio.Task] = None
         
         # Event system for new candle notification
@@ -146,14 +147,17 @@ class DataHandler:
             return
         self._running = True
         self._update_task = asyncio.create_task(self._update_loop())
+        self._ticker_task = asyncio.create_task(self._ticker_loop())
         self._save_task = asyncio.create_task(self._auto_save_loop())
-        logger.info("DataHandler update and auto-save loops started.")
+        logger.info("DataHandler update, ticker, and auto-save loops started.")
 
     async def stop(self):
         """Stops the background loops and saves cache."""
         self._running = False
         if self._update_task and not self._update_task.done():
             self._update_task.cancel()
+        if self._ticker_task and not self._ticker_task.done():
+            self._ticker_task.cancel()
         if self._save_task and not self._save_task.done():
             self._save_task.cancel()
         
@@ -166,6 +170,7 @@ class DataHandler:
         logger.info("DataHandler stopped and executor shutdown.")
 
     async def _update_loop(self):
+        """Loop for fetching OHLCV candles and updating indicators."""
         while self._running:
             try:
                 tasks = [self.update_symbol_data(symbol) for symbol in self.symbols]
@@ -177,6 +182,23 @@ class DataHandler:
                 logger.error("Error in data update loop", error=str(e), exc_info=True)
             
             await asyncio.sleep(self.update_interval)
+
+    async def _ticker_loop(self):
+        """High-frequency loop for fetching current prices (tickers)."""
+        while self._running:
+            try:
+                # Fetch all tickers in one batch if possible
+                tickers = await self.exchange_api.get_tickers(self.symbols)
+                for symbol, ticker_data in tickers.items():
+                    if ticker_data and 'last' in ticker_data:
+                        self._shared_latest_prices[symbol] = ticker_data['last']
+            except asyncio.CancelledError:
+                logger.info("Ticker loop cancelled.")
+                break
+            except Exception as e:
+                logger.error("Error in ticker loop", error=str(e))
+            
+            await asyncio.sleep(self.config.data_handler.ticker_update_interval_seconds)
 
     async def _auto_save_loop(self):
         """Periodically saves the raw data buffers to disk."""
@@ -297,6 +319,9 @@ class DataHandler:
         
         # Atomic update of the consumption dataframe
         self._dataframes[symbol] = processed_df
+        
+        # Update latest price from candle close as a fallback or for backtesting
+        # In live mode, _ticker_loop will overwrite this with fresher data
         self._update_latest_price(symbol, processed_df)
 
         # Check for new closed candle to trigger event
