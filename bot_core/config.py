@@ -49,11 +49,16 @@ class MarketRegimeConfig(BaseModel):
     adx_col: str = "adx"
     adx_threshold: float = 25.0
 
-    # --- Efficiency Filter Settings (New) ---
+    # --- Efficiency Filter Settings ---
     # Kaufman Efficiency Ratio (KER): Change / Volatility
-    # High values (>0.3) indicate smooth trends. Low values indicate chop.
     efficiency_period: int = 10
     efficiency_threshold: float = 0.3
+
+    # --- Hurst Exponent Settings (New) ---
+    use_hurst_filter: bool = True
+    hurst_window: int = 100
+    hurst_mean_reversion_threshold: float = 0.45 # Below this = Mean Reverting (Sideways)
+    hurst_trending_threshold: float = 0.55 # Above this = Trending
     
     # --- Adaptive Regime Settings ---
     use_dynamic_thresholds: bool = False
@@ -124,7 +129,7 @@ class AIFeatureEngineeringConfig(BaseModel):
     use_time_features: bool = False # Cyclical encoding of Hour/Day
     use_price_action_features: bool = False # Candle body/wick ratios
 
-    # --- Quantitative Features (New) ---
+    # --- Quantitative Features ---
     use_volatility_estimators: bool = False # Garman-Klass Volatility
     use_frac_diff: bool = False # Fractional Differentiation
     frac_diff_d: float = 0.4 # Differencing factor (0.0 = Raw, 1.0 = Returns)
@@ -255,7 +260,7 @@ class RiskManagementConfig(BaseModel):
     trailing_stop_activation_pct: float
     trailing_stop_pct: float
     
-    # --- Stop Loss Type (New) ---
+    # --- Stop Loss Type ---
     # 'ATR': Volatility based (Entry +/- ATR * Multiplier)
     # 'SWING': Structural (Recent Low/High +/- Buffer)
     stop_loss_type: Literal["ATR", "SWING"] = "ATR"
@@ -324,7 +329,7 @@ class OptimizerConfig(BaseModel):
     optimize_risk_params: bool = True
     risk_adjustment_step: float = 0.1 # Step for R:R and ATR Multiplier
     
-    # --- Risk Sizing Optimization (New) ---
+    # --- Risk Sizing Optimization ---
     optimize_risk_sizing: bool = True
     target_kelly_fraction: float = 0.25 # Conservative default (Quarter Kelly)
     min_risk_pct: float = 0.005 # 0.5% floor
