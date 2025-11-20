@@ -32,6 +32,29 @@ class TradeSignal(BaseModel):
     strategy_name: str
     metadata: Dict[str, Any] = {}
 
+class StrategyPersistence:
+    """Helper class to handle JSON state persistence for strategies."""
+    def __init__(self, path: str):
+        self.path = path
+
+    def save(self, state: Dict[str, Any]):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, 'w') as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logger.error("Failed to save strategy state", error=str(e))
+
+    def load(self) -> Dict[str, Any]:
+        if not os.path.exists(self.path):
+            return {}
+        try:
+            with open(self.path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error("Failed to load strategy state", error=str(e))
+            return {}
+
 class TradingStrategy(abc.ABC):
     def __init__(self, config: StrategyParamsBase):
         self.config = config
@@ -146,7 +169,7 @@ class AIEnsembleStrategy(TradingStrategy):
         self.individual_model_logs: Dict[str, List[Tuple[datetime, Dict[str, Any]]]] = {}
         self.model_performance_stats: Dict[str, Dict[str, deque]] = {}
         
-        self.state_path = os.path.join(self.ai_config.model_path, "strategy_state.json")
+        self.persistence = StrategyPersistence(os.path.join(self.ai_config.model_path, "strategy_state.json"))
 
         try:
             self.ensemble_learner = EnsembleLearner(self.ai_config)
@@ -166,67 +189,58 @@ class AIEnsembleStrategy(TradingStrategy):
         await self.ensemble_learner.warmup_models(symbols)
 
     def _save_state(self):
-        try:
-            state = {
-                'last_retrained_at': {k: v.isoformat() for k, v in self.last_retrained_at.items()},
-                'last_signal_time': {k: v.isoformat() for k, v in self.last_signal_time.items()},
-                'force_retrain_flags': self.force_retrain_flags,
-                'drift_counters': self.drift_counters,
-                'accuracy_history': {k: list(v) for k, v in self.accuracy_history.items()},
-                'prediction_logs': {k: [(ts.isoformat(), p) for ts, p in v] for k, v in self.prediction_logs.items()},
-                'individual_model_logs': {
-                    k: [(ts.isoformat(), {m: p.tolist() if isinstance(p, np.ndarray) else p for m, p in preds.items()}) 
-                        for ts, preds in v[-50:]] 
-                    for k, v in self.individual_model_logs.items()
-                },
-                'model_performance_stats': {
-                    k: {m: list(d) for m, d in v.items()} for k, v in self.model_performance_stats.items()
-                }
+        state = {
+            'last_retrained_at': {k: v.isoformat() for k, v in self.last_retrained_at.items()},
+            'last_signal_time': {k: v.isoformat() for k, v in self.last_signal_time.items()},
+            'force_retrain_flags': self.force_retrain_flags,
+            'drift_counters': self.drift_counters,
+            'accuracy_history': {k: list(v) for k, v in self.accuracy_history.items()},
+            'prediction_logs': {k: [(ts.isoformat(), p) for ts, p in v] for k, v in self.prediction_logs.items()},
+            'individual_model_logs': {
+                k: [(ts.isoformat(), {m: p.tolist() if isinstance(p, np.ndarray) else p for m, p in preds.items()}) 
+                    for ts, preds in v[-50:]] 
+                for k, v in self.individual_model_logs.items()
+            },
+            'model_performance_stats': {
+                k: {m: list(d) for m, d in v.items()} for k, v in self.model_performance_stats.items()
             }
-            os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
-            with open(self.state_path, 'w') as f:
-                json.dump(state, f, indent=2)
-        except Exception as e:
-            logger.error("Failed to save strategy state", error=str(e))
+        }
+        self.persistence.save(state)
 
     def _load_state(self):
-        if not os.path.exists(self.state_path):
+        state = self.persistence.load()
+        if not state:
             return
-        try:
-            with open(self.state_path, 'r') as f:
-                state = json.load(f)
-            
-            if 'last_retrained_at' in state:
-                self.last_retrained_at = {k: datetime.fromisoformat(v) for k, v in state['last_retrained_at'].items()}
-            if 'last_signal_time' in state:
-                self.last_signal_time = {k: datetime.fromisoformat(v) for k, v in state['last_signal_time'].items()}
 
-            self.force_retrain_flags = state.get('force_retrain_flags', {})
-            self.drift_counters = state.get('drift_counters', {})
-            
-            if 'accuracy_history' in state:
-                for k, v in state['accuracy_history'].items():
-                    self.accuracy_history[k] = deque(v, maxlen=self.ai_config.performance.window_size)
-            
-            if 'prediction_logs' in state:
-                for k, v in state['prediction_logs'].items():
-                    self.prediction_logs[k] = [(datetime.fromisoformat(ts), p) for ts, p in v]
-            
-            if 'individual_model_logs' in state:
-                for k, v in state['individual_model_logs'].items():
-                    self.individual_model_logs[k] = [
-                        (datetime.fromisoformat(ts), {m: np.array(p) for m, p in preds.items()}) 
-                        for ts, preds in v
-                    ]
-            
-            if 'model_performance_stats' in state:
-                window = self.ai_config.ensemble_weights.dynamic_window
-                for k, v in state['model_performance_stats'].items():
-                    self.model_performance_stats[k] = {m: deque(d, maxlen=window) for m, d in v.items()}
-            
-            logger.info("Restored AI Strategy state from disk.")
-        except Exception as e:
-            logger.error("Failed to load strategy state", error=str(e))
+        if 'last_retrained_at' in state:
+            self.last_retrained_at = {k: datetime.fromisoformat(v) for k, v in state['last_retrained_at'].items()}
+        if 'last_signal_time' in state:
+            self.last_signal_time = {k: datetime.fromisoformat(v) for k, v in state['last_signal_time'].items()}
+
+        self.force_retrain_flags = state.get('force_retrain_flags', {})
+        self.drift_counters = state.get('drift_counters', {})
+        
+        if 'accuracy_history' in state:
+            for k, v in state['accuracy_history'].items():
+                self.accuracy_history[k] = deque(v, maxlen=self.ai_config.performance.window_size)
+        
+        if 'prediction_logs' in state:
+            for k, v in state['prediction_logs'].items():
+                self.prediction_logs[k] = [(datetime.fromisoformat(ts), p) for ts, p in v]
+        
+        if 'individual_model_logs' in state:
+            for k, v in state['individual_model_logs'].items():
+                self.individual_model_logs[k] = [
+                    (datetime.fromisoformat(ts), {m: np.array(p) for m, p in preds.items()}) 
+                    for ts, preds in v
+                ]
+        
+        if 'model_performance_stats' in state:
+            window = self.ai_config.ensemble_weights.dynamic_window
+            for k, v in state['model_performance_stats'].items():
+                self.model_performance_stats[k] = {m: deque(d, maxlen=window) for m, d in v.items()}
+        
+        logger.info("Restored AI Strategy state from disk.")
 
     def _in_cooldown(self, symbol: str) -> bool:
         last_sig = self.last_signal_time.get(symbol)
