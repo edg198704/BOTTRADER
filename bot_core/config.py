@@ -39,6 +39,16 @@ class EnsembleWeightsConfig(BaseModel):
     dynamic_window: int = 25
     dynamic_smoothing_factor: float = 0.1 # EMA smoothing for weights
 
+class MetaLabelingConfig(BaseModel):
+    enabled: bool = True
+    # Minimum probability from Meta-Model to accept a trade
+    probability_threshold: float = 0.55 
+    # If True, adds the primary model's confidence score as a feature for the meta-model
+    use_primary_confidence_feature: bool = True
+    # Meta-Model Hyperparameters (Random Forest)
+    n_estimators: int = 100
+    max_depth: int = 5
+
 class DriftDetectionConfig(BaseModel):
     enabled: bool = True
     contamination: float = 0.05 # Expected proportion of outliers in training data
@@ -224,6 +234,7 @@ class AIEnsembleStrategyParams(StrategyParamsBase):
     market_regime: MarketRegimeConfig = MarketRegimeConfig()
     performance: AIPerformanceConfig = AIPerformanceConfig()
     drift: DriftDetectionConfig = DriftDetectionConfig()
+    meta_labeling: MetaLabelingConfig = MetaLabelingConfig()
 
 # --- Core Component Configs ---
 
