@@ -1,258 +1,149 @@
 import asyncio
+import logging
 import functools
-import numpy as np
-import pandas as pd
-from typing import Tuple, Type, List, Dict, Any, Optional
 from datetime import datetime, timezone
+from typing import Callable, Dict, List, Any
 
-from bot_core.logger import get_logger
-
-# Note: The logger is fetched at the module level.
-# When used inside the decorator, it will correctly reference the decorated function's module.
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 class Clock:
     """
-    Centralized time provider to enable deterministic testing and backtesting.
-    In LIVE mode, returns system time.
-    In SIMULATION mode, returns the injected mock time.
+    Centralized clock for time abstraction.
+    Allows backtesting to override 'now' without patching datetime.now().
     """
-    _mock_time: Optional[datetime] = None
+    _mock_time = None
 
     @classmethod
     def now(cls) -> datetime:
-        """Returns the current time (UTC)."""
         if cls._mock_time:
             return cls._mock_time
         return datetime.now(timezone.utc)
 
     @classmethod
     def set_time(cls, dt: datetime):
-        """Sets the mock time for simulation."""
-        if dt.tzinfo is None:
-            # Assume UTC if no timezone provided during simulation set
-            dt = dt.replace(tzinfo=timezone.utc)
         cls._mock_time = dt
 
     @classmethod
     def reset(cls):
-        """Resets to system time."""
         cls._mock_time = None
 
-    @classmethod
-    def timestamp(cls) -> float:
-        """Returns current timestamp as float."""
-        return cls.now().timestamp()
-
-class PerformanceMetrics:
-    """Calculates advanced performance metrics for trading strategies."""
-    
-    @staticmethod
-    def calculate(trades: List[Dict[str, Any]], initial_capital: float) -> Dict[str, Any]:
-        if not trades:
-            return {
-                'total_trades': 0,
-                'win_rate': 0.0,
-                'profit_factor': 0.0,
-                'sharpe_ratio': 0.0,
-                'sortino_ratio': 0.0,
-                'max_drawdown': 0.0,
-                'total_return_pct': 0.0
-            }
-
-        df = pd.DataFrame(trades)
-        df['pnl'] = pd.to_numeric(df['pnl'])
-        df['close_timestamp'] = pd.to_datetime(df['close_timestamp'])
-        df.sort_values('close_timestamp', inplace=True)
-
-        # Basic Metrics
-        total_trades = len(df)
-        wins = df[df['pnl'] > 0]
-        losses = df[df['pnl'] <= 0]
-        win_rate = len(wins) / total_trades if total_trades > 0 else 0.0
-        
-        gross_profit = wins['pnl'].sum()
-        gross_loss = abs(losses['pnl'].sum())
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
-        
-        total_pnl = df['pnl'].sum()
-        total_return_pct = (total_pnl / initial_capital) * 100
-
-        # Equity Curve & Drawdown
-        df['cumulative_pnl'] = df['pnl'].cumsum()
-        df['equity'] = initial_capital + df['cumulative_pnl']
-        df['peak_equity'] = df['equity'].cummax()
-        df['drawdown'] = (df['equity'] - df['peak_equity']) / df['peak_equity']
-        max_drawdown = abs(df['drawdown'].min())
-
-        # Risk-Adjusted Returns (Sharpe/Sortino)
-        # We approximate using per-trade returns. For more accuracy, daily returns are better.
-        returns = df['pnl'] / initial_capital
-        mean_return = returns.mean()
-        std_return = returns.std()
-        
-        sharpe_ratio = 0.0
-        if std_return > 0:
-            # Annualized Sharpe (assuming ~252 trading days, but here we just use trade frequency)
-            # A simple approximation: Mean / Std
-            sharpe_ratio = mean_return / std_return
-
-        downside_returns = returns[returns < 0]
-        downside_std = downside_returns.std()
-        sortino_ratio = 0.0
-        if downside_std > 0:
-            sortino_ratio = mean_return / downside_std
-
-        return {
-            'total_trades': total_trades,
-            'win_rate': round(win_rate * 100, 2),
-            'profit_factor': round(profit_factor, 2),
-            'sharpe_ratio': round(sharpe_ratio, 2),
-            'sortino_ratio': round(sortino_ratio, 2),
-            'max_drawdown': round(max_drawdown * 100, 2),
-            'total_return_pct': round(total_return_pct, 2),
-            'final_equity': round(initial_capital + total_pnl, 2)
-        }
-
-def async_retry(
-    max_attempts: int = 3,
-    delay_seconds: int = 1,
-    backoff_factor: int = 2,
-    exceptions: Tuple[Type[Exception], ...] = (Exception,)
-):
-    """
-    A decorator for retrying asynchronous functions with exponential backoff.
-
-    Args:
-        max_attempts: The maximum number of attempts.
-        delay_seconds: The initial delay between retries in seconds.
-        backoff_factor: The factor by which the delay is multiplied after each retry.
-        exceptions: A tuple of exception types to catch and trigger a retry.
-    """
-    def decorator(func):
+def async_retry(max_attempts: int = 3, delay_seconds: float = 1.0, backoff_factor: float = 2.0, exceptions: tuple = (Exception,)):
+    """Decorator for retrying async functions with exponential backoff."""
+    def decorator(func: Callable):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
-            _delay = delay_seconds
-            for attempt in range(1, max_attempts + 1):
+            attempt = 0
+            current_delay = delay_seconds
+            while attempt < max_attempts:
                 try:
                     return await func(*args, **kwargs)
                 except exceptions as e:
-                    # Use the logger from the module where the decorated function is defined
-                    func_logger = get_logger(func.__module__)
-                    func_logger.warning(
-                        f"Attempt {attempt}/{max_attempts} failed for {func.__name__}",
-                        error=str(e),
-                        attempt=attempt,
-                        max_attempts=max_attempts,
-                        func_name=func.__name__
-                    )
-                    if attempt < max_attempts:
-                        func_logger.info(
-                            f"Retrying {func.__name__} in {_delay} seconds...",
-                            delay=_delay,
-                            func_name=func.__name__
-                        )
-                        await asyncio.sleep(_delay)
-                        _delay *= backoff_factor
-                    else:
-                        func_logger.error(
-                            f"All {max_attempts} attempts failed for {func.__name__}.",
-                            func_name=func.__name__
-                        )
+                    attempt += 1
+                    if attempt >= max_attempts:
                         raise
+                    logger.warning(f"Retrying {func.__name__} due to {e}. Attempt {attempt}/{max_attempts}")
+                    await asyncio.sleep(current_delay)
+                    current_delay *= backoff_factor
         return wrapper
     return decorator
 
-def generate_indicator_rename_map(indicators_config: List[Dict[str, Any]]) -> Dict[str, str]:
-    """
-    Generates a mapping from verbose pandas-ta column names to simplified, consistent names.
-    This function is the single source of truth for renaming indicators, ensuring consistency
-    between startup validation and runtime data processing.
-    """
-    rename_map = {}
-    for conf in indicators_config:
-        kind = conf.get("kind")
-        if not kind:
-            continue
-
-        alias = conf.get("alias")
-
-        if kind == "rsi":
-            length = conf.get("length", 14)
-            rename_map[f"RSI_{length}"] = alias or "rsi"
-        elif kind == "macd":
-            fast = conf.get("fast", 12)
-            slow = conf.get("slow", 26)
-            signal = conf.get("signal", 9)
-            base = f"MACD_{fast}_{slow}_{signal}"
-            base_alias = alias or "macd"
-            rename_map[base] = base_alias
-            rename_map[f"{base}h"] = f"{base_alias}_hist"
-            rename_map[f"{base}s"] = f"{base_alias}_signal"
-        elif kind == "bbands":
-            length = conf.get("length", 20)
-            std = float(conf.get("std", 2.0))
-            base = f"_{length}_{std:.1f}"
-            base_alias = alias or "bb"
-            rename_map[f"BBL{base}"] = f"{base_alias}_lower"
-            rename_map[f"BBM{base}"] = f"{base_alias}_middle"
-            rename_map[f"BBU{base}"] = f"{base_alias}_upper"
-        elif kind == "atr":
-            length = conf.get("length", 14)
-            rename_map[f"ATRr_{length}"] = alias or "atr"
-        elif kind == "adx":
-            length = conf.get("length", 14)
-            rename_map[f"ADX_{length}"] = alias or "adx"
-        elif kind == "sma":
-            if not alias:
-                raise ValueError(f"Indicator 'sma' with length {conf.get('length')} must have an 'alias' in the configuration to avoid ambiguity.")
-            length = conf.get("length")
-            rename_map[f"SMA_{length}"] = alias
-        elif kind == "log_return":
-            length = conf.get("length", 1)
-            rename_map[f"LOGRET_{length}"] = alias or "log_return"
-        else:
-            # Handle generic case with alias
-            if alias:
-                params = "_".join(str(v) for k, v in conf.items() if k not in ['kind', 'alias'])
-                ta_name = f"{kind.upper()}_{params}"
-                rename_map[ta_name] = alias
-
-    return rename_map
-
 def parse_timeframe_to_seconds(timeframe: str) -> int:
-    """
-    Parses a timeframe string (e.g., '1m', '1h', '1d') into seconds.
-    """
-    if not timeframe:
-        return 60
-    
+    """Converts a timeframe string (e.g., '5m', '1h') to seconds."""
     unit = timeframe[-1]
+    if unit not in ['s', 'm', 'h', 'd', 'w']:
+        return 0
     try:
         value = int(timeframe[:-1])
     except ValueError:
-        return 60
-
-    multipliers = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}
-    return value * multipliers.get(unit, 60)
-
-def calculate_min_history_depth(indicators_config: List[Dict[str, Any]]) -> int:
-    """
-    Calculates the minimum historical data points required to compute all configured indicators.
-    Adds a safety buffer to ensure convergence (e.g. for EMA/RSI).
-    """
-    max_lookback = 0
-    for conf in indicators_config:
-        kind = conf.get("kind", "")
-        # Check common length parameters
-        length = conf.get("length", 0)
-        slow = conf.get("slow", 0)
+        return 0
         
-        current_max = max(length, slow)
-        if current_max > max_lookback:
-            max_lookback = current_max
+    multipliers = {
+        's': 1,
+        'm': 60,
+        'h': 3600,
+        'd': 86400,
+        'w': 604800
+    }
+    return value * multipliers[unit]
+
+def calculate_min_history_depth(indicators: List[Dict[str, Any]]) -> int:
+    """Calculates the minimum historical data needed based on indicator lengths."""
+    max_depth = 0
+    for ind in indicators:
+        kind = ind.get('kind', '').lower()
+        depth = 0
+        
+        if 'length' in ind:
+            depth = int(ind['length'])
+        elif kind == 'macd':
+            slow = ind.get('slow', 26)
+            signal = ind.get('signal', 9)
+            depth = slow + signal
+        
+        # Add buffer for convergence (EMA, RSI, etc. need more history)
+        if kind in ['ema', 'rsi', 'adx', 'atr']:
+            depth = depth * 3
+        
+        if depth > max_depth:
+            max_depth = depth
             
-    # Add buffer: 50 candles or 2x lookback for convergence stability
-    # e.g. EMA needs more than 'length' to converge accurately
-    buffer = max(50, max_lookback)
-    return max_lookback + buffer
+    return max(max_depth, 100) # Return at least 100 candles
+
+def generate_indicator_rename_map(indicators: List[Dict[str, Any]]) -> Dict[str, str]:
+    """
+    Generates a mapping from pandas-ta default column names to configured aliases.
+    Handles specific logic for multi-column indicators like MACD and BBANDS to match
+    the feature columns expected by the AI strategy.
+    """
+    rename_map = {}
+    for ind in indicators:
+        kind = ind.get('kind', '').lower()
+        alias = ind.get('alias')
+        
+        # Helper to format pandas-ta default names
+        length = ind.get('length')
+        
+        if kind == 'rsi':
+            l = length if length else 14
+            rename_map[f"RSI_{l}"] = alias if alias else "rsi"
+            
+        elif kind == 'sma':
+            l = length if length else 10
+            rename_map[f"SMA_{l}"] = alias if alias else f"sma_{l}"
+            
+        elif kind == 'ema':
+            l = length if length else 10
+            rename_map[f"EMA_{l}"] = alias if alias else f"ema_{l}"
+            
+        elif kind == 'atr':
+            l = length if length else 14
+            # pandas-ta often uses ATRr or ATR depending on version/config
+            rename_map[f"ATRr_{l}"] = alias if alias else "atr"
+            
+        elif kind == 'adx':
+            l = length if length else 14
+            # ADX produces ADX, DMP, DMN. We usually just want ADX line.
+            rename_map[f"ADX_{l}"] = alias if alias else "adx"
+            
+        elif kind == 'log_return':
+            l = length if length else 1
+            rename_map[f"LOGRET_{l}"] = alias if alias else "log_return"
+            
+        elif kind == 'macd':
+            fast = ind.get('fast', 12)
+            slow = ind.get('slow', 26)
+            signal = ind.get('signal', 9)
+            # Default pandas-ta output: MACD_12_26_9
+            col_name = f"MACD_{fast}_{slow}_{signal}"
+            rename_map[col_name] = alias if alias else "macd"
+            
+        elif kind == 'bbands':
+            l = length if length else 20
+            std = ind.get('std', 2.0)
+            # Default pandas-ta outputs: BBL_20_2.0, BBM_20_2.0, BBU_20_2.0
+            # We map them to standard names expected by config if no alias provided
+            rename_map[f"BBU_{l}_{std}"] = "bb_upper"
+            rename_map[f"BBL_{l}_{std}"] = "bb_lower"
+            rename_map[f"BBM_{l}_{std}"] = "bb_mid"
+            
+    return rename_map
