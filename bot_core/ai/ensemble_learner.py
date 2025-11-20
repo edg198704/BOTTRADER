@@ -31,6 +31,7 @@ try:
     from sklearn.isotonic import IsotonicRegression
     from xgboost import XGBClassifier
     from scipy.optimize import minimize
+    from scipy.stats import skew, kurtosis, norm
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
@@ -49,6 +50,11 @@ except ImportError:
     def compute_class_weight(*args, **kwargs): return []
     def compute_sample_weight(*args, **kwargs): return []
     def minimize(*args, **kwargs): return None
+    def skew(*args, **kwargs): return 0.0
+    def kurtosis(*args, **kwargs): return 0.0
+    class norm: 
+        @staticmethod
+        def cdf(x): return 0.5
     class nn:
         class Module: pass
     class optim: pass
@@ -362,6 +368,32 @@ def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyP
     except Exception:
         return None
 
+def _calculate_psr(sharpe_ratio: float, returns: np.ndarray, benchmark_sr: float = 0.0) -> float:
+    """
+    Calculates the Probabilistic Sharpe Ratio (PSR).
+    PSR estimates the probability that the true Sharpe Ratio is greater than the benchmark.
+    Adjusts for non-normality (Skewness, Kurtosis) and track record length.
+    """
+    if len(returns) < 2:
+        return 0.0
+    
+    T = len(returns)
+    skew_val = skew(returns)
+    kurt_val = kurtosis(returns)
+    
+    # Standard deviation of the Sharpe Ratio estimator
+    # sigma_SR = sqrt((1 - gamma3*SR + (gamma4-1)/4 * SR^2) / (T-1))
+    numerator = 1 - (skew_val * sharpe_ratio) + ((kurt_val - 1) / 4) * (sharpe_ratio ** 2)
+    if numerator < 0: numerator = 0 # Safety clamp
+    
+    sigma_sr = np.sqrt(numerator / (T - 1))
+    
+    if sigma_sr == 0:
+        return 0.0
+        
+    z_score = (sharpe_ratio - benchmark_sr) / sigma_sr
+    return norm.cdf(z_score)
+
 def _evaluate_ensemble(models: Dict[str, Any], 
                        X: np.ndarray, 
                        y: np.ndarray, 
@@ -445,9 +477,14 @@ def _evaluate_ensemble(models: Dict[str, Any],
     std_ret = np.std(strategy_returns)
     sharpe = mean_ret / std_ret if std_ret > 0 else 0.0
     
+    psr = 0.0
+    if config.training.use_probabilistic_sharpe:
+        psr = _calculate_psr(sharpe, strategy_returns)
+
     return {
         'profit_factor': float(profit_factor), 
         'sharpe': float(sharpe),
+        'psr': float(psr),
         'total_return': float(np.sum(strategy_returns)),
         'win_rate': float(len(winning_returns) / len(strategy_returns)) if len(strategy_returns) > 0 else 0.0
     }
@@ -479,17 +516,27 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         full_returns = df['close'].pct_change().shift(-1)
         market_returns = full_returns.loc[common_index].fillna(0.0).values
 
-        # --- DATA SPLITTING (Dev / Test) ---
+        # --- DATA SPLITTING (Dev / Test) with PURGING ---
         # CRITICAL: Split BEFORE feature selection to prevent leakage
         test_split_idx = int(len(X_full) * (1 - config.training.validation_split))
+        
+        # Determine purge gap based on labeling horizon to prevent look-ahead bias
+        purge_gap = config.features.labeling_horizon if config.training.purge_overlap else 0
         
         X_dev_raw = X_full[:test_split_idx]
         y_dev = y[:test_split_idx]
         returns_dev = market_returns[:test_split_idx]
         
-        X_test_raw = X_full[test_split_idx:]
-        y_test = y[test_split_idx:]
-        returns_test = market_returns[test_split_idx:]
+        # Purge the beginning of the test set to avoid leakage from the end of dev set
+        # The labels at the end of Dev look forward 'horizon' steps. 
+        # We must skip 'horizon' steps in Test to ensure Test data wasn't seen in Dev labels.
+        X_test_raw = X_full[test_split_idx + purge_gap:]
+        y_test = y[test_split_idx + purge_gap:]
+        returns_test = market_returns[test_split_idx + purge_gap:]
+
+        if len(X_test_raw) < 50:
+            worker_logger.warning("Test set too small after purging.")
+            return False
 
         # --- FEATURE SELECTION (On Dev Set Only) ---
         selected_indices = list(range(X_full.shape[1]))
@@ -532,7 +579,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 champ_indices = [all_feature_names.index(f) for f in champ_features if f in all_feature_names]
                 if len(champ_indices) == len(champ_features):
                     X_champ_full = X_full[:, champ_indices]
-                    X_champ_test = X_champ_full[test_split_idx:]
+                    # Apply same purging logic to champion evaluation data
+                    X_champ_test = X_champ_full[test_split_idx + purge_gap:]
                     X_champ_seq_test, y_champ_seq_test = FeatureProcessor.create_sequences(X_champ_test, y_test, seq_len)
                     
                     champion_metrics = _evaluate_ensemble(
@@ -540,23 +588,26 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                         config, device, returns_test, weights_override=champion_weights, 
                         calibrator=champion_calibrator, threshold_override=champion_threshold
                     )
-                    worker_logger.info(f"Champion Metrics: PF={champion_metrics.get('profit_factor', 0):.2f}, Sharpe={champion_metrics.get('sharpe', 0):.4f}")
+                    worker_logger.info(f"Champion Metrics: PF={champion_metrics.get('profit_factor', 0):.2f}, Sharpe={champion_metrics.get('sharpe', 0):.4f}, PSR={champion_metrics.get('psr', 0):.4f}")
             except Exception as e:
                 worker_logger.warning(f"Could not evaluate champion: {e}")
 
-        # --- WALK-FORWARD VALIDATION (STACKING) ---
+        # --- WALK-FORWARD VALIDATION (STACKING) with PURGING ---
         oos_predictions = {} 
         oos_indices = []
         use_cv = len(X_dev) > 500 and config.training.cv_splits > 1
         
         if use_cv:
-            worker_logger.info(f"Starting Walk-Forward Validation with {config.training.cv_splits} splits...")
+            worker_logger.info(f"Starting Walk-Forward Validation with {config.training.cv_splits} splits (Purge Gap: {purge_gap})...")
             tscv = TimeSeriesSplit(n_splits=config.training.cv_splits)
-            horizon = config.features.labeling_horizon
             
             for fold, (train_idx, val_idx) in enumerate(tscv.split(X_dev)):
-                if len(train_idx) > horizon:
-                    train_idx = train_idx[:-horizon]
+                # Apply Purging to the Training Set of the Fold
+                # The end of the training set must be purged to avoid leaking into the validation set
+                if len(train_idx) > purge_gap:
+                    train_idx = train_idx[:-purge_gap]
+                else:
+                    continue # Skip fold if purge consumes entire train set (unlikely)
                 
                 X_fold_train, X_fold_val = X_dev[train_idx], X_dev[val_idx]
                 y_fold_train, y_fold_val = y_dev[train_idx], y_dev[val_idx]
@@ -728,19 +779,22 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
 
         val_size = int(len(X_dev) * 0.15)
         if val_size > seq_len:
-            X_final_train = X_dev[:-val_size]
-            y_final_train = y_dev[:-val_size]
-            X_final_val = X_dev[-val_size:]
-            y_final_val = y_dev[-val_size:]
-            
-            X_seq_tr, y_seq_tr = FeatureProcessor.create_sequences(X_final_train, y_final_train, seq_len)
-            X_seq_val, y_seq_val = FeatureProcessor.create_sequences(X_final_val, y_final_val, seq_len)
-            
-            for name in ['lstm', 'attention']:
-                if name not in final_models: continue
-                model = final_models[name]
-                _train_torch_model(model, X_seq_tr, y_seq_tr, X_seq_val, y_seq_val, config, device, torch_class_weights)
-                trained_models[name] = model
+            # Apply purging to final validation split as well
+            train_end = len(X_dev) - val_size - purge_gap
+            if train_end > 0:
+                X_final_train = X_dev[:train_end]
+                y_final_train = y_dev[:train_end]
+                X_final_val = X_dev[-val_size:]
+                y_final_val = y_dev[-val_size:]
+                
+                X_seq_tr, y_seq_tr = FeatureProcessor.create_sequences(X_final_train, y_final_train, seq_len)
+                X_seq_val, y_seq_val = FeatureProcessor.create_sequences(X_final_val, y_final_val, seq_len)
+                
+                for name in ['lstm', 'attention']:
+                    if name not in final_models: continue
+                    model = final_models[name]
+                    _train_torch_model(model, X_seq_tr, y_seq_tr, X_seq_val, y_seq_val, config, device, torch_class_weights)
+                    trained_models[name] = model
         else:
             X_seq_dev, y_seq_dev = FeatureProcessor.create_sequences(X_dev, y_dev, seq_len)
             if len(X_seq_dev) > 0:
@@ -778,23 +832,41 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         
         pf = challenger_metrics.get('profit_factor', 0)
         sharpe = challenger_metrics.get('sharpe', 0)
-        worker_logger.info(f"Challenger Metrics (Test Set): PF={pf:.2f}, Sharpe={sharpe:.4f}")
+        psr = challenger_metrics.get('psr', 0)
+        worker_logger.info(f"Challenger Metrics (Test Set): PF={pf:.2f}, Sharpe={sharpe:.4f}, PSR={psr:.4f}")
 
         if pf < config.training.min_profit_factor:
             worker_logger.warning(f"Challenger rejected: PF {pf:.2f} < {config.training.min_profit_factor}")
             return False
-        if sharpe < config.training.min_sharpe_ratio:
-            worker_logger.warning(f"Challenger rejected: Sharpe {sharpe:.4f} < {config.training.min_sharpe_ratio}")
-            return False
+        
+        # Use PSR for selection if enabled, otherwise fallback to Sharpe
+        if config.training.use_probabilistic_sharpe:
+            # Require at least 95% confidence that Sharpe > 0
+            if psr < 0.95:
+                 worker_logger.warning(f"Challenger rejected: PSR {psr:.4f} < 0.95 (Low confidence in positive Sharpe)")
+                 return False
+        else:
+            if sharpe < config.training.min_sharpe_ratio:
+                worker_logger.warning(f"Challenger rejected: Sharpe {sharpe:.4f} < {config.training.min_sharpe_ratio}")
+                return False
 
         if champion_metrics:
             champ_sharpe = champion_metrics.get('sharpe', 0)
+            champ_psr = champion_metrics.get('psr', 0)
             improvement_needed = config.training.min_improvement_pct
             is_better = False
-            if champ_sharpe <= 0:
-                if sharpe > champ_sharpe + 0.05: is_better = True
+            
+            if config.training.use_probabilistic_sharpe:
+                # If using PSR, we prefer higher PSR, or higher Sharpe if PSR is similar
+                if psr > champ_psr + 0.05:
+                    is_better = True
+                elif psr > 0.95 and sharpe > champ_sharpe * (1 + improvement_needed):
+                    is_better = True
             else:
-                if sharpe > champ_sharpe * (1 + improvement_needed): is_better = True
+                if champ_sharpe <= 0:
+                    if sharpe > champ_sharpe + 0.05: is_better = True
+                else:
+                    if sharpe > champ_sharpe * (1 + improvement_needed): is_better = True
             
             if not is_better:
                 worker_logger.warning(f"Challenger failed to beat Champion. Champ Sharpe: {champ_sharpe:.4f}, Challenger: {sharpe:.4f}")
