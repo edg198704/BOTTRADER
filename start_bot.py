@@ -154,7 +154,8 @@ async def main():
         order_lifecycle_manager=order_lifecycle_manager,
         alert_system=alert_system,
         shared_latest_prices=latest_prices,
-        market_details={} # This will be populated by the bot after loading
+        market_details={}, # This will be populated by the bot after loading
+        data_handler=data_handler # Injected for ATR calculation
     )
 
     bot = TradingBot(
