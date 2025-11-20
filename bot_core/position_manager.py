@@ -34,12 +34,21 @@ class Position(Base):
     trade_id = Column(String, nullable=True) # Immutable Logical Trade ID (Client Order ID of first order)
     stop_loss_price = Column(Float, nullable=True)
     take_profit_price = Column(Float, nullable=True)
-    # Use Clock.now as the default callable for time abstraction
-    open_timestamp = Column(DateTime, default=Clock.now)
+    
+    # Timestamps
+    creation_timestamp = Column(DateTime, default=Clock.now) # Time when signal was generated/pending order created
+    open_timestamp = Column(DateTime, default=Clock.now) # Time when position was confirmed/filled
     close_timestamp = Column(DateTime, nullable=True)
+    
     close_price = Column(Float, nullable=True)
     pnl = Column(Float, nullable=True) # Net PnL (after fees)
     fees = Column(Float, default=0.0, nullable=False) # Total fees paid (entry + exit)
+    
+    # Execution Analytics
+    decision_price = Column(Float, nullable=True) # Price at the moment the strategy generated the signal
+    execution_latency_ms = Column(Float, nullable=True) # Time in ms from creation to fill
+    slippage_pct = Column(Float, nullable=True) # (Fill Price - Decision Price) / Decision Price
+
     # trailing_ref_price tracks peak price for longs, and trough price for shorts
     trailing_ref_price = Column(Float, nullable=True)
     trailing_stop_active = Column(Boolean, default=False, nullable=False)
@@ -94,6 +103,19 @@ class PositionManager:
                     if 'breakeven_active' not in columns:
                         conn.execute(text("ALTER TABLE positions ADD COLUMN breakeven_active BOOLEAN DEFAULT 0"))
                         logger.info("Schema updated: Added breakeven_active column to positions table.")
+                    # Execution Analytics Columns
+                    if 'decision_price' not in columns:
+                        conn.execute(text("ALTER TABLE positions ADD COLUMN decision_price FLOAT"))
+                        logger.info("Schema updated: Added decision_price column to positions table.")
+                    if 'creation_timestamp' not in columns:
+                        conn.execute(text("ALTER TABLE positions ADD COLUMN creation_timestamp DATETIME"))
+                        logger.info("Schema updated: Added creation_timestamp column to positions table.")
+                    if 'execution_latency_ms' not in columns:
+                        conn.execute(text("ALTER TABLE positions ADD COLUMN execution_latency_ms FLOAT"))
+                        logger.info("Schema updated: Added execution_latency_ms column to positions table.")
+                    if 'slippage_pct' not in columns:
+                        conn.execute(text("ALTER TABLE positions ADD COLUMN slippage_pct FLOAT"))
+                        logger.info("Schema updated: Added slippage_pct column to positions table.")
         except Exception as e:
             logger.warning(f"Schema update check failed: {e}")
 
@@ -180,11 +202,11 @@ class PositionManager:
 
     # --- Pending Position Management (Two-Phase Commit) ---
 
-    async def create_pending_position(self, symbol: str, side: str, order_id: str, trade_id: str, strategy_metadata: Optional[Dict[str, Any]] = None) -> Optional[Position]:
+    async def create_pending_position(self, symbol: str, side: str, order_id: str, trade_id: str, decision_price: float, strategy_metadata: Optional[Dict[str, Any]] = None) -> Optional[Position]:
         async with self._db_lock:
-            return await self._run_in_executor(self._create_pending_position_sync, symbol, side, order_id, trade_id, strategy_metadata)
+            return await self._run_in_executor(self._create_pending_position_sync, symbol, side, order_id, trade_id, decision_price, strategy_metadata)
 
-    def _create_pending_position_sync(self, symbol: str, side: str, order_id: str, trade_id: str, strategy_metadata: Optional[Dict[str, Any]]) -> Optional[Position]:
+    def _create_pending_position_sync(self, symbol: str, side: str, order_id: str, trade_id: str, decision_price: float, strategy_metadata: Optional[Dict[str, Any]]) -> Optional[Position]:
         session = self.SessionLocal()
         try:
             # Check for existing open or pending positions to prevent duplicates
@@ -207,6 +229,8 @@ class PositionManager:
                 status=PositionStatus.PENDING,
                 order_id=order_id,
                 trade_id=trade_id,
+                decision_price=decision_price,
+                creation_timestamp=Clock.now(),
                 trailing_ref_price=0.0,
                 trailing_stop_active=False,
                 breakeven_active=False,
@@ -216,7 +240,7 @@ class PositionManager:
             session.add(new_position)
             session.commit()
             session.refresh(new_position)
-            logger.info("Created PENDING position", symbol=symbol, order_id=order_id, trade_id=trade_id)
+            logger.info("Created PENDING position", symbol=symbol, order_id=order_id, trade_id=trade_id, decision_price=decision_price)
             return new_position
         except Exception as e:
             logger.error("Failed to create pending position", symbol=symbol, error=str(e))
@@ -271,24 +295,45 @@ class PositionManager:
                 logger.error("Cannot confirm position: No PENDING position found with matching Order ID.", symbol=symbol, order_id=order_id)
                 return None
 
+            # Calculate Execution Analytics
+            fill_time = Clock.now()
+            latency = 0.0
+            if position.creation_timestamp:
+                latency = (fill_time - position.creation_timestamp).total_seconds() * 1000.0
+            
+            slippage = 0.0
+            if position.decision_price and position.decision_price > 0:
+                # Raw percentage difference: (Fill - Decision) / Decision
+                # Positive = Price moved UP. Negative = Price moved DOWN.
+                slippage = (entry_price - position.decision_price) / position.decision_price
+
             position.status = PositionStatus.OPEN
             position.quantity = quantity
             position.entry_price = entry_price
             position.stop_loss_price = stop_loss
             position.take_profit_price = take_profit
             position.trailing_ref_price = entry_price
-            position.open_timestamp = Clock.now()
+            position.open_timestamp = fill_time
             position.fees += fees # Add entry fees
+            position.execution_latency_ms = latency
+            position.slippage_pct = slippage
             
             session.commit()
             session.refresh(position)
-            logger.info("Confirmed position as OPEN", symbol=symbol, order_id=order_id, quantity=quantity, price=entry_price, fees=fees)
+            logger.info("Confirmed position as OPEN", 
+                        symbol=symbol, 
+                        order_id=order_id, 
+                        quantity=quantity, 
+                        price=entry_price, 
+                        fees=fees,
+                        latency_ms=f"{latency:.2f}",
+                        slippage_pct=f"{slippage:.4%}")
             
             if self.alert_system:
                 asyncio.run_coroutine_threadsafe(self.alert_system.send_alert(
                     level='info',
                     message=f"🟢 Opened {position.side} position for {symbol}",
-                    details={'symbol': symbol, 'side': position.side, 'quantity': quantity, 'entry_price': entry_price, 'fees': fees}
+                    details={'symbol': symbol, 'side': position.side, 'quantity': quantity, 'entry_price': entry_price, 'fees': fees, 'slippage': f"{slippage:.4%}"}
                 ), asyncio.get_running_loop())
 
             return position
@@ -446,7 +491,12 @@ class PositionManager:
                 trailing_ref_price=position.trailing_ref_price,
                 trailing_stop_active=position.trailing_stop_active,
                 breakeven_active=position.breakeven_active,
-                strategy_metadata=position.strategy_metadata
+                strategy_metadata=position.strategy_metadata,
+                # Inherit execution stats for record keeping
+                decision_price=position.decision_price,
+                creation_timestamp=position.creation_timestamp,
+                execution_latency_ms=position.execution_latency_ms,
+                slippage_pct=position.slippage_pct
             )
             session.add(closed_chunk)
 
