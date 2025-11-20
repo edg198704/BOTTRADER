@@ -17,7 +17,6 @@ logger = get_logger(__name__)
 class DataHandler:
     """
     Manages market data lifecycle and acts as the primary Event Producer for the system.
-    Ensures thread-safe access to data buffers.
     """
     def __init__(self, exchange_api: ExchangeAPI, config: BotConfig, shared_latest_prices: Dict[str, float], event_bus: Optional[EventBus] = None):
         self.exchange_api = exchange_api
@@ -73,9 +72,6 @@ class DataHandler:
         self.analysis_window = max(self.history_limit * 2, 500)
         self._executor = ThreadPoolExecutor(max_workers=min(len(self.symbols) + 2, 8))
         
-        # Lock for thread-safe data access
-        self._lock = asyncio.Lock()
-        
         logger.info("DataHandler initialized.", event_bus_connected=self.event_bus is not None)
 
     async def initialize_data(self):
@@ -90,17 +86,16 @@ class DataHandler:
             ohlcv_data = await self.exchange_api.get_market_data(symbol, self.timeframe, self.history_limit)
             fresh_df = create_dataframe(ohlcv_data)
             
-            async with self._lock:
-                if cached_df is not None and not cached_df.empty:
-                    if fresh_df is not None and not fresh_df.empty:
-                        combined = pd.concat([cached_df, fresh_df])
-                        combined = combined[~combined.index.duplicated(keep='last')]
-                        combined.sort_index(inplace=True)
-                        self._raw_buffers[symbol] = combined
-                    else:
-                        self._raw_buffers[symbol] = cached_df
+            if cached_df is not None and not cached_df.empty:
+                if fresh_df is not None and not fresh_df.empty:
+                    combined = pd.concat([cached_df, fresh_df])
+                    combined = combined[~combined.index.duplicated(keep='last')]
+                    combined.sort_index(inplace=True)
+                    self._raw_buffers[symbol] = combined
                 else:
-                    self._raw_buffers[symbol] = fresh_df
+                    self._raw_buffers[symbol] = cached_df
+            else:
+                self._raw_buffers[symbol] = fresh_df
 
             await self._process_analysis_window(symbol)
             
@@ -130,9 +125,8 @@ class DataHandler:
             self._save_task.cancel()
         
         logger.info("Saving market data cache...")
-        async with self._lock:
-            save_tasks = [self._save_to_cache(symbol, df) for symbol, df in self._raw_buffers.items()]
-            await asyncio.gather(*save_tasks)
+        save_tasks = [self._save_to_cache(symbol, df) for symbol, df in self._raw_buffers.items()]
+        await asyncio.gather(*save_tasks)
         
         self._executor.shutdown(wait=True)
         logger.info("DataHandler stopped.")
@@ -164,17 +158,14 @@ class DataHandler:
         while self._running:
             try:
                 await asyncio.sleep(self.auto_save_interval)
-                async with self._lock:
-                    save_tasks = [self._save_to_cache(symbol, df) for symbol, df in self._raw_buffers.items()]
-                    await asyncio.gather(*save_tasks)
+                save_tasks = [self._save_to_cache(symbol, df) for symbol, df in self._raw_buffers.items()]
+                await asyncio.gather(*save_tasks)
             except asyncio.CancelledError:
                 break
 
     async def update_symbol_data(self, symbol: str):
         try:
-            async with self._lock:
-                current_buffer = self._raw_buffers.get(symbol)
-            
+            current_buffer = self._raw_buffers.get(symbol)
             required_history = self.history_limit
             fetch_limit = 5
             is_recovery = False
@@ -203,25 +194,24 @@ class DataHandler:
             latest_df = create_dataframe(latest_ohlcv)
             if latest_df is None or latest_df.empty: return
 
-            async with self._lock:
-                if is_recovery:
-                    if current_buffer is not None:
-                        combined_df = pd.concat([current_buffer, latest_df])
-                        combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
-                        combined_df.sort_index(inplace=True)
-                        self._raw_buffers[symbol] = combined_df
-                    else:
-                        self._raw_buffers[symbol] = latest_df
+            if is_recovery:
+                if current_buffer is not None:
+                    combined_df = pd.concat([current_buffer, latest_df])
+                    combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
+                    combined_df.sort_index(inplace=True)
+                    self._raw_buffers[symbol] = combined_df
                 else:
-                    if symbol in self._raw_buffers:
-                        current_raw = self._raw_buffers[symbol]
-                        combined_df = pd.concat([current_raw, latest_df])
-                        combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
-                        if len(combined_df) > self.max_training_buffer:
-                            combined_df = combined_df.iloc[-self.max_training_buffer:]
-                        self._raw_buffers[symbol] = combined_df
-                    else:
-                        self._raw_buffers[symbol] = latest_df
+                    self._raw_buffers[symbol] = latest_df
+            else:
+                if symbol in self._raw_buffers:
+                    current_raw = self._raw_buffers[symbol]
+                    combined_df = pd.concat([current_raw, latest_df])
+                    combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
+                    if len(combined_df) > self.max_training_buffer:
+                        combined_df = combined_df.iloc[-self.max_training_buffer:]
+                    self._raw_buffers[symbol] = combined_df
+                else:
+                    self._raw_buffers[symbol] = latest_df
 
             await self._process_analysis_window(symbol)
 
@@ -229,24 +219,21 @@ class DataHandler:
             logger.warning("Failed to update market data", symbol=symbol, error=str(e))
 
     async def _process_analysis_window(self, symbol: str):
-        async with self._lock:
-            raw_df = self._raw_buffers.get(symbol)
-            if raw_df is None or raw_df.empty: return
+        raw_df = self._raw_buffers.get(symbol)
+        if raw_df is None or raw_df.empty: return
 
-            if len(raw_df) > self.analysis_window:
-                analysis_slice = raw_df.iloc[-self.analysis_window:].copy()
-            else:
-                analysis_slice = raw_df.copy()
+        # Optimization: Only process what we need for indicators
+        if len(raw_df) > self.analysis_window:
+            analysis_slice = raw_df.iloc[-self.analysis_window:].copy()
+        else:
+            analysis_slice = raw_df.copy()
 
-        # Calculate indicators outside the lock to avoid blocking
         processed_df = await self._calculate_indicators_async(analysis_slice)
-        
-        async with self._lock:
-            self._dataframes[symbol] = processed_df
-            self._update_latest_price(symbol, processed_df)
+        self._dataframes[symbol] = processed_df
+        self._update_latest_price(symbol, processed_df)
 
         # Event Emission Logic
-        # We get a safe copy for the event
+        # We only emit if we have a new closed candle
         closed_df = self.get_market_data(symbol, include_forming=False)
         if closed_df is not None and not closed_df.empty:
             last_closed_ts = closed_df.index[-1]
@@ -255,7 +242,7 @@ class DataHandler:
             if last_emitted is None or last_closed_ts > last_emitted:
                 self._last_emitted_candle_ts[symbol] = last_closed_ts
                 if self.event_bus:
-                    # Publish event to the bus
+                    # Publish event to the bus (non-blocking by default in bus implementation)
                     await self.event_bus.publish(MarketDataEvent(symbol=symbol, data=closed_df))
 
     async def _calculate_indicators_async(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -267,10 +254,10 @@ class DataHandler:
             self._shared_latest_prices[symbol] = df['close'].iloc[-1]
 
     def get_market_data(self, symbol: str, include_forming: bool = True) -> Optional[pd.DataFrame]:
-        """Returns a copy of the market data dataframe (not thread-safe if called directly without lock)."""
         df = self._dataframes.get(symbol)
         if df is None or df.empty: return None
         
+        # Optimization: Avoid copy if not needed, but safety first for consumers
         df_copy = df.copy()
         if not include_forming:
             last_ts = df_copy.index[-1]
@@ -283,17 +270,7 @@ class DataHandler:
         
         return df_copy if not df_copy.empty else None
 
-    async def get_market_data_safe(self, symbol: str, include_forming: bool = True) -> Optional[pd.DataFrame]:
-        """Thread-safe method to get a copy of the market data."""
-        async with self._lock:
-            return self.get_market_data(symbol, include_forming)
-
     def get_correlation(self, symbol_a: str, symbol_b: str, lookback: int = 50) -> float:
-        # Note: This method reads _dataframes directly. 
-        # In a strict async context, this should be awaited, but RiskManager calls it synchronously.
-        # We assume RiskManager runs in the same thread loop, but for safety, we should use the lock if possible.
-        # However, making this async requires refactoring RiskManager to be fully async.
-        # For now, we rely on the fact that dict get is atomic in Python.
         df_a = self._dataframes.get(symbol_a)
         df_b = self._dataframes.get(symbol_b)
         if df_a is None or df_b is None or df_a.empty or df_b.empty: return 0.0
@@ -307,13 +284,11 @@ class DataHandler:
             return 0.0
 
     async def fetch_full_history_for_symbol(self, symbol: str, limit: int) -> Optional[pd.DataFrame]:
-        async with self._lock:
-            raw_df = self._raw_buffers.get(symbol)
-            target_df = None
-            if raw_df is not None and len(raw_df) >= limit:
-                target_df = raw_df.copy()
-        
-        if target_df is None:
+        raw_df = self._raw_buffers.get(symbol)
+        target_df = None
+        if raw_df is not None and len(raw_df) >= limit:
+            target_df = raw_df.copy()
+        else:
             try:
                 ohlcv_data = await self.exchange_api.get_market_data(symbol, self.timeframe, limit)
                 if ohlcv_data:
@@ -324,7 +299,7 @@ class DataHandler:
 
         if target_df is not None and not target_df.empty:
             return await self._calculate_indicators_async(target_df)
-        return await self.get_market_data_safe(symbol)
+        return self.get_market_data(symbol)
 
     async def _save_to_cache(self, symbol: str, df: pd.DataFrame):
         if df is None or df.empty: return
