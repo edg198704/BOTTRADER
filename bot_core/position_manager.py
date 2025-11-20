@@ -21,6 +21,7 @@ class PositionStatus(enum.Enum):
     PENDING = 'PENDING'
     OPEN = 'OPEN'
     CLOSED = 'CLOSED'
+    FAILED = 'FAILED' # New status for failed entries
 
 class Position(Base):
     __tablename__ = 'positions'
@@ -55,6 +56,9 @@ class Position(Base):
     breakeven_active = Column(Boolean, default=False, nullable=False)
     # Stores JSON context about the strategy decision (model version, confidence, etc.)
     strategy_metadata = Column(String, nullable=True)
+    
+    # Reason for exit or failure
+    exit_reason = Column(String, nullable=True)
 
 class PortfolioState(Base):
     __tablename__ = 'portfolio_state'
@@ -103,6 +107,9 @@ class PositionManager:
                     if 'breakeven_active' not in columns:
                         conn.execute(text("ALTER TABLE positions ADD COLUMN breakeven_active BOOLEAN DEFAULT 0"))
                         logger.info("Schema updated: Added breakeven_active column to positions table.")
+                    if 'exit_reason' not in columns:
+                        conn.execute(text("ALTER TABLE positions ADD COLUMN exit_reason TEXT"))
+                        logger.info("Schema updated: Added exit_reason column to positions table.")
                     # Execution Analytics Columns
                     if 'decision_price' not in columns:
                         conn.execute(text("ALTER TABLE positions ADD COLUMN decision_price FLOAT"))
@@ -344,12 +351,12 @@ class PositionManager:
         finally:
             session.close()
 
-    async def void_position(self, symbol: str, order_id: str):
-        """Deletes a PENDING position if the order failed or was cancelled."""
+    async def mark_position_failed(self, symbol: str, order_id: str, reason: str):
+        """Marks a PENDING position as FAILED instead of deleting it, for execution analysis."""
         async with self._db_lock:
-            await self._run_in_executor(self._void_position_sync, symbol, order_id)
+            await self._run_in_executor(self._mark_position_failed_sync, symbol, order_id, reason)
 
-    def _void_position_sync(self, symbol: str, order_id: str):
+    def _mark_position_failed_sync(self, symbol: str, order_id: str, reason: str):
         session = self.SessionLocal()
         try:
             position = session.query(Position).filter(
@@ -359,11 +366,13 @@ class PositionManager:
             ).first()
             
             if position:
-                session.delete(position)
+                position.status = PositionStatus.FAILED
+                position.close_timestamp = Clock.now()
+                position.exit_reason = reason
                 session.commit()
-                logger.info("Voided PENDING position", symbol=symbol, order_id=order_id)
+                logger.info("Marked PENDING position as FAILED", symbol=symbol, order_id=order_id, reason=reason)
         except Exception as e:
-            logger.error("Failed to void position", symbol=symbol, error=str(e))
+            logger.error("Failed to mark position as failed", symbol=symbol, error=str(e))
             session.rollback()
         finally:
             session.close()
@@ -418,6 +427,7 @@ class PositionManager:
             position.close_price = close_price
             position.close_timestamp = Clock.now()
             position.pnl = net_pnl
+            position.exit_reason = reason
             session.commit()
             session.refresh(position)
             logger.info("Closed position", symbol=symbol, net_pnl=f"{net_pnl:.2f}", gross_pnl=f"{gross_pnl:.2f}", fees=f"{position.fees:.2f}", reason=reason)
@@ -492,6 +502,7 @@ class PositionManager:
                 trailing_stop_active=position.trailing_stop_active,
                 breakeven_active=position.breakeven_active,
                 strategy_metadata=position.strategy_metadata,
+                exit_reason=reason,
                 # Inherit execution stats for record keeping
                 decision_price=position.decision_price,
                 creation_timestamp=position.creation_timestamp,
@@ -704,6 +715,20 @@ class PositionManager:
         session = self.SessionLocal()
         try:
             return session.query(Position).filter(Position.status == PositionStatus.CLOSED).all()
+        finally:
+            session.close()
+
+    async def get_recent_execution_history(self, limit: int) -> List[Position]:
+        """Returns recent positions (CLOSED or FAILED) for execution analysis."""
+        async with self._db_lock:
+            return await self._run_in_executor(self._get_recent_execution_history_sync, limit)
+
+    def _get_recent_execution_history_sync(self, limit: int) -> List[Position]:
+        session = self.SessionLocal()
+        try:
+            return session.query(Position).filter(
+                Position.status.in_([PositionStatus.CLOSED, PositionStatus.FAILED])
+            ).order_by(Position.creation_timestamp.desc()).limit(limit).all()
         finally:
             session.close()
 
