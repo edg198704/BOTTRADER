@@ -66,6 +66,9 @@ def validate_config(config: BotConfig):
         if config.strategy.params.features.use_volatility_estimators:
             available_columns.update(['volatility_gk'])
 
+        if config.strategy.params.features.use_microstructure_features:
+            available_columns.update(['amihud_illiquidity', 'volatility_parkinson'])
+
         if config.strategy.params.features.use_frac_diff:
             available_columns.update(['close_frac'])
 
