@@ -94,8 +94,6 @@ class TradeExecutor:
                 
                 if is_close_long or is_close_short:
                     await self.close_position(position, "Strategy Signal")
-                    # We don't return a result for close here as it's handled differently in metrics currently,
-                    # but could be expanded.
                     return None
         return None
 
@@ -250,8 +248,6 @@ class TradeExecutor:
             return None
         except Exception as e:
             logger.error("Order placement error", error=str(e))
-            # We don't mark failed here immediately, we let the reconciliation loop handle stuck pending orders
-            # unless we are sure it failed. But here we are sure it threw exception.
             await self.position_manager.mark_position_failed(symbol, trade_id, f"Placement Error: {str(e)}")
             return None
 
@@ -296,7 +292,7 @@ class TradeExecutor:
             fees = self._calculate_or_extract_fee(order_state, fill_price, fill_quantity)
             confirmed_quantity = fill_quantity
             
-            # Adjust quantity for fees if paid in base asset (common in crypto)
+            # Adjust quantity for fees if paid in base asset
             if side == 'BUY':
                 fee_currency = None
                 if order_state.get('fee') and 'currency' in order_state['fee']:
