@@ -246,6 +246,9 @@ class ExecutionConfig(BaseModel):
     chase_aggressiveness_pct: float
     max_chase_slippage_pct: float = 0.02 # Max 2% deviation from initial price during chase
     execute_on_timeout: bool
+    
+    # --- New Execution Params ---
+    post_only: bool = False # If True, forces LIMIT orders to be Maker-only
 
 class DataHandlerConfig(BaseModel):
     history_limit: int
