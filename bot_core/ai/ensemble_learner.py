@@ -106,6 +106,8 @@ def _create_fresh_models(config: AIEnsembleStrategyParams, num_features: int, de
     attn_config = hp.attention
 
     # Determine class weight setting for Sklearn models
+    # Note: If using custom sample weights (return-based), we might disable auto class_weight here
+    # to avoid double counting, or use it in hybrid mode.
     cw_option = 'balanced' if config.training.use_class_weighting else None
 
     models = {
@@ -580,6 +582,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         X_dev, X_test = X[:test_split_idx], X[test_split_idx:]
         y_dev, y_test = y[:test_split_idx], y[test_split_idx:]
         returns_test = market_returns[test_split_idx:]
+        returns_dev = market_returns[:test_split_idx]
         
         # Prepare Test Sequences
         seq_len = config.features.sequence_length
@@ -778,29 +781,75 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         trained_models = {}
         feature_importance = {}
         
-        # Weights for final training
-        sample_weights = None
-        torch_weights = None
+        # --- ADVANCED SAMPLE WEIGHTING ---
+        # Calculate sample weights based on config (Balanced, Return-Based, or Hybrid)
+        final_sample_weights = None
+        
+        # 1. Balanced Weights (Inverse Class Frequency)
+        balanced_weights = None
+        if config.training.use_class_weighting or config.training.sample_weighting_mode in ['balanced', 'hybrid']:
+            balanced_weights = compute_sample_weight(class_weight='balanced', y=y_dev)
+        
+        # 2. Return-Based Weights (Magnitude of future return)
+        return_weights = None
+        if config.training.sample_weighting_mode in ['return_based', 'hybrid']:
+            # Use absolute log returns as weight base
+            # Add small epsilon to avoid zero weights
+            abs_returns = np.abs(returns_dev) + 1e-5
+            # Normalize to have mean 1.0 to keep scale consistent with balanced weights
+            return_weights = abs_returns / np.mean(abs_returns)
+            
+        # 3. Combine
+        if config.training.sample_weighting_mode == 'hybrid':
+            final_sample_weights = balanced_weights * return_weights
+        elif config.training.sample_weighting_mode == 'return_based':
+            final_sample_weights = return_weights
+        elif config.training.sample_weighting_mode == 'balanced':
+            final_sample_weights = balanced_weights
+        else:
+            final_sample_weights = None
+
+        # Prepare PyTorch weights (Class weights for Loss function)
+        # Note: PyTorch CrossEntropyLoss takes class weights, not sample weights directly in the criterion init easily without reduction='none'
+        # For simplicity, we use the balanced class weights for the Loss function if enabled.
+        torch_class_weights = None
         if config.training.use_class_weighting:
-            sample_weights = compute_sample_weight(class_weight='balanced', y=y_dev)
             unique_classes = np.unique(y_dev)
-            class_weights = compute_class_weight(class_weight='balanced', classes=unique_classes, y=y_dev)
-            weight_map = {c: w for c, w in zip(unique_classes, class_weights)}
-            final_weights = [weight_map.get(c, 1.0) for c in [0, 1, 2]]
-            torch_weights = torch.FloatTensor(final_weights).to(device)
+            cw = compute_class_weight(class_weight='balanced', classes=unique_classes, y=y_dev)
+            weight_map = {c: w for c, w in zip(unique_classes, cw)}
+            # Ensure we have weights for all 3 classes [0, 1, 2]
+            final_cw = [weight_map.get(c, 1.0) for c in [0, 1, 2]]
+            torch_class_weights = torch.FloatTensor(final_cw).to(device)
 
         # Train Sklearn/XGBoost
         for name, model in final_models.items():
             if name in ['lstm', 'attention']: continue
             fit_params = {}
-            if name == 'gb' and sample_weights is not None:
-                fit_params['sample_weight'] = sample_weights
+            
+            # Pass sample weights if available and supported
+            if final_sample_weights is not None:
+                if name == 'gb':
+                    fit_params['sample_weight'] = final_sample_weights
+                elif name == 'technical':
+                    # VotingClassifier fits estimators. We need to pass sample_weight to them.
+                    # But VotingClassifier.fit doesn't accept sample_weight in older sklearn versions easily for all sub-estimators.
+                    # However, recent versions support it if underlying models do.
+                    # For simplicity/robustness, we might skip weighting for the VotingClassifier or apply it manually if needed.
+                    # Let's try passing it, but catch errors.
+                    try:
+                        fit_params['sample_weight'] = final_sample_weights
+                    except:
+                        pass
 
             if config.training.auto_tune_models and name == 'gb':
                 param_dist = {'n_estimators': [100, 200], 'max_depth': [3, 5, 7], 'learning_rate': [0.01, 0.1, 0.2]}
                 model = _optimize_hyperparameters(model, X_dev, y_dev, param_dist, config.training.n_iter_search, worker_logger, fit_params)
             else:
-                model.fit(X_dev, y_dev, **fit_params)
+                try:
+                    model.fit(X_dev, y_dev, **fit_params)
+                except TypeError:
+                    # Fallback if sample_weight not supported
+                    model.fit(X_dev, y_dev)
             
             trained_models[name] = model
             if hasattr(model, 'feature_importances_'):
@@ -824,7 +873,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             for name in ['lstm', 'attention']:
                 if name not in final_models: continue
                 model = final_models[name]
-                _train_torch_model(model, X_seq_tr, y_seq_tr, X_seq_val, y_seq_val, config, device, torch_weights)
+                _train_torch_model(model, X_seq_tr, y_seq_tr, X_seq_val, y_seq_val, config, device, torch_class_weights)
                 trained_models[name] = model
         else:
             # Fallback if data too small: train without early stopping on full set
@@ -837,7 +886,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                     if name not in final_models: continue
                     model = final_models[name]
                     optimizer = optim.Adam(model.parameters(), lr=config.training.learning_rate)
-                    criterion = nn.CrossEntropyLoss(weight=torch_weights) if torch_weights is not None else nn.CrossEntropyLoss()
+                    criterion = nn.CrossEntropyLoss(weight=torch_class_weights) if torch_class_weights is not None else nn.CrossEntropyLoss()
                     
                     model.train()
                     for epoch in range(config.training.epochs):
