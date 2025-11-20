@@ -15,6 +15,7 @@ class StrategyOptimizer:
     1. Confidence Thresholds (Entry Strictness)
     2. Reward-to-Risk Ratios (Exit Targets)
     3. ATR Stop Multipliers (Risk Width)
+    4. Risk Per Trade % (Position Sizing via Realized Kelly)
     
     Adjustments are based on realized performance (Win Rate & Profit Factor) per market regime.
     """
@@ -63,6 +64,9 @@ class StrategyOptimizer:
                     if 'atr_stop_multiplier' in params:
                         regime_override.atr_stop_multiplier = params['atr_stop_multiplier']
                         updates += 1
+                    if 'risk_per_trade_pct' in params:
+                        regime_override.risk_per_trade_pct = params['risk_per_trade_pct']
+                        updates += 1
 
             if updates > 0:
                 logger.info(f"Restored {updates} optimized parameters from state file.", path=path)
@@ -100,6 +104,8 @@ class StrategyOptimizer:
                     params['reward_to_risk_ratio'] = regime_override.reward_to_risk_ratio
                 if regime_override.atr_stop_multiplier is not None:
                     params['atr_stop_multiplier'] = regime_override.atr_stop_multiplier
+                if regime_override.risk_per_trade_pct is not None:
+                    params['risk_per_trade_pct'] = regime_override.risk_per_trade_pct
                 
                 if params:
                     state['regime_risk_params'][regime] = params
@@ -223,12 +229,10 @@ class StrategyOptimizer:
                 # Initialize if None
                 if regime_risk.reward_to_risk_ratio is None:
                     regime_risk.reward_to_risk_ratio = self.config.risk_management.reward_to_risk_ratio
-                if regime_risk.atr_stop_multiplier is None:
+                if regime_override_atr := regime_risk.atr_stop_multiplier:
+                     pass # Just checking existence
+                else:
                     regime_risk.atr_stop_multiplier = self.config.risk_management.atr_stop_multiplier
-                
-                # Logic: 
-                # If PF is bad (< 1.0) BUT Win Rate is decent (> 40%), the payoff is the problem -> Increase R:R.
-                # If PF is good (> 1.5) BUT Win Rate is low (< 40%), we are getting stopped out too often -> Widen Stop (Increase ATR Mult).
                 
                 # Adjust Reward-to-Risk
                 if profit_factor < self.opt_config.min_profit_factor and win_rate >= 0.40:
@@ -240,7 +244,6 @@ class StrategyOptimizer:
                         logger.info(f"Optimizer INCREASED {regime} R:R.", old=old_rr, new=new_rr, reason="Low PF, Decent WR")
                 
                 # Adjust ATR Multiplier (Stop Width)
-                # Note: Widening stop improves Win Rate but hurts R:R. Only do this if PF is healthy enough to absorb it.
                 if profit_factor > 1.2 and win_rate < 0.40:
                     old_atr = regime_risk.atr_stop_multiplier
                     new_atr = min(old_atr + self.opt_config.risk_adjustment_step, self.opt_config.max_atr_multiplier)
@@ -248,6 +251,62 @@ class StrategyOptimizer:
                         regime_risk.atr_stop_multiplier = new_atr
                         any_changes = True
                         logger.info(f"Optimizer WIDENED {regime} Stop.", old=old_atr, new=new_atr, reason="Low WR, Good PF")
+
+            # --- 3. Optimize Risk Sizing (Realized Kelly) ---
+            if self.opt_config.optimize_risk_sizing and hasattr(rm_config, regime):
+                regime_risk = getattr(rm_config, regime)
+                
+                # Initialize if None
+                if regime_risk.risk_per_trade_pct is None:
+                    regime_risk.risk_per_trade_pct = self.config.risk_management.risk_per_trade_pct
+                
+                current_risk = regime_risk.risk_per_trade_pct
+                
+                # Calculate Realized Kelly
+                # K = W - (1-W)/R
+                # R = AvgWin / AvgLoss
+                avg_win = sum(t.pnl for t in wins) / len(wins) if wins else 0.0
+                avg_loss = abs(sum(t.pnl for t in losses) / len(losses)) if losses else 0.0
+                
+                if avg_loss > 0 and win_rate > 0:
+                    realized_r = avg_win / avg_loss
+                    kelly = win_rate - (1.0 - win_rate) / realized_r
+                    
+                    # Target Risk = Kelly * Fraction
+                    target_risk = kelly * self.opt_config.target_kelly_fraction
+                    
+                    # Clamp Target
+                    target_risk = max(self.opt_config.min_risk_pct, min(target_risk, self.opt_config.max_risk_pct))
+                    
+                    # Move current risk towards target (Dampening)
+                    step = self.opt_config.risk_size_step
+                    new_risk = current_risk
+                    
+                    if target_risk > current_risk + (step * 0.5):
+                        new_risk = min(current_risk + step, target_risk)
+                    elif target_risk < current_risk - (step * 0.5):
+                        new_risk = max(current_risk - step, target_risk)
+                    
+                    if new_risk != current_risk:
+                        regime_risk.risk_per_trade_pct = round(new_risk, 5)
+                        any_changes = True
+                        logger.info(f"Optimizer ADJUSTED {regime} Risk Size.", 
+                                    old=current_risk, new=new_risk, 
+                                    kelly=f"{kelly:.2f}", realized_r=f"{realized_r:.2f}")
+                elif avg_loss == 0 and win_rate > 0:
+                    # Infinite R (No losses yet), slowly scale up
+                    new_risk = min(current_risk + self.opt_config.risk_size_step, self.opt_config.max_risk_pct)
+                    if new_risk != current_risk:
+                        regime_risk.risk_per_trade_pct = round(new_risk, 5)
+                        any_changes = True
+                        logger.info(f"Optimizer INCREASED {regime} Risk Size (No Losses).", old=current_risk, new=new_risk)
+                else:
+                    # No wins or terrible performance, scale down to min
+                    new_risk = max(current_risk - self.opt_config.risk_size_step, self.opt_config.min_risk_pct)
+                    if new_risk != current_risk:
+                        regime_risk.risk_per_trade_pct = round(new_risk, 5)
+                        any_changes = True
+                        logger.info(f"Optimizer DECREASED {regime} Risk Size (Poor Perf).", old=current_risk, new=new_risk)
 
         if any_changes:
             self._save_state()
