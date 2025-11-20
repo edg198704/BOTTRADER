@@ -42,6 +42,10 @@ strategy:
   symbols: ["BTC/USDT", "ETH/USDT"] # List of symbols to trade
   interval_seconds: 10      # Time in seconds between each trading cycle check.
   timeframe: "5m"           # Timeframe for OHLCV data (e.g., '1m', '5m', '1h', '1d')
+  
+  # --- Multi-Timeframe Settings (New) ---
+  # Define higher timeframes to generate context features (e.g., '1h_rsi', '4h_sma_fast')
+  secondary_timeframes: ["1h"]
 
   # This section now drives all technical indicator calculations in a modular way.
   # Each item is passed to the pandas-ta library.
@@ -84,7 +88,8 @@ strategy:
     # The bot will validate this on startup.
     # NOTE: Replaced raw 'close' with 'log_return' for stationarity.
     # ADDED: regime_trend, regime_volatility, and regime_efficiency to give the AI context about the market state.
-    feature_columns: ['log_return', 'rsi', 'macd', 'volume', 'bb_upper', 'bb_lower', 'regime_trend', 'regime_volatility', 'regime_efficiency']
+    # NEW: Added '1h_rsi' to leverage Multi-Timeframe context.
+    feature_columns: ['log_return', 'rsi', '1h_rsi', 'macd', 'volume', 'bb_upper', 'bb_lower', 'regime_trend', 'regime_volatility', 'regime_efficiency']
     confidence_threshold: 0.65 # Base threshold for ENTRIES
     exit_confidence_threshold: 0.55 # Base threshold for EXITS (Lower = easier to exit)
     model_path: "models/ensemble"
