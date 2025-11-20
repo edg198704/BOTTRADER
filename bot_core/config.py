@@ -196,6 +196,7 @@ class StrategyConfig(BaseModel):
     symbols: List[str]
     interval_seconds: int
     timeframe: str
+    secondary_timeframes: List[str] = [] # List of higher timeframes (e.g., ['1h', '4h'])
     indicators: List[Dict[str, Any]]
     params: Union[AIEnsembleStrategyParams, SimpleMACrossoverStrategyParams] = Field(..., discriminator='name')
 
