@@ -127,9 +127,29 @@ class TradeExecutor:
 
         order_type = self.config.execution.default_order_type
         limit_price = None
+        
         if order_type == 'LIMIT':
+            # Fetch fresh ticker data for precise execution
+            try:
+                ticker = await self.exchange_api.get_ticker_data(symbol)
+                bid = ticker.get('bid')
+                ask = ticker.get('ask')
+                last = ticker.get('last', current_price)
+            except Exception as e:
+                logger.warning("Failed to fetch ticker for execution, falling back to candle close.", error=str(e))
+                bid, ask, last = None, None, current_price
+
             offset = self.config.execution.limit_price_offset_pct
-            limit_price = current_price * (1 - offset) if side == 'BUY' else current_price * (1 + offset)
+            
+            if side == 'BUY':
+                # Target Best Bid to be a Maker, adjusted by offset (usually negative to be deeper, or positive to be aggressive)
+                # Config comment says: "0.05% offset from current price".
+                # Standard interpretation: Buy Limit = Price * (1 - offset)
+                ref_price = bid if bid else last
+                limit_price = ref_price * (1 - offset)
+            else:
+                ref_price = ask if ask else last
+                limit_price = ref_price * (1 + offset)
 
         # 1. Generate Trade ID (Idempotency Key & Group ID)
         trade_id = str(uuid.uuid4())
@@ -281,9 +301,26 @@ class TradeExecutor:
 
         order_type = self.config.execution.default_order_type
         limit_price = None
-        if order_type == 'LIMIT' and current_price:
+        
+        if order_type == 'LIMIT':
+            # Fetch fresh ticker for close
+            try:
+                ticker = await self.exchange_api.get_ticker_data(position.symbol)
+                bid = ticker.get('bid')
+                ask = ticker.get('ask')
+                last = ticker.get('last', current_price)
+            except Exception as e:
+                logger.warning("Failed to fetch ticker for close, falling back to candle close.", error=str(e))
+                bid, ask, last = None, None, current_price
+
             offset = self.config.execution.limit_price_offset_pct
-            limit_price = current_price * (1 + offset) if close_side == 'BUY' else current_price * (1 - offset)
+            
+            if close_side == 'BUY':
+                ref_price = bid if bid else last
+                limit_price = ref_price * (1 - offset)
+            else:
+                ref_price = ask if ask else last
+                limit_price = ref_price * (1 + offset)
         else:
             order_type = 'MARKET'
 
