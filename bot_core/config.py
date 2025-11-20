@@ -33,6 +33,12 @@ class EnsembleWeightsConfig(BaseModel):
     # Optimize weights per regime (Bull, Bear, Sideways, Volatile)
     use_regime_specific_weights: bool = True
 
+class DriftDetectionConfig(BaseModel):
+    enabled: bool = True
+    contamination: float = 0.05 # Expected proportion of outliers in training data
+    confidence_penalty: float = 0.2 # Subtract from confidence if anomaly detected
+    block_trade: bool = False # If True, block trade completely on anomaly
+
 class MarketRegimeConfig(BaseModel):
     # Static Fallbacks
     trend_strength_threshold: float = 0.015
@@ -176,6 +182,7 @@ class AIEnsembleStrategyParams(StrategyParamsBase):
     ensemble_weights: EnsembleWeightsConfig = EnsembleWeightsConfig()
     market_regime: MarketRegimeConfig = MarketRegimeConfig()
     performance: AIPerformanceConfig = AIPerformanceConfig()
+    drift: DriftDetectionConfig = DriftDetectionConfig()
 
 # --- Core Component Configs ---
 
