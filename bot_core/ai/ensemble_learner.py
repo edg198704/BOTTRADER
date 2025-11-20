@@ -22,7 +22,7 @@ try:
     import torch.nn as nn
     import torch.optim as optim
     from torch.utils.data import TensorDataset, DataLoader
-    from sklearn.ensemble import VotingClassifier, RandomForestClassifier
+    from sklearn.ensemble import VotingClassifier, RandomForestClassifier, IsolationForest
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import precision_score, classification_report, log_loss
     from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
@@ -41,6 +41,7 @@ except ImportError:
     class RandomizedSearchCV: pass
     class TimeSeriesSplit: pass
     class IsotonicRegression: pass
+    class IsolationForest: pass
     def precision_score(*args, **kwargs): return 0.0
     def log_loss(*args, **kwargs): return 0.0
     def classification_report(*args, **kwargs): return ""
@@ -302,7 +303,7 @@ def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.nd
 
 def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyParams, device) -> Optional[Dict[str, Any]]:
     """
-    Loads trained models and metadata from disk. 
+    Loads trained models and metadata from disk.
     Returns None if not found or if feature configuration mismatches.
     """
     safe_symbol = symbol.replace('/', '_')
@@ -342,6 +343,12 @@ def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyP
         if os.path.exists(calib_path):
             calibrator = joblib.load(calib_path)
 
+        # Load Drift Detector
+        drift_detector = None
+        drift_path = os.path.join(load_dir, "drift_detector.joblib")
+        if os.path.exists(drift_path):
+            drift_detector = joblib.load(drift_path)
+
         # Load PyTorch Models
         if 'lstm' in config.ensemble_weights.dict():
             path = os.path.join(load_dir, "lstm.pth")
@@ -367,6 +374,7 @@ def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyP
         return {
             'models': models,
             'calibrator': calibrator,
+            'drift_detector': drift_detector,
             'meta': meta
         }
 
@@ -795,6 +803,20 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                             optimizer.step()
                     trained_models[name] = model
 
+        # --- DRIFT DETECTION TRAINING ---
+        drift_detector = None
+        if config.drift.enabled:
+            worker_logger.info("Training Drift Detector (Isolation Forest)...")
+            try:
+                drift_detector = IsolationForest(
+                    contamination=config.drift.contamination, 
+                    random_state=42, 
+                    n_jobs=1
+                )
+                drift_detector.fit(X_dev)
+            except Exception as e:
+                worker_logger.error(f"Drift detector training failed: {e}")
+
         # --- CHALLENGER EVALUATION (Using Test Set) ---
         challenger_metrics = _evaluate_ensemble(
             trained_models, X_test, y_test, X_seq_test, y_seq_test, 
@@ -843,6 +865,9 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             
             if calibrator:
                 joblib.dump(calibrator, os.path.join(temp_dir, "calibrator.joblib"))
+            
+            if drift_detector:
+                joblib.dump(drift_detector, os.path.join(temp_dir, "drift_detector.joblib"))
 
             meta = {
                 'timestamp': datetime.now().isoformat(),
@@ -941,6 +966,7 @@ class EnsembleLearner:
         models = entry['models']
         meta = entry['meta']
         calibrator = entry.get('calibrator')
+        drift_detector = entry.get('drift_detector')
         
         # Prepare Data
         df_proc = FeatureProcessor.process_data(df, self.config)
@@ -953,6 +979,19 @@ class EnsembleLearner:
         df_proc = df_proc[active_features]
         X = df_proc.iloc[-1:].values
         
+        # --- DRIFT DETECTION ---
+        is_anomaly = False
+        anomaly_score = 0.0
+        if drift_detector and self.config.drift.enabled:
+            try:
+                # predict returns -1 for outlier, 1 for inlier
+                pred = drift_detector.predict(X)[0]
+                is_anomaly = (pred == -1)
+                # decision_function returns negative for outliers
+                anomaly_score = drift_detector.decision_function(X)[0]
+            except Exception as e:
+                logger.error(f"Drift detection failed: {e}")
+
         seq_len = self.config.features.sequence_length
         if len(df_proc) >= seq_len:
             X_seq = df_proc.iloc[-seq_len:].values.reshape(1, seq_len, -1)
@@ -972,7 +1011,6 @@ class EnsembleLearner:
         # Override with regime specific weights if available
         if config_weights.use_regime_specific_weights and regime and regime in regime_weights:
             active_weight_map = regime_weights[regime]
-            # logger.debug(f"Using regime-specific weights for {regime}", weights=active_weight_map)
         
         def get_weight(name, default_weight):
             if active_weight_map:
@@ -1070,7 +1108,9 @@ class EnsembleLearner:
             'active_weights': votes,
             'top_features': top_features,
             'metrics': meta.get('metrics', {}),
-            'optimized_weights': active_weight_map if active_weight_map else None
+            'optimized_weights': active_weight_map if active_weight_map else None,
+            'is_anomaly': is_anomaly,
+            'anomaly_score': float(anomaly_score)
         }
 
     async def predict(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None) -> Dict[str, Any]:
