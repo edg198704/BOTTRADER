@@ -40,6 +40,7 @@ execution:
 data_handler:
   history_limit: 200 # Number of historical candles to load at startup
   update_interval_multiplier: 0.5 # Update data every (strategy.interval_seconds * 0.5) seconds
+  ticker_update_interval_seconds: 2.0 # Poll tickers every 2 seconds for real-time pricing
 
 strategy:
   symbols: ["BTC/USDT", "ETH/USDT"] # List of symbols to trade
@@ -312,6 +313,9 @@ risk_management:
   # Prevents a single bad asset from draining the portfolio.
   max_consecutive_losses: 3 # Halt trading symbol after 3 losses in a row
   consecutive_loss_cooldown_minutes: 60 # Cooldown duration
+
+  # --- Monitoring (New) ---
+  monitor_interval_seconds: 2.0 # Check positions every 2 seconds
 
   regime_based_risk:
     # Override default risk parameters based on the detected market regime.
