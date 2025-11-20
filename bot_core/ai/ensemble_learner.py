@@ -168,12 +168,13 @@ def _optimize_hyperparameters(model, X, y, param_dist, n_iter, logger_instance, 
         model.fit(X, y, **(fit_params or {}))
         return model
 
-def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.ndarray, method: str = 'slsqp') -> Dict[str, float]:
+def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.ndarray, method: str = 'slsqp', sample_weights: Optional[np.ndarray] = None) -> Dict[str, float]:
     """
     Finds optimal weights for the ensemble using Scipy Optimization (SLSQP) or Random Search.
-    Minimizes Log Loss.
+    Minimizes Log Loss, optionally weighted by sample_weights.
     predictions: Dict of model_name -> prob_array (N, 3)
     y_true: array (N,)
+    sample_weights: array (N,) or None
     """
     model_names = list(predictions.keys())
     if not model_names:
@@ -197,7 +198,7 @@ def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.nd
         
         # Clip to avoid log(0)
         ensemble_probs = np.clip(ensemble_probs, 1e-15, 1 - 1e-15)
-        return log_loss(y_true, ensemble_probs)
+        return log_loss(y_true, ensemble_probs, sample_weight=sample_weights)
 
     if method == 'slsqp' and ML_AVAILABLE:
         try:
@@ -404,7 +405,7 @@ def _evaluate_ensemble(models: Dict[str, Any],
 def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrategyParams) -> bool:
     """
     Standalone function to train models in a separate process.
-    Implements Walk-Forward Validation (Stacking) for robust weight optimization.
+    Implements Walk-Forward Validation (Stacking) with Purging for robust weight optimization.
     """
     worker_logger = get_logger(f"trainer_{symbol}")
     worker_logger.info(f"Starting training task for {symbol} with {len(df)} records.")
@@ -489,7 +490,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             except Exception as e:
                 worker_logger.warning(f"Could not evaluate champion: {e}")
 
-        # --- WALK-FORWARD VALIDATION (STACKING) ---
+        # --- WALK-FORWARD VALIDATION (STACKING) WITH PURGING ---
         # Generate Out-Of-Sample predictions for X_dev to optimize weights
         
         oos_predictions = {} # model_name -> list of arrays
@@ -499,10 +500,16 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         use_cv = len(X_dev) > 500 and config.training.cv_splits > 1
         
         if use_cv:
-            worker_logger.info(f"Starting Walk-Forward Validation with {config.training.cv_splits} splits...")
+            worker_logger.info(f"Starting Walk-Forward Validation with {config.training.cv_splits} splits (Purged)...")
             tscv = TimeSeriesSplit(n_splits=config.training.cv_splits)
+            horizon = config.features.labeling_horizon
             
             for fold, (train_idx, val_idx) in enumerate(tscv.split(X_dev)):
+                # PURGING: Remove samples from end of train set that overlap with validation labels
+                # The labels in train_idx[-horizon:] contain information about prices in val_idx
+                if len(train_idx) > horizon:
+                    train_idx = train_idx[:-horizon]
+                
                 X_fold_train, X_fold_val = X_dev[train_idx], X_dev[val_idx]
                 y_fold_train, y_fold_val = y_dev[train_idx], y_dev[val_idx]
                 
@@ -561,6 +568,11 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 combined_indices = np.concatenate(oos_indices)
                 y_oos = y_dev[combined_indices]
                 
+                # Calculate sample weights for OOS data if class weighting is enabled
+                oos_sample_weights = None
+                if config.training.use_class_weighting:
+                    oos_sample_weights = compute_sample_weight(class_weight='balanced', y=y_oos)
+                
                 combined_preds = {}
                 valid_models = []
                 for name, pred_list in oos_predictions.items():
@@ -583,7 +595,9 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                     # 1. Global Weight Optimization
                     if config.ensemble_weights.auto_tune:
                         optimized_weights = _optimize_ensemble_weights(
-                            combined_preds, y_oos, method=config.ensemble_weights.optimization_method
+                            combined_preds, y_oos, 
+                            method=config.ensemble_weights.optimization_method,
+                            sample_weights=oos_sample_weights
                         )
                     else:
                         cw = config.ensemble_weights
@@ -597,10 +611,6 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                         worker_logger.info("Optimizing weights per market regime...")
                         # Instantiate detector to get regimes for the OOS data
                         detector = MarketRegimeDetector(config)
-                        # We need the original DF subset corresponding to the OOS indices
-                        # common_index aligns with X_full. combined_indices are indices into X_dev.
-                        # X_dev is X_full[:test_split_idx].
-                        # So combined_indices map directly to common_index[:test_split_idx]
                         
                         dev_indices = common_index[:test_split_idx]
                         oos_timestamps = dev_indices[combined_indices]
@@ -617,8 +627,13 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                                 regime_y = y_oos[mask]
                                 regime_preds = {k: v[mask] for k, v in combined_preds.items()}
                                 
+                                # Also filter sample weights if they exist
+                                regime_sw = oos_sample_weights[mask] if oos_sample_weights is not None else None
+                                
                                 r_weights = _optimize_ensemble_weights(
-                                    regime_preds, regime_y, method=config.ensemble_weights.optimization_method
+                                    regime_preds, regime_y, 
+                                    method=config.ensemble_weights.optimization_method,
+                                    sample_weights=regime_sw
                                 )
                                 regime_weights[regime] = r_weights
                                 worker_logger.info(f"Optimized weights for {regime}: {r_weights}")
