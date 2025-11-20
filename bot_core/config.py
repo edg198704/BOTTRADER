@@ -255,7 +255,14 @@ class RiskManagementConfig(BaseModel):
     trailing_stop_activation_pct: float
     trailing_stop_pct: float
     
-    # --- ATR Trailing Stop (New) ---
+    # --- Stop Loss Type (New) ---
+    # 'ATR': Volatility based (Entry +/- ATR * Multiplier)
+    # 'SWING': Structural (Recent Low/High +/- Buffer)
+    stop_loss_type: Literal["ATR", "SWING"] = "ATR"
+    swing_lookback: int = 20 # Number of candles to look back for Swing High/Low
+    swing_buffer_atr_multiplier: float = 1.0 # Buffer added to Swing point (in ATR units)
+
+    # --- ATR Trailing Stop ---
     use_atr_for_trailing: bool = False
     atr_trailing_multiplier: float = 2.0
     atr_column_name: str = "atr"
