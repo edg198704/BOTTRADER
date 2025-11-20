@@ -227,6 +227,9 @@ strategy:
       trend_percentile: 0.75 # Top 25% of absolute trend strength defines a 'Trend'
       volatility_percentile: 0.80 # Top 20% of volatility values define 'Volatile'
 
+      # --- Stability Settings (New) ---
+      regime_confirmation_window: 3 # Number of candles to look back for regime voting
+
       # Map these to the aliases defined in 'indicators' above
       trend_fast_ma_col: "sma_fast"
       trend_slow_ma_col: "sma_slow"
