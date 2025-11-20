@@ -29,6 +29,7 @@ try:
     from sklearn.utils.class_weight import compute_class_weight, compute_sample_weight
     from sklearn.isotonic import IsotonicRegression
     from xgboost import XGBClassifier
+    from scipy.optimize import minimize
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
@@ -45,6 +46,7 @@ except ImportError:
     def classification_report(*args, **kwargs): return ""
     def compute_class_weight(*args, **kwargs): return []
     def compute_sample_weight(*args, **kwargs): return []
+    def minimize(*args, **kwargs): return None
     class nn:
         class Module: pass
     class optim: pass
@@ -166,9 +168,10 @@ def _optimize_hyperparameters(model, X, y, param_dist, n_iter, logger_instance, 
         model.fit(X, y, **(fit_params or {}))
         return model
 
-def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.ndarray, iterations: int = 1000) -> Dict[str, float]:
+def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.ndarray, method: str = 'slsqp') -> Dict[str, float]:
     """
-    Finds optimal weights for the ensemble using Random Search to minimize Log Loss.
+    Finds optimal weights for the ensemble using Scipy Optimization (SLSQP) or Random Search.
+    Minimizes Log Loss.
     predictions: Dict of model_name -> prob_array (N, 3)
     y_true: array (N,)
     """
@@ -176,25 +179,52 @@ def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.nd
     if not model_names:
         return {}
     
-    best_score = float('inf')
-    best_weights = {name: 1.0/len(model_names) for name in model_names}
-    
+    n_models = len(model_names)
     # Convert dict to list of arrays for fast vectorized math
     # shape: (num_models, num_samples, num_classes)
     pred_stack = np.array([predictions[name] for name in model_names])
     
-    for _ in range(iterations):
-        # Generate random weights summing to 1
-        w = np.random.dirichlet(np.ones(len(model_names)))
+    # Default equal weights
+    best_weights = {name: 1.0/n_models for name in model_names}
+
+    def loss_func(weights):
+        # Normalize weights to sum to 1 (just in case, though constraints handle this)
+        w = np.array(weights)
+        w = w / np.sum(w)
         
         # Weighted average: sum(w[i] * pred_stack[i])
         ensemble_probs = np.tensordot(w, pred_stack, axes=([0],[0]))
         
         # Clip to avoid log(0)
         ensemble_probs = np.clip(ensemble_probs, 1e-15, 1 - 1e-15)
-        
-        # Calculate Log Loss
-        score = log_loss(y_true, ensemble_probs)
+        return log_loss(y_true, ensemble_probs)
+
+    if method == 'slsqp' and ML_AVAILABLE:
+        try:
+            # Constraints: sum(w) = 1
+            constraints = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1})
+            # Bounds: 0 <= w <= 1
+            bounds = [(0, 1)] * n_models
+            # Initial guess: equal weights
+            x0 = np.ones(n_models) / n_models
+            
+            res = minimize(loss_func, x0, method='SLSQP', bounds=bounds, constraints=constraints, tol=1e-4)
+            
+            if res.success:
+                optimized_w = res.x / np.sum(res.x) # Ensure strict sum to 1
+                best_weights = {name: float(optimized_w[i]) for i, name in enumerate(model_names)}
+                return best_weights
+        except Exception as e:
+            # Fallback to random search if optimization fails
+            pass
+
+    # Fallback: Random Search (Monte Carlo)
+    best_score = float('inf')
+    iterations = 1000
+    
+    for _ in range(iterations):
+        w = np.random.dirichlet(np.ones(n_models))
+        score = loss_func(w)
         
         if score < best_score:
             best_score = score
@@ -552,7 +582,9 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 if combined_preds:
                     # 1. Global Weight Optimization
                     if config.ensemble_weights.auto_tune:
-                        optimized_weights = _optimize_ensemble_weights(combined_preds, y_oos)
+                        optimized_weights = _optimize_ensemble_weights(
+                            combined_preds, y_oos, method=config.ensemble_weights.optimization_method
+                        )
                     else:
                         cw = config.ensemble_weights
                         optimized_weights = {
@@ -585,7 +617,9 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                                 regime_y = y_oos[mask]
                                 regime_preds = {k: v[mask] for k, v in combined_preds.items()}
                                 
-                                r_weights = _optimize_ensemble_weights(regime_preds, regime_y)
+                                r_weights = _optimize_ensemble_weights(
+                                    regime_preds, regime_y, method=config.ensemble_weights.optimization_method
+                                )
                                 regime_weights[regime] = r_weights
                                 worker_logger.info(f"Optimized weights for {regime}: {r_weights}")
                             else:
