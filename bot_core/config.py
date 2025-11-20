@@ -32,6 +32,12 @@ class EnsembleWeightsConfig(BaseModel):
     disagreement_penalty: float = 0.5
     # Optimize weights per regime (Bull, Bear, Sideways, Volatile)
     use_regime_specific_weights: bool = True
+    
+    # --- Dynamic Weighting (New) ---
+    # Adjusts weights in real-time based on recent performance (last N candles)
+    use_dynamic_weighting: bool = True
+    dynamic_window: int = 25
+    dynamic_smoothing_factor: float = 0.1 # EMA smoothing for weights
 
 class DriftDetectionConfig(BaseModel):
     enabled: bool = True
