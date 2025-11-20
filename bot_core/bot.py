@@ -77,6 +77,7 @@ class TradingBot:
 
         await self._load_market_details()
         await self.reconcile_pending_positions()
+        await self.reconcile_open_positions()
         
         logger.info("Warming up strategy...")
         await self.strategy.warmup(self.config.strategy.symbols)
@@ -242,6 +243,65 @@ class TradingBot:
 
             except Exception as e:
                 logger.error("Error reconciling pending position", symbol=pos.symbol, error=str(e))
+
+    async def reconcile_open_positions(self):
+        """
+        Checks if OPEN positions in the database actually exist on the exchange (via balance check).
+        If a position is missing on the exchange, it is closed in the DB to prevent state drift.
+        """
+        logger.info("Reconciling OPEN positions with exchange balances...")
+        open_positions = await self.position_manager.get_all_open_positions()
+        if not open_positions:
+            logger.info("No OPEN positions to reconcile.")
+            return
+
+        try:
+            balances = await self.exchange_api.get_balance()
+        except Exception as e:
+            logger.error("Failed to fetch balances for reconciliation. Skipping.", error=str(e))
+            return
+
+        for pos in open_positions:
+            # Assume symbol format "BASE/QUOTE"
+            try:
+                base_asset = pos.symbol.split('/')[0]
+            except IndexError:
+                logger.warning("Could not parse base asset from symbol. Skipping reconciliation.", symbol=pos.symbol)
+                continue
+
+            asset_balance = balances.get(base_asset, {}).get('total', 0.0)
+            
+            # Threshold: 90% of recorded quantity to account for fees/dust/rounding
+            # If we think we have 1.0 but exchange says 0.0, it's a phantom.
+            if asset_balance < (pos.quantity * 0.90):
+                logger.warning("Phantom position detected during startup.", 
+                               symbol=pos.symbol, 
+                               db_qty=pos.quantity, 
+                               exchange_bal=asset_balance)
+                
+                # Fetch current price for PnL estimation
+                current_price = pos.entry_price # Fallback
+                try:
+                    ticker = await self.exchange_api.get_ticker_data(pos.symbol)
+                    if ticker and ticker.get('last'):
+                        current_price = ticker['last']
+                except Exception:
+                    logger.warning("Could not fetch ticker for phantom close. Using entry price.", symbol=pos.symbol)
+
+                await self.position_manager.close_position(
+                    pos.symbol, 
+                    current_price, 
+                    reason="Startup Reconciliation (Missing on Exchange)"
+                )
+                
+                if self.alert_system:
+                    await self.alert_system.send_alert(
+                        level='warning',
+                        message=f"⚠️ Auto-Reconciled Phantom Position for {pos.symbol} on startup.",
+                        details={'db_qty': pos.quantity, 'wallet_bal': asset_balance}
+                    )
+            else:
+                logger.info("Position verified on exchange.", symbol=pos.symbol, db_qty=pos.quantity, exchange_bal=asset_balance)
 
     async def run(self):
         self.running = True
