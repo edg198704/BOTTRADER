@@ -305,6 +305,11 @@ risk_management:
   max_volume_participation_pct: 0.01 # Limit trade to 1% of average volume
   volume_lookback_periods: 20 # Calculate average volume over last 20 candles
 
+  # --- Symbol Specific Risk (New) ---
+  # Prevents a single bad asset from draining the portfolio.
+  max_consecutive_losses: 3 # Halt trading symbol after 3 losses in a row
+  consecutive_loss_cooldown_minutes: 60 # Cooldown duration
+
   regime_based_risk:
     # Override default risk parameters based on the detected market regime.
     # If a parameter is not set here, the default value above will be used.
