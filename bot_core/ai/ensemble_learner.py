@@ -988,6 +988,16 @@ class EnsembleLearner:
         except Exception as e:
             logger.error(f"Failed to reload models for {symbol}: {e}")
 
+    async def warmup_models(self, symbols: List[str]):
+        """
+        Eagerly loads models for the provided symbols in parallel.
+        """
+        logger.info(f"Warming up models for {len(symbols)} symbols...")
+        tasks = [self.reload_models(symbol) for symbol in symbols]
+        await asyncio.gather(*tasks)
+        loaded_count = sum(1 for s in symbols if s in self.symbol_models)
+        logger.info(f"Warmup complete. Loaded {loaded_count}/{len(symbols)} models.")
+
     async def rollback_model(self, symbol: str) -> bool:
         safe_symbol = symbol.replace('/', '_')
         final_dir = os.path.join(self.config.model_path, safe_symbol)
