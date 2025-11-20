@@ -99,6 +99,10 @@ class TradingBot:
         logger.info("Market details loading complete and passed to TradeExecutor.")
 
     async def reconcile_pending_positions(self):
+        """
+        Robustly reconciles positions stuck in 'PENDING' state.
+        Queries the exchange using the 'trade_id' (client_order_id) to determine the true state.
+        """
         logger.info("Reconciling PENDING positions...")
         pending_positions = await self.position_manager.get_pending_positions()
         if not pending_positions:
@@ -107,9 +111,53 @@ class TradingBot:
         logger.info("Found PENDING positions. Reconciling...", count=len(pending_positions))
         for pos in pending_positions:
             try:
-                # In a real scenario, we would check the order status on exchange and update DB
-                # For now, we mark them failed to be safe if they are stale
-                await self.position_manager.mark_position_failed(pos.symbol, pos.order_id, "Startup Reconciliation")
+                # 1. Check Exchange for the Order by Client ID
+                exchange_order = await self.exchange_api.fetch_order_by_client_id(pos.symbol, pos.trade_id)
+                
+                if exchange_order:
+                    status = exchange_order.get('status')
+                    logger.info("Found matching exchange order for pending position", 
+                                symbol=pos.symbol, trade_id=pos.trade_id, status=status)
+                    
+                    if status == 'FILLED':
+                        # Order succeeded! Confirm position.
+                        filled_qty = exchange_order.get('filled', 0.0)
+                        avg_price = exchange_order.get('average', 0.0)
+                        fee_cost = 0.0
+                        if exchange_order.get('fee'):
+                            fee_cost = float(exchange_order['fee'].get('cost', 0.0))
+                        
+                        # Calculate SL/TP based on actual fill price
+                        # We need to reconstruct the logic or use what was intended. 
+                        # For simplicity, we use the intended SL/TP logic from RiskManager if possible, 
+                        # but here we might just have to use defaults or mark it open and let PositionMonitor handle it.
+                        # Ideally, we'd store the intended SL/TP in metadata, but for now we recalculate.
+                        
+                        # Fetch current data for SL calc
+                        df = self.data_handler.get_market_data(pos.symbol)
+                        sl = self.risk_manager.calculate_stop_loss(pos.side, avg_price, df)
+                        tp = self.risk_manager.calculate_take_profit(pos.side, avg_price, sl)
+
+                        await self.position_manager.confirm_position_open(
+                            pos.symbol, exchange_order['id'], filled_qty, avg_price, sl, tp, fees=fee_cost
+                        )
+                        logger.info("Recovered PENDING position as OPEN.", symbol=pos.symbol)
+
+                    elif status == 'OPEN':
+                        # Order is still open. To be safe and reset state, we cancel it.
+                        logger.warning("Pending position has OPEN order on exchange. Cancelling to reset state.", symbol=pos.symbol)
+                        await self.exchange_api.cancel_order(exchange_order['id'], pos.symbol)
+                        await self.position_manager.mark_position_failed(pos.symbol, pos.order_id, "Startup Reconciliation (Cancelled Open Order)")
+                    
+                    else:
+                        # CANCELED, REJECTED, EXPIRED
+                        await self.position_manager.mark_position_failed(pos.symbol, pos.order_id, f"Startup Reconciliation (Exchange Status: {status})")
+                
+                else:
+                    # Order not found on exchange. It likely never made it.
+                    logger.warning("Order not found on exchange for pending position. Marking failed.", symbol=pos.symbol, trade_id=pos.trade_id)
+                    await self.position_manager.mark_position_failed(pos.symbol, pos.order_id, "Startup Reconciliation (Order Not Found)")
+
             except Exception as e:
                 logger.error("Error reconciling pending position", symbol=pos.symbol, error=str(e))
 
@@ -132,6 +180,7 @@ class TradingBot:
                 continue
 
             asset_balance = balances.get(base_asset, {}).get('total', 0.0)
+            # Tolerance check: If we hold significantly less than the DB says, we have a phantom position.
             if asset_balance < (pos.quantity * 0.90):
                 logger.warning("Phantom position detected.", symbol=pos.symbol, db_qty=pos.quantity, exchange_bal=asset_balance)
                 current_price = self.latest_prices.get(pos.symbol, pos.entry_price)
@@ -247,6 +296,7 @@ class TradingBot:
                 
                 reconcile_counter += 1
                 if reconcile_counter >= 2:
+                    # Periodic check for stuck pending positions
                     await self.reconcile_pending_positions()
                     reconcile_counter = 0
 
