@@ -477,7 +477,7 @@ def _evaluate_ensemble(models: Dict[str, Any],
         'win_rate': float(len(winning_returns) / len(strategy_returns)) if len(strategy_returns) > 0 else 0.0
     }
 
-def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrategyParams) -> bool:
+def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrategyParams, leader_df: Optional[pd.DataFrame] = None) -> bool:
     """
     Standalone function to train models in a separate process.
     Implements Walk-Forward Validation (Stacking) with Purging for robust weight optimization.
@@ -492,8 +492,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
     try:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # 1. Prepare Data
-        df_proc = FeatureProcessor.process_data(df, config)
+        # 1. Prepare Data (Including Leader Features)
+        df_proc = FeatureProcessor.process_data(df, config, leader_df=leader_df)
         all_feature_names = list(df_proc.columns)
         labels = FeatureProcessor.create_labels(df, config)
         
@@ -958,7 +958,7 @@ class EnsembleLearner:
         except Exception as e:
             logger.error(f"Failed to reload models for {symbol}: {e}")
 
-    def _predict_sync(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None) -> Dict[str, Any]:
+    def _predict_sync(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None, leader_df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
         entry = self.symbol_models.get(symbol)
         if not entry:
             return {}
@@ -968,8 +968,8 @@ class EnsembleLearner:
         calibrator = entry.get('calibrator')
         drift_detector = entry.get('drift_detector')
         
-        # Prepare Data
-        df_proc = FeatureProcessor.process_data(df, self.config)
+        # Prepare Data (Including Leader Features)
+        df_proc = FeatureProcessor.process_data(df, self.config, leader_df=leader_df)
         active_features = meta.get('active_feature_columns', meta.get('feature_columns'))
         
         if not set(active_features).issubset(set(df_proc.columns)):
@@ -1113,11 +1113,11 @@ class EnsembleLearner:
             'anomaly_score': float(anomaly_score)
         }
 
-    async def predict(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None) -> Dict[str, Any]:
+    async def predict(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None, leader_df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
         if symbol not in self.symbol_models:
             await self.reload_models(symbol)
             if symbol not in self.symbol_models:
                 return {}
 
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self.executor, self._predict_sync, df, symbol, regime)
+        return await loop.run_in_executor(self.executor, self._predict_sync, df, symbol, regime, leader_df)
