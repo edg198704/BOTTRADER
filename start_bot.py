@@ -63,6 +63,12 @@ def validate_config(config: BotConfig):
         if config.strategy.params.features.use_price_action_features:
             available_columns.update(['pa_body_size', 'pa_upper_wick', 'pa_lower_wick'])
 
+        if config.strategy.params.features.use_volatility_estimators:
+            available_columns.update(['volatility_gk'])
+
+        if config.strategy.params.features.use_frac_diff:
+            available_columns.update(['close_frac'])
+
         required_columns = set(config.strategy.params.feature_columns)
         missing_columns = required_columns - available_columns
         
