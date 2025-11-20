@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Callable, Type, Tuple, Dict, Any, List, Optional
 
@@ -159,3 +160,13 @@ def generate_indicator_rename_map(indicators_config: List[Dict[str, Any]]) -> Di
             rename_map[name] = alias
 
     return rename_map
+
+def escape_markdown_v2(text: str) -> str:
+    """
+    Escapes characters for Telegram MarkdownV2 format.
+    Characters to escape: _ * [ ] ( ) ~ ` > # + - = | { } . !
+    """
+    if not text:
+        return ""
+    escape_chars = r"_*\[\]()~`>#+-=|{}.!"
+    return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", str(text))
