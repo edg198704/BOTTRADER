@@ -120,6 +120,10 @@ class AIFeatureEngineeringConfig(BaseModel):
     lag_features: List[str] = [] # List of column names to generate lags for
     lag_depth: int = 0 # Number of past periods to include as features
 
+    # --- Advanced Features (New) ---
+    use_time_features: bool = False # Cyclical encoding of Hour/Day
+    use_price_action_features: bool = False # Candle body/wick ratios
+
     # --- Feature Selection ---
     use_feature_selection: bool = True
     max_active_features: int = 20 # Cap the number of features fed to models to reduce noise
