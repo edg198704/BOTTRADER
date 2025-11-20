@@ -135,6 +135,65 @@ class TradeExecutor:
                 
         return limit_price
 
+    async def _retry_entry_with_smart_balance(self, symbol: str, side: str, order_type: str, limit_price: float, trade_id: str, market_details: Dict) -> Optional[Dict]:
+        """
+        Attempts to retry an entry order by fetching the exact available balance and recalculating
+        the maximum feasible quantity. This handles cases where local fee estimation or dust
+        caused the initial order to exceed available funds.
+        """
+        try:
+            # 1. Identify Asset to Check
+            base_asset, quote_asset = symbol.split('/')
+            target_asset = quote_asset if side == 'BUY' else base_asset
+            
+            # 2. Fetch Balance
+            balances = await self.exchange_api.get_balance()
+            free_balance = balances.get(target_asset, {}).get('free', 0.0)
+            
+            if free_balance <= 0:
+                logger.warning("Smart Retry failed: Zero free balance.", asset=target_asset)
+                return None
+
+            # 3. Calculate Max Quantity
+            new_qty = 0.0
+            if side == 'BUY':
+                # For BUY, we need to account for fees if they are deducted from the cost (uncommon but possible)
+                # or simply ensure Cost < Balance. 
+                # Safe approach: Cost + Fee < Balance. 
+                # Approx Fee Rate
+                fee_rate = self.config.exchange.taker_fee_pct
+                max_cost = free_balance / (1 + fee_rate)
+                new_qty = max_cost / limit_price
+            else:
+                # For SELL, we just sell what we have
+                new_qty = free_balance
+
+            # 4. Adjust for Precision/Limits
+            adjusted_qty = self.order_sizer.adjust_order_quantity(symbol, new_qty, limit_price, market_details)
+            
+            if adjusted_qty <= 0:
+                logger.warning("Smart Retry failed: Adjusted quantity is zero/below limits.", raw_qty=new_qty)
+                return None
+
+            logger.info("Retrying entry with smart balance calculation.", 
+                        original_asset=target_asset, 
+                        balance=free_balance, 
+                        new_qty=adjusted_qty)
+
+            # 5. Place Order
+            extra_params = {'clientOrderId': trade_id}
+            if self.config.execution.post_only and order_type == 'LIMIT':
+                extra_params['postOnly'] = True
+
+            return await self.exchange_api.place_order(
+                symbol, side, order_type, adjusted_qty, price=limit_price, 
+                extra_params=extra_params
+            )
+
+        except Exception as e:
+            logger.error("Smart Retry encountered an exception.", error=str(e))
+            return None
+
     async def _execute_open_position(self, symbol: str, side: str, current_price: float, df: pd.DataFrame, regime: Optional[str], signal: Dict):
         # Await async DB call to get ALL active positions (OPEN + PENDING) for accurate risk check
         active_positions = await self.position_manager.get_all_active_positions()
@@ -206,33 +265,24 @@ class TradeExecutor:
         order_result = None
         try:
             # Use trade_id as the initial clientOrderId
+            extra_params = {'clientOrderId': trade_id}
+            if self.config.execution.post_only and order_type == 'LIMIT':
+                extra_params['postOnly'] = True
+
             order_result = await self.exchange_api.place_order(
                 symbol, side, order_type, final_quantity, price=limit_price, 
-                extra_params={'clientOrderId': trade_id}
+                extra_params=extra_params
             )
         except BotInsufficientFundsError:
             # --- Smart Retry for Entry ---
-            logger.warning("Insufficient funds for entry. Attempting one-time retry with reduced size.", symbol=symbol)
-            try:
-                # Reduce quantity by 1% to account for fees/slippage
-                reduced_qty = final_quantity * 0.99
-                # Re-adjust for precision
-                reduced_qty = self.order_sizer.adjust_order_quantity(symbol, reduced_qty, current_price, market_details)
-                
-                if reduced_qty > 0:
-                    order_result = await self.exchange_api.place_order(
-                        symbol, side, order_type, reduced_qty, price=limit_price, 
-                        extra_params={'clientOrderId': trade_id}
-                    )
-                    final_quantity = reduced_qty # Update for lifecycle manager
-                    logger.info("Retry successful with reduced quantity.", original=final_quantity, new=reduced_qty)
-                else:
-                    logger.error("Reduced quantity too small to trade.")
-                    await self.position_manager.mark_position_failed(symbol, trade_id, "Insufficient Funds (Retry Failed)")
-                    return
-            except Exception as retry_e:
-                logger.error("Retry failed for entry order.", error=str(retry_e))
-                await self.position_manager.mark_position_failed(symbol, trade_id, f"Insufficient Funds (Retry Exception: {str(retry_e)})")
+            logger.warning("Insufficient funds for entry. Attempting smart retry with balance check.", symbol=symbol)
+            order_result = await self._retry_entry_with_smart_balance(
+                symbol, side, order_type, limit_price, trade_id, market_details
+            )
+            
+            if not order_result:
+                logger.error("Smart retry failed or produced invalid order.")
+                await self.position_manager.mark_position_failed(symbol, trade_id, "Insufficient Funds (Retry Failed)")
                 return
 
         except BotInvalidOrderError as e:
@@ -265,7 +315,7 @@ class TradeExecutor:
             initial_order=order_result, 
             symbol=symbol, 
             side=side, 
-            quantity=final_quantity, 
+            quantity=final_quantity,
             initial_price=limit_price,
             market_details=market_details,
             on_order_replace=_on_order_replace,
@@ -391,7 +441,13 @@ class TradeExecutor:
         used_quantity = close_quantity
 
         try:
-            order_result = await self.exchange_api.place_order(position.symbol, close_side, order_type, close_quantity, price=limit_price)
+            extra_params = {}
+            if self.config.execution.post_only and order_type == 'LIMIT':
+                extra_params['postOnly'] = True
+
+            order_result = await self.exchange_api.place_order(
+                position.symbol, close_side, order_type, close_quantity, price=limit_price, extra_params=extra_params
+            )
         except BotInsufficientFundsError:
             # --- Smart Retry Logic for Dust/Fees ---
             logger.warning("Insufficient funds to close position. Attempting smart retry with actual wallet balance.", symbol=position.symbol)
@@ -415,8 +471,12 @@ class TradeExecutor:
                     )
                     
                     if used_quantity > 0:
+                        extra_params = {}
+                        if self.config.execution.post_only and order_type == 'LIMIT':
+                            extra_params['postOnly'] = True
+
                         order_result = await self.exchange_api.place_order(
-                            position.symbol, close_side, order_type, used_quantity, price=limit_price
+                            position.symbol, close_side, order_type, used_quantity, price=limit_price, extra_params=extra_params
                         )
                     else:
                         logger.error("Adjusted wallet balance is too small to trade.", symbol=position.symbol)
