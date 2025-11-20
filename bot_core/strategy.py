@@ -240,7 +240,10 @@ class AIEnsembleStrategy(TradingStrategy):
         return time_since.total_seconds() < cooldown_seconds
 
     def _get_confidence_threshold(self, regime: str, is_exit: bool = False, optimized_base: Optional[float] = None) -> float:
-        """Determines the confidence threshold based on the current market regime and action type."""
+        """
+        Determines the confidence threshold based on the current market regime and action type.
+        Implements a 'max(ai, manager)' logic where the stricter of the two thresholds is used.
+        """
         regime_config = self.ai_config.market_regime
         
         if is_exit:
@@ -255,22 +258,29 @@ class AIEnsembleStrategy(TradingStrategy):
                 return regime_config.sideways_exit_threshold
             return base
         else:
-            # If we have an optimized base (which is now regime-specific from the learner),
-            # we prioritize it unless the config explicitly disables optimization.
+            # 1. Determine AI-Suggested Threshold (Statistical Optimal from Training)
+            ai_threshold = self.ai_config.confidence_threshold
             if optimized_base is not None and self.ai_config.training.optimize_entry_threshold:
-                return optimized_base
+                ai_threshold = optimized_base
 
-            base = self.ai_config.confidence_threshold
+            # 2. Determine Manager-Mandated Threshold (Config/Optimizer Override)
+            manager_threshold = self.ai_config.confidence_threshold
             
             if regime == 'bull' and regime_config.bull_confidence_threshold is not None:
-                return regime_config.bull_confidence_threshold
+                manager_threshold = regime_config.bull_confidence_threshold
             elif regime == 'bear' and regime_config.bear_confidence_threshold is not None:
-                return regime_config.bear_confidence_threshold
+                manager_threshold = regime_config.bear_confidence_threshold
             elif regime == 'volatile' and regime_config.volatile_confidence_threshold is not None:
-                return regime_config.volatile_confidence_threshold
+                manager_threshold = regime_config.volatile_confidence_threshold
             elif regime == 'sideways' and regime_config.sideways_confidence_threshold is not None:
-                return regime_config.sideways_confidence_threshold
-            return base
+                manager_threshold = regime_config.sideways_confidence_threshold
+            
+            # 3. Apply the stricter of the two (Safety Floor)
+            # If Optimizer tightens risk (raises manager_threshold), we respect it.
+            # If AI training suggests a very high threshold (noisy data), we respect it.
+            final_threshold = max(ai_threshold, manager_threshold)
+            
+            return final_threshold
 
     def get_latest_regime(self, symbol: str) -> Optional[str]:
         return self.last_detected_regime.get(symbol)
@@ -294,7 +304,7 @@ class AIEnsembleStrategy(TradingStrategy):
             return None
             
         # Filter out poor performers
-        min_acc = self.ai_config.ensemble_weights.min_model_accuracy
+        min_acc = 0.45 # Hardcoded safety floor for dynamic weights
         valid_models = {m: acc for m, acc in accuracies.items() if acc > min_acc}
         
         if not valid_models:
@@ -304,7 +314,6 @@ class AIEnsembleStrategy(TradingStrategy):
         total_acc = sum(valid_models.values())
         weights = {m: acc / total_acc for m, acc in valid_models.items()}
         
-        # Apply smoothing if previous weights exist (not implemented here for simplicity, direct calc)
         return weights
 
     async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[Dict[str, Any]]:
@@ -329,7 +338,6 @@ class AIEnsembleStrategy(TradingStrategy):
         if prev_regime and prev_regime != regime:
             logger.info("Market regime shift detected.", symbol=symbol, old=prev_regime, new=regime)
             # Trigger proactive retrain if not recently retrained
-            # We use the force flag to bypass the standard interval check in needs_retraining
             self.force_retrain_flags[symbol] = True
             logger.info("Triggering proactive retrain due to regime shift.", symbol=symbol)
 
@@ -423,12 +431,19 @@ class AIEnsembleStrategy(TradingStrategy):
         required_threshold = self._get_confidence_threshold(regime, is_exit, optimized_base=optimized_threshold)
         
         if confidence < required_threshold:
-            logger.debug("Confidence below threshold", symbol=symbol, confidence=confidence, required=required_threshold, regime=regime, is_exit=is_exit)
+            logger.debug("Confidence below threshold", 
+                         symbol=symbol, 
+                         confidence=confidence, 
+                         required=required_threshold, 
+                         regime=regime, 
+                         is_exit=is_exit,
+                         optimized_base=optimized_threshold)
             return None
 
         strategy_metadata = {
             'model_version': model_version,
             'confidence': confidence,
+            'effective_threshold': required_threshold, # Pass the actual threshold used for decision
             'regime': regime,
             'regime_confidence': regime_result.get('confidence'),
             'model_type': prediction.get('model_type'),
