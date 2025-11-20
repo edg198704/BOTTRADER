@@ -2,6 +2,9 @@ import asyncio
 import functools
 import logging
 import re
+import json
+import os
+import tempfile
 from datetime import datetime, timezone
 from typing import Callable, Type, Tuple, Dict, Any, List, Optional
 
@@ -34,6 +37,42 @@ class Clock:
     def reset(cls):
         """Resets the clock to system time."""
         cls._mock_time = None
+
+class AtomicJsonStore:
+    """
+    Helper class to handle atomic JSON state persistence.
+    Ensures that state files are not corrupted if the process crashes during a write.
+    """
+    def __init__(self, path: str):
+        self.path = path
+
+    def save(self, state: Dict[str, Any]):
+        try:
+            dir_name = os.path.dirname(self.path)
+            if dir_name:
+                os.makedirs(dir_name, exist_ok=True)
+            
+            # Write to temp file first
+            with tempfile.NamedTemporaryFile('w', dir=dir_name if dir_name else '.', delete=False) as tf:
+                json.dump(state, tf, indent=2, default=str)
+                temp_name = tf.name
+            
+            # Atomic rename
+            os.replace(temp_name, self.path)
+        except Exception as e:
+            logger.error(f"Failed to save state atomically to {self.path}", error=str(e))
+            if 'temp_name' in locals() and os.path.exists(temp_name):
+                os.remove(temp_name)
+
+    def load(self) -> Dict[str, Any]:
+        if not os.path.exists(self.path):
+            return {}
+        try:
+            with open(self.path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load state from {self.path}", error=str(e))
+            return {}
 
 def async_retry(max_attempts: int = 3, delay_seconds: float = 1.0, backoff_factor: float = 2.0, exceptions: Tuple[Type[Exception], ...] = (Exception,)):
     """
@@ -168,5 +207,5 @@ def escape_markdown_v2(text: str) -> str:
     """
     if not text:
         return ""
-    escape_chars = r"_*\[\]()~`>#+-=|{}.!"
+    escape_chars = r"_*[\]()~`>#+-=|{}.!"
     return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", str(text))
