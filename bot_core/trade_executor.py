@@ -74,6 +74,12 @@ class TradeExecutor:
             if not position:
                 if action not in ['BUY', 'SELL']:
                     return
+                
+                # --- Pre-Flight Liquidity Check ---
+                if not await self._check_liquidity(symbol, current_price):
+                    logger.warning("Trade aborted due to poor liquidity/spread.", symbol=symbol)
+                    return
+
                 await self._execute_open_position(symbol, action, current_price, df_with_indicators, market_regime, signal)
             
             # --- Handle Closing an Existing Position ---
@@ -83,6 +89,32 @@ class TradeExecutor:
                 
                 if is_close_long or is_close_short:
                     await self.close_position(position, "Strategy Signal")
+
+    async def _check_liquidity(self, symbol: str, current_price: float) -> bool:
+        """
+        Verifies that the market spread is within acceptable limits before entering a trade.
+        """
+        try:
+            book = await self.exchange_api.fetch_order_book(symbol, limit=5)
+            if not book or not book.get('bids') or not book.get('asks'):
+                return False
+            
+            best_bid = book['bids'][0][0]
+            best_ask = book['asks'][0][0]
+            
+            if best_bid <= 0 or best_ask <= 0:
+                return False
+                
+            spread = (best_ask - best_bid) / current_price
+            
+            if spread > self.config.execution.max_entry_spread_pct:
+                logger.warning("Spread too high for entry", symbol=symbol, spread=f"{spread:.4%}", max_allowed=f"{self.config.execution.max_entry_spread_pct:.4%}")
+                return False
+                
+            return True
+        except Exception as e:
+            logger.error("Liquidity check failed", symbol=symbol, error=str(e))
+            return False # Fail safe
 
     def _calculate_or_extract_fee(self, order_state: Dict[str, Any], price: float, quantity: float) -> float:
         """Extracts fee from order state or estimates it based on config."""
