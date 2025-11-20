@@ -102,6 +102,10 @@ class AITrainingConfig(BaseModel):
     min_sharpe_ratio: float = 0.05 # Require slightly positive risk-adjusted return
     min_improvement_pct: float = 0.02 # Require 2% improvement over previous model to replace it
     
+    # --- Advanced Validation ---
+    use_probabilistic_sharpe: bool = True # Use PSR instead of raw Sharpe for selection
+    purge_overlap: bool = True # Drop samples between Train/Test that overlap via label horizon
+
     # --- Hyperparameter Optimization ---
     auto_tune_models: bool = False
     n_iter_search: int = 10
