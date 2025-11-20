@@ -120,6 +120,12 @@ class AIEnsembleStrategy(TradingStrategy):
         self.force_retrain_flags: Dict[str, bool] = {}
         self.drift_counters: Dict[str, int] = {}
         
+        # Dynamic Weighting State
+        # symbol -> list of (timestamp, {model_name: probs_array})
+        self.individual_model_logs: Dict[str, List[Tuple[datetime, Dict[str, Any]]]] = {}
+        # symbol -> {model_name: deque(correct_bools)}
+        self.model_performance_stats: Dict[str, Dict[str, deque]] = {}
+        
         self.data_fetcher = None # Will be set by Bot
 
         # State Persistence Path
@@ -150,7 +156,17 @@ class AIEnsembleStrategy(TradingStrategy):
                 # Convert deque to list for JSON
                 'accuracy_history': {k: list(v) for k, v in self.accuracy_history.items()},
                 # Persist logs (timestamps as strings)
-                'prediction_logs': {k: [(ts.isoformat(), p) for ts, p in v] for k, v in self.prediction_logs.items()}
+                'prediction_logs': {k: [(ts.isoformat(), p) for ts, p in v] for k, v in self.prediction_logs.items()},
+                # Persist individual model logs (simplified for storage)
+                # We only store the last N logs to avoid huge files
+                'individual_model_logs': {
+                    k: [(ts.isoformat(), {m: p.tolist() if isinstance(p, np.ndarray) else p for m, p in preds.items()}) 
+                        for ts, preds in v[-50:]] 
+                    for k, v in self.individual_model_logs.items()
+                },
+                'model_performance_stats': {
+                    k: {m: list(d) for m, d in v.items()} for k, v in self.model_performance_stats.items()
+                }
             }
             
             # Ensure dir exists
@@ -185,8 +201,20 @@ class AIEnsembleStrategy(TradingStrategy):
             
             if 'prediction_logs' in state:
                 for k, v in state['prediction_logs'].items():
-                    # Reconstruct tuples (timestamp, prediction)
                     self.prediction_logs[k] = [(datetime.fromisoformat(ts), p) for ts, p in v]
+            
+            if 'individual_model_logs' in state:
+                for k, v in state['individual_model_logs'].items():
+                    # Reconstruct numpy arrays from lists
+                    self.individual_model_logs[k] = [
+                        (datetime.fromisoformat(ts), {m: np.array(p) for m, p in preds.items()}) 
+                        for ts, preds in v
+                    ]
+            
+            if 'model_performance_stats' in state:
+                window = self.ai_config.ensemble_weights.dynamic_window
+                for k, v in state['model_performance_stats'].items():
+                    self.model_performance_stats[k] = {m: deque(d, maxlen=window) for m, d in v.items()}
             
             logger.info("Restored AI Strategy state from disk.")
         except Exception as e:
@@ -235,6 +263,38 @@ class AIEnsembleStrategy(TradingStrategy):
     def get_latest_regime(self, symbol: str) -> Optional[str]:
         return self.last_detected_regime.get(symbol)
 
+    def _calculate_dynamic_weights(self, symbol: str) -> Optional[Dict[str, float]]:
+        """Calculates ensemble weights based on recent individual model accuracy."""
+        if not self.ai_config.ensemble_weights.use_dynamic_weighting:
+            return None
+            
+        stats = self.model_performance_stats.get(symbol)
+        if not stats:
+            return None
+            
+        accuracies = {}
+        for model, history in stats.items():
+            if len(history) >= 5: # Minimum samples to consider
+                acc = sum(history) / len(history)
+                accuracies[model] = acc
+        
+        if not accuracies:
+            return None
+            
+        # Filter out poor performers
+        min_acc = self.ai_config.ensemble_weights.min_model_accuracy
+        valid_models = {m: acc for m, acc in accuracies.items() if acc > min_acc}
+        
+        if not valid_models:
+            return None
+            
+        # Normalize to sum to 1
+        total_acc = sum(valid_models.values())
+        weights = {m: acc / total_acc for m, acc in valid_models.items()}
+        
+        # Apply smoothing if previous weights exist (not implemented here for simplicity, direct calc)
+        return weights
+
     async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[Dict[str, Any]]:
         if not self.ensemble_learner.is_trained:
             logger.debug("AI models not trained yet, skipping analysis.", symbol=symbol)
@@ -267,7 +327,12 @@ class AIEnsembleStrategy(TradingStrategy):
         if self.ai_config.market_leader_symbol and self.data_fetcher:
             leader_df = self.data_fetcher.get_market_data(self.ai_config.market_leader_symbol)
 
-        prediction = await self.ensemble_learner.predict(df_enriched, symbol, regime=regime, leader_df=leader_df)
+        # --- Dynamic Weighting ---
+        dynamic_weights = self._calculate_dynamic_weights(symbol)
+        if dynamic_weights:
+            logger.debug("Using dynamic ensemble weights", symbol=symbol, weights=dynamic_weights)
+
+        prediction = await self.ensemble_learner.predict(df_enriched, symbol, regime=regime, leader_df=leader_df, custom_weights=dynamic_weights)
         
         action = prediction.get('action')
         confidence = prediction.get('confidence', 0.0)
@@ -278,6 +343,7 @@ class AIEnsembleStrategy(TradingStrategy):
         is_anomaly = prediction.get('is_anomaly', False)
         anomaly_score = prediction.get('anomaly_score', 0.0)
         optimized_threshold = prediction.get('optimized_threshold')
+        individual_preds = prediction.get('individual_predictions', {})
 
         state_changed = False
 
@@ -302,14 +368,23 @@ class AIEnsembleStrategy(TradingStrategy):
                 self.drift_counters[symbol] = 0
                 state_changed = True
 
+        current_time = df.index[-1]
+        
+        # Log Ensemble Prediction
         if self.ai_config.performance.enabled and action:
             action_map = {'sell': 0, 'hold': 1, 'buy': 2}
             pred_int = action_map.get(action, 1)
-            current_time = df.index[-1]
             
             if symbol not in self.prediction_logs:
                 self.prediction_logs[symbol] = []
             self.prediction_logs[symbol].append((current_time, pred_int))
+            state_changed = True
+
+        # Log Individual Predictions for Dynamic Weighting
+        if individual_preds:
+            if symbol not in self.individual_model_logs:
+                self.individual_model_logs[symbol] = []
+            self.individual_model_logs[symbol].append((current_time, individual_preds))
             state_changed = True
 
         if state_changed:
@@ -377,64 +452,100 @@ class AIEnsembleStrategy(TradingStrategy):
         return None
 
     async def _monitor_performance(self, symbol: str, df: pd.DataFrame):
+        # --- 1. Monitor Ensemble Accuracy ---
         logs = self.prediction_logs.get(symbol, [])
-        if not logs:
-            return
+        if logs:
+            horizon = self.ai_config.features.labeling_horizon
+            eval_df = df.tail(200)
+            if len(eval_df) >= horizon + 1:
+                try:
+                    actual_labels = FeatureProcessor.create_labels(eval_df, self.ai_config)
+                    
+                    if symbol not in self.accuracy_history:
+                        self.accuracy_history[symbol] = deque(maxlen=self.ai_config.performance.window_size)
 
-        horizon = self.ai_config.features.labeling_horizon
-        eval_df = df.tail(200)
-        if len(eval_df) < horizon + 1:
-            return
+                    remaining_logs = []
+                    evaluated_count = 0
 
-        try:
-            actual_labels = FeatureProcessor.create_labels(eval_df, self.ai_config)
-        except Exception as e:
-            logger.error("Failed to generate labels for performance monitoring", error=str(e))
-            return
+                    for ts, pred_int in logs:
+                        if ts in actual_labels.index:
+                            actual = actual_labels.loc[ts]
+                            if not np.isnan(actual):
+                                is_correct = 1 if int(actual) == pred_int else 0
+                                self.accuracy_history[symbol].append(is_correct)
+                                evaluated_count += 1
+                            else:
+                                remaining_logs.append((ts, pred_int))
+                        else:
+                            if ts > df.index[0]:
+                                remaining_logs.append((ts, pred_int))
+                    
+                    self.prediction_logs[symbol] = remaining_logs
 
-        if symbol not in self.accuracy_history:
-            self.accuracy_history[symbol] = deque(maxlen=self.ai_config.performance.window_size)
+                    if evaluated_count > 0:
+                        self._save_state()
 
-        remaining_logs = []
-        evaluated_count = 0
+                    if len(self.accuracy_history[symbol]) >= 10:
+                        accuracy = sum(self.accuracy_history[symbol]) / len(self.accuracy_history[symbol])
+                        
+                        if self.ai_config.performance.auto_rollback and accuracy < self.ai_config.performance.critical_accuracy_threshold:
+                            logger.critical("Model accuracy CRITICAL. Initiating ROLLBACK.", symbol=symbol, accuracy=f"{accuracy:.2%}")
+                            success = await self.ensemble_learner.rollback_model(symbol)
+                            if success:
+                                self.accuracy_history[symbol].clear()
+                                self.prediction_logs[symbol] = []
+                                self.force_retrain_flags[symbol] = False
+                                self._save_state()
+                                return
 
-        for ts, pred_int in logs:
-            if ts in actual_labels.index:
-                actual = actual_labels.loc[ts]
-                if not np.isnan(actual):
-                    is_correct = 1 if int(actual) == pred_int else 0
-                    self.accuracy_history[symbol].append(is_correct)
-                    evaluated_count += 1
-                else:
-                    remaining_logs.append((ts, pred_int))
-            else:
-                if ts > df.index[0]:
-                    remaining_logs.append((ts, pred_int))
-        
-        self.prediction_logs[symbol] = remaining_logs
+                        if accuracy < self.ai_config.performance.min_accuracy:
+                            if not self.force_retrain_flags.get(symbol, False):
+                                logger.warning("Model accuracy dropped below threshold. Forcing retrain and blocking entries.", 
+                                            symbol=symbol, accuracy=f"{accuracy:.2%}", threshold=self.ai_config.performance.min_accuracy)
+                                self.force_retrain_flags[symbol] = True
+                                self._save_state()
+                except Exception as e:
+                    logger.error("Failed to monitor ensemble performance", error=str(e))
 
-        if evaluated_count > 0:
-            self._save_state()
+        # --- 2. Monitor Individual Model Accuracy (Dynamic Weighting) ---
+        if self.ai_config.ensemble_weights.use_dynamic_weighting:
+            ind_logs = self.individual_model_logs.get(symbol, [])
+            if ind_logs:
+                try:
+                    # Re-generate labels if not done above (optimization: reuse if possible, but safe to redo)
+                    horizon = self.ai_config.features.labeling_horizon
+                    eval_df = df.tail(200)
+                    if len(eval_df) >= horizon + 1:
+                        actual_labels = FeatureProcessor.create_labels(eval_df, self.ai_config)
+                        
+                        if symbol not in self.model_performance_stats:
+                            self.model_performance_stats[symbol] = {}
 
-        if len(self.accuracy_history[symbol]) >= 10:
-            accuracy = sum(self.accuracy_history[symbol]) / len(self.accuracy_history[symbol])
-            
-            if self.ai_config.performance.auto_rollback and accuracy < self.ai_config.performance.critical_accuracy_threshold:
-                logger.critical("Model accuracy CRITICAL. Initiating ROLLBACK.", symbol=symbol, accuracy=f"{accuracy:.2%}")
-                success = await self.ensemble_learner.rollback_model(symbol)
-                if success:
-                    self.accuracy_history[symbol].clear()
-                    self.prediction_logs[symbol] = []
-                    self.force_retrain_flags[symbol] = False
-                    self._save_state()
-                    return
-
-            if accuracy < self.ai_config.performance.min_accuracy:
-                if not self.force_retrain_flags.get(symbol, False):
-                    logger.warning("Model accuracy dropped below threshold. Forcing retrain and blocking entries.", 
-                                   symbol=symbol, accuracy=f"{accuracy:.2%}", threshold=self.ai_config.performance.min_accuracy)
-                    self.force_retrain_flags[symbol] = True
-                    self._save_state()
+                        remaining_ind_logs = []
+                        
+                        for ts, preds_dict in ind_logs:
+                            if ts in actual_labels.index:
+                                actual = actual_labels.loc[ts]
+                                if not np.isnan(actual):
+                                    actual_int = int(actual)
+                                    for model_name, probs in preds_dict.items():
+                                        # Determine model prediction (argmax)
+                                        model_pred = np.argmax(probs)
+                                        is_correct = 1 if model_pred == actual_int else 0
+                                        
+                                        if model_name not in self.model_performance_stats[symbol]:
+                                            self.model_performance_stats[symbol][model_name] = deque(maxlen=self.ai_config.ensemble_weights.dynamic_window)
+                                        
+                                        self.model_performance_stats[symbol][model_name].append(is_correct)
+                                else:
+                                    remaining_ind_logs.append((ts, preds_dict))
+                            else:
+                                if ts > df.index[0]:
+                                    remaining_ind_logs.append((ts, preds_dict))
+                        
+                        self.individual_model_logs[symbol] = remaining_ind_logs
+                except Exception as e:
+                    logger.error("Failed to monitor individual model performance", error=str(e))
 
     async def retrain(self, symbol: str, df: pd.DataFrame, executor: Executor):
         logger.info("Strategy is triggering model retraining via ProcessPool.", symbol=symbol)
@@ -464,6 +575,11 @@ class AIEnsembleStrategy(TradingStrategy):
                 self.prediction_logs[symbol] = []
                 if symbol in self.accuracy_history:
                     self.accuracy_history[symbol].clear()
+                
+                # Clear dynamic weighting history on retrain to start fresh with new models
+                self.individual_model_logs[symbol] = []
+                if symbol in self.model_performance_stats:
+                    self.model_performance_stats[symbol].clear()
                 
                 self._save_state()
                 logger.info("Model training successful. Reloading models.", symbol=symbol)
