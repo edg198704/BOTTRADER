@@ -77,6 +77,11 @@ async def run_backtest():
         os.makedirs(config.backtest.model_path, exist_ok=True)
         logger.info(f"Using backtest model path: {config.backtest.model_path}")
 
+    # 3. Optimizer: Use a separate state file for backtesting
+    config.optimizer.state_file_path = "backtest_optimizer_state.json"
+    if os.path.exists(config.optimizer.state_file_path):
+        os.remove(config.optimizer.state_file_path)
+
     # 1. Load Data
     historical_data = await load_historical_data(config, None)
     if not historical_data:
@@ -165,6 +170,7 @@ async def run_backtest():
                 logger.warning(f"Insufficient data for initial training of {symbol}")
 
     equity_curve: List[Dict[str, Any]] = []
+    last_optimization_time = current_time
 
     try:
         while current_time <= end_time:
@@ -184,20 +190,28 @@ async def run_backtest():
                     if training_df is not None and not training_df.empty:
                         await strategy.retrain(symbol, training_df, bot.process_executor)
 
-            # 3. Run Bot Logic
+            # 3. Run Strategy Optimizer (Self-Optimization Simulation)
+            if config.optimizer.enabled:
+                time_since_opt = (current_time - last_optimization_time).total_seconds()
+                if time_since_opt >= (config.optimizer.interval_hours * 3600):
+                    logger.info(f"Running Strategy Optimizer at {current_time}...")
+                    await bot.optimizer.optimize()
+                    last_optimization_time = current_time
+
+            # 4. Run Bot Logic
             for symbol in config.strategy.symbols:
                 await bot.process_symbol_tick(symbol)
                 
-            # 4. Run Position Monitor
+            # 5. Run Position Monitor
             open_positions = await position_manager.get_all_open_positions()
             for pos in open_positions:
                 await position_monitor._check_position(pos)
                 
-            # 5. Record Equity
+            # 6. Record Equity
             equity = position_manager.get_portfolio_value(shared_latest_prices, open_positions)
             equity_curve.append({'timestamp': current_time, 'equity': equity})
 
-            # 6. Advance Time
+            # 7. Advance Time
             current_time += interval
             
             if current_time.hour == 0 and current_time.minute == 0 and current_time.second == 0:
@@ -207,7 +221,7 @@ async def run_backtest():
         # Ensure we shut down the bot's executor to prevent hanging
         await bot.stop()
 
-    # 6. Final Report
+    # 8. Final Report
     logger.info("Backtest Complete. Generating Report...")
     
     closed_positions = await position_manager.get_all_closed_positions()
