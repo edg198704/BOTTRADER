@@ -24,7 +24,17 @@ class DataHandler:
     def __init__(self, exchange_api: ExchangeAPI, config: BotConfig, shared_latest_prices: Dict[str, float]):
         self.exchange_api = exchange_api
         self.config = config
-        self.symbols = config.strategy.symbols
+        
+        # Initialize symbols list from strategy config
+        self.symbols = list(config.strategy.symbols)
+        
+        # Automatically track Market Leader if configured in AI Strategy
+        if isinstance(config.strategy.params, AIEnsembleStrategyParams):
+            leader = config.strategy.params.market_leader_symbol
+            if leader and leader not in self.symbols:
+                self.symbols.append(leader)
+                logger.info(f"Added market leader symbol {leader} to DataHandler tracking.")
+
         self.timeframe = config.strategy.timeframe
         self.secondary_timeframes = config.strategy.secondary_timeframes
         
@@ -32,14 +42,12 @@ class DataHandler:
         min_required = calculate_min_history_depth(config.strategy.indicators)
         
         # Scale history limit if secondary timeframes are used
-        # Heuristic: If using 1h (12x 5m), we need roughly 12x the history to calculate the same period MA
         scale_factor = 1.0
         if self.secondary_timeframes:
             base_seconds = parse_timeframe_to_seconds(self.timeframe)
             max_tf_seconds = max([parse_timeframe_to_seconds(tf) for tf in self.secondary_timeframes])
             if base_seconds > 0:
                 scale_factor = max(1.0, max_tf_seconds / base_seconds)
-                # Cap scaling to avoid fetching millions of candles, but ensure at least enough for HTF warmup
                 scale_factor = min(scale_factor, 24.0) 
         
         adjusted_min_required = int(min_required * scale_factor)
@@ -77,7 +85,6 @@ class DataHandler:
         # Dynamic Buffer Sizing for AI
         self.max_training_buffer = 10000
         if hasattr(config.strategy.params, 'training_data_limit'):
-             # Keep a buffer slightly larger than training limit to avoid edge cases
              self.max_training_buffer = int(config.strategy.params.training_data_limit * 1.2)
              logger.info(f"Adjusted max_training_buffer to {self.max_training_buffer} based on strategy config.")
 
