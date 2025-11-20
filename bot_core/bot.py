@@ -40,7 +40,6 @@ class TradingBot:
         self.metrics_writer = metrics_writer
         self.shared_bot_state = shared_bot_state if shared_bot_state is not None else {}
         
-        # Initialize Optimizer
         self.optimizer = StrategyOptimizer(config, position_manager)
         
         self.running = False
@@ -49,17 +48,14 @@ class TradingBot:
         self.market_details: Dict[str, Dict[str, Any]] = {}
         self.tasks: list[asyncio.Task] = []
         
-        # Track processed candles to avoid redundant analysis on the same closed candle
         self.processed_candles: Dict[str, pd.Timestamp] = {}
         
-        # Executor for CPU-intensive tasks like AI training
         self.process_executor = ProcessPoolExecutor(max_workers=2)
         
         self._initialize_shared_state()
         logger.info("TradingBot orchestrator initialized.")
 
     def _initialize_shared_state(self):
-        """Initializes the shared state dictionary for external components like Telegram."""
         self.shared_bot_state['status'] = 'initializing'
         self.shared_bot_state['start_time'] = self.start_time
         self.shared_bot_state['position_manager'] = self.position_manager
@@ -69,25 +65,24 @@ class TradingBot:
         self.shared_bot_state['strategy'] = self.strategy
 
     async def setup(self):
-        """Performs initial setup: loads market details and reconciles state. Separated for backtesting."""
         logger.info("Setting up TradingBot components...")
         
-        # Inject DataHandler into Strategy if it's an AI strategy needing external data
         if isinstance(self.strategy, AIEnsembleStrategy):
             self.strategy.data_fetcher = self.data_handler
             logger.info("Injected DataHandler into AIEnsembleStrategy.")
 
+        # Inject strategy into PositionMonitor for regime-aware risk management
+        self.position_monitor.set_strategy(self.strategy)
+
         await self._load_market_details()
         await self.reconcile_pending_positions()
         
-        # Warmup strategy (preload models, etc.)
         logger.info("Warming up strategy...")
         await self.strategy.warmup(self.config.strategy.symbols)
         
         logger.info("TradingBot setup complete.")
 
     async def _load_market_details(self):
-        """Fetches and caches exchange trading rules for all configured symbols."""
         logger.info("Loading market details for all symbols...")
         for symbol in self.config.strategy.symbols:
             try:
@@ -99,15 +94,12 @@ class TradingBot:
                     logger.error("Failed to load market details for symbol, trading may fail.", symbol=symbol)
             except Exception as e:
                 logger.critical("Could not load market details for symbol due to an exception.", symbol=symbol, error=str(e))
-        # Pass the loaded market details to the trade executor
         self.trade_executor.market_details = self.market_details
         logger.info("Market details loading complete and passed to TradeExecutor.")
 
     async def reconcile_pending_positions(self):
-        """Performs safety checks and state reconciliation for PENDING positions."""
         logger.info("Reconciling PENDING positions...")
         
-        # 1. Reconcile PENDING positions (Two-Phase Commit Recovery)
         pending_positions = await self.position_manager.get_pending_positions()
         if not pending_positions:
             return
@@ -120,25 +112,20 @@ class TradingBot:
                 continue
 
             try:
-                # Try to fetch by ID first
                 try:
                     order = await self.exchange_api.fetch_order(pos.order_id, pos.symbol)
                 except Exception:
                     order = None
                 
-                # If not found, it might be a Client Order ID that the exchange doesn't index directly.
-                # Scan open orders to find a match.
                 if not order:
                     logger.info("Order not found by ID, scanning open orders for Client ID match...", symbol=pos.symbol, id=pos.order_id)
                     open_orders = await self.exchange_api.fetch_open_orders(pos.symbol)
                     for o in open_orders:
-                        # Check standard CCXT field 'clientOrderId'
                         if o.get('clientOrderId') == pos.order_id:
                             order = o
                             logger.info("Found match in open orders via Client ID.", symbol=pos.symbol, exchange_id=o['id'])
-                            # Update DB with real ID
                             await self.position_manager.update_pending_order_id(pos.symbol, pos.order_id, o['id'])
-                            pos.order_id = o['id'] # Update local obj for subsequent logic
+                            pos.order_id = o['id']
                             break
 
                 if not order:
@@ -148,11 +135,9 @@ class TradingBot:
 
                 status = order.get('status')
                 
-                # Helper to confirm position from order data
                 async def confirm_from_order(order_data):
                     filled_qty = order_data.get('filled', 0.0)
                     avg_price = order_data.get('average', 0.0)
-                    # Fallback SL/TP since we might not have market data yet
                     sl_pct = 0.05
                     tp_pct = 0.05
                     if pos.side == 'BUY':
@@ -169,18 +154,14 @@ class TradingBot:
                     await confirm_from_order(order)
                 
                 elif status in ['CANCELED', 'REJECTED', 'EXPIRED']:
-                    # Check for partial fills even in terminal states
                     filled = order.get('filled', 0.0)
                     if filled > 0:
                         logger.info("Pending position was terminal but partially filled. Recovering.", symbol=pos.symbol, status=status)
                         await confirm_from_order(order)
                     else:
-                        # ZOMBIE CHECK: Before voiding, check if there are any OTHER orders (Open OR Closed)
-                        # that belong to this trade_id (e.g. chase orders placed before crash)
                         zombie_recovered = False
                         if pos.trade_id:
                             logger.info("Checking for zombie chase orders (Open)...", symbol=pos.symbol, trade_id=pos.trade_id)
-                            # 1. Check Open Orders
                             open_orders = await self.exchange_api.fetch_open_orders(pos.symbol)
                             for o in open_orders:
                                 client_oid = o.get('clientOrderId', '')
@@ -188,10 +169,6 @@ class TradingBot:
                                     logger.info("Found zombie chase order (OPEN)! Recovering.", symbol=pos.symbol, new_order_id=o['id'])
                                     await self.position_manager.update_pending_order_id(pos.symbol, pos.order_id, o['id'])
                                     zombie_recovered = True
-                                    # We found it, now we need to handle it (it's OPEN, so we likely want to cancel it or let it run)
-                                    # For safety, we update the ID and let the next loop/logic handle it, or handle it here.
-                                    # Since we are in the 'CANCELED' block of the *original* order, we must handle the new one.
-                                    # We'll cancel it to be safe and confirm any partials.
                                     cancelled_order = await self.exchange_api.cancel_order(o['id'], pos.symbol)
                                     if cancelled_order and cancelled_order.get('filled', 0.0) > 0:
                                         await confirm_from_order(cancelled_order)
@@ -199,7 +176,6 @@ class TradingBot:
                                         await self.position_manager.mark_position_failed(pos.symbol, o['id'], "Reconciliation: Zombie Chase Cancelled Empty")
                                     break
                             
-                            # 2. Check Recent History (Deep Scan) if not found in Open
                             if not zombie_recovered:
                                 logger.info("Deep scan for zombie chase orders (History)...", symbol=pos.symbol, trade_id=pos.trade_id)
                                 try:
@@ -207,7 +183,6 @@ class TradingBot:
                                     for o in recent_orders:
                                         client_oid = o.get('clientOrderId', '')
                                         if client_oid and client_oid.startswith(pos.trade_id):
-                                            # We found a related order in history.
                                             status_hist = o.get('status')
                                             if status_hist in ['FILLED', 'PARTIALLY_FILLED']:
                                                 logger.info("Found zombie chase order (FILLED) in history! Recovering.", symbol=pos.symbol, new_order_id=o['id'])
@@ -216,7 +191,6 @@ class TradingBot:
                                                 zombie_recovered = True
                                                 break
                                             elif status_hist == 'OPEN':
-                                                # Should have been caught by fetch_open_orders, but just in case
                                                 logger.info("Found zombie chase order (OPEN) in history! Recovering.", symbol=pos.symbol, new_order_id=o['id'])
                                                 await self.position_manager.update_pending_order_id(pos.symbol, pos.order_id, o['id'])
                                                 cancelled_order = await self.exchange_api.cancel_order(o['id'], pos.symbol)
@@ -235,7 +209,6 @@ class TradingBot:
                 
                 elif status == 'OPEN':
                     logger.info("Pending position order is still OPEN. Cancelling...", symbol=pos.symbol)
-                    # Cancel returns the updated order object (or fetches it)
                     cancelled_order = await self.exchange_api.cancel_order(pos.order_id, pos.symbol)
                     
                     if cancelled_order and cancelled_order.get('filled', 0.0) > 0:
@@ -248,41 +221,29 @@ class TradingBot:
             except Exception as e:
                 logger.error("Error reconciling pending position", symbol=pos.symbol, error=str(e))
 
-        # 2. Cancel all open orders to ensure clean slate (remove orphans)
-        # Note: We only do this on startup or explicit reconciliation, not every loop.
-        # But for safety, we skip this in the periodic loop if not explicitly requested.
-        # For now, we assume this method is safe to run periodically as it only targets PENDING positions.
-        # Orphan cleanup is separate.
-
     async def run(self):
-        """Main entry point to start all bot activities."""
         self.running = True
         self.shared_bot_state['status'] = 'running'
         logger.info("Starting TradingBot...", symbols=self.config.strategy.symbols)
         
         await self.setup()
 
-        # Start shared loops
         self.tasks.append(asyncio.create_task(self.data_handler.run()))
         self.tasks.append(asyncio.create_task(self._monitoring_loop()))
         self.tasks.append(asyncio.create_task(self.position_monitor.run()))
         self.tasks.append(asyncio.create_task(self._retraining_loop()))
         self.tasks.append(asyncio.create_task(self.optimizer.run()))
 
-        # Start a trading cycle for each symbol
         for symbol in self.config.strategy.symbols:
             self.tasks.append(asyncio.create_task(self._trading_cycle_for_symbol(symbol)))
         
         await asyncio.gather(*self.tasks, return_exceptions=True)
 
     async def _trading_cycle_for_symbol(self, symbol: str):
-        """Runs the trading logic loop for a single symbol to find entry/exit signals."""
         logger.info("Starting trading cycle for symbol", symbol=symbol)
         while self.running:
             set_correlation_id()
             
-            # Wait for new data event instead of sleeping
-            # We use a timeout slightly larger than the interval to ensure we don't hang forever if data stops
             timeout = self.config.strategy.interval_seconds * 2
             await self.data_handler.wait_for_new_candle(symbol, timeout=timeout)
             
@@ -295,43 +256,34 @@ class TradingBot:
                 break
             except Exception as e:
                 logger.critical("Unhandled exception in trading cycle", symbol=symbol, error=str(e), exc_info=True)
-            
-            # No sleep needed here, wait_for_new_candle handles the timing
 
     async def process_symbol_tick(self, symbol: str):
-        """Executes a single trading logic iteration for a symbol. Public for backtesting."""
         if self.risk_manager.is_halted:
             logger.warning("Trading is halted by RiskManager.")
             return
 
-        # Request only CLOSED candles to prevent repainting
         df_with_indicators = self.data_handler.get_market_data(symbol, include_forming=False)
         if df_with_indicators is None or df_with_indicators.empty:
             logger.warning("Could not get market data from handler.", symbol=symbol)
             return
         
-        # Check if we have already processed this specific candle
         last_candle_ts = df_with_indicators.index[-1]
         if self.processed_candles.get(symbol) == last_candle_ts:
-            # We have already analyzed this closed candle. Wait for the next one.
             return
 
         if symbol not in self.latest_prices:
             logger.warning("Latest price for symbol not available yet.", symbol=symbol)
             return
 
-        # Await the async DB call
         position = await self.position_manager.get_open_position(symbol)
         signal = await self.strategy.analyze_market(symbol, df_with_indicators, position)
 
         if signal: 
             await self._handle_signal(signal, df_with_indicators, position)
         
-        # Mark this candle as processed so we don't re-analyze it in the next tick
         self.processed_candles[symbol] = last_candle_ts
 
     async def _monitoring_loop(self):
-        """Periodically runs health checks, portfolio monitoring, and state reconciliation."""
         reconcile_counter = 0
         while self.running:
             try:
@@ -340,7 +292,6 @@ class TradingBot:
                 if self.metrics_writer and self.metrics_writer.enabled:
                     await self.metrics_writer.write_metric('health', fields=health_status)
                 
-                # --- Periodic Reconciliation (Every 2 minutes) ---
                 reconcile_counter += 1
                 if reconcile_counter >= 2:
                     await self.reconcile_pending_positions()
@@ -350,21 +301,18 @@ class TradingBot:
                     await asyncio.sleep(5)
                     continue
 
-                # Await the async DB call
                 open_positions = await self.position_manager.get_all_open_positions()
                 portfolio_value = self.position_manager.get_portfolio_value(self.latest_prices, open_positions)
                 
                 daily_pnl = await self.position_manager.get_daily_realized_pnl()
                 
-                # Update Risk Manager and check for emergency liquidation
                 await self.risk_manager.update_portfolio_risk(portfolio_value, daily_pnl)
                 
                 if self.risk_manager.liquidation_needed:
                     logger.critical("Risk Manager requested emergency liquidation. Closing all positions.")
                     await self._liquidate_all_positions("Emergency Risk Halt")
-                    self.risk_manager.liquidation_needed = False # Reset flag after action
+                    self.risk_manager.liquidation_needed = False
 
-                # Update shared state for Telegram bot
                 self.shared_bot_state['portfolio_equity'] = portfolio_value
                 self.shared_bot_state['open_positions_count'] = len(open_positions)
                 self.shared_bot_state['daily_pnl'] = daily_pnl
@@ -377,10 +325,9 @@ class TradingBot:
                 break
             except Exception as e:
                 logger.error("Error in monitoring loop", error=str(e))
-            await asyncio.sleep(60) # Monitoring interval
+            await asyncio.sleep(60)
 
     async def _liquidate_all_positions(self, reason: str):
-        """Closes all open positions immediately."""
         logger.warning("Initiating portfolio liquidation...", reason=reason)
         open_positions = await self.position_manager.get_all_open_positions()
         
@@ -397,9 +344,7 @@ class TradingBot:
         logger.info("Portfolio liquidation complete.")
 
     async def _retraining_loop(self):
-        """Periodically checks if the strategy models need retraining and triggers it."""
         logger.info("Starting model retraining loop.")
-        # Wait a bit on startup to let data load
         await asyncio.sleep(60)
 
         while self.running:
@@ -418,8 +363,6 @@ class TradingBot:
                         )
 
                         if training_df is not None and not training_df.empty:
-                            # Run the potentially CPU-intensive training in a separate process
-                            # We pass the executor to the strategy so it can manage the process submission
                             await self.strategy.retrain(
                                 symbol,
                                 training_df,
@@ -428,7 +371,6 @@ class TradingBot:
                         else:
                             logger.error("Could not fetch training data, skipping retraining for now.", symbol=symbol)
                 
-                # Check again in an hour
                 await asyncio.sleep(3600)
 
             except asyncio.CancelledError:
@@ -436,14 +378,12 @@ class TradingBot:
                 break
             except Exception as e:
                 logger.error("Error in retraining loop", error=str(e), exc_info=True)
-                await asyncio.sleep(3600) # Wait before retrying on error
+                await asyncio.sleep(3600)
 
     async def _handle_signal(self, signal: Dict, df_with_indicators: pd.DataFrame, position: Optional[Position]):
-        """Delegates signal handling to the TradeExecutor."""
         await self.trade_executor.execute_trade_signal(signal, df_with_indicators, position)
 
     async def _close_position(self, position: Position, reason: str):
-        """Delegates position closing to the TradeExecutor."""
         await self.trade_executor.close_position(position, reason)
 
     async def stop(self):
@@ -455,7 +395,6 @@ class TradingBot:
         await self.position_monitor.stop()
         await self.optimizer.stop()
         
-        # Clean up strategy resources
         await self.strategy.close()
 
         for task in self.tasks:
@@ -468,7 +407,6 @@ class TradingBot:
         if self.position_manager: self.position_manager.close()
         if self.metrics_writer: await self.metrics_writer.close()
         
-        # Shutdown the process executor
         self.process_executor.shutdown(wait=False)
         
         logger.info("TradingBot stopped gracefully.")
