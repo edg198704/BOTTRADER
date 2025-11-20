@@ -414,8 +414,23 @@ class TradeExecutor:
             )
 
         if close_quantity <= 0:
-            logger.error("Cannot close position, adjusted quantity is zero.", symbol=position.symbol, original_qty=position.quantity)
-            return
+            # --- DUST HANDLING FIX ---
+            # If the quantity is too small to trade, we must check if it's negligible dust.
+            # If value < $1.00 (arbitrary dust threshold), we force close it in DB to prevent infinite loops.
+            estimated_value = position.quantity * (current_price or 0.0)
+            if estimated_value < 1.0:
+                logger.warning("Position value is dust (below exchange limits). Forcing DB close.", 
+                               symbol=position.symbol, value=estimated_value, qty=position.quantity)
+                await self.position_manager.close_position(
+                    position.symbol, 
+                    current_price or position.entry_price, 
+                    f"{reason} (Dust Cleanup)"
+                )
+                return
+            else:
+                logger.error("Cannot close position, adjusted quantity is zero but value is significant.", 
+                             symbol=position.symbol, original_qty=position.quantity, value=estimated_value)
+                return
 
         order_type = self.config.execution.default_order_type
         limit_price = None
