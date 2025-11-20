@@ -29,7 +29,7 @@ class EnsembleWeightsConfig(BaseModel):
     # Penalize confidence if models disagree (StdDev of probs * penalty)
     disagreement_penalty: float = 0.5
     # Optimize weights per regime (Bull, Bear, Sideways, Volatile)
-    use_regime_specific_weights: bool = False
+    use_regime_specific_weights: bool = True
 
 class MarketRegimeConfig(BaseModel):
     # Static Fallbacks
@@ -76,10 +76,6 @@ class AITrainingConfig(BaseModel):
     batch_size: int = 64
     learning_rate: float = 0.001
     early_stopping_patience: int = 5
-    # --- Scheduler Settings ---
-    scheduler_patience: int = 3
-    scheduler_factor: float = 0.5
-    
     validation_split: float = Field(0.15, ge=0.0, lt=1.0)
     cv_splits: int = 5 # Number of folds for Walk-Forward Validation
     min_precision_threshold: float = Field(0.5, ge=0.0, le=1.0)
