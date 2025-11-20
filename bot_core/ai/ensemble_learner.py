@@ -1014,7 +1014,7 @@ class EnsembleLearner:
             logger.error(f"Rollback failed for {symbol}: {e}")
             return False
 
-    def _predict_sync(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None, leader_df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    def _predict_sync(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None, leader_df: Optional[pd.DataFrame] = None, custom_weights: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
         entry = self.symbol_models.get(symbol)
         if not entry:
             return {}
@@ -1056,11 +1056,14 @@ class EnsembleLearner:
         optimized_weights = meta.get('optimized_weights')
         regime_weights = meta.get('regime_weights', {})
         
-        use_dynamic = config_weights.auto_tune and optimized_weights
-        active_weight_map = optimized_weights if use_dynamic else {}
-        
-        if config_weights.use_regime_specific_weights and regime and regime in regime_weights:
+        # Determine base weights
+        active_weight_map = {}
+        if custom_weights:
+            active_weight_map = custom_weights
+        elif config_weights.use_regime_specific_weights and regime and regime in regime_weights:
             active_weight_map = regime_weights[regime]
+        elif config_weights.auto_tune and optimized_weights:
+            active_weight_map = optimized_weights
         
         def get_weight(name, default_weight):
             if active_weight_map:
@@ -1068,6 +1071,7 @@ class EnsembleLearner:
             return default_weight
 
         model_predictions = []
+        individual_preds = {}
         
         try:
             if 'gb' in models:
@@ -1077,6 +1081,7 @@ class EnsembleLearner:
                 votes['hold'] += probs[1] * w
                 votes['buy'] += probs[2] * w
                 model_predictions.append((w, probs))
+                individual_preds['gb'] = probs
 
             if 'technical' in models:
                 probs = models['technical'].predict_proba(X)[0]
@@ -1085,6 +1090,7 @@ class EnsembleLearner:
                 votes['hold'] += probs[1] * w
                 votes['buy'] += probs[2] * w
                 model_predictions.append((w, probs))
+                individual_preds['technical'] = probs
 
             if X_seq is not None:
                 with torch.no_grad():
@@ -1098,6 +1104,7 @@ class EnsembleLearner:
                         votes['hold'] += probs[1] * w
                         votes['buy'] += probs[2] * w
                         model_predictions.append((w, probs))
+                        individual_preds['lstm'] = probs
                         
                     if 'attention' in models:
                         logits = models['attention'](tensor_in)
@@ -1107,6 +1114,7 @@ class EnsembleLearner:
                         votes['hold'] += probs[1] * w
                         votes['buy'] += probs[2] * w
                         model_predictions.append((w, probs))
+                        individual_preds['attention'] = probs
 
         except Exception as e:
             logger.error(f"Inference error for {symbol}: {e}")
@@ -1155,14 +1163,15 @@ class EnsembleLearner:
             'optimized_weights': active_weight_map if active_weight_map else None,
             'is_anomaly': is_anomaly,
             'anomaly_score': float(anomaly_score),
-            'optimized_threshold': meta.get('optimized_threshold')
+            'optimized_threshold': meta.get('optimized_threshold'),
+            'individual_predictions': individual_preds
         }
 
-    async def predict(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None, leader_df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    async def predict(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None, leader_df: Optional[pd.DataFrame] = None, custom_weights: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
         if symbol not in self.symbol_models:
             await self.reload_models(symbol)
             if symbol not in self.symbol_models:
                 return {}
 
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self.executor, self._predict_sync, df, symbol, regime, leader_df)
+        return await loop.run_in_executor(self.executor, self._predict_sync, df, symbol, regime, leader_df, custom_weights)
