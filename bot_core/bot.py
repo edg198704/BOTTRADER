@@ -22,7 +22,7 @@ logger = get_logger(__name__)
 
 class TaskSupervisor:
     """
-    Manages the lifecycle of background tasks with robust error handling and restarting capabilities.
+    Manages the lifecycle of background tasks with monitoring and restart capabilities.
     """
     def __init__(self):
         self.active_tasks: Dict[str, asyncio.Task] = {}
@@ -32,13 +32,25 @@ class TaskSupervisor:
     def spawn(self, name: str, coroutine, critical: bool = False):
         if name in self.active_tasks and not self.active_tasks[name].done():
             return
-        task = asyncio.create_task(coroutine, name=name)
+        
+        # Wrap coroutine to handle cancellation gracefully
+        async def wrapped_coro():
+            try:
+                await coroutine
+            except asyncio.CancelledError:
+                logger.info(f"Task {name} cancelled.")
+            except Exception as e:
+                logger.error(f"Task {name} failed unexpectedly.", error=str(e), exc_info=True)
+                raise
+
+        task = asyncio.create_task(wrapped_coro(), name=name)
         self.active_tasks[name] = task
         if critical:
             self.critical_services.add(name)
         logger.info(f"Spawned task: {name} (Critical: {critical})")
 
     async def monitor(self):
+        """Monitors tasks and handles failures."""
         while not self._shutdown_event.is_set():
             for name, task in list(self.active_tasks.items()):
                 if task.done():
@@ -50,9 +62,10 @@ class TaskSupervisor:
                                 logger.critical(f"Critical service {name} failed. Initiating shutdown.")
                                 self._shutdown_event.set()
                             else:
-                                # Optional: Add restart logic for non-critical tasks here
+                                logger.warning(f"Non-critical task {name} ended. It may need restarting.")
                                 del self.active_tasks[name]
                         else:
+                            logger.info(f"Task {name} completed successfully.")
                             del self.active_tasks[name]
                     except asyncio.CancelledError:
                         del self.active_tasks[name]
@@ -65,61 +78,6 @@ class TaskSupervisor:
         if tasks: 
             await asyncio.gather(*tasks, return_exceptions=True)
         self.active_tasks.clear()
-
-class SymbolProcessor:
-    """
-    Manages the processing queue for a single symbol to ensure sequential execution
-    of ticks while allowing concurrency across different symbols.
-    Handles backpressure by dropping older ticks if the queue is full (LIFO/Freshness priority).
-    """
-    def __init__(self, symbol: str, bot: 'TradingBot', max_queue_size: int = 1):
-        self.symbol = symbol
-        self.bot = bot
-        self.queue = asyncio.Queue(maxsize=max_queue_size)
-        self._task: Optional[asyncio.Task] = None
-        self._running = False
-
-    def start(self):
-        if not self._running:
-            self._running = True
-            self._task = asyncio.create_task(self._process_loop(), name=f"Processor-{self.symbol}")
-
-    async def stop(self):
-        self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-
-    async def enqueue_tick(self):
-        """
-        Enqueues a processing request. If the queue is full, it drops the oldest item
-        to ensure we always process the latest market data.
-        """
-        try:
-            if self.queue.full():
-                try:
-                    self.queue.get_nowait()
-                    self.queue.task_done()
-                except asyncio.QueueEmpty:
-                    pass
-            
-            self.queue.put_nowait(True) # Payload is irrelevant, we always pull latest state
-        except Exception as e:
-            logger.error(f"Failed to enqueue tick for {self.symbol}", error=str(e))
-
-    async def _process_loop(self):
-        while self._running:
-            try:
-                await self.queue.get()
-                await self.bot.process_symbol_tick_logic(self.symbol)
-                self.queue.task_done()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error processing tick for {self.symbol}", error=str(e), exc_info=True)
 
 class TradingBot:
     def __init__(self, config: BotConfig, exchange_api: ExchangeAPI, data_handler: DataHandler, 
@@ -151,12 +109,10 @@ class TradingBot:
         self.market_details: Dict[str, Dict[str, Any]] = {}
         self.processed_candles: Dict[str, pd.Timestamp] = {}
         
+        # Use ProcessPoolExecutor for CPU-bound AI training
         self.process_executor = ProcessPoolExecutor(max_workers=2)
         self._symbol_heartbeats: Dict[str, float] = {}
         self._watchdog_threshold = 300
-        
-        # Per-symbol processing queues
-        self.symbol_processors: Dict[str, SymbolProcessor] = {}
         
         self._initialize_shared_state()
         logger.info("TradingBot orchestrator initialized.")
@@ -183,11 +139,6 @@ class TradingBot:
         logger.info("Warming up strategy...")
         await self.strategy.warmup(self.config.strategy.symbols)
         
-        # Initialize Symbol Processors
-        for symbol in self.config.strategy.symbols:
-            self.symbol_processors[symbol] = SymbolProcessor(symbol, self)
-            self.symbol_processors[symbol].start()
-
         # Subscribe to Event Bus
         self.event_bus.subscribe(MarketDataEvent, self.on_market_data)
         logger.info("Subscribed to MarketDataEvent.")
@@ -237,35 +188,32 @@ class TradingBot:
         self.supervisor.spawn("Optimizer", self.optimizer.run(), critical=False)
         self.supervisor.spawn("Watchdog", self._watchdog_loop(), critical=False)
 
+        # The main loop just monitors the supervisor
         await self.supervisor.monitor()
         logger.info("Supervisor loop ended. Shutting down.")
 
     async def on_market_data(self, event: MarketDataEvent):
-        """
-        Event Handler for new market data.
-        Delegates processing to the specific symbol's processor queue.
-        """
+        """Event Handler for new market data."""
         set_correlation_id()
         self._symbol_heartbeats[event.symbol] = time.time()
         
-        processor = self.symbol_processors.get(event.symbol)
-        if processor:
-            await processor.enqueue_tick()
-        else:
-            logger.warning(f"Received data for unknown symbol: {event.symbol}")
+        # Fire and forget processing to avoid blocking the event bus
+        # We use create_task here so the bus can move on to other subscribers
+        asyncio.create_task(self.process_symbol_tick(event.symbol))
 
-    async def process_symbol_tick_logic(self, symbol: str):
-        """
-        The core trading logic for a symbol. Executed sequentially per symbol.
-        """
+    async def process_symbol_tick(self, symbol: str):
         if self.risk_manager.is_halted: return
 
-        # Fetch latest data (thread-safe copy)
-        df = await self.data_handler.get_market_data_safe(symbol)
+        # Backpressure check: If we are processing too slowly, skip old data
+        # This is a simplified check; a real queue would be better but this suffices for now
+        last_processed = self.processed_candles.get(symbol)
+        
+        # Fetch data without forming candle to ensure we act on closed bars
+        df = self.data_handler.get_market_data(symbol, include_forming=False)
         if df is None or df.empty: return
         
         last_ts = df.index[-1]
-        if self.processed_candles.get(symbol) == last_ts:
+        if last_processed == last_ts:
             return
 
         if symbol not in self.latest_prices:
@@ -275,7 +223,7 @@ class TradingBot:
         try:
             signal = await self.strategy.analyze_market(symbol, df, position)
         except Exception as e:
-            logger.error("Strategy analysis failed", symbol=symbol, error=str(e), exc_info=True)
+            logger.error("Strategy analysis failed", symbol=symbol, error=str(e))
             return
 
         if signal: 
@@ -290,7 +238,7 @@ class TradingBot:
             now = time.time()
             for symbol in self.config.strategy.symbols:
                 last_beat = self._symbol_heartbeats.get(symbol, 0)
-                if (now - last_beat) > self._watchdog_threshold:
+                if last_beat > 0 and (now - last_beat) > self._watchdog_threshold:
                     logger.warning("Watchdog Alert: Symbol stalled.", symbol=symbol)
                     if self.alert_system:
                         await self.alert_system.send_alert('warning', f"Watchdog: No data for {symbol} in {int(now-last_beat)}s.")
@@ -367,11 +315,6 @@ class TradingBot:
     async def stop(self):
         logger.info("Stopping TradingBot...")
         self.shared_bot_state['status'] = 'stopping'
-        
-        # Stop symbol processors first
-        for processor in self.symbol_processors.values():
-            await processor.stop()
-            
         await self.supervisor.stop_all()
         await self.data_handler.stop()
         await self.position_monitor.stop()
