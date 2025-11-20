@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, Optional, Set, List
 from datetime import datetime, timezone
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor
@@ -33,7 +33,6 @@ class TaskSupervisor:
         if name in self.active_tasks and not self.active_tasks[name].done():
             return
         
-        # Wrap coroutine to handle cancellation gracefully
         async def wrapped_coro():
             try:
                 await coroutine
@@ -109,13 +108,24 @@ class TradingBot:
         self.market_details: Dict[str, Dict[str, Any]] = {}
         self.processed_candles: Dict[str, pd.Timestamp] = {}
         
+        # --- Worker Pool Configuration ---
+        # Use a bounded queue to handle backpressure. 
+        # If the strategy is too slow, we don't want to explode memory with pending tasks.
+        self.market_event_queue: asyncio.Queue[MarketDataEvent] = asyncio.Queue(maxsize=100)
+        self.worker_tasks: List[asyncio.Task] = []
+        
+        # Determine worker count based on strategy type
+        self.num_workers = 1
+        if hasattr(config.strategy.params, 'inference_workers'):
+            self.num_workers = config.strategy.params.inference_workers
+        
         # Use ProcessPoolExecutor for CPU-bound AI training
         self.process_executor = ProcessPoolExecutor(max_workers=2)
         self._symbol_heartbeats: Dict[str, float] = {}
         self._watchdog_threshold = 300
         
         self._initialize_shared_state()
-        logger.info("TradingBot orchestrator initialized.")
+        logger.info("TradingBot orchestrator initialized.", workers=self.num_workers)
 
     def _initialize_shared_state(self):
         self.shared_bot_state['status'] = 'initializing'
@@ -188,31 +198,59 @@ class TradingBot:
         self.supervisor.spawn("Optimizer", self.optimizer.run(), critical=False)
         self.supervisor.spawn("Watchdog", self._watchdog_loop(), critical=False)
 
+        # Spawn Strategy Workers
+        for i in range(self.num_workers):
+            self.supervisor.spawn(f"StrategyWorker_{i}", self._strategy_worker_loop(), critical=True)
+
         # The main loop just monitors the supervisor
         await self.supervisor.monitor()
         logger.info("Supervisor loop ended. Shutting down.")
 
     async def on_market_data(self, event: MarketDataEvent):
-        """Event Handler for new market data."""
+        """
+        Event Handler for new market data.
+        Pushes the event to a queue for processing by workers.
+        """
         set_correlation_id()
         self._symbol_heartbeats[event.symbol] = time.time()
         
-        # Fire and forget processing to avoid blocking the event bus
-        # We use create_task here so the bus can move on to other subscribers
-        asyncio.create_task(self.process_symbol_tick(event.symbol))
+        try:
+            # Non-blocking put. If queue is full, we drop the event to prevent OOM.
+            # In HFT, old data is useless data.
+            self.market_event_queue.put_nowait(event)
+        except asyncio.QueueFull:
+            logger.warning("Market Event Queue Full! Dropping tick.", symbol=event.symbol)
 
-    async def process_symbol_tick(self, symbol: str):
+    async def _strategy_worker_loop(self):
+        """
+        Worker loop that consumes market events and executes strategy logic.
+        """
+        logger.info("Strategy worker started.")
+        while not self.supervisor._shutdown_event.is_set():
+            try:
+                event = await self.market_event_queue.get()
+                try:
+                    await self.process_symbol_tick(event.symbol, event.data)
+                finally:
+                    self.market_event_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Error in strategy worker", error=str(e), exc_info=True)
+
+    async def process_symbol_tick(self, symbol: str, df: Optional[pd.DataFrame] = None):
         if self.risk_manager.is_halted: return
 
-        # Backpressure check: If we are processing too slowly, skip old data
-        # This is a simplified check; a real queue would be better but this suffices for now
-        last_processed = self.processed_candles.get(symbol)
+        # Use the dataframe provided in the event to ensure consistency.
+        # If None (e.g. manual trigger), fetch from handler.
+        if df is None:
+            df = self.data_handler.get_market_data(symbol, include_forming=False)
         
-        # Fetch data without forming candle to ensure we act on closed bars
-        df = self.data_handler.get_market_data(symbol, include_forming=False)
         if df is None or df.empty: return
         
+        # Deduplication check
         last_ts = df.index[-1]
+        last_processed = self.processed_candles.get(symbol)
         if last_processed == last_ts:
             return
 
