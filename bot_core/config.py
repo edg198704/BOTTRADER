@@ -313,9 +313,13 @@ class RiskManagementConfig(BaseModel):
     use_kelly_criterion: bool = False
     kelly_fraction: float = 0.5 # Half-Kelly by default for safety
 
-    # --- Liquidity Constraints (New) ---
+    # --- Liquidity Constraints ---
     max_volume_participation_pct: float = 0.01 # Limit trade to 1% of recent volume
     volume_lookback_periods: int = 20
+
+    # --- Symbol Specific Risk (New) ---
+    max_consecutive_losses: int = 3 # Halt trading symbol after 3 losses in a row
+    consecutive_loss_cooldown_minutes: int = 60 # Cooldown duration
 
     regime_based_risk: RegimeBasedRiskConfig
     time_based_exit: TimeBasedExitConfig = TimeBasedExitConfig()
