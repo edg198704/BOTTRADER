@@ -68,6 +68,7 @@ class TradeExecutor:
                 if signal.action not in ['BUY', 'SELL']:
                     return
                 
+                # 1. Liquidity Check
                 if not await self._check_liquidity(symbol, current_price):
                     logger.warning("Trade aborted due to poor liquidity/spread.", symbol=symbol)
                     return
@@ -158,11 +159,15 @@ class TradeExecutor:
     async def _execute_open_position(self, signal: TradeSignal, current_price: float, df: pd.DataFrame):
         symbol = signal.symbol
         side = signal.action
-        active_positions = await self.position_manager.get_all_active_positions()
         
-        if not self.risk_manager.check_trade_allowed(symbol, active_positions):
+        # 1. Risk Gatekeeper Check
+        active_positions = await self.position_manager.get_all_active_positions()
+        allowed, reason = self.risk_manager.validate_entry(symbol, active_positions)
+        if not allowed:
+            logger.info("Trade rejected by Risk Manager", symbol=symbol, reason=reason)
             return
 
+        # 2. Calculate Sizing
         portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, active_positions)
         stop_loss = self.risk_manager.calculate_stop_loss(side, current_price, df, market_regime=signal.regime)
         
@@ -191,6 +196,7 @@ class TradeExecutor:
         if final_quantity <= 0:
             return
 
+        # 3. Prepare Order
         order_type = self.config.execution.default_order_type
         limit_price = None
         if order_type == 'LIMIT':
@@ -200,6 +206,7 @@ class TradeExecutor:
                 ticker = {'last': current_price}
             limit_price = self._calculate_limit_price(symbol, side, current_price, ticker, df)
 
+        # 4. Create Pending DB Record (The Intent)
         trade_id = str(uuid.uuid4())
         await self.position_manager.create_pending_position(
             symbol, side, trade_id, trade_id, 
@@ -207,6 +214,7 @@ class TradeExecutor:
             strategy_metadata=signal.metadata
         )
 
+        # 5. Execute Order
         order_result = None
         try:
             extra_params = {'clientOrderId': trade_id}
@@ -226,11 +234,15 @@ class TradeExecutor:
             return
         except Exception as e:
             logger.error("Order placement error", error=str(e))
+            # We don't mark failed here immediately, we let the reconciliation loop handle stuck pending orders
+            # unless we are sure it failed. But here we are sure it threw exception.
+            await self.position_manager.mark_position_failed(symbol, trade_id, f"Placement Error: {str(e)}")
             return
 
         if not order_result:
             return
 
+        # 6. Update DB with Real Order ID
         exchange_order_id = order_result.get('orderId')
         if exchange_order_id and exchange_order_id != trade_id:
             await self.position_manager.update_pending_order_id(symbol, trade_id, exchange_order_id)
@@ -241,6 +253,7 @@ class TradeExecutor:
         async def _on_order_replace(old_id: str, new_id: str):
             await self.position_manager.update_pending_order_id(symbol, old_id, new_id)
 
+        # 7. Manage Lifecycle (Chase/Fill)
         final_order_state = await self.order_lifecycle_manager.manage(
             initial_order=order_result, 
             symbol=symbol, 
@@ -252,6 +265,7 @@ class TradeExecutor:
             trade_id=trade_id
         )
         
+        # 8. Finalize (Confirm Open or Fail)
         await self._finalize_entry(symbol, side, current_order_id, final_order_state, df, signal.regime, signal.confidence, confidence_threshold)
 
     async def _finalize_entry(self, symbol: str, side: str, order_id: str, order_state: Optional[Dict], df: pd.DataFrame, regime: Optional[str], confidence: float, threshold: Optional[float]):
@@ -266,6 +280,7 @@ class TradeExecutor:
             fees = self._calculate_or_extract_fee(order_state, fill_price, fill_quantity)
             confirmed_quantity = fill_quantity
             
+            # Adjust quantity for fees if paid in base asset (common in crypto)
             if side == 'BUY':
                 fee_currency = None
                 if order_state.get('fee') and 'currency' in order_state['fee']:
@@ -310,6 +325,7 @@ class TradeExecutor:
                 close_quantity = self.order_sizer.adjust_order_quantity(position.symbol, position.quantity, current_price or 0.0, market_details)
 
             if close_quantity <= 0:
+                # Handle dust
                 estimated_value = position.quantity * (current_price or 0.0)
                 if estimated_value < 1.0:
                     await self.position_manager.close_position(position.symbol, current_price or position.entry_price, f"{reason} (Dust)")
@@ -337,6 +353,7 @@ class TradeExecutor:
                     extra_params['postOnly'] = True
                 order_result = await self.exchange_api.place_order(position.symbol, close_side, order_type, close_quantity, price=limit_price, extra_params=extra_params)
             except BotInsufficientFundsError:
+                # Try to close whatever we have available (handling partial external closes)
                 try:
                     base_asset = position.symbol.split('/')[0]
                     balances = await self.exchange_api.get_balance()
