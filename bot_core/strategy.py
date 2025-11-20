@@ -112,13 +112,6 @@ class AIEnsembleStrategy(TradingStrategy):
         self.force_retrain_flags: Dict[str, bool] = {}
         
         # Reference to DataHandler (injected via property or method if needed, but usually accessed via bot)
-        # Since Strategy is initialized before DataHandler in bot.py, we need a way to access data.
-        # However, analyze_market receives 'df'. For leader data, we need to fetch it.
-        # We will assume the caller (Bot) passes a way to get leader data, OR we rely on the fact that
-        # we can't easily access DataHandler here without circular deps.
-        # SOLUTION: We will modify analyze_market signature in the future or use a workaround.
-        # Actually, we can't easily change the signature of analyze_market without changing Bot.
-        # BUT, we can use a hack: The Bot instance sets a reference to itself on the strategy after init.
         self.data_fetcher = None # Will be set by Bot
 
         try:
@@ -146,7 +139,7 @@ class AIEnsembleStrategy(TradingStrategy):
         time_since = Clock.now() - last_sig
         return time_since.total_seconds() < cooldown_seconds
 
-    def _get_confidence_threshold(self, regime: str, is_exit: bool = False) -> float:
+    def _get_confidence_threshold(self, regime: str, is_exit: bool = False, optimized_base: Optional[float] = None) -> float:
         """Determines the confidence threshold based on the current market regime and action type."""
         regime_config = self.ai_config.market_regime
         
@@ -164,7 +157,9 @@ class AIEnsembleStrategy(TradingStrategy):
             return base
         else:
             # Use entry thresholds
-            base = self.ai_config.confidence_threshold
+            # Prioritize optimized base threshold if available
+            base = optimized_base if optimized_base is not None else self.ai_config.confidence_threshold
+            
             if regime == 'bull' and regime_config.bull_confidence_threshold is not None:
                 return regime_config.bull_confidence_threshold
             elif regime == 'bear' and regime_config.bear_confidence_threshold is not None:
@@ -224,6 +219,7 @@ class AIEnsembleStrategy(TradingStrategy):
         metrics = prediction.get('metrics')
         is_anomaly = prediction.get('is_anomaly', False)
         anomaly_score = prediction.get('anomaly_score', 0.0)
+        optimized_threshold = prediction.get('optimized_threshold')
 
         # --- DRIFT DETECTION CHECK ---
         if is_anomaly:
@@ -254,7 +250,8 @@ class AIEnsembleStrategy(TradingStrategy):
                (position.side == 'SELL' and action == 'buy'):
                 is_exit = True
         
-        required_threshold = self._get_confidence_threshold(regime, is_exit)
+        # Pass the optimized threshold to the helper
+        required_threshold = self._get_confidence_threshold(regime, is_exit, optimized_base=optimized_threshold)
         
         if confidence < required_threshold:
             logger.debug("Confidence below threshold", symbol=symbol, confidence=confidence, required=required_threshold, regime=regime, is_exit=is_exit)
@@ -270,7 +267,8 @@ class AIEnsembleStrategy(TradingStrategy):
             'active_weights': active_weights,
             'top_features': top_features,
             'metrics': metrics,
-            'is_anomaly': is_anomaly
+            'is_anomaly': is_anomaly,
+            'optimized_threshold': optimized_threshold
         }
 
         signal = {
