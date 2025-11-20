@@ -20,6 +20,7 @@ from bot_core.ai.regime_detector import MarketRegimeDetector
 try:
     import torch
     import torch.nn as nn
+    import torch.nn.functional as F
     import torch.optim as optim
     from torch.utils.data import TensorDataset, DataLoader
     from sklearn.ensemble import VotingClassifier, RandomForestClassifier, IsolationForest
@@ -53,6 +54,9 @@ except ImportError:
     class optim: pass
     class TensorDataset: pass
     class DataLoader: pass
+    class F:
+        @staticmethod
+        def softmax(x, dim=1): return x
 
 logger = get_logger(__name__)
 
@@ -147,6 +151,7 @@ def _create_fresh_models(config: AIEnsembleStrategyParams, num_features: int, de
 def _train_torch_model(model, X_train, y_train, X_val, y_val, config, device, class_weights=None):
     """
     Robust training loop for PyTorch models with Early Stopping and LR Scheduling.
+    Note: Model returns LOGITS, so CrossEntropyLoss is appropriate.
     """
     if len(X_train) == 0 or len(X_val) == 0:
         return model
@@ -398,7 +403,10 @@ def _evaluate_ensemble(models: Dict[str, Any],
                 model.eval()
                 with torch.no_grad():
                     inputs = torch.FloatTensor(X_seq).to(device)
-                    probs = model(inputs).cpu().numpy()
+                    # Models return logits, apply softmax
+                    logits = model(inputs)
+                    probs = F.softmax(logits, dim=1).cpu().numpy()
+                    
                     target_len = len(ensemble_probs[valid_nn_indices])
                     if len(probs) == target_len:
                         w = get_weight(model_name, default_weight)
@@ -571,7 +579,9 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                         _train_torch_model(model, X_seq_tr, y_seq_tr, X_seq_val, y_seq_val, config, device)
                         model.eval()
                         with torch.no_grad():
-                            preds = model(torch.FloatTensor(X_seq_val).to(device)).cpu().numpy()
+                            # Apply Softmax to logits
+                            logits = model(torch.FloatTensor(X_seq_val).to(device))
+                            preds = F.softmax(logits, dim=1).cpu().numpy()
                             if name not in oos_predictions: oos_predictions[name] = []
                             oos_predictions[name].append(preds)
                 
@@ -1009,7 +1019,8 @@ class EnsembleLearner:
                     tensor_in = torch.FloatTensor(X_seq).to(self.device)
                     
                     if 'lstm' in models:
-                        probs = models['lstm'](tensor_in).cpu().numpy()[0]
+                        logits = models['lstm'](tensor_in)
+                        probs = F.softmax(logits, dim=1).cpu().numpy()[0]
                         w = get_weight('lstm', config_weights.lstm)
                         votes['sell'] += probs[0] * w
                         votes['hold'] += probs[1] * w
@@ -1017,7 +1028,8 @@ class EnsembleLearner:
                         model_predictions.append((w, probs))
                         
                     if 'attention' in models:
-                        probs = models['attention'](tensor_in).cpu().numpy()[0]
+                        logits = models['attention'](tensor_in)
+                        probs = F.softmax(logits, dim=1).cpu().numpy()[0]
                         w = get_weight('attention', config_weights.attention)
                         votes['sell'] += probs[0] * w
                         votes['hold'] += probs[1] * w
