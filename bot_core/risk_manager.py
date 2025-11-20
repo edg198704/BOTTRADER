@@ -373,13 +373,14 @@ class RiskManager:
         
         return True
 
-    def calculate_stop_loss(self, side: str, entry_price: float, df_with_indicators: pd.DataFrame, market_regime: Optional[str] = None) -> float:
+    def calculate_stop_loss(self, side: str, entry_price: float, df_with_indicators: Optional[pd.DataFrame], market_regime: Optional[str] = None) -> float:
         atr_col = self.config.atr_column_name
         atr = 0.0
-        if atr_col in df_with_indicators.columns and not df_with_indicators[atr_col].empty:
-            atr = df_with_indicators[atr_col].iloc[-1]
+        if df_with_indicators is not None and not df_with_indicators.empty:
+            if atr_col in df_with_indicators.columns:
+                atr = df_with_indicators[atr_col].iloc[-1]
         
-        if self.config.stop_loss_type == 'SWING':
+        if self.config.stop_loss_type == 'SWING' and df_with_indicators is not None and not df_with_indicators.empty:
             lookback = self.config.swing_lookback
             if len(df_with_indicators) >= lookback:
                 window = df_with_indicators.iloc[-lookback:]
