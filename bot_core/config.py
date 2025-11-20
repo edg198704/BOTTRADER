@@ -38,6 +38,8 @@ class DriftDetectionConfig(BaseModel):
     contamination: float = 0.05 # Expected proportion of outliers in training data
     confidence_penalty: float = 0.2 # Subtract from confidence if anomaly detected
     block_trade: bool = False # If True, block trade completely on anomaly
+    # --- New Lifecycle Params ---
+    max_consecutive_anomalies: int = 12 # Trigger retrain if ~1 hour of anomalies (5m candles)
 
 class MarketRegimeConfig(BaseModel):
     # Static Fallbacks
@@ -165,6 +167,9 @@ class AIPerformanceConfig(BaseModel):
     enabled: bool = True
     window_size: int = 50
     min_accuracy: float = 0.45
+    # --- New Lifecycle Params ---
+    auto_rollback: bool = True
+    critical_accuracy_threshold: float = 0.30 # If accuracy drops below this, rollback immediately
 
 class AIHyperparameters(BaseModel):
     xgboost: XGBoostConfig = XGBoostConfig()
