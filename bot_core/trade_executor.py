@@ -2,6 +2,7 @@ import pandas as pd
 import uuid
 import asyncio
 from typing import Dict, Any, Optional
+from pydantic import BaseModel
 
 from bot_core.logger import get_logger
 from bot_core.config import BotConfig
@@ -15,6 +16,16 @@ from bot_core.data_handler import DataHandler
 from bot_core.strategy import TradeSignal
 
 logger = get_logger(__name__)
+
+class TradeExecutionResult(BaseModel):
+    symbol: str
+    action: str
+    quantity: float
+    price: float
+    fees: float
+    order_id: str
+    status: str
+    metadata: Dict[str, Any] = {}
 
 class TradeExecutor:
     """
@@ -51,29 +62,30 @@ class TradeExecutor:
             self._symbol_locks[symbol] = asyncio.Lock()
         return self._symbol_locks[symbol]
 
-    async def execute_trade_signal(self, signal: TradeSignal, df_with_indicators: pd.DataFrame, position: Optional[Position]):
+    async def execute_trade_signal(self, signal: TradeSignal, df_with_indicators: pd.DataFrame, position: Optional[Position]) -> Optional[TradeExecutionResult]:
         """
         Processes a trading signal to open or close a position.
         Acquires a symbol-specific lock to ensure atomicity.
+        Returns a TradeExecutionResult if a trade was executed, else None.
         """
         symbol = signal.symbol
         async with self._get_lock(symbol):
             current_price = self.latest_prices.get(symbol)
             if not current_price:
                 logger.warning("Cannot execute signal: No price data.", symbol=symbol)
-                return
+                return None
 
             # --- Handle Opening a New Position ---
             if not position:
                 if signal.action not in ['BUY', 'SELL']:
-                    return
+                    return None
                 
                 # 1. Liquidity Check
                 if not await self._check_liquidity(symbol, current_price):
                     logger.warning("Trade aborted due to poor liquidity/spread.", symbol=symbol)
-                    return
+                    return None
 
-                await self._execute_open_position(signal, current_price, df_with_indicators)
+                return await self._execute_open_position(signal, current_price, df_with_indicators)
             
             # --- Handle Closing an Existing Position ---
             elif position:
@@ -82,6 +94,10 @@ class TradeExecutor:
                 
                 if is_close_long or is_close_short:
                     await self.close_position(position, "Strategy Signal")
+                    # We don't return a result for close here as it's handled differently in metrics currently,
+                    # but could be expanded.
+                    return None
+        return None
 
     async def _check_liquidity(self, symbol: str, current_price: float) -> bool:
         try:
@@ -156,7 +172,7 @@ class TradeExecutor:
             logger.error("Smart Retry exception", error=str(e))
             return None
 
-    async def _execute_open_position(self, signal: TradeSignal, current_price: float, df: pd.DataFrame):
+    async def _execute_open_position(self, signal: TradeSignal, current_price: float, df: pd.DataFrame) -> Optional[TradeExecutionResult]:
         symbol = signal.symbol
         side = signal.action
         
@@ -165,7 +181,7 @@ class TradeExecutor:
         allowed, reason = self.risk_manager.validate_entry(symbol, active_positions)
         if not allowed:
             logger.info("Trade rejected by Risk Manager", symbol=symbol, reason=reason)
-            return
+            return None
 
         # 2. Calculate Sizing
         portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, active_positions)
@@ -190,11 +206,11 @@ class TradeExecutor:
         market_details = self.market_details.get(symbol)
         if not market_details:
             logger.error("Market details missing.", symbol=symbol)
-            return
+            return None
 
         final_quantity = self.order_sizer.adjust_order_quantity(symbol, ideal_quantity, current_price, market_details)
         if final_quantity <= 0:
-            return
+            return None
 
         # 3. Prepare Order
         order_type = self.config.execution.default_order_type
@@ -228,19 +244,19 @@ class TradeExecutor:
             order_result = await self._retry_entry_with_smart_balance(symbol, side, order_type, limit_price, trade_id, market_details)
             if not order_result:
                 await self.position_manager.mark_position_failed(symbol, trade_id, "Insufficient Funds")
-                return
+                return None
         except BotInvalidOrderError as e:
             await self.position_manager.mark_position_failed(symbol, trade_id, f"Invalid Order: {str(e)}")
-            return
+            return None
         except Exception as e:
             logger.error("Order placement error", error=str(e))
             # We don't mark failed here immediately, we let the reconciliation loop handle stuck pending orders
             # unless we are sure it failed. But here we are sure it threw exception.
             await self.position_manager.mark_position_failed(symbol, trade_id, f"Placement Error: {str(e)}")
-            return
+            return None
 
         if not order_result:
-            return
+            return None
 
         # 6. Update DB with Real Order ID
         exchange_order_id = order_result.get('orderId')
@@ -266,16 +282,16 @@ class TradeExecutor:
         )
         
         # 8. Finalize (Confirm Open or Fail)
-        await self._finalize_entry(symbol, side, current_order_id, final_order_state, df, signal.regime, signal.confidence, confidence_threshold)
+        return await self._finalize_entry(symbol, side, current_order_id, final_order_state, df, signal.regime, signal.confidence, confidence_threshold)
 
-    async def _finalize_entry(self, symbol: str, side: str, order_id: str, order_state: Optional[Dict], df: pd.DataFrame, regime: Optional[str], confidence: float, threshold: Optional[float]):
+    async def _finalize_entry(self, symbol: str, side: str, order_id: str, order_state: Optional[Dict], df: pd.DataFrame, regime: Optional[str], confidence: float, threshold: Optional[float]) -> Optional[TradeExecutionResult]:
         fill_quantity = order_state.get('filled', 0.0) if order_state else 0.0
         final_status = order_state.get('status') if order_state else 'UNKNOWN'
         
         if fill_quantity > 0:
             fill_price = order_state.get('average')
             if not fill_price or fill_price <= 0:
-                return
+                return None
 
             fees = self._calculate_or_extract_fee(order_state, fill_price, fill_quantity)
             confirmed_quantity = fill_quantity
@@ -299,6 +315,18 @@ class TradeExecutor:
                 symbol, order_id, confirmed_quantity, fill_price, 
                 final_stop_loss, final_take_profit, fees=fees
             )
+            
+            return TradeExecutionResult(
+                symbol=symbol,
+                action=side,
+                quantity=confirmed_quantity,
+                price=fill_price,
+                fees=fees,
+                order_id=order_id,
+                status='FILLED',
+                metadata={'regime': regime, 'confidence': confidence}
+            )
+            
         elif final_status == 'OPEN':
             logger.critical("Order stuck OPEN. Manual intervention required.", order_id=order_id)
             await self.alert_system.send_alert(
@@ -306,8 +334,10 @@ class TradeExecutor:
                 message=f"🚨 ZOMBIE ORDER: {order_id} for {symbol} stuck OPEN.",
                 details={'symbol': symbol, 'order_id': order_id}
             )
+            return None
         else:
             await self.position_manager.mark_position_failed(symbol, order_id, f"Lifecycle Failed: {final_status}")
+            return None
 
     async def close_position(self, position: Position, reason: str):
         async with self._get_lock(position.symbol):
