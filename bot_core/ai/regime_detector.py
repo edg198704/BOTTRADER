@@ -23,7 +23,8 @@ class MarketRegimeDetector:
                     trend_fast=config.market_regime.trend_fast_ma_col,
                     trend_slow=config.market_regime.trend_slow_ma_col,
                     use_adx=config.market_regime.use_adx_filter,
-                    use_hurst=config.market_regime.use_hurst_filter)
+                    use_hurst=config.market_regime.use_hurst_filter,
+                    confirmation_window=config.market_regime.regime_confirmation_window)
 
     def _calculate_rolling_hurst(self, series: pd.Series, window: int) -> pd.Series:
         """
@@ -185,6 +186,7 @@ class MarketRegimeDetector:
     async def detect_regime(self, symbol: str, df: pd.DataFrame) -> Dict[str, Any]:
         """
         Analyzes the provided DataFrame to determine the market regime.
+        Uses a sliding window voting mechanism (Hysteresis) to prevent signal flickering.
         """
         if len(df) < 50:
             return {'regime': MarketRegime.UNKNOWN.value, 'confidence': 0.0}
@@ -193,22 +195,38 @@ class MarketRegimeDetector:
         rsi_col = mr_config.rsi_col
 
         try:
-            # Use pre-calculated features if they exist
-            if {'regime_trend', 'regime_volatility', 'regime_efficiency', 'regime_hurst'}.issubset(df.columns):
-                trend_strength = df['regime_trend'].iloc[-1]
-                vol_ratio = df['regime_volatility'].iloc[-1]
-                efficiency = df['regime_efficiency'].iloc[-1]
-                hurst = df['regime_hurst'].iloc[-1]
-            else:
-                # Fallback calculation
-                fast_ma = df[mr_config.trend_fast_ma_col].iloc[-1] if mr_config.trend_fast_ma_col in df.columns else 0
-                slow_ma = df[mr_config.trend_slow_ma_col].iloc[-1] if mr_config.trend_slow_ma_col in df.columns else 1
-                trend_strength = (fast_ma - slow_ma) / slow_ma if slow_ma > 0 else 0
-                vol_ratio = 1.0
-                efficiency = 0.5
-                hurst = 0.5
+            # 1. Ensure features exist
+            if not {'regime_trend', 'regime_volatility', 'regime_efficiency', 'regime_hurst'}.issubset(df.columns):
+                df = self.add_regime_features(df)
 
-            # --- Determine Thresholds ---
+            # 2. Determine Dominant Regime (Hysteresis)
+            # Look back N candles to find the mode
+            window_size = mr_config.regime_confirmation_window
+            if len(df) >= window_size:
+                tail_df = df.iloc[-window_size:]
+            else:
+                tail_df = df
+            
+            # Reuse vectorized logic for consistency
+            regime_series = self.get_regime_series(tail_df)
+            
+            if not regime_series.empty:
+                # Get the most frequent regime in the window
+                dominant_regime_str = regime_series.mode()[0]
+                regime = MarketRegime(dominant_regime_str)
+            else:
+                regime = MarketRegime.SIDEWAYS
+
+            # 3. Calculate Confidence Metrics based on the LATEST candle (Current State)
+            # We need the raw metrics of the last candle to determine how strong the signal is right now
+            last_row = df.iloc[-1]
+            trend_strength = last_row['regime_trend']
+            vol_ratio = last_row['regime_volatility']
+            efficiency = last_row['regime_efficiency']
+            hurst = last_row['regime_hurst']
+            rsi_val = last_row[rsi_col] if rsi_col in df.columns else 50
+
+            # Determine Thresholds (for confidence calc)
             trend_thresh = mr_config.trend_strength_threshold
             vol_thresh = mr_config.volatility_multiplier
             eff_thresh = mr_config.efficiency_threshold
@@ -220,62 +238,29 @@ class MarketRegimeDetector:
                 if 'regime_volatility' in window.columns:
                     vol_thresh = window['regime_volatility'].quantile(mr_config.volatility_percentile)
 
-            # --- Regime Classification ---
-            regime = MarketRegime.SIDEWAYS
-            confidence = 0.0
-            forced_sideways = False
+            # Calculate Base Confidence
+            trend_conf = min(1.0, abs(trend_strength) / (trend_thresh * 2)) if trend_thresh > 0 else 0.0
+            rsi_conf = abs(rsi_val - 50) / 50
             
-            # 1. ADX Filter
-            if mr_config.use_adx_filter and mr_config.adx_col in df.columns:
-                adx_val = df[mr_config.adx_col].iloc[-1]
-                if adx_val < mr_config.adx_threshold:
-                    regime = MarketRegime.SIDEWAYS
-                    forced_sideways = True
-                    confidence = min(1.0, (mr_config.adx_threshold - adx_val) / mr_config.adx_threshold)
-                    confidence = 0.5 + (confidence * 0.5)
-
-            # 2. Efficiency & Hurst Filter
-            if not forced_sideways:
-                is_mean_reverting = hurst < mr_config.hurst_mean_reversion_threshold
-                is_inefficient = efficiency < eff_thresh
-                
-                if is_mean_reverting or is_inefficient:
-                    if vol_ratio > vol_thresh:
-                        regime = MarketRegime.VOLATILE
-                    else:
-                        regime = MarketRegime.SIDEWAYS
-                    
-                    forced_sideways = True
-                    # Confidence boosts if both metrics agree on chop
-                    base_conf = (eff_thresh - efficiency) / eff_thresh if is_inefficient else 0.0
-                    hurst_conf = (mr_config.hurst_mean_reversion_threshold - hurst) / mr_config.hurst_mean_reversion_threshold if is_mean_reverting else 0.0
-                    confidence = min(1.0, max(base_conf, hurst_conf))
-
-            # 3. Standard Trend/Vol Logic
-            if not forced_sideways:
-                is_volatile = vol_ratio > vol_thresh
-                
-                if is_volatile:
-                    regime = MarketRegime.VOLATILE
-                elif trend_strength > trend_thresh:
-                    regime = MarketRegime.BULL
-                elif trend_strength < -trend_thresh:
-                    regime = MarketRegime.BEAR
-                else:
-                    regime = MarketRegime.SIDEWAYS
-
-                # --- Confidence Calculation ---
-                rsi_val = df[rsi_col].iloc[-1] if rsi_col in df.columns else 50
-                trend_conf = min(1.0, abs(trend_strength) / (trend_thresh * 2)) if trend_thresh > 0 else 0.0
-                rsi_conf = abs(rsi_val - 50) / 50
-                
-                # Hurst boosts confidence if it aligns with trend (H > 0.55)
-                hurst_boost = 0.0
-                if hurst > mr_config.hurst_trending_threshold:
-                    hurst_boost = (hurst - mr_config.hurst_trending_threshold) * 2.0
-                
-                confidence = (trend_conf * 0.5) + (rsi_conf * 0.2) + (efficiency * 0.1) + (hurst_boost * 0.2)
+            # Hurst boosts confidence if it aligns with trend (H > 0.55)
+            hurst_boost = 0.0
+            if hurst > mr_config.hurst_trending_threshold:
+                hurst_boost = (hurst - mr_config.hurst_trending_threshold) * 2.0
             
+            confidence = (trend_conf * 0.5) + (rsi_conf * 0.2) + (efficiency * 0.1) + (hurst_boost * 0.2)
+
+            # 4. Apply Hysteresis Penalty
+            # If the dominant regime (voting result) differs from the immediate single-candle regime,
+            # it means we are likely in a transition or noise. Reduce confidence.
+            
+            # Calculate immediate regime for comparison
+            immediate_regime_series = self.get_regime_series(df.iloc[-1:])
+            if not immediate_regime_series.empty:
+                immediate_regime_str = immediate_regime_series.iloc[0]
+                if immediate_regime_str != regime.value:
+                    # Transition detected: Penalize confidence
+                    confidence *= 0.8
+
             result = {
                 'regime': regime.value, 
                 'confidence': round(confidence, 2),
