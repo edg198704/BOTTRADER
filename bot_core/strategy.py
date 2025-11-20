@@ -2,6 +2,8 @@ import abc
 import asyncio
 import pandas as pd
 import numpy as np
+import json
+import os
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timedelta
 from concurrent.futures import Executor
@@ -120,9 +122,13 @@ class AIEnsembleStrategy(TradingStrategy):
         
         self.data_fetcher = None # Will be set by Bot
 
+        # State Persistence Path
+        self.state_path = os.path.join(self.ai_config.model_path, "strategy_state.json")
+
         try:
             self.ensemble_learner = EnsembleLearner(self.ai_config)
             self.regime_detector = MarketRegimeDetector(self.ai_config)
+            self._load_state()
             logger.info("AIEnsembleStrategy initialized")
         except ImportError as e:
             logger.critical("Failed to initialize AIEnsembleStrategy due to missing ML libraries", error=str(e))
@@ -130,7 +136,61 @@ class AIEnsembleStrategy(TradingStrategy):
 
     async def close(self):
         """Shuts down the ensemble learner resources."""
+        self._save_state()
         await self.ensemble_learner.close()
+
+    def _save_state(self):
+        """Persists runtime state to disk."""
+        try:
+            state = {
+                'last_retrained_at': {k: v.isoformat() for k, v in self.last_retrained_at.items()},
+                'last_signal_time': {k: v.isoformat() for k, v in self.last_signal_time.items()},
+                'force_retrain_flags': self.force_retrain_flags,
+                'drift_counters': self.drift_counters,
+                # Convert deque to list for JSON
+                'accuracy_history': {k: list(v) for k, v in self.accuracy_history.items()},
+                # Persist logs (timestamps as strings)
+                'prediction_logs': {k: [(ts.isoformat(), p) for ts, p in v] for k, v in self.prediction_logs.items()}
+            }
+            
+            # Ensure dir exists
+            os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+            
+            with open(self.state_path, 'w') as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logger.error("Failed to save strategy state", error=str(e))
+
+    def _load_state(self):
+        """Loads runtime state from disk."""
+        if not os.path.exists(self.state_path):
+            return
+
+        try:
+            with open(self.state_path, 'r') as f:
+                state = json.load(f)
+            
+            if 'last_retrained_at' in state:
+                self.last_retrained_at = {k: datetime.fromisoformat(v) for k, v in state['last_retrained_at'].items()}
+            
+            if 'last_signal_time' in state:
+                self.last_signal_time = {k: datetime.fromisoformat(v) for k, v in state['last_signal_time'].items()}
+
+            self.force_retrain_flags = state.get('force_retrain_flags', {})
+            self.drift_counters = state.get('drift_counters', {})
+            
+            if 'accuracy_history' in state:
+                for k, v in state['accuracy_history'].items():
+                    self.accuracy_history[k] = deque(v, maxlen=self.ai_config.performance.window_size)
+            
+            if 'prediction_logs' in state:
+                for k, v in state['prediction_logs'].items():
+                    # Reconstruct tuples (timestamp, prediction)
+                    self.prediction_logs[k] = [(datetime.fromisoformat(ts), p) for ts, p in v]
+            
+            logger.info("Restored AI Strategy state from disk.")
+        except Exception as e:
+            logger.error("Failed to load strategy state", error=str(e))
 
     def _in_cooldown(self, symbol: str) -> bool:
         """Checks if the symbol is in a signal cooldown period."""
@@ -219,8 +279,11 @@ class AIEnsembleStrategy(TradingStrategy):
         anomaly_score = prediction.get('anomaly_score', 0.0)
         optimized_threshold = prediction.get('optimized_threshold')
 
+        state_changed = False
+
         if is_anomaly:
             self.drift_counters[symbol] = self.drift_counters.get(symbol, 0) + 1
+            state_changed = True
             if self.drift_counters[symbol] >= self.ai_config.drift.max_consecutive_anomalies:
                 logger.warning("Sustained data drift detected. Forcing retrain.", symbol=symbol, count=self.drift_counters[symbol])
                 self.force_retrain_flags[symbol] = True
@@ -228,13 +291,16 @@ class AIEnsembleStrategy(TradingStrategy):
             
             if self.ai_config.drift.block_trade:
                 logger.warning("Drift detected (Anomaly). Blocking trade.", symbol=symbol, score=anomaly_score)
+                self._save_state()
                 return None
             else:
                 penalty = self.ai_config.drift.confidence_penalty
                 confidence = max(0.0, confidence - penalty)
                 logger.info("Drift detected. Penalizing confidence.", symbol=symbol, penalty=penalty, new_conf=confidence, score=anomaly_score)
         else:
-            self.drift_counters[symbol] = 0
+            if self.drift_counters.get(symbol, 0) > 0:
+                self.drift_counters[symbol] = 0
+                state_changed = True
 
         if self.ai_config.performance.enabled and action:
             action_map = {'sell': 0, 'hold': 1, 'buy': 2}
@@ -244,6 +310,10 @@ class AIEnsembleStrategy(TradingStrategy):
             if symbol not in self.prediction_logs:
                 self.prediction_logs[symbol] = []
             self.prediction_logs[symbol].append((current_time, pred_int))
+            state_changed = True
+
+        if state_changed:
+            self._save_state()
 
         logger.debug("AI prediction received", symbol=symbol, **prediction)
 
@@ -301,6 +371,7 @@ class AIEnsembleStrategy(TradingStrategy):
 
         if signal_generated:
             self.last_signal_time[symbol] = Clock.now()
+            self._save_state()
             return signal
 
         return None
@@ -342,6 +413,9 @@ class AIEnsembleStrategy(TradingStrategy):
         
         self.prediction_logs[symbol] = remaining_logs
 
+        if evaluated_count > 0:
+            self._save_state()
+
         if len(self.accuracy_history[symbol]) >= 10:
             accuracy = sum(self.accuracy_history[symbol]) / len(self.accuracy_history[symbol])
             
@@ -352,6 +426,7 @@ class AIEnsembleStrategy(TradingStrategy):
                     self.accuracy_history[symbol].clear()
                     self.prediction_logs[symbol] = []
                     self.force_retrain_flags[symbol] = False
+                    self._save_state()
                     return
 
             if accuracy < self.ai_config.performance.min_accuracy:
@@ -359,6 +434,7 @@ class AIEnsembleStrategy(TradingStrategy):
                     logger.warning("Model accuracy dropped below threshold. Forcing retrain and blocking entries.", 
                                    symbol=symbol, accuracy=f"{accuracy:.2%}", threshold=self.ai_config.performance.min_accuracy)
                     self.force_retrain_flags[symbol] = True
+                    self._save_state()
 
     async def retrain(self, symbol: str, df: pd.DataFrame, executor: Executor):
         logger.info("Strategy is triggering model retraining via ProcessPool.", symbol=symbol)
@@ -389,6 +465,7 @@ class AIEnsembleStrategy(TradingStrategy):
                 if symbol in self.accuracy_history:
                     self.accuracy_history[symbol].clear()
                 
+                self._save_state()
                 logger.info("Model training successful. Reloading models.", symbol=symbol)
                 await self.ensemble_learner.reload_models(symbol)
             else:
