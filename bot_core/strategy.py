@@ -170,6 +170,13 @@ class AIEnsembleStrategy(TradingStrategy):
         if self.ai_config.performance.enabled:
             self._monitor_performance(symbol, df)
 
+        # --- Performance Circuit Breaker ---
+        # If the model is flagged for forced retraining due to poor accuracy, 
+        # we block new entries but allow exits to protect capital.
+        if position is None and self.force_retrain_flags.get(symbol, False):
+            logger.warning("Skipping entry signal due to poor model performance (Circuit Breaker Active).", symbol=symbol)
+            return None
+
         # 2. Enrich Data with Regime Features
         # This injects 'regime_trend' and 'regime_volatility' into the DF so the model can use them
         df_enriched = self.regime_detector.add_regime_features(df)
@@ -327,7 +334,7 @@ class AIEnsembleStrategy(TradingStrategy):
             accuracy = sum(self.accuracy_history[symbol]) / len(self.accuracy_history[symbol])
             if accuracy < self.ai_config.performance.min_accuracy:
                 if not self.force_retrain_flags.get(symbol, False):
-                    logger.warning("Model accuracy dropped below threshold. Forcing retrain.", 
+                    logger.warning("Model accuracy dropped below threshold. Forcing retrain and blocking entries.", 
                                    symbol=symbol, accuracy=f"{accuracy:.2%}", threshold=self.ai_config.performance.min_accuracy)
                     self.force_retrain_flags[symbol] = True
 
