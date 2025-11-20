@@ -42,6 +42,11 @@ class ExchangeAPI(abc.ABC):
         pass
 
     @abc.abstractmethod
+    async def get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Fetches current ticker data for multiple symbols in a batch."""
+        pass
+
+    @abc.abstractmethod
     async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]:
         """Places an order on the exchange."""
         pass
@@ -134,6 +139,12 @@ class MockExchangeAPI(ExchangeAPI):
             "bid": self.last_price - (spread / 2),
             "ask": self.last_price + (spread / 2)
         }
+
+    async def get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        results = {}
+        for sym in symbols:
+            results[sym] = await self.get_ticker_data(sym)
+        return results
 
     async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]:
         self.order_id_counter += 1
@@ -313,6 +324,12 @@ class BacktestExchangeAPI(ExchangeAPI):
             "ask": price + (spread / 2)
         }
 
+    async def get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        results = {}
+        for sym in symbols:
+            results[sym] = await self.get_ticker_data(sym)
+        return results
+
     async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]:
         self.order_id_counter += 1
         order_id = f"bt_order_{self.order_id_counter}"
@@ -467,6 +484,7 @@ class CCXTExchangeAPI(ExchangeAPI):
         )
         self.get_market_data = retry_decorator(self.get_market_data)
         self.get_ticker_data = retry_decorator(self.get_ticker_data)
+        self.get_tickers = retry_decorator(self.get_tickers)
         self.place_order = retry_decorator(self.place_order)
         self.fetch_order = retry_decorator(self.fetch_order)
         self.fetch_open_orders = retry_decorator(self.fetch_open_orders)
@@ -536,6 +554,28 @@ class CCXTExchangeAPI(ExchangeAPI):
             }
         except (NetworkError, ExchangeError) as e:
             logger.error("Final attempt failed for get_ticker_data", symbol=symbol, error=str(e))
+            raise
+
+    async def get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        try:
+            if self.exchange.has['fetchTickers']:
+                raw_tickers = await self.exchange.fetch_tickers(symbols)
+                return {
+                    sym: {
+                        "symbol": sym,
+                        "last": t.get('last'),
+                        "bid": t.get('bid'),
+                        "ask": t.get('ask')
+                    } for sym, t in raw_tickers.items() if sym in symbols
+                }
+            else:
+                # Fallback to loop
+                results = {}
+                for sym in symbols:
+                    results[sym] = await self.get_ticker_data(sym)
+                return results
+        except (NetworkError, ExchangeError) as e:
+            logger.error("Final attempt failed for get_tickers", error=str(e))
             raise
 
     async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]:
