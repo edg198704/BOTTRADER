@@ -108,6 +108,37 @@ class FeatureProcessor:
         return df
 
     @staticmethod
+    def _add_microstructure_features(df: pd.DataFrame) -> pd.DataFrame:
+        """Generates Amihud Illiquidity and Parkinson Volatility."""
+        df = df.copy()
+        required = ['open', 'high', 'low', 'close', 'volume']
+        if not all(col in df.columns for col in required):
+            return df
+
+        # 1. Parkinson Volatility (Range-based)
+        # sqrt(1 / (4 * ln(2)) * ln(High / Low)^2)
+        # More efficient estimator than Close-to-Close
+        const = 1.0 / (4.0 * np.log(2.0))
+        log_hl = np.log(df['high'] / df['low'])
+        df['volatility_parkinson'] = np.sqrt(const * log_hl**2)
+
+        # 2. Amihud Illiquidity Proxy
+        # |Return| / (Volume * Close)
+        # Measures price impact per unit of volume traded.
+        # High values = Low Liquidity (Price moves easily with little volume)
+        # We use a rolling average to smooth it out
+        abs_return = df['close'].pct_change().abs()
+        dollar_volume = df['volume'] * df['close']
+        dollar_volume = dollar_volume.replace(0, 1.0) # Avoid div/0
+        
+        raw_illiquidity = abs_return / dollar_volume
+        # Scale up by 1e6 or similar to make numbers readable, or just normalize later
+        # We'll just normalize later, but let's smooth it first
+        df['amihud_illiquidity'] = raw_illiquidity.rolling(window=10).mean()
+
+        return df
+
+    @staticmethod
     def _get_weights_ffd(d: float, thres: float, lim: int) -> np.ndarray:
         """Calculates weights for Fractional Differentiation (Fixed Window)."""
         w, k = [1.], 1
@@ -201,13 +232,13 @@ class FeatureProcessor:
     def process_data(df: pd.DataFrame, config: AIEnsembleStrategyParams, leader_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         """
         Applies the full feature engineering pipeline:
-        1. Generate Time/Price Action/Quant features (if enabled).
+        1. Generate Time/Price Action/Quant/Microstructure features (if enabled).
         2. Merge Market Leader features (if enabled and provided).
         3. Stationarize features (Absolute -> Relative).
         4. Select base feature columns.
         5. Generates lagged features (if configured).
         6. Drops NaNs introduced by lags.
-        7. Applies Z-score normalization.
+        7. Applies Normalization (Z-Score or Robust).
         8. Enforces column order matching get_feature_names.
         """
         df_processed = df.copy()
@@ -222,6 +253,9 @@ class FeatureProcessor:
         if config.features.use_volatility_estimators:
             df_processed = FeatureProcessor._add_volatility_features(df_processed)
 
+        if config.features.use_microstructure_features:
+            df_processed = FeatureProcessor._add_microstructure_features(df_processed)
+
         if config.features.use_frac_diff:
             df_processed = FeatureProcessor._apply_frac_diff(
                 df_processed, 
@@ -229,7 +263,7 @@ class FeatureProcessor:
                 config.features.frac_diff_thres
             )
 
-        # 2. Merge Market Leader Features (New)
+        # 2. Merge Market Leader Features
         if config.features.use_leader_features and leader_df is not None and not leader_df.empty:
             try:
                 # Extract relevant columns from leader
@@ -245,7 +279,6 @@ class FeatureProcessor:
                 
                 # Merge onto main DF
                 # We use join with forward fill to handle slight timestamp mismatches
-                # (e.g. leader candle closed 100ms before/after)
                 df_processed = df_processed.join(leader_feats, how='left')
                 
                 # Forward fill any gaps in leader data (up to a limit)
@@ -288,13 +321,26 @@ class FeatureProcessor:
         # 6. Drop NaNs (from lags, frac diff, and missing data)
         subset.dropna(inplace=True)
         
-        # 7. Normalize
+        # 7. Normalize (Z-Score or Robust)
         window = config.features.normalization_window
-        rolling_mean = subset.rolling(window=window).mean()
-        rolling_std = subset.rolling(window=window).std()
-        
         epsilon = 1e-8
-        normalized = (subset - rolling_mean) / (rolling_std + epsilon)
+
+        if config.features.scaling_method == 'robust':
+            # Robust Scaling: (X - Median) / IQR
+            rolling_median = subset.rolling(window=window).median()
+            rolling_q75 = subset.rolling(window=window).quantile(0.75)
+            rolling_q25 = subset.rolling(window=window).quantile(0.25)
+            rolling_iqr = rolling_q75 - rolling_q25
+            
+            # Handle zero IQR to avoid division by zero
+            rolling_iqr = rolling_iqr.replace(0, epsilon)
+            
+            normalized = (subset - rolling_median) / rolling_iqr
+        else:
+            # Standard Z-Score: (X - Mean) / Std
+            rolling_mean = subset.rolling(window=window).mean()
+            rolling_std = subset.rolling(window=window).std()
+            normalized = (subset - rolling_mean) / (rolling_std + epsilon)
         
         # Rolling normalization introduces NaNs at the start of the window
         normalized.dropna(inplace=True)
