@@ -1,6 +1,7 @@
 import asyncio
 import time
-from typing import Dict, Any, Optional, Set, List
+import signal
+from typing import Dict, Any, Optional, Set, List, Coroutine
 from datetime import datetime, timezone
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor
@@ -22,35 +23,42 @@ logger = get_logger(__name__)
 
 class ServiceManager:
     """
-    Manages the lifecycle of background services with robust monitoring, 
-    restart capabilities, and dependency handling.
+     robustly manages the lifecycle of background services (tasks).
+    Supports critical/non-critical services, health monitoring, and graceful shutdowns.
     """
     def __init__(self):
         self.services: Dict[str, asyncio.Task] = {}
         self.critical_services: Set[str] = set()
         self._shutdown_event = asyncio.Event()
+        self._service_coroutines: Dict[str, Coroutine] = {}
 
-    def register(self, name: str, coroutine, critical: bool = False):
-        """Registers a service task to be managed."""
-        if name in self.services and not self.services[name].done():
-            logger.warning(f"Service {name} is already running.")
-            return
-        
-        async def wrapped_service():
-            try:
-                logger.info(f"Service {name} started.")
-                await coroutine
-                logger.info(f"Service {name} stopped gracefully.")
-            except asyncio.CancelledError:
-                logger.info(f"Service {name} cancelled.")
-            except Exception as e:
-                logger.error(f"Service {name} crashed.", error=str(e), exc_info=True)
-                raise
-
-        task = asyncio.create_task(wrapped_service(), name=name)
-        self.services[name] = task
+    def register(self, name: str, coroutine: Coroutine, critical: bool = False):
+        """Registers a service coroutine to be managed."""
+        self._service_coroutines[name] = coroutine
         if critical:
             self.critical_services.add(name)
+
+    def start_all(self):
+        """Starts all registered services."""
+        for name, coro in self._service_coroutines.items():
+            self._start_service(name, coro)
+
+    def _start_service(self, name: str, coro: Coroutine):
+        if name in self.services and not self.services[name].done():
+            return
+
+        async def wrapped_service():
+            try:
+                logger.info(f"Service '{name}' started.")
+                await coro
+                logger.info(f"Service '{name}' stopped gracefully.")
+            except asyncio.CancelledError:
+                logger.info(f"Service '{name}' cancelled.")
+            except Exception as e:
+                logger.error(f"Service '{name}' crashed.", error=str(e), exc_info=True)
+                raise
+
+        self.services[name] = asyncio.create_task(wrapped_service(), name=name)
 
     async def monitor(self):
         """Monitors services and handles failures."""
@@ -60,19 +68,19 @@ class ServiceManager:
                     try:
                         exc = task.exception()
                         if exc:
-                            logger.error(f"Service {name} failed with exception.", error=str(exc))
+                            logger.error(f"Service '{name}' failed.", error=str(exc))
                             if name in self.critical_services:
-                                logger.critical(f"Critical service {name} failed. Initiating system shutdown.")
+                                logger.critical(f"Critical service '{name}' failed. Initiating system shutdown.")
                                 self._shutdown_event.set()
                             else:
-                                logger.warning(f"Non-critical service {name} stopped. It may need manual restart logic here if desired.")
+                                logger.warning(f"Non-critical service '{name}' stopped. Attempting restart in 5s...")
+                                # Logic to restart could be added here if coroutine factory is provided
+                                # For now, we just log it.
                         else:
-                            # Normal exit
-                            pass
+                            logger.info(f"Service '{name}' finished normally.")
                     except asyncio.CancelledError:
                         pass
                     
-                    # Remove done task
                     if name in self.services:
                         del self.services[name]
             
@@ -83,13 +91,11 @@ class ServiceManager:
         self._shutdown_event.set()
         logger.info("Stopping all services...")
         
-        # Cancel all running tasks
         tasks_to_cancel = [t for t in self.services.values() if not t.done()]
         for t in tasks_to_cancel:
             t.cancel()
         
         if tasks_to_cancel:
-            # Wait for them to finish cancelling
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
         
         self.services.clear()
@@ -127,23 +133,25 @@ class TradingBot:
         
         # Concurrency Control
         self._symbol_locks: Dict[str, asyncio.Lock] = {}
+        self._symbol_heartbeats: Dict[str, float] = {}
+        self._watchdog_threshold = 300
         
         # Use ProcessPoolExecutor for CPU-bound AI training
         self.process_executor = ProcessPoolExecutor(max_workers=2)
-        self._symbol_heartbeats: Dict[str, float] = {}
-        self._watchdog_threshold = 300
         
         self._initialize_shared_state()
         logger.info("TradingBot orchestrator initialized.")
 
     def _initialize_shared_state(self):
-        self.shared_bot_state['status'] = 'initializing'
-        self.shared_bot_state['start_time'] = self.start_time
-        self.shared_bot_state['position_manager'] = self.position_manager
-        self.shared_bot_state['risk_manager'] = self.risk_manager
-        self.shared_bot_state['latest_prices'] = self.latest_prices
-        self.shared_bot_state['config'] = self.config
-        self.shared_bot_state['strategy'] = self.strategy
+        self.shared_bot_state.update({
+            'status': 'initializing',
+            'start_time': self.start_time,
+            'position_manager': self.position_manager,
+            'risk_manager': self.risk_manager,
+            'latest_prices': self.latest_prices,
+            'config': self.config,
+            'strategy': self.strategy
+        })
 
     def _get_symbol_lock(self, symbol: str) -> asyncio.Lock:
         if symbol not in self._symbol_locks:
@@ -151,15 +159,23 @@ class TradingBot:
         return self._symbol_locks[symbol]
 
     async def setup(self):
+        """Performs initial setup and dependency injection."""
         logger.info("Setting up TradingBot components...")
+        
+        # Inject dependencies into strategy if needed
         if isinstance(self.strategy, AIEnsembleStrategy):
             self.strategy.data_fetcher = self.data_handler
 
         self.position_monitor.set_strategy(self.strategy)
+        
+        # Load Market Details
         await self._load_market_details()
+        
+        # Reconcile State
         await self.reconcile_pending_positions()
         await self.reconcile_open_positions()
         
+        # Warmup Strategy
         logger.info("Warming up strategy...")
         await self.strategy.warmup(self.config.strategy.symbols)
         
@@ -170,20 +186,24 @@ class TradingBot:
         logger.info("TradingBot setup complete.")
 
     async def _load_market_details(self):
+        """Loads exchange rules for all symbols."""
         for symbol in self.config.strategy.symbols:
             try:
                 details = await self.exchange_api.fetch_market_details(symbol)
-                if details: self.market_details[symbol] = details
+                if details: 
+                    self.market_details[symbol] = details
             except Exception as e:
                 logger.error("Could not load market details", symbol=symbol, error=str(e))
         self.trade_executor.market_details = self.market_details
 
     async def reconcile_pending_positions(self):
+        """Marks stale pending positions as failed."""
         pending = await self.position_manager.get_pending_positions()
         for pos in pending:
             await self.position_manager.mark_position_failed(pos.symbol, pos.order_id, "Startup Reconciliation")
 
     async def reconcile_open_positions(self):
+        """Checks for phantom positions (DB says open, Exchange says closed/empty)."""
         open_positions = await self.position_manager.get_all_open_positions()
         if not open_positions: return
         try:
@@ -191,28 +211,35 @@ class TradingBot:
             for pos in open_positions:
                 base = pos.symbol.split('/')[0]
                 bal = balances.get(base, {}).get('total', 0.0)
+                # If we have significantly less balance than the position size, it's a phantom
                 if bal < (pos.quantity * 0.90):
-                    logger.warning("Phantom position detected.", symbol=pos.symbol)
+                    logger.warning("Phantom position detected.", symbol=pos.symbol, db_qty=pos.quantity, wallet_bal=bal)
                     price = self.latest_prices.get(pos.symbol, pos.entry_price)
                     await self.position_manager.close_position(pos.symbol, price, reason="Startup Reconciliation")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("Error reconciling open positions", error=str(e))
 
     async def run(self):
+        """Main entry point for the bot."""
         self.shared_bot_state['status'] = 'running'
         logger.info("Starting TradingBot...", symbols=self.config.strategy.symbols)
         
         await self.setup()
 
         # Register Services
+        # Critical: Data, Position Monitor
         self.service_manager.register("DataHandler", self.data_handler.run(), critical=True)
-        self.service_manager.register("Monitoring", self._monitoring_loop(), critical=False)
         self.service_manager.register("PositionMonitor", self.position_monitor.run(), critical=True)
+        
+        # Non-Critical: Monitoring, Retraining, Optimizer, Watchdog
+        self.service_manager.register("Monitoring", self._monitoring_loop(), critical=False)
         self.service_manager.register("Retraining", self._retraining_loop(), critical=False)
         self.service_manager.register("Optimizer", self.optimizer.run(), critical=False)
         self.service_manager.register("Watchdog", self._watchdog_loop(), critical=False)
 
-        # The main loop just monitors the service manager
+        self.service_manager.start_all()
+
+        # Block on service monitor
         await self.service_manager.monitor()
         logger.info("Service Manager loop ended. Shutting down.")
 
@@ -222,6 +249,7 @@ class TradingBot:
         self._symbol_heartbeats[event.symbol] = time.time()
         
         # Fire and forget processing to avoid blocking the event bus
+        # We use a task to allow the event bus to proceed immediately
         asyncio.create_task(self.process_symbol_tick(event.symbol))
 
     async def process_symbol_tick(self, symbol: str):
@@ -233,33 +261,34 @@ class TradingBot:
 
         lock = self._get_symbol_lock(symbol)
         if lock.locked():
-            logger.warning(f"Skipping tick for {symbol} - previous tick still processing.")
+            logger.warning(f"Skipping tick for {symbol} - previous tick still processing (Backpressure).")
             return
 
         async with lock:
             tick_start = time.perf_counter()
             try:
-                # Backpressure check: If we are processing too slowly, skip old data
+                # 1. Check Data Freshness
                 last_processed = self.processed_candles.get(symbol)
-                
-                # Fetch data without forming candle to ensure we act on closed bars
                 df = self.data_handler.get_market_data(symbol, include_forming=False)
+                
                 if df is None or df.empty: return
                 
                 last_ts = df.index[-1]
                 if last_processed == last_ts:
-                    return
+                    return # Already processed this candle
 
                 if symbol not in self.latest_prices:
                     return
 
-                # Fast cached read
+                # 2. Fetch Context
                 position = await self.position_manager.get_open_position(symbol)
                 
-                # Execute Strategy Analysis
+                # 3. Strategy Analysis (with Timeout)
                 try:
-                    # Add timeout to strategy analysis to prevent hangs
-                    signal = await asyncio.wait_for(self.strategy.analyze_market(symbol, df, position), timeout=5.0)
+                    signal = await asyncio.wait_for(
+                        self.strategy.analyze_market(symbol, df, position), 
+                        timeout=10.0
+                    )
                 except asyncio.TimeoutError:
                     logger.error("Strategy analysis timed out", symbol=symbol)
                     return
@@ -267,12 +296,13 @@ class TradingBot:
                     logger.error("Strategy analysis failed", symbol=symbol, error=str(e), exc_info=True)
                     return
 
+                # 4. Signal Execution
                 if signal: 
                     await self._handle_signal(signal, df, position)
                 
                 self.processed_candles[symbol] = last_ts
                 
-                # Latency Metrics
+                # 5. Metrics
                 duration_ms = (time.perf_counter() - tick_start) * 1000
                 if self.metrics_writer:
                     await self.metrics_writer.write_metric('tick_latency', fields={'duration_ms': duration_ms}, tags={'symbol': symbol})
@@ -281,6 +311,7 @@ class TradingBot:
                 logger.error(f"Critical error processing tick for {symbol}", error=str(e), exc_info=True)
 
     async def _watchdog_loop(self):
+        """Monitors data liveness."""
         logger.info("Watchdog started.")
         while not self.service_manager._shutdown_event.is_set():
             await asyncio.sleep(60)
@@ -288,17 +319,20 @@ class TradingBot:
             for symbol in self.config.strategy.symbols:
                 last_beat = self._symbol_heartbeats.get(symbol, 0)
                 if last_beat > 0 and (now - last_beat) > self._watchdog_threshold:
-                    logger.warning("Watchdog Alert: Symbol stalled.", symbol=symbol)
+                    logger.warning("Watchdog Alert: Symbol stalled.", symbol=symbol, seconds_since_data=int(now-last_beat))
                     if self.alert_system:
                         await self.alert_system.send_alert('warning', f"Watchdog: No data for {symbol} in {int(now-last_beat)}s.")
 
     async def _monitoring_loop(self):
+        """Periodic system health and risk monitoring."""
         reconcile_counter = 0
         while not self.service_manager._shutdown_event.is_set():
             try:
+                # System Health
                 health = self.health_checker.get_health_status()
                 if self.metrics_writer: await self.metrics_writer.write_metric('health', fields=health)
                 
+                # Periodic Reconciliation (every 2 mins)
                 reconcile_counter += 1
                 if reconcile_counter >= 2:
                     await self.reconcile_pending_positions()
@@ -308,16 +342,19 @@ class TradingBot:
                     await asyncio.sleep(5)
                     continue
 
+                # Portfolio Risk Update
                 open_pos = await self.position_manager.get_all_open_positions()
                 val = self.position_manager.get_portfolio_value(self.latest_prices, open_pos)
                 pnl = await self.position_manager.get_daily_realized_pnl()
                 
                 await self.risk_manager.update_portfolio_risk(val, pnl)
                 
+                # Emergency Liquidation Check
                 if self.risk_manager.liquidation_needed:
                     await self._liquidate_all_positions("Emergency Risk Halt")
                     self.risk_manager.liquidation_needed = False
 
+                # Update Shared State for Telegram/API
                 self.shared_bot_state['portfolio_equity'] = val
                 self.shared_bot_state['open_positions_count'] = len(open_pos)
                 self.shared_bot_state['daily_pnl'] = pnl
@@ -335,8 +372,9 @@ class TradingBot:
         await asyncio.gather(*tasks)
 
     async def _retraining_loop(self):
+        """Periodic model retraining."""
         logger.info("Starting model retraining loop.")
-        await asyncio.sleep(10) 
+        await asyncio.sleep(60) # Initial delay
         while not self.service_manager._shutdown_event.is_set():
             try:
                 for symbol in self.config.strategy.symbols:
@@ -359,19 +397,26 @@ class TradingBot:
             await self.metrics_writer.write_metric('trade_execution', fields=result.dict())
 
     async def _close_position(self, position: Position, reason: str):
+        """Callback for PositionMonitor to trigger closes."""
         await self.trade_executor.close_position(position, reason)
 
     async def stop(self):
+        """Graceful shutdown."""
         logger.info("Stopping TradingBot...")
         self.shared_bot_state['status'] = 'stopping'
+        
         await self.service_manager.stop_all()
+        
+        # Stop components
         await self.data_handler.stop()
         await self.position_monitor.stop()
         await self.optimizer.stop()
         await self.strategy.close()
+        
         if self.exchange_api: await self.exchange_api.close()
         if self.position_manager: self.position_manager.close()
         if self.metrics_writer: await self.metrics_writer.close()
+        
         self.process_executor.shutdown(wait=True)
         logger.info("TradingBot stopped gracefully.")
         self.shared_bot_state['status'] = 'stopped'
