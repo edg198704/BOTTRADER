@@ -949,9 +949,10 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                     optimized_threshold = _optimize_entry_threshold(y_test_aligned, ensemble_probs, returns_test_aligned)
                     worker_logger.info(f"Optimal Entry Threshold found: {optimized_threshold:.2f}")
 
-        # --- SAVE ARTIFACTS ---
+        # --- SAVE ARTIFACTS (With Backup) ---
         safe_symbol = symbol.replace('/', '_')
         final_dir = os.path.join(config.model_path, safe_symbol)
+        backup_dir = os.path.join(config.model_path, f"{safe_symbol}_backup")
         temp_dir = os.path.join(config.model_path, f"{safe_symbol}_temp")
         
         if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
@@ -984,7 +985,13 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             with open(os.path.join(temp_dir, "metadata.json"), 'w') as f:
                 json.dump(meta, f, indent=2)
             
-            if os.path.exists(final_dir): shutil.rmtree(final_dir)
+            # --- BACKUP LOGIC ---
+            if os.path.exists(final_dir):
+                if os.path.exists(backup_dir):
+                    shutil.rmtree(backup_dir)
+                shutil.move(final_dir, backup_dir)
+                worker_logger.info(f"Backed up previous model to {backup_dir}")
+            
             os.rename(temp_dir, final_dir)
             
             worker_logger.info(f"Training complete. Artifacts saved to {final_dir}")
@@ -1059,6 +1066,37 @@ class EnsembleLearner:
 
         except Exception as e:
             logger.error(f"Failed to reload models for {symbol}: {e}")
+
+    async def rollback_model(self, symbol: str) -> bool:
+        """
+        Attempts to restore the previous model from backup.
+        """
+        safe_symbol = symbol.replace('/', '_')
+        final_dir = os.path.join(self.config.model_path, safe_symbol)
+        backup_dir = os.path.join(self.config.model_path, f"{safe_symbol}_backup")
+        
+        if not os.path.exists(backup_dir):
+            logger.warning(f"No backup found for {symbol}. Cannot rollback.")
+            return False
+            
+        try:
+            # Swap directories
+            temp_hold = os.path.join(self.config.model_path, f"{safe_symbol}_bad_hold")
+            if os.path.exists(final_dir):
+                os.rename(final_dir, temp_hold)
+            
+            os.rename(backup_dir, final_dir)
+            
+            # Cleanup bad model (optional, or keep for analysis)
+            if os.path.exists(temp_hold):
+                shutil.rmtree(temp_hold)
+                
+            logger.info(f"Rolled back model for {symbol} from backup.")
+            await self.reload_models(symbol)
+            return True
+        except Exception as e:
+            logger.error(f"Rollback failed for {symbol}: {e}")
+            return False
 
     def _predict_sync(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None, leader_df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
         entry = self.symbol_models.get(symbol)
