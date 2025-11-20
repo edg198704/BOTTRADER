@@ -207,7 +207,6 @@ class TradingBot:
         self._symbol_heartbeats[event.symbol] = time.time()
         
         # Fire and forget processing to avoid blocking the event bus
-        # We use create_task here so the bus can move on to other subscribers
         asyncio.create_task(self.process_symbol_tick(event.symbol))
 
     async def process_symbol_tick(self, symbol: str):
@@ -219,13 +218,11 @@ class TradingBot:
 
         lock = self._get_symbol_lock(symbol)
         if lock.locked():
-            # If we are already processing a tick for this symbol, we skip this one to prevent
-            # race conditions on strategy state (e.g. LSTM hidden states) or position state.
-            # For a candle-based bot, this usually means the previous candle processing is lagging.
             logger.warning(f"Skipping tick for {symbol} - previous tick still processing.")
             return
 
         async with lock:
+            tick_start = time.perf_counter()
             try:
                 # Backpressure check: If we are processing too slowly, skip old data
                 last_processed = self.processed_candles.get(symbol)
@@ -241,6 +238,7 @@ class TradingBot:
                 if symbol not in self.latest_prices:
                     return
 
+                # Fast cached read
                 position = await self.position_manager.get_open_position(symbol)
                 
                 # Execute Strategy Analysis
@@ -254,6 +252,11 @@ class TradingBot:
                     await self._handle_signal(signal, df, position)
                 
                 self.processed_candles[symbol] = last_ts
+                
+                # Latency Metrics
+                duration_ms = (time.perf_counter() - tick_start) * 1000
+                if self.metrics_writer:
+                    await self.metrics_writer.write_metric('tick_latency', fields={'duration_ms': duration_ms}, tags={'symbol': symbol})
                 
             except Exception as e:
                 logger.error(f"Critical error processing tick for {symbol}", error=str(e), exc_info=True)
