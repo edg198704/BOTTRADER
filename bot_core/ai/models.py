@@ -66,8 +66,8 @@ class LSTMPredictor(nn.Module):
 
 class AttentionNetwork(nn.Module):
     """
-    Residual Transformer Block Architecture.
-    Embedding -> PosEnc -> [TransformerEncoderLayer] -> GlobalAvgPool -> FC
+    Residual Transformer Block Architecture optimized for Time Series.
+    Uses the last sequence element's embedding for prediction instead of global averaging.
     """
     def __init__(self, input_dim, hidden_dim, num_layers, nhead, dropout):
         super().__init__()
@@ -83,6 +83,7 @@ class AttentionNetwork(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
+        self.ln = nn.LayerNorm(hidden_dim)
         self.fc = nn.Linear(hidden_dim, 3) # 0: sell, 1: hold, 2: buy
 
     def forward(self, x):
@@ -90,7 +91,10 @@ class AttentionNetwork(nn.Module):
         x = self.embedding(x)
         x = self.pos_encoder(x)
         x = self.transformer(x)
-        # Global Average Pooling over sequence dimension
-        x = x.mean(dim=1)
-        # Return LOGITS
-        return self.fc(x)
+        
+        # Take the last time step's embedding as the context for prediction
+        # Shape: (batch, hidden_dim)
+        last_step = x[:, -1, :]
+        
+        out = self.ln(last_step)
+        return self.fc(out)
