@@ -90,7 +90,8 @@ strategy:
     # ADDED: regime_trend, regime_volatility, and regime_efficiency to give the AI context about the market state.
     # NEW: Added '1h_rsi' to leverage Multi-Timeframe context.
     # NEW: Added 'time_hour_sin', 'time_hour_cos', 'pa_body_size' for advanced feature engineering.
-    feature_columns: ['log_return', 'rsi', '1h_rsi', 'macd', 'volume', 'bb_upper', 'bb_lower', 'regime_trend', 'regime_volatility', 'regime_efficiency', 'time_hour_sin', 'time_hour_cos', 'pa_body_size']
+    # NEW: Added 'volatility_gk' and 'close_frac' for quantitative features.
+    feature_columns: ['log_return', 'rsi', '1h_rsi', 'macd', 'volume', 'bb_upper', 'bb_lower', 'regime_trend', 'regime_volatility', 'regime_efficiency', 'time_hour_sin', 'time_hour_cos', 'pa_body_size', 'volatility_gk', 'close_frac']
     confidence_threshold: 0.65 # Base threshold for ENTRIES
     exit_confidence_threshold: 0.55 # Base threshold for EXITS (Lower = easier to exit)
     model_path: "models/ensemble"
@@ -127,6 +128,12 @@ strategy:
       # --- Advanced Features (New) ---
       use_time_features: true
       use_price_action_features: true
+
+      # --- Quantitative Features (New) ---
+      use_volatility_estimators: true # Enable Garman-Klass Volatility
+      use_frac_diff: true # Enable Fractional Differentiation
+      frac_diff_d: 0.4 # Differencing factor (0.4 is a common starting point)
+      frac_diff_thres: 0.0001 # Weight cutoff
 
     # --- Model Training Parameters ---
     training:
