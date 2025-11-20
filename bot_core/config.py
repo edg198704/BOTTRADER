@@ -361,6 +361,21 @@ class BacktestConfig(BaseModel):
     slippage_pct: float = 0.0005 # 0.05% 
     model_path: str = "backtest_models"
 
+class ExecutionOptimizerConfig(BaseModel):
+    enabled: bool = True
+    target_fill_rate: float = 0.90 # Aim for 90% fill rate on entries
+    max_slippage_tolerance: float = 0.001 # 0.1% max acceptable slippage
+    
+    # Adjustment Steps
+    offset_adjustment_step: float = 0.0001 # 0.01% step
+    chase_adjustment_step: float = 0.0001 # 0.01% step
+    
+    # Bounds
+    min_limit_offset: float = -0.001 # Can go slightly negative (aggressive)
+    max_limit_offset: float = 0.005 # 0.5% max passive
+    min_chase_aggro: float = 0.0
+    max_chase_aggro: float = 0.005
+
 class OptimizerConfig(BaseModel):
     enabled: bool = False
     interval_hours: int = 24
@@ -393,6 +408,9 @@ class OptimizerConfig(BaseModel):
     max_reward_to_risk: float = 3.0
     min_atr_multiplier: float = 1.5
     max_atr_multiplier: float = 4.0
+
+    # --- Execution Optimization ---
+    execution: ExecutionOptimizerConfig = ExecutionOptimizerConfig()
 
 # --- Top-Level Bot Config ---
 
