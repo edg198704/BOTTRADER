@@ -448,7 +448,9 @@ class TradeExecutor:
             if is_full_close or is_smart_retry_close:
                 # We pass the actual filled quantity to ensure PnL is calculated on what was sold,
                 # but the position record is closed fully, effectively discarding any dust discrepancy.
-                await self.position_manager.close_position(position.symbol, close_price, reason, actual_filled_qty=fill_quantity, fees=fees)
+                closed_pos = await self.position_manager.close_position(position.symbol, close_price, reason, actual_filled_qty=fill_quantity, fees=fees)
+                if closed_pos:
+                    self.risk_manager.update_trade_outcome(closed_pos.symbol, closed_pos.pnl)
             else:
                 # Partial fill handling
                 await self.position_manager.reduce_position(position.symbol, fill_quantity, close_price, reason, fees=fees)
