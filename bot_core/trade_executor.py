@@ -123,14 +123,7 @@ class TradeExecutor:
 
         # Apply Offset
         if side == 'BUY':
-            # Buy Limit = Price - Offset (Deeper) or Price + Offset (Aggressive)?
-            # Config comment says "0.05% offset". Usually means "Better than market" (Deeper).
-            # However, for aggressive entry, we might want Price * (1 + offset).
-            # Standard convention: Limit Buy is below market. 
-            # BUT, if we want to ensure fill, we might place it slightly above bid but below ask.
-            # Let's stick to the standard interpretation: Buy Limit = Price * (1 - offset)
-            # If user wants aggressive, they can set negative offset in config? No, pydantic might block.
-            # Let's assume offset is 'distance from reference'.
+            # Buy Limit = Price * (1 - offset)
             limit_price = ref_price * (1 - self.config.execution.limit_price_offset_pct) 
             if self.config.execution.limit_offset_type == 'ATR':
                  limit_price = ref_price - offset_val
@@ -235,16 +228,16 @@ class TradeExecutor:
                     logger.info("Retry successful with reduced quantity.", original=final_quantity, new=reduced_qty)
                 else:
                     logger.error("Reduced quantity too small to trade.")
-                    await self.position_manager.void_position(symbol, trade_id)
+                    await self.position_manager.mark_position_failed(symbol, trade_id, "Insufficient Funds (Retry Failed)")
                     return
             except Exception as retry_e:
                 logger.error("Retry failed for entry order.", error=str(retry_e))
-                await self.position_manager.void_position(symbol, trade_id)
+                await self.position_manager.mark_position_failed(symbol, trade_id, f"Insufficient Funds (Retry Exception: {str(retry_e)})")
                 return
 
         except BotInvalidOrderError as e:
-            logger.error("Order rejected by exchange logic. Voiding pending position.", error=str(e))
-            await self.position_manager.void_position(symbol, trade_id)
+            logger.error("Order rejected by exchange logic. Marking position failed.", error=str(e))
+            await self.position_manager.mark_position_failed(symbol, trade_id, f"Invalid Order: {str(e)}")
             return
         except Exception as e:
             logger.error("Critical error during order placement. Leaving PENDING position for reconciliation.", error=str(e))
@@ -342,8 +335,8 @@ class TradeExecutor:
             
         else:
             # Order is definitively dead (CANCELED, REJECTED, EXPIRED) and empty.
-            logger.error("Order to open position did not fill. Voiding pending position.", order_id=current_order_id, final_status=final_status)
-            await self.position_manager.void_position(symbol, current_order_id)
+            logger.error("Order to open position did not fill. Marking position failed.", order_id=current_order_id, final_status=final_status)
+            await self.position_manager.mark_position_failed(symbol, current_order_id, f"Order Lifecycle Failed: {final_status}")
             
             await self.alert_system.send_alert(
                 level='error',
