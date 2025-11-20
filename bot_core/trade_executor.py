@@ -10,6 +10,7 @@ from bot_core.risk_manager import RiskManager
 from bot_core.order_sizer import OrderSizer
 from bot_core.order_lifecycle_manager import OrderLifecycleManager
 from bot_core.monitoring import AlertSystem
+from bot_core.data_handler import DataHandler
 
 logger = get_logger(__name__)
 
@@ -28,7 +29,8 @@ class TradeExecutor:
                  order_lifecycle_manager: OrderLifecycleManager,
                  alert_system: AlertSystem,
                  shared_latest_prices: Dict[str, float],
-                 market_details: Dict[str, Dict[str, Any]]):
+                 market_details: Dict[str, Dict[str, Any]],
+                 data_handler: DataHandler):
         self.config = config
         self.exchange_api = exchange_api
         self.position_manager = position_manager
@@ -38,6 +40,7 @@ class TradeExecutor:
         self.alert_system = alert_system
         self.latest_prices = shared_latest_prices
         self.market_details = market_details
+        self.data_handler = data_handler
         logger.info("TradeExecutor initialized.")
 
     async def execute_trade_signal(self, signal: Dict, df_with_indicators: pd.DataFrame, position: Optional[Position]):
@@ -82,6 +85,62 @@ class TradeExecutor:
         fee_rate = self.config.exchange.taker_fee_pct
         estimated_fee = price * quantity * fee_rate
         return estimated_fee
+
+    def _calculate_limit_price(self, symbol: str, side: str, current_price: float, ticker: Dict[str, float], df: Optional[pd.DataFrame] = None) -> float:
+        """Calculates the limit price based on configuration (Fixed % or ATR-based)."""
+        bid = ticker.get('bid')
+        ask = ticker.get('ask')
+        last = ticker.get('last', current_price)
+
+        # Determine Base Price
+        if side == 'BUY':
+            ref_price = bid if bid else last
+        else:
+            ref_price = ask if ask else last
+
+        # Determine Offset
+        offset_val = 0.0
+        
+        if self.config.execution.limit_offset_type == 'ATR' and df is not None:
+            # Try to calculate ATR-based offset
+            atr_col = self.config.risk_management.atr_column_name
+            if atr_col in df.columns:
+                atr = df[atr_col].iloc[-1]
+                if atr > 0:
+                    offset_val = atr * self.config.execution.limit_offset_atr_multiplier
+                    # Normalize to price for logging consistency
+                    pct_equiv = offset_val / ref_price
+                    logger.debug("Using ATR-based limit offset", symbol=symbol, atr=atr, offset=offset_val, pct=f"{pct_equiv:.4%}")
+                else:
+                    # Fallback if ATR is 0
+                    offset_val = ref_price * self.config.execution.limit_price_offset_pct
+            else:
+                # Fallback if column missing
+                offset_val = ref_price * self.config.execution.limit_price_offset_pct
+        else:
+            # Fixed Percentage Offset
+            offset_val = ref_price * self.config.execution.limit_price_offset_pct
+
+        # Apply Offset
+        if side == 'BUY':
+            # Buy Limit = Price - Offset (Deeper) or Price + Offset (Aggressive)?
+            # Config comment says "0.05% offset". Usually means "Better than market" (Deeper).
+            # However, for aggressive entry, we might want Price * (1 + offset).
+            # Standard convention: Limit Buy is below market. 
+            # BUT, if we want to ensure fill, we might place it slightly above bid but below ask.
+            # Let's stick to the standard interpretation: Buy Limit = Price * (1 - offset)
+            # If user wants aggressive, they can set negative offset in config? No, pydantic might block.
+            # Let's assume offset is 'distance from reference'.
+            limit_price = ref_price * (1 - self.config.execution.limit_price_offset_pct) 
+            if self.config.execution.limit_offset_type == 'ATR':
+                 limit_price = ref_price - offset_val
+        else:
+            # Sell Limit = Price * (1 + offset)
+            limit_price = ref_price * (1 + self.config.execution.limit_price_offset_pct)
+            if self.config.execution.limit_offset_type == 'ATR':
+                limit_price = ref_price + offset_val
+                
+        return limit_price
 
     async def _execute_open_position(self, symbol: str, side: str, current_price: float, df: pd.DataFrame, regime: Optional[str], signal: Dict):
         # Await async DB call to get ALL active positions (OPEN + PENDING) for accurate risk check
@@ -132,24 +191,11 @@ class TradeExecutor:
             # Fetch fresh ticker data for precise execution
             try:
                 ticker = await self.exchange_api.get_ticker_data(symbol)
-                bid = ticker.get('bid')
-                ask = ticker.get('ask')
-                last = ticker.get('last', current_price)
             except Exception as e:
                 logger.warning("Failed to fetch ticker for execution, falling back to candle close.", error=str(e))
-                bid, ask, last = None, None, current_price
+                ticker = {'last': current_price}
 
-            offset = self.config.execution.limit_price_offset_pct
-            
-            if side == 'BUY':
-                # Target Best Bid to be a Maker, adjusted by offset (usually negative to be deeper, or positive to be aggressive)
-                # Config comment says: "0.05% offset from current price".
-                # Standard interpretation: Buy Limit = Price * (1 - offset)
-                ref_price = bid if bid else last
-                limit_price = ref_price * (1 - offset)
-            else:
-                ref_price = ask if ask else last
-                limit_price = ref_price * (1 + offset)
+            limit_price = self._calculate_limit_price(symbol, side, current_price, ticker, df)
 
         # 1. Generate Trade ID (Idempotency Key & Group ID)
         trade_id = str(uuid.uuid4())
@@ -335,21 +381,16 @@ class TradeExecutor:
             # Fetch fresh ticker for close
             try:
                 ticker = await self.exchange_api.get_ticker_data(position.symbol)
-                bid = ticker.get('bid')
-                ask = ticker.get('ask')
-                last = ticker.get('last', current_price)
             except Exception as e:
                 logger.warning("Failed to fetch ticker for close, falling back to candle close.", error=str(e))
-                bid, ask, last = None, None, current_price
+                ticker = {'last': current_price}
 
-            offset = self.config.execution.limit_price_offset_pct
+            # Fetch DF for ATR calculation if needed
+            df = None
+            if self.config.execution.limit_offset_type == 'ATR':
+                df = self.data_handler.get_market_data(position.symbol)
             
-            if close_side == 'BUY':
-                ref_price = bid if bid else last
-                limit_price = ref_price * (1 - offset)
-            else:
-                ref_price = ask if ask else last
-                limit_price = ref_price * (1 + offset)
+            limit_price = self._calculate_limit_price(position.symbol, close_side, current_price, ticker, df)
         else:
             order_type = 'MARKET'
 
