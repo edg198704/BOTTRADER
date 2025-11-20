@@ -247,6 +247,12 @@ risk_management:
   trailing_stop_activation_pct: 0.02 # Activate TSL after 2% profit
   trailing_stop_pct: 0.01 # Trail by 1% of peak price
 
+  # --- Stop Loss Type (New) ---
+  # Options: 'ATR' (Volatility) or 'SWING' (Structural)
+  stop_loss_type: "ATR" 
+  swing_lookback: 20 # Lookback for Swing High/Low
+  swing_buffer_atr_multiplier: 1.0 # Buffer added to Swing point
+
   # --- Breakeven Stop (New) ---
   # Moves Stop Loss to Entry Price (+ buffer) once a profit threshold is reached.
   breakeven:
