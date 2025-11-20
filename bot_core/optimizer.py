@@ -137,6 +137,7 @@ class StrategyOptimizer:
             logger.error("Failed to save optimizer state", error=str(e))
 
     async def run(self):
+        """Starts the background optimization loop."""
         if not self.opt_config.enabled:
             logger.info("Optimizer disabled in config.")
             return
@@ -149,9 +150,7 @@ class StrategyOptimizer:
 
         while self.running:
             try:
-                await self.optimize_strategy_parameters()
-                if self.opt_config.execution.enabled:
-                    await self.optimize_execution_parameters()
+                await self.optimize()
             except asyncio.CancelledError:
                 logger.info("StrategyOptimizer loop cancelled.")
                 break
@@ -160,6 +159,13 @@ class StrategyOptimizer:
             
             # Sleep for the configured interval
             await asyncio.sleep(self.opt_config.interval_hours * 3600)
+
+    async def optimize(self):
+        """Executes a single optimization cycle. Can be called manually."""
+        logger.info("Executing optimization cycle...")
+        await self.optimize_strategy_parameters()
+        if self.opt_config.execution.enabled:
+            await self.optimize_execution_parameters()
 
     async def optimize_strategy_parameters(self):
         logger.info("Running strategy parameter optimization...")
