@@ -146,9 +146,14 @@ class RiskManager:
             return 0.0
 
         # --- Base Risk Calculation ---
+        # Fetch base risk, potentially optimized by StrategyOptimizer
         base_risk_pct = self._get_regime_param('risk_per_trade_pct', market_regime)
         
-        # --- Kelly Criterion Logic ---
+        # Safety floor to prevent 0% risk unless explicitly halted
+        base_risk_pct = max(0.001, base_risk_pct)
+        
+        # --- Kelly Criterion Logic (Validation-Based) ---
+        # Note: This uses Model Validation metrics. The Optimizer uses Realized metrics to tune base_risk_pct.
         kelly_risk_pct = None
         if self.config.use_kelly_criterion and model_metrics:
             # Extract metrics from the model's validation performance
@@ -177,7 +182,7 @@ class RiskManager:
                     # Ensure non-negative
                     kelly_risk_pct = max(0.0, kelly_risk_pct)
                     
-                    logger.info("Kelly Criterion calculated", 
+                    logger.info("Kelly Criterion calculated (Validation)", 
                                 symbol=symbol, 
                                 win_rate=win_rate, 
                                 profit_factor=profit_factor, 
