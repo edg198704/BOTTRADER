@@ -26,6 +26,8 @@ class EnsembleWeightsConfig(BaseModel):
     attention: float = 0.2
     auto_tune: bool = True
     use_stacking: bool = True
+    # Optimization method: 'random' or 'slsqp'
+    optimization_method: str = 'slsqp'
     # Penalize confidence if models disagree (StdDev of probs * penalty)
     disagreement_penalty: float = 0.5
     # Optimize weights per regime (Bull, Bear, Sideways, Volatile)
@@ -229,6 +231,8 @@ class BreakevenConfig(BaseModel):
 
 class RiskManagementConfig(BaseModel):
     max_position_size_usd: float
+    # New: Cap position size as a percentage of total portfolio equity
+    max_position_size_portfolio_pct: float = 1.0 # Default 100% (no effective cap unless set lower)
     max_daily_loss_usd: float
     max_open_positions: int
     circuit_breaker_threshold: float
