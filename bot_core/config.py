@@ -307,10 +307,17 @@ class OptimizerConfig(BaseModel):
     max_threshold_cap: float = 0.90
     min_threshold_floor: float = 0.55
     
-    # --- Risk Parameter Optimization (New) ---
+    # --- Risk Parameter Optimization ---
     optimize_risk_params: bool = True
     risk_adjustment_step: float = 0.1 # Step for R:R and ATR Multiplier
     
+    # --- Risk Sizing Optimization (New) ---
+    optimize_risk_sizing: bool = True
+    target_kelly_fraction: float = 0.25 # Conservative default (Quarter Kelly)
+    min_risk_pct: float = 0.005 # 0.5% floor
+    max_risk_pct: float = 0.05 # 5% cap
+    risk_size_step: float = 0.0025 # 0.25% step adjustment
+
     # Bounds
     min_reward_to_risk: float = 1.0
     max_reward_to_risk: float = 3.0
