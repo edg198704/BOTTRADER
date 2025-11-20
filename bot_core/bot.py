@@ -245,7 +245,7 @@ class TradingBot:
                 try:
                     signal = await self.strategy.analyze_market(symbol, df, position)
                 except Exception as e:
-                    logger.error("Strategy analysis failed", symbol=symbol, error=str(e))
+                    logger.error("Strategy analysis failed", symbol=symbol, error=str(e), exc_info=True)
                     return
 
                 if signal: 
