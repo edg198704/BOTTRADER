@@ -1,6 +1,6 @@
 from typing import List, Optional, Any, Dict, TYPE_CHECKING
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from bot_core.config import RiskManagementConfig
 from bot_core.logger import get_logger
@@ -31,6 +31,10 @@ class RiskManager:
         self.liquidation_needed = False
         self.liquidation_triggered = False
         
+        # Symbol-Specific Risk Tracking
+        self.symbol_consecutive_losses: Dict[str, int] = {}
+        self.symbol_cooldowns: Dict[str, datetime] = {}
+        
         logger.info("RiskManager initialized.")
 
     async def initialize(self):
@@ -49,6 +53,31 @@ class RiskManager:
     def is_halted(self) -> bool:
         """Returns True if any risk halt condition is met."""
         return self.circuit_breaker_halted or self.daily_loss_halted
+
+    def update_trade_outcome(self, symbol: str, pnl: float):
+        """Updates consecutive loss counters based on realized PnL."""
+        if pnl < 0:
+            self.symbol_consecutive_losses[symbol] = self.symbol_consecutive_losses.get(symbol, 0) + 1
+            logger.info(f"Recorded loss for {symbol}. Consecutive: {self.symbol_consecutive_losses[symbol]}")
+            
+            if self.symbol_consecutive_losses[symbol] >= self.config.max_consecutive_losses:
+                cooldown_duration = timedelta(minutes=self.config.consecutive_loss_cooldown_minutes)
+                self.symbol_cooldowns[symbol] = Clock.now() + cooldown_duration
+                logger.warning(f"Symbol {symbol} halted due to consecutive losses.", 
+                               count=self.symbol_consecutive_losses[symbol], 
+                               until=self.symbol_cooldowns[symbol])
+                
+                if self.alert_system:
+                    import asyncio
+                    asyncio.create_task(self.alert_system.send_alert(
+                        level='warning',
+                        message=f"⚠️ Symbol {symbol} halted for {self.config.consecutive_loss_cooldown_minutes}m due to {self.symbol_consecutive_losses[symbol]} consecutive losses.",
+                        details={'symbol': symbol, 'losses': self.symbol_consecutive_losses[symbol]}
+                    ))
+        elif pnl > 0:
+            if symbol in self.symbol_consecutive_losses and self.symbol_consecutive_losses[symbol] > 0:
+                self.symbol_consecutive_losses[symbol] = 0
+                logger.info(f"Recorded win for {symbol}. Consecutive losses reset.")
 
     async def update_portfolio_risk(self, portfolio_value: float, daily_realized_pnl: float):
         # Initialize on first run if DB was empty or initialize wasn't called
@@ -334,6 +363,17 @@ class RiskManager:
             reason = "Circuit Breaker" if self.circuit_breaker_halted else "Max Daily Loss"
             logger.warning(f"Trade rejected: Trading is halted by {reason}.", symbol=symbol)
             return False
+        
+        # Check Symbol Cooldown
+        if symbol in self.symbol_cooldowns:
+            if Clock.now() < self.symbol_cooldowns[symbol]:
+                logger.warning(f"Trade rejected: {symbol} is in cooldown until {self.symbol_cooldowns[symbol]}")
+                return False
+            else:
+                # Cooldown expired
+                del self.symbol_cooldowns[symbol]
+                self.symbol_consecutive_losses[symbol] = 0
+                logger.info(f"Cooldown expired for {symbol}. Resuming trading.")
         
         if len(open_positions) >= self.config.max_open_positions:
             logger.warning("Trade rejected: Max open positions reached.", symbol=symbol, limit=self.config.max_open_positions)
