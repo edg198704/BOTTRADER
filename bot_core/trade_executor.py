@@ -156,7 +156,12 @@ class TradeExecutor:
 
         # 2. Record PENDING Position (Pre-Commit)
         # We persist the intent BEFORE the network call to handle crashes gracefully.
-        await self.position_manager.create_pending_position(symbol, side, trade_id, trade_id, strategy_metadata=strategy_metadata)
+        # Pass current_price as decision_price for slippage tracking
+        await self.position_manager.create_pending_position(
+            symbol, side, trade_id, trade_id, 
+            decision_price=current_price, 
+            strategy_metadata=strategy_metadata
+        )
 
         # 3. Place Order (With Smart Retry)
         order_result = None
@@ -336,7 +341,7 @@ class TradeExecutor:
                 # 1. Fetch actual available balance
                 base_asset = position.symbol.split('/')[0]
                 balances = await self.exchange_api.get_balance()
-                available_balance = balances.get(base_asset, {}).get('free', 0.0)
+                available_balance = balances.get(base_asset, {}).get('total', 0.0)
                 
                 # 2. Check if balance is within tolerance (e.g., > 98% of tracked qty)
                 # This implies the discrepancy is likely due to fees or dust.
