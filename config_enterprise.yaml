@@ -33,6 +33,9 @@ execution:
   # If the order is still not filled after all chase attempts, place a MARKET order to guarantee execution.
   # WARNING: This can lead to significant slippage. Use with caution.
   execute_on_timeout: false
+  
+  # --- Advanced Execution ---
+  post_only: false # If true, LIMIT orders will be rejected if they would execute immediately (Taker).
 
 data_handler:
   history_limit: 200 # Number of historical candles to load at startup
