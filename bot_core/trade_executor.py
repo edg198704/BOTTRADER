@@ -12,6 +12,7 @@ from bot_core.order_sizer import OrderSizer
 from bot_core.order_lifecycle_manager import OrderLifecycleManager
 from bot_core.monitoring import AlertSystem
 from bot_core.data_handler import DataHandler
+from bot_core.strategy import TradeSignal
 
 logger = get_logger(__name__)
 
@@ -42,9 +43,7 @@ class TradeExecutor:
         self.market_details = market_details
         self.data_handler = data_handler
         
-        # Atomic locks per symbol to prevent overlapping execution logic
         self._symbol_locks: Dict[str, asyncio.Lock] = {}
-        
         logger.info("TradeExecutor initialized.")
 
     def _get_lock(self, symbol: str) -> asyncio.Lock:
@@ -52,119 +51,88 @@ class TradeExecutor:
             self._symbol_locks[symbol] = asyncio.Lock()
         return self._symbol_locks[symbol]
 
-    async def execute_trade_signal(self, signal: Dict, df_with_indicators: pd.DataFrame, position: Optional[Position]):
+    async def execute_trade_signal(self, signal: TradeSignal, df_with_indicators: pd.DataFrame, position: Optional[Position]):
         """
         Processes a trading signal to open or close a position.
         Acquires a symbol-specific lock to ensure atomicity.
         """
-        symbol = signal.get('symbol')
-        if not symbol:
-            return
-
+        symbol = signal.symbol
         async with self._get_lock(symbol):
-            action = signal.get('action')
             current_price = self.latest_prices.get(symbol)
-            market_regime = signal.get('regime')
-
-            if not all([action, current_price]):
-                logger.warning("Received invalid signal for execution", signal=signal)
+            if not current_price:
+                logger.warning("Cannot execute signal: No price data.", symbol=symbol)
                 return
 
             # --- Handle Opening a New Position ---
             if not position:
-                if action not in ['BUY', 'SELL']:
+                if signal.action not in ['BUY', 'SELL']:
                     return
                 
-                # --- Pre-Flight Liquidity Check ---
                 if not await self._check_liquidity(symbol, current_price):
                     logger.warning("Trade aborted due to poor liquidity/spread.", symbol=symbol)
                     return
 
-                await self._execute_open_position(symbol, action, current_price, df_with_indicators, market_regime, signal)
+                await self._execute_open_position(signal, current_price, df_with_indicators)
             
             # --- Handle Closing an Existing Position ---
             elif position:
-                is_close_long = (action == 'SELL' or action == 'CLOSE') and position.side == 'BUY'
-                is_close_short = (action == 'BUY' or action == 'CLOSE') and position.side == 'SELL'
+                is_close_long = (signal.action == 'SELL') and position.side == 'BUY'
+                is_close_short = (signal.action == 'BUY') and position.side == 'SELL'
                 
                 if is_close_long or is_close_short:
                     await self.close_position(position, "Strategy Signal")
 
     async def _check_liquidity(self, symbol: str, current_price: float) -> bool:
-        """
-        Verifies that the market spread is within acceptable limits before entering a trade.
-        """
         try:
             book = await self.exchange_api.fetch_order_book(symbol, limit=5)
             if not book or not book.get('bids') or not book.get('asks'):
                 return False
-            
             best_bid = book['bids'][0][0]
             best_ask = book['asks'][0][0]
-            
             if best_bid <= 0 or best_ask <= 0:
                 return False
-                
             spread = (best_ask - best_bid) / current_price
-            
             if spread > self.config.execution.max_entry_spread_pct:
                 logger.warning("Spread too high for entry", symbol=symbol, spread=f"{spread:.4%}", max_allowed=f"{self.config.execution.max_entry_spread_pct:.4%}")
                 return False
-                
             return True
         except Exception as e:
             logger.error("Liquidity check failed", symbol=symbol, error=str(e))
-            return False # Fail safe
+            return False
 
     def _calculate_or_extract_fee(self, order_state: Dict[str, Any], price: float, quantity: float) -> float:
-        """Extracts fee from order state or estimates it based on config."""
         if order_state and 'fee' in order_state and order_state['fee']:
             fee_data = order_state['fee']
             if 'cost' in fee_data and fee_data['cost'] is not None:
                 return float(fee_data['cost'])
-        
-        # Fallback estimate
-        fee_rate = self.config.exchange.taker_fee_pct
-        return price * quantity * fee_rate
+        return price * quantity * self.config.exchange.taker_fee_pct
 
     def _calculate_limit_price(self, symbol: str, side: str, current_price: float, ticker: Dict[str, float], df: Optional[pd.DataFrame] = None) -> float:
         bid = ticker.get('bid')
         ask = ticker.get('ask')
         last = ticker.get('last', current_price)
-
         ref_price = (bid if bid else last) if side == 'BUY' else (ask if ask else last)
-        offset_val = 0.0
         
+        offset_val = 0.0
         if self.config.execution.limit_offset_type == 'ATR' and df is not None:
             atr_col = self.config.risk_management.atr_column_name
             if atr_col in df.columns:
                 atr = df[atr_col].iloc[-1]
-                if atr > 0:
-                    offset_val = atr * self.config.execution.limit_offset_atr_multiplier
-                else:
-                    offset_val = ref_price * self.config.execution.limit_price_offset_pct
+                offset_val = atr * self.config.execution.limit_offset_atr_multiplier if atr > 0 else ref_price * self.config.execution.limit_price_offset_pct
             else:
                 offset_val = ref_price * self.config.execution.limit_price_offset_pct
         else:
             offset_val = ref_price * self.config.execution.limit_price_offset_pct
 
-        if side == 'BUY':
-            limit_price = ref_price - offset_val
-        else:
-            limit_price = ref_price + offset_val
-                
-        return limit_price
+        return ref_price - offset_val if side == 'BUY' else ref_price + offset_val
 
     async def _retry_entry_with_smart_balance(self, symbol: str, side: str, order_type: str, limit_price: float, trade_id: str, market_details: Dict) -> Optional[Dict]:
         try:
             base_asset, quote_asset = symbol.split('/')
             target_asset = quote_asset if side == 'BUY' else base_asset
-            
             balances = await self.exchange_api.get_balance()
             free_balance = balances.get(target_asset, {}).get('free', 0.0)
-            
-            if free_balance <= 0:
-                return None
+            if free_balance <= 0: return None
 
             new_qty = 0.0
             if side == 'BUY':
@@ -175,37 +143,30 @@ class TradeExecutor:
                 new_qty = free_balance
 
             adjusted_qty = self.order_sizer.adjust_order_quantity(symbol, new_qty, limit_price, market_details)
-            
-            if adjusted_qty <= 0:
-                return None
+            if adjusted_qty <= 0: return None
 
             logger.info("Retrying entry with smart balance.", asset=target_asset, balance=free_balance, new_qty=adjusted_qty)
-
             extra_params = {'clientOrderId': trade_id}
             if self.config.execution.post_only and order_type == 'LIMIT':
                 extra_params['postOnly'] = True
 
-            return await self.exchange_api.place_order(
-                symbol, side, order_type, adjusted_qty, price=limit_price, 
-                extra_params=extra_params
-            )
+            return await self.exchange_api.place_order(symbol, side, order_type, adjusted_qty, price=limit_price, extra_params=extra_params)
         except Exception as e:
             logger.error("Smart Retry exception", error=str(e))
             return None
 
-    async def _execute_open_position(self, symbol: str, side: str, current_price: float, df: pd.DataFrame, regime: Optional[str], signal: Dict):
+    async def _execute_open_position(self, signal: TradeSignal, current_price: float, df: pd.DataFrame):
+        symbol = signal.symbol
+        side = signal.action
         active_positions = await self.position_manager.get_all_active_positions()
+        
         if not self.risk_manager.check_trade_allowed(symbol, active_positions):
             return
 
         portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, active_positions)
-        stop_loss = self.risk_manager.calculate_stop_loss(side, current_price, df, market_regime=regime)
+        stop_loss = self.risk_manager.calculate_stop_loss(side, current_price, df, market_regime=signal.regime)
         
-        strategy_metadata = signal.get('strategy_metadata', {})
-        confidence = strategy_metadata.get('confidence')
-        metrics = strategy_metadata.get('metrics')
-        confidence_threshold = strategy_metadata.get('effective_threshold')
-        
+        confidence_threshold = signal.metadata.get('effective_threshold')
         if confidence_threshold is None:
             confidence_threshold = getattr(self.config.strategy.params, 'confidence_threshold', None)
 
@@ -215,10 +176,10 @@ class TradeExecutor:
             entry_price=current_price, 
             stop_loss_price=stop_loss, 
             open_positions=active_positions,
-            market_regime=regime,
-            confidence=confidence,
+            market_regime=signal.regime,
+            confidence=signal.confidence,
             confidence_threshold=confidence_threshold,
-            model_metrics=metrics
+            model_metrics=signal.metadata.get('metrics')
         )
         
         market_details = self.market_details.get(symbol)
@@ -227,13 +188,11 @@ class TradeExecutor:
             return
 
         final_quantity = self.order_sizer.adjust_order_quantity(symbol, ideal_quantity, current_price, market_details)
-
         if final_quantity <= 0:
             return
 
         order_type = self.config.execution.default_order_type
         limit_price = None
-        
         if order_type == 'LIMIT':
             try:
                 ticker = await self.exchange_api.get_ticker_data(symbol)
@@ -242,11 +201,10 @@ class TradeExecutor:
             limit_price = self._calculate_limit_price(symbol, side, current_price, ticker, df)
 
         trade_id = str(uuid.uuid4())
-
         await self.position_manager.create_pending_position(
             symbol, side, trade_id, trade_id, 
             decision_price=current_price, 
-            strategy_metadata=strategy_metadata
+            strategy_metadata=signal.metadata
         )
 
         order_result = None
@@ -256,13 +214,10 @@ class TradeExecutor:
                 extra_params['postOnly'] = True
 
             order_result = await self.exchange_api.place_order(
-                symbol, side, order_type, final_quantity, price=limit_price, 
-                extra_params=extra_params
+                symbol, side, order_type, final_quantity, price=limit_price, extra_params=extra_params
             )
         except BotInsufficientFundsError:
-            order_result = await self._retry_entry_with_smart_balance(
-                symbol, side, order_type, limit_price, trade_id, market_details
-            )
+            order_result = await self._retry_entry_with_smart_balance(symbol, side, order_type, limit_price, trade_id, market_details)
             if not order_result:
                 await self.position_manager.mark_position_failed(symbol, trade_id, "Insufficient Funds")
                 return
@@ -297,22 +252,24 @@ class TradeExecutor:
             trade_id=trade_id
         )
         
-        fill_quantity = final_order_state.get('filled', 0.0) if final_order_state else 0.0
-        final_status = final_order_state.get('status') if final_order_state else 'UNKNOWN'
+        await self._finalize_entry(symbol, side, current_order_id, final_order_state, df, signal.regime, signal.confidence, confidence_threshold)
+
+    async def _finalize_entry(self, symbol: str, side: str, order_id: str, order_state: Optional[Dict], df: pd.DataFrame, regime: Optional[str], confidence: float, threshold: Optional[float]):
+        fill_quantity = order_state.get('filled', 0.0) if order_state else 0.0
+        final_status = order_state.get('status') if order_state else 'UNKNOWN'
         
         if fill_quantity > 0:
-            fill_price = final_order_state.get('average')
+            fill_price = order_state.get('average')
             if not fill_price or fill_price <= 0:
                 return
 
-            fees = self._calculate_or_extract_fee(final_order_state, fill_price, fill_quantity)
+            fees = self._calculate_or_extract_fee(order_state, fill_price, fill_quantity)
             confirmed_quantity = fill_quantity
             
             if side == 'BUY':
                 fee_currency = None
-                if final_order_state.get('fee') and 'currency' in final_order_state['fee']:
-                    fee_currency = final_order_state['fee']['currency']
-                
+                if order_state.get('fee') and 'currency' in order_state['fee']:
+                    fee_currency = order_state['fee']['currency']
                 base_asset = symbol.split('/')[0]
                 if fee_currency == base_asset:
                     confirmed_quantity = max(0.0, fill_quantity - fees)
@@ -320,28 +277,25 @@ class TradeExecutor:
             final_stop_loss = self.risk_manager.calculate_stop_loss(side, fill_price, df, market_regime=regime)
             final_take_profit = self.risk_manager.calculate_take_profit(
                 side, fill_price, final_stop_loss, market_regime=regime,
-                confidence=confidence, confidence_threshold=confidence_threshold
+                confidence=confidence, confidence_threshold=threshold
             )
             
             await self.position_manager.confirm_position_open(
-                symbol, current_order_id, confirmed_quantity, fill_price, 
+                symbol, order_id, confirmed_quantity, fill_price, 
                 final_stop_loss, final_take_profit, fees=fees
             )
-        
         elif final_status == 'OPEN':
-            logger.critical("Order stuck OPEN. Manual intervention required.", order_id=current_order_id)
+            logger.critical("Order stuck OPEN. Manual intervention required.", order_id=order_id)
             await self.alert_system.send_alert(
                 level='critical',
-                message=f"🚨 ZOMBIE ORDER: {current_order_id} for {symbol} stuck OPEN.",
-                details={'symbol': symbol, 'order_id': current_order_id}
+                message=f"🚨 ZOMBIE ORDER: {order_id} for {symbol} stuck OPEN.",
+                details={'symbol': symbol, 'order_id': order_id}
             )
         else:
-            await self.position_manager.mark_position_failed(symbol, current_order_id, f"Lifecycle Failed: {final_status}")
+            await self.position_manager.mark_position_failed(symbol, order_id, f"Lifecycle Failed: {final_status}")
 
     async def close_position(self, position: Position, reason: str):
-        # Acquire lock to prevent concurrent closes (e.g. TSL and Signal triggering same time)
         async with self._get_lock(position.symbol):
-            # Re-check status inside lock
             fresh_pos = await self.position_manager.get_open_position(position.symbol)
             if not fresh_pos:
                 return
@@ -353,9 +307,7 @@ class TradeExecutor:
             if not market_details:
                 close_quantity = position.quantity
             else:
-                close_quantity = self.order_sizer.adjust_order_quantity(
-                    position.symbol, position.quantity, current_price or 0.0, market_details
-                )
+                close_quantity = self.order_sizer.adjust_order_quantity(position.symbol, position.quantity, current_price or 0.0, market_details)
 
             if close_quantity <= 0:
                 estimated_value = position.quantity * (current_price or 0.0)
@@ -365,13 +317,11 @@ class TradeExecutor:
 
             order_type = self.config.execution.default_order_type
             limit_price = None
-            
             if order_type == 'LIMIT':
                 try:
                     ticker = await self.exchange_api.get_ticker_data(position.symbol)
                 except Exception:
                     ticker = {'last': current_price}
-                
                 df = None
                 if self.config.execution.limit_offset_type == 'ATR':
                     df = self.data_handler.get_market_data(position.symbol)
@@ -381,31 +331,21 @@ class TradeExecutor:
 
             order_result = None
             used_quantity = close_quantity
-
             try:
                 extra_params = {}
                 if self.config.execution.post_only and order_type == 'LIMIT':
                     extra_params['postOnly'] = True
-
-                order_result = await self.exchange_api.place_order(
-                    position.symbol, close_side, order_type, close_quantity, price=limit_price, extra_params=extra_params
-                )
+                order_result = await self.exchange_api.place_order(position.symbol, close_side, order_type, close_quantity, price=limit_price, extra_params=extra_params)
             except BotInsufficientFundsError:
-                # Smart Retry for Close (Dust/Fee issues)
                 try:
                     base_asset = position.symbol.split('/')[0]
                     balances = await self.exchange_api.get_balance()
                     available_balance = balances.get(base_asset, {}).get('total', 0.0)
-                    
                     tolerance = position.quantity * 0.98
                     if available_balance >= tolerance and available_balance < position.quantity:
-                        used_quantity = self.order_sizer.adjust_order_quantity(
-                            position.symbol, available_balance, current_price or 0.0, market_details
-                        )
+                        used_quantity = self.order_sizer.adjust_order_quantity(position.symbol, available_balance, current_price or 0.0, market_details)
                         if used_quantity > 0:
-                            order_result = await self.exchange_api.place_order(
-                                position.symbol, close_side, order_type, used_quantity, price=limit_price, extra_params=extra_params
-                            )
+                            order_result = await self.exchange_api.place_order(position.symbol, close_side, order_type, used_quantity, price=limit_price, extra_params=extra_params)
                     else:
                         await self._handle_phantom_position(position)
                         return
@@ -428,18 +368,15 @@ class TradeExecutor:
             )
             
             fill_quantity = final_order_state.get('filled', 0.0) if final_order_state else 0.0
-            
             if fill_quantity > 0:
                 close_price = final_order_state['average']
                 fees = self._calculate_or_extract_fee(final_order_state, close_price, fill_quantity)
-                
                 is_full_close = fill_quantity >= (position.quantity * 0.999)
                 is_smart_retry_close = (used_quantity < position.quantity) and (fill_quantity >= (used_quantity * 0.999))
 
                 if is_full_close or is_smart_retry_close:
                     closed_pos = await self.position_manager.close_position(position.symbol, close_price, reason, actual_filled_qty=fill_quantity, fees=fees)
-                    if closed_pos:
-                        self.risk_manager.update_trade_outcome(closed_pos.symbol, closed_pos.pnl)
+                    if closed_pos: self.risk_manager.update_trade_outcome(closed_pos.symbol, closed_pos.pnl)
                 else:
                     await self.position_manager.reduce_position(position.symbol, fill_quantity, close_price, reason, fees=fees)
             else:
@@ -456,7 +393,6 @@ class TradeExecutor:
             balances = await self.exchange_api.get_balance()
             asset_balance = balances.get(base_asset, {}).get('total', 0.0)
             open_orders = await self.exchange_api.fetch_open_orders(position.symbol)
-            
             if asset_balance < (position.quantity * 0.01) and not open_orders:
                 logger.info("Confirmed phantom position. Reconciling.")
                 close_price = self.latest_prices.get(position.symbol, position.entry_price)
