@@ -117,6 +117,7 @@ async def main():
         config=config,
         position_manager=position_manager,
         risk_manager=risk_manager,
+        data_handler=data_handler,
         shared_latest_prices=latest_prices
     )
 
