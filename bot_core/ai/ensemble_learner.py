@@ -273,6 +273,7 @@ def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.nd
     return best_weights
 
 def _optimize_entry_threshold(y_true: np.ndarray, probs: np.ndarray, returns: np.ndarray) -> float:
+    """Finds the single best threshold for the given dataset."""
     best_threshold = 0.60
     best_score = -float('inf')
     thresholds = np.arange(0.50, 0.91, 0.01)
@@ -300,6 +301,28 @@ def _optimize_entry_threshold(y_true: np.ndarray, probs: np.ndarray, returns: np
             best_threshold = float(t)
             
     return best_threshold
+
+def _optimize_regime_thresholds(y_true: np.ndarray, probs: np.ndarray, returns: np.ndarray, regimes: np.ndarray) -> Dict[str, float]:
+    """Finds the best threshold for each market regime present in the data."""
+    unique_regimes = np.unique(regimes)
+    regime_thresholds = {}
+    
+    # Calculate global fallback first
+    global_threshold = _optimize_entry_threshold(y_true, probs, returns)
+    
+    for regime in unique_regimes:
+        mask = (regimes == regime)
+        if np.sum(mask) < 50: # Insufficient data for this regime
+            regime_thresholds[regime] = global_threshold
+            continue
+            
+        y_regime = y_true[mask]
+        probs_regime = probs[mask]
+        returns_regime = returns[mask]
+        
+        regime_thresholds[regime] = _optimize_entry_threshold(y_regime, probs_regime, returns_regime)
+        
+    return regime_thresholds
 
 def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyParams, device) -> Optional[Dict[str, Any]]:
     safe_symbol = symbol.replace('/', '_')
@@ -505,6 +528,11 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         all_feature_names = list(df_proc.columns)
         labels = FeatureProcessor.create_labels(df, config)
         
+        # Calculate Regimes for Optimization
+        regime_detector = MarketRegimeDetector(config)
+        # We need to ensure regime series aligns with df_proc
+        full_regimes = regime_detector.get_regime_series(df)
+        
         common_index = df_proc.index.intersection(labels.index)
         if len(common_index) < 200:
             worker_logger.warning("Insufficient data after alignment.")
@@ -512,24 +540,20 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             
         X_full = df_proc.loc[common_index].values
         y = labels.loc[common_index].values.astype(int)
+        regimes_aligned = full_regimes.loc[common_index].values
 
         full_returns = df['close'].pct_change().shift(-1)
         market_returns = full_returns.loc[common_index].fillna(0.0).values
 
         # --- DATA SPLITTING (Dev / Test) with PURGING ---
-        # CRITICAL: Split BEFORE feature selection to prevent leakage
         test_split_idx = int(len(X_full) * (1 - config.training.validation_split))
-        
-        # Determine purge gap based on labeling horizon to prevent look-ahead bias
         purge_gap = config.features.labeling_horizon if config.training.purge_overlap else 0
         
         X_dev_raw = X_full[:test_split_idx]
         y_dev = y[:test_split_idx]
         returns_dev = market_returns[:test_split_idx]
+        regimes_dev = regimes_aligned[:test_split_idx]
         
-        # Purge the beginning of the test set to avoid leakage from the end of dev set
-        # The labels at the end of Dev look forward 'horizon' steps. 
-        # We must skip 'horizon' steps in Test to ensure Test data wasn't seen in Dev labels.
         X_test_raw = X_full[test_split_idx + purge_gap:]
         y_test = y[test_split_idx + purge_gap:]
         returns_test = market_returns[test_split_idx + purge_gap:]
@@ -555,7 +579,6 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             except Exception as e:
                 worker_logger.error(f"Feature selection failed: {e}. Using all features.")
 
-        # Apply selection to both sets
         X_dev = X_dev_raw[:, selected_indices]
         X_test = X_test_raw[:, selected_indices]
         num_features = X_dev.shape[1]
@@ -579,7 +602,6 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 champ_indices = [all_feature_names.index(f) for f in champ_features if f in all_feature_names]
                 if len(champ_indices) == len(champ_features):
                     X_champ_full = X_full[:, champ_indices]
-                    # Apply same purging logic to champion evaluation data
                     X_champ_test = X_champ_full[test_split_idx + purge_gap:]
                     X_champ_seq_test, y_champ_seq_test = FeatureProcessor.create_sequences(X_champ_test, y_test, seq_len)
                     
@@ -592,7 +614,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             except Exception as e:
                 worker_logger.warning(f"Could not evaluate champion: {e}")
 
-        # --- WALK-FORWARD VALIDATION (STACKING) with PURGING ---
+        # --- WALK-FORWARD VALIDATION (STACKING) ---
         oos_predictions = {} 
         oos_indices = []
         use_cv = len(X_dev) > 500 and config.training.cv_splits > 1
@@ -602,19 +624,16 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             tscv = TimeSeriesSplit(n_splits=config.training.cv_splits)
             
             for fold, (train_idx, val_idx) in enumerate(tscv.split(X_dev)):
-                # Apply Purging to the Training Set of the Fold
-                # The end of the training set must be purged to avoid leaking into the validation set
                 if len(train_idx) > purge_gap:
                     train_idx = train_idx[:-purge_gap]
                 else:
-                    continue # Skip fold if purge consumes entire train set (unlikely)
+                    continue
                 
                 X_fold_train, X_fold_val = X_dev[train_idx], X_dev[val_idx]
                 y_fold_train, y_fold_val = y_dev[train_idx], y_dev[val_idx]
                 
                 fold_models = _create_fresh_models(config, num_features, device)
                 
-                # Train Fold Models
                 for name in ['gb', 'technical']:
                     fold_models[name].fit(X_fold_train, y_fold_train)
                     preds = fold_models[name].predict_proba(X_fold_val)
@@ -630,7 +649,6 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                         _train_torch_model(model, X_seq_tr, y_seq_tr, X_seq_val, y_seq_val, config, device)
                         model.eval()
                         with torch.no_grad():
-                            # Apply Softmax to logits
                             logits = model(torch.FloatTensor(X_seq_val).to(device))
                             preds = F.softmax(logits, dim=1).cpu().numpy()
                             if name not in oos_predictions: oos_predictions[name] = []
@@ -644,12 +662,14 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         regime_weights = {}
         calibrator = None
         optimized_threshold = None
+        regime_thresholds = {}
         
         if use_cv and oos_indices:
             try:
                 combined_indices = np.concatenate(oos_indices)
                 y_oos = y_dev[combined_indices]
                 returns_oos = returns_dev[combined_indices]
+                regimes_oos = regimes_dev[combined_indices]
                 
                 oos_sample_weights = None
                 if config.training.use_class_weighting:
@@ -685,15 +705,9 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                     
                     # 2. Optimize Regime Weights
                     if config.ensemble_weights.use_regime_specific_weights:
-                        detector = MarketRegimeDetector(config)
-                        dev_indices = common_index[:test_split_idx]
-                        oos_timestamps = dev_indices[combined_indices]
-                        full_regimes = detector.get_regime_series(df)
-                        oos_regimes = full_regimes.loc[oos_timestamps].values
-                        
-                        unique_regimes = np.unique(oos_regimes)
+                        unique_regimes = np.unique(regimes_oos)
                         for regime in unique_regimes:
-                            mask = (oos_regimes == regime)
+                            mask = (regimes_oos == regime)
                             if np.sum(mask) > 50:
                                 regime_y = y_oos[mask]
                                 regime_preds = {k: v[mask] for k, v in combined_preds.items()}
@@ -716,10 +730,12 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                         calibrator.fit(ensemble_probs_oos, y_oos)
                         ensemble_probs_oos = calibrator.predict(ensemble_probs_oos)
 
-                    # 4. Optimize Threshold (Using OOS predictions)
+                    # 4. Optimize Thresholds (Global & Regime-Specific)
                     if config.training.optimize_entry_threshold:
                         optimized_threshold = _optimize_entry_threshold(y_oos, ensemble_probs_oos, returns_oos)
-                        worker_logger.info(f"Optimal Entry Threshold (OOS): {optimized_threshold:.2f}")
+                        regime_thresholds = _optimize_regime_thresholds(y_oos, ensemble_probs_oos, returns_oos, regimes_oos)
+                        worker_logger.info(f"Optimal Entry Threshold (Global): {optimized_threshold:.2f}")
+                        worker_logger.info(f"Optimal Regime Thresholds: {regime_thresholds}")
 
             except Exception as e:
                 worker_logger.error(f"CV Optimization failed: {e}", exc_info=True)
@@ -779,7 +795,6 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
 
         val_size = int(len(X_dev) * 0.15)
         if val_size > seq_len:
-            # Apply purging to final validation split as well
             train_end = len(X_dev) - val_size - purge_gap
             if train_end > 0:
                 X_final_train = X_dev[:train_end]
@@ -823,7 +838,6 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 worker_logger.error(f"Drift detector training failed: {e}")
 
         # --- CHALLENGER EVALUATION (Using Test Set) ---
-        # Use the optimized threshold from OOS for evaluation
         challenger_metrics = _evaluate_ensemble(
             trained_models, X_test, y_test, X_seq_test, y_seq_test, 
             config, device, returns_test, weights_override=optimized_weights, 
@@ -839,9 +853,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             worker_logger.warning(f"Challenger rejected: PF {pf:.2f} < {config.training.min_profit_factor}")
             return False
         
-        # Use PSR for selection if enabled, otherwise fallback to Sharpe
         if config.training.use_probabilistic_sharpe:
-            # Require at least 95% confidence that Sharpe > 0
             if psr < 0.95:
                  worker_logger.warning(f"Challenger rejected: PSR {psr:.4f} < 0.95 (Low confidence in positive Sharpe)")
                  return False
@@ -857,7 +869,6 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             is_better = False
             
             if config.training.use_probabilistic_sharpe:
-                # If using PSR, we prefer higher PSR, or higher Sharpe if PSR is similar
                 if psr > champ_psr + 0.05:
                     is_better = True
                 elif psr > 0.95 and sharpe > champ_sharpe * (1 + improvement_needed):
@@ -903,7 +914,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 'num_features': num_features,
                 'optimized_weights': optimized_weights,
                 'regime_weights': regime_weights,
-                'optimized_threshold': optimized_threshold
+                'optimized_threshold': optimized_threshold,
+                'regime_thresholds': regime_thresholds
             }
             with open(os.path.join(temp_dir, "metadata.json"), 'w') as f:
                 json.dump(meta, f, indent=2)
@@ -989,9 +1001,6 @@ class EnsembleLearner:
             logger.error(f"Failed to reload models for {symbol}: {e}")
 
     async def warmup_models(self, symbols: List[str]):
-        """
-        Eagerly loads models for the provided symbols in parallel.
-        """
         logger.info(f"Warming up models for {len(symbols)} symbols...")
         tasks = [self.reload_models(symbol) for symbol in symbols]
         await asyncio.gather(*tasks)
@@ -1163,6 +1172,13 @@ class EnsembleLearner:
                 if idx < len(cols):
                     top_features[cols[idx]] = float(imps[idx])
 
+        # Determine Optimized Threshold for Current Regime
+        optimized_threshold = meta.get('optimized_threshold')
+        regime_thresholds = meta.get('regime_thresholds', {})
+        
+        if regime and regime in regime_thresholds:
+            optimized_threshold = regime_thresholds[regime]
+
         return {
             'action': best_action,
             'confidence': round(confidence, 4),
@@ -1173,7 +1189,7 @@ class EnsembleLearner:
             'optimized_weights': active_weight_map if active_weight_map else None,
             'is_anomaly': is_anomaly,
             'anomaly_score': float(anomaly_score),
-            'optimized_threshold': meta.get('optimized_threshold'),
+            'optimized_threshold': optimized_threshold,
             'individual_predictions': individual_preds
         }
 
