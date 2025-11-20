@@ -141,6 +141,9 @@ class AIFeatureEngineeringConfig(BaseModel):
     frac_diff_d: float = 0.4 # Differencing factor (0.0 = Raw, 1.0 = Returns)
     frac_diff_thres: float = 1e-4 # Weight cutoff for FracDiff window
 
+    # --- Market Context Features (New) ---
+    use_leader_features: bool = False # If True, injects returns/RSI from market_leader_symbol
+
     # --- Feature Selection ---
     use_feature_selection: bool = True
     max_active_features: int = 20 # Cap the number of features fed to models to reduce noise
@@ -176,6 +179,10 @@ class AIEnsembleStrategyParams(StrategyParamsBase):
     training_data_limit: int = 5000
     signal_cooldown_candles: int = 1
     inference_workers: int = 2
+    
+    # --- Market Context ---
+    market_leader_symbol: Optional[str] = "BTC/USDT" # Symbol to use as global market context
+
     features: AIFeatureEngineeringConfig
     training: AITrainingConfig = AITrainingConfig()
     hyperparameters: AIHyperparameters = AIHyperparameters()
