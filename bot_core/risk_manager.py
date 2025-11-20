@@ -1,5 +1,7 @@
 from typing import List, Optional, Any, Dict, TYPE_CHECKING, Tuple
 import pandas as pd
+import json
+import os
 from datetime import datetime, timedelta
 
 from bot_core.config import RiskManagementConfig
@@ -18,6 +20,7 @@ class RiskManager:
     """
     The authoritative Gatekeeper for all trading decisions.
     Enforces portfolio-wide constraints, circuit breakers, and position sizing.
+    Persists critical risk state (consecutive losses, cooldowns) to disk.
     """
     def __init__(self, config: RiskManagementConfig, position_manager: 'PositionManager', data_handler: 'DataHandler', alert_system: Optional['AlertSystem'] = None):
         self.config = config
@@ -36,23 +39,53 @@ class RiskManager:
         self.liquidation_needed = False
         self.liquidation_triggered = False
         
-        # Symbol-Specific State
+        # Symbol-Specific State (Persisted)
         self.symbol_consecutive_losses: Dict[str, int] = {}
         self.symbol_cooldowns: Dict[str, datetime] = {}
+        
+        self.state_file = "risk_state.json"
         
         logger.info("RiskManager initialized.")
 
     async def initialize(self):
-        """Loads persistent risk state from the database."""
+        """Loads persistent risk state from the database and local file."""
+        # Load Portfolio State from DB
         state = await self.position_manager.get_portfolio_state()
         if state:
             self.initial_capital = state['initial_capital']
             self.peak_portfolio_value = state['peak_equity']
-            logger.info("RiskManager loaded persistent state.", 
+            logger.info("RiskManager loaded portfolio state.", 
                         initial_capital=self.initial_capital, 
                         peak_equity=self.peak_portfolio_value)
         else:
-            logger.warning("RiskManager could not load persistent state. Will initialize on first update.")
+            logger.warning("RiskManager could not load portfolio state. Will initialize on first update.")
+            
+        # Load Risk Counters from File
+        self._load_state()
+
+    def _load_state(self):
+        if not os.path.exists(self.state_file):
+            return
+        try:
+            with open(self.state_file, 'r') as f:
+                data = json.load(f)
+                self.symbol_consecutive_losses = data.get('consecutive_losses', {})
+                cooldowns = data.get('cooldowns', {})
+                self.symbol_cooldowns = {k: datetime.fromisoformat(v) for k, v in cooldowns.items()}
+            logger.info("RiskManager loaded persistent risk counters.")
+        except Exception as e:
+            logger.error("Failed to load risk state", error=str(e))
+
+    def _save_state(self):
+        try:
+            data = {
+                'consecutive_losses': self.symbol_consecutive_losses,
+                'cooldowns': {k: v.isoformat() for k, v in self.symbol_cooldowns.items()}
+            }
+            with open(self.state_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.error("Failed to save risk state", error=str(e))
 
     @property
     def is_halted(self) -> bool:
@@ -78,6 +111,7 @@ class RiskManager:
                 # Cooldown expired, cleanup
                 del self.symbol_cooldowns[symbol]
                 self.symbol_consecutive_losses[symbol] = 0
+                self._save_state()
                 logger.info(f"Cooldown expired for {symbol}. Resuming trading.")
 
         # 3. Position Limits
@@ -111,9 +145,12 @@ class RiskManager:
                         message=f"⚠️ Symbol {symbol} halted for {self.config.consecutive_loss_cooldown_minutes}m due to {self.symbol_consecutive_losses[symbol]} consecutive losses.",
                         details={'symbol': symbol, 'losses': self.symbol_consecutive_losses[symbol]}
                     ))
+            self._save_state()
+            
         elif pnl > 0:
             if symbol in self.symbol_consecutive_losses and self.symbol_consecutive_losses[symbol] > 0:
                 self.symbol_consecutive_losses[symbol] = 0
+                self._save_state()
                 logger.info(f"Recorded win for {symbol}. Consecutive losses reset.")
 
     async def update_portfolio_risk(self, portfolio_value: float, daily_realized_pnl: float):
