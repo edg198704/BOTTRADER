@@ -270,6 +270,7 @@ class ExecutionConfig(BaseModel):
     
     # --- New Execution Params ---
     post_only: bool = False # If True, forces LIMIT orders to be Maker-only
+    max_entry_spread_pct: float = 0.001 # Max 0.1% spread allowed for entry. Abort if higher.
 
 class DataHandlerConfig(BaseModel):
     history_limit: int
