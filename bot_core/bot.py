@@ -345,7 +345,8 @@ class TradingBot:
 
     async def _retraining_loop(self):
         logger.info("Starting model retraining loop.")
-        await asyncio.sleep(60)
+        # Reduced initial delay to ensure missing models are trained promptly on startup
+        await asyncio.sleep(10) 
 
         while self.running:
             try:
@@ -371,14 +372,15 @@ class TradingBot:
                         else:
                             logger.error("Could not fetch training data, skipping retraining for now.", symbol=symbol)
                 
-                await asyncio.sleep(3600)
+                # Check every 5 minutes instead of 1 hour to recover faster from failures
+                await asyncio.sleep(300)
 
             except asyncio.CancelledError:
                 logger.info("Retraining loop cancelled.")
                 break
             except Exception as e:
                 logger.error("Error in retraining loop", error=str(e), exc_info=True)
-                await asyncio.sleep(3600)
+                await asyncio.sleep(300)
 
     async def _handle_signal(self, signal: Dict, df_with_indicators: pd.DataFrame, position: Optional[Position]):
         await self.trade_executor.execute_trade_signal(signal, df_with_indicators, position)
