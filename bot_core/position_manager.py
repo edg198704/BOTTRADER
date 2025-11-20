@@ -476,15 +476,22 @@ class PositionManager:
         finally:
             session.close()
 
-    async def manage_trailing_stop(self, pos: Position, current_price: float, rm_config: RiskManagementConfig) -> Position:
+    async def manage_trailing_stop(self, pos: Position, current_price: float, rm_config: RiskManagementConfig, atr: Optional[float] = None) -> Position:
         async with self._db_lock:
-            return await self._run_in_executor(self._manage_trailing_stop_sync, pos, current_price, rm_config)
+            return await self._run_in_executor(self._manage_trailing_stop_sync, pos, current_price, rm_config, atr)
 
-    def _manage_trailing_stop_sync(self, pos: Position, current_price: float, rm_config: RiskManagementConfig) -> Position:
+    def _manage_trailing_stop_sync(self, pos: Position, current_price: float, rm_config: RiskManagementConfig, atr: Optional[float]) -> Position:
         session = self.SessionLocal()
         try:
             pos = session.merge(pos)
-            original_stop_loss = pos.stop_loss_price
+            
+            # Determine trailing distance: ATR-based or Percentage-based
+            trailing_dist = 0.0
+            if rm_config.use_atr_for_trailing and atr is not None and atr > 0:
+                trailing_dist = atr * rm_config.atr_trailing_multiplier
+            else:
+                # Fallback to percentage if ATR not enabled or not available
+                trailing_dist = pos.trailing_ref_price * rm_config.trailing_stop_pct
 
             if pos.side == 'BUY':
                 if not pos.trailing_stop_active:
@@ -493,10 +500,19 @@ class PositionManager:
                         pos.trailing_stop_active = True
                         logger.info("Trailing stop activated for LONG", symbol=pos.symbol, price=current_price)
                 
+                # Update High Water Mark (Reference Price)
                 pos.trailing_ref_price = max(pos.trailing_ref_price, current_price)
 
                 if pos.trailing_stop_active:
-                    new_stop_price = pos.trailing_ref_price * (1 - rm_config.trailing_stop_pct)
+                    # For ATR: Stop = High - (ATR * Multiplier)
+                    # For Pct: Stop = High * (1 - Pct)
+                    # We unified this into trailing_dist above
+                    if rm_config.use_atr_for_trailing and atr is not None and atr > 0:
+                        new_stop_price = pos.trailing_ref_price - trailing_dist
+                    else:
+                        new_stop_price = pos.trailing_ref_price * (1 - rm_config.trailing_stop_pct)
+                    
+                    # Only move stop UP
                     pos.stop_loss_price = max(pos.stop_loss_price, new_stop_price)
 
             elif pos.side == 'SELL':
@@ -506,14 +522,22 @@ class PositionManager:
                         pos.trailing_stop_active = True
                         logger.info("Trailing stop activated for SHORT", symbol=pos.symbol, price=current_price)
 
+                # Update Low Water Mark (Reference Price)
                 pos.trailing_ref_price = min(pos.trailing_ref_price, current_price)
 
                 if pos.trailing_stop_active:
-                    new_stop_price = pos.trailing_ref_price * (1 + rm_config.trailing_stop_pct)
+                    # For ATR: Stop = Low + (ATR * Multiplier)
+                    # For Pct: Stop = Low * (1 + Pct)
+                    if rm_config.use_atr_for_trailing and atr is not None and atr > 0:
+                        new_stop_price = pos.trailing_ref_price + trailing_dist
+                    else:
+                        new_stop_price = pos.trailing_ref_price * (1 + rm_config.trailing_stop_pct)
+                    
+                    # Only move stop DOWN
                     pos.stop_loss_price = min(pos.stop_loss_price, new_stop_price)
 
             if session.is_modified(pos):
-                logger.debug("Updating trailing stop", symbol=pos.symbol, new_sl=pos.stop_loss_price)
+                logger.debug("Updating trailing stop", symbol=pos.symbol, new_sl=pos.stop_loss_price, method="ATR" if (rm_config.use_atr_for_trailing and atr) else "PCT")
                 session.commit()
                 session.refresh(pos)
             
