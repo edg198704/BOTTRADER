@@ -137,16 +137,22 @@ class AIFeatureEngineeringConfig(BaseModel):
 
     # --- Quantitative Features ---
     use_volatility_estimators: bool = False # Garman-Klass Volatility
+    use_microstructure_features: bool = False # Amihud Illiquidity, Parkinson Volatility
     use_frac_diff: bool = False # Fractional Differentiation
     frac_diff_d: float = 0.4 # Differencing factor (0.0 = Raw, 1.0 = Returns)
     frac_diff_thres: float = 1e-4 # Weight cutoff for FracDiff window
 
-    # --- Market Context Features (New) ---
+    # --- Market Context Features ---
     use_leader_features: bool = False # If True, injects returns/RSI from market_leader_symbol
 
     # --- Feature Selection ---
     use_feature_selection: bool = True
     max_active_features: int = 20 # Cap the number of features fed to models to reduce noise
+    
+    # --- Scaling Method ---
+    # 'zscore': (x - mean) / std
+    # 'robust': (x - median) / IQR (Better for outliers)
+    scaling_method: Literal['zscore', 'robust'] = 'zscore'
 
 class AIPerformanceConfig(BaseModel):
     enabled: bool = True
