@@ -147,6 +147,25 @@ class AIEnsembleStrategy(TradingStrategy):
             self._training_in_progress.discard(symbol)
             asyncio.create_task(self.state.save())
 
+    def _check_technical_guardrails(self, symbol: str, df: pd.DataFrame, action: str) -> bool:
+        """
+        Deterministic safety checks to prevent AI from trading into extreme conditions.
+        """
+        if df is None or df.empty: return False
+        last_row = df.iloc[-1]
+        
+        # RSI Guardrail
+        if 'rsi' in df.columns:
+            rsi = last_row['rsi']
+            if action == 'BUY' and rsi > 85:
+                logger.info(f"Signal rejected by RSI Guardrail (Overbought: {rsi:.2f})", symbol=symbol)
+                return False
+            if action == 'SELL' and rsi < 15:
+                logger.info(f"Signal rejected by RSI Guardrail (Oversold: {rsi:.2f})", symbol=symbol)
+                return False
+                
+        return True
+
     async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[TradeSignal]:
         if not self.ensemble_learner.is_trained: return None
         
@@ -194,6 +213,10 @@ class AIEnsembleStrategy(TradingStrategy):
             elif pred.action == 'sell': final_action = 'SELL'
             
         if final_action:
+            # Apply Technical Guardrails
+            if not self._check_technical_guardrails(symbol, df, final_action):
+                return None
+
             self.state.last_signal_time[symbol] = Clock.now()
             asyncio.create_task(self.state.save())
             meta = {
