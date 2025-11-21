@@ -26,84 +26,53 @@ class EnsembleWeightsConfig(BaseModel):
     attention: float = 0.2
     auto_tune: bool = True
     use_stacking: bool = True
-    # Optimization method: 'random' or 'slsqp'
     optimization_method: str = 'slsqp'
-    # Penalize confidence if models disagree (StdDev of probs * penalty)
     disagreement_penalty: float = 0.5
-    # Optimize weights per regime (Bull, Bear, Sideways, Volatile)
     use_regime_specific_weights: bool = True
-    
-    # --- Dynamic Weighting (New) ---
-    # Adjusts weights in real-time based on recent performance (last N candles)
     use_dynamic_weighting: bool = True
     dynamic_window: int = 25
-    dynamic_smoothing_factor: float = 0.1 # EMA smoothing for weights
-    
-    # --- Online Learning (New) ---
-    # Learning rate for adjusting weights based on realized trade PnL
+    dynamic_smoothing_factor: float = 0.1
     adaptive_weight_learning_rate: float = 0.05
 
 class MetaLabelingConfig(BaseModel):
     enabled: bool = True
-    # Minimum probability from Meta-Model to accept a trade
-    probability_threshold: float = 0.55 
-    # If True, adds the primary model's confidence score as a feature for the meta-model
+    probability_threshold: float = 0.55
     use_primary_confidence_feature: bool = True
-    # Meta-Model Hyperparameters (Random Forest)
     n_estimators: int = 100
     max_depth: int = 5
 
 class DriftDetectionConfig(BaseModel):
     enabled: bool = True
-    contamination: float = 0.05 # Expected proportion of outliers in training data
-    confidence_penalty: float = 0.2 # Subtract from confidence if anomaly detected
-    block_trade: bool = False # If True, block trade completely on anomaly
-    # --- New Lifecycle Params ---
-    max_consecutive_anomalies: int = 12 # Trigger retrain if ~1 hour of anomalies (5m candles)
+    contamination: float = 0.05
+    confidence_penalty: float = 0.2
+    block_trade: bool = False
+    max_consecutive_anomalies: int = 12
 
 class MarketRegimeConfig(BaseModel):
-    # Static Fallbacks
     trend_strength_threshold: float = 0.015
     volatility_multiplier: float = 1.5
-    
-    # Column Mappings
     trend_fast_ma_col: str = "sma_fast"
     trend_slow_ma_col: str = "sma_slow"
     volatility_col: str = "atr"
     rsi_col: str = "rsi"
-    
-    # --- ADX Filter Settings ---
     use_adx_filter: bool = False
     adx_col: str = "adx"
     adx_threshold: float = 25.0
-
-    # --- Efficiency Filter Settings ---
-    # Kaufman Efficiency Ratio (KER): Change / Volatility
     efficiency_period: int = 10
     efficiency_threshold: float = 0.3
-
-    # --- Hurst Exponent Settings (New) ---
     use_hurst_filter: bool = True
     hurst_window: int = 100
-    hurst_mean_reversion_threshold: float = 0.45 # Below this = Mean Reverting (Sideways)
-    hurst_trending_threshold: float = 0.55 # Above this = Trending
-    
-    # --- Adaptive Regime Settings ---
+    hurst_mean_reversion_threshold: float = 0.45
+    hurst_trending_threshold: float = 0.55
     use_dynamic_thresholds: bool = False
     dynamic_window: int = 500
-    trend_percentile: float = 0.75 # Top 25% of absolute trend values define a trend
-    volatility_percentile: float = 0.80 # Top 20% of volatility values define volatile regime
-    
-    # --- Stability Settings ---
-    regime_confirmation_window: int = 3 # Number of candles to look back for regime voting
-
-    # --- Dynamic Confidence Thresholds (Entry) ---
+    trend_percentile: float = 0.75
+    volatility_percentile: float = 0.80
+    regime_confirmation_window: int = 3
     bull_confidence_threshold: Optional[float] = None
     bear_confidence_threshold: Optional[float] = None
     volatile_confidence_threshold: Optional[float] = None
     sideways_confidence_threshold: Optional[float] = None
-
-    # --- Dynamic Confidence Thresholds (Exit) ---
     bull_exit_threshold: Optional[float] = None
     bear_exit_threshold: Optional[float] = None
     volatile_exit_threshold: Optional[float] = None
@@ -115,33 +84,18 @@ class AITrainingConfig(BaseModel):
     learning_rate: float = 0.001
     early_stopping_patience: int = 5
     validation_split: float = Field(0.15, ge=0.0, lt=1.0)
-    cv_splits: int = 5 # Number of folds for Walk-Forward Validation
+    cv_splits: int = 5
     min_precision_threshold: float = Field(0.5, ge=0.0, le=1.0)
-    # --- Profitability Gates ---
-    min_profit_factor: float = 1.05 # Require positive expectancy (Gross Profit / Gross Loss)
-    min_sharpe_ratio: float = 0.05 # Require slightly positive risk-adjusted return
-    min_improvement_pct: float = 0.02 # Require 2% improvement over previous model to replace it
-    
-    # --- Advanced Validation ---
-    use_probabilistic_sharpe: bool = True # Use PSR instead of raw Sharpe for selection
-    purge_overlap: bool = True # Drop samples between Train/Test that overlap via label horizon
-
-    # --- Hyperparameter Optimization ---
+    min_profit_factor: float = 1.05
+    min_sharpe_ratio: float = 0.05
+    min_improvement_pct: float = 0.02
+    use_probabilistic_sharpe: bool = True
+    purge_overlap: bool = True
     auto_tune_models: bool = False
     n_iter_search: int = 10
-    # --- Data Handling ---
     use_class_weighting: bool = True
-    # Sample Weighting Mode: 
-    # 'balanced': Inverse class frequency
-    # 'return_based': Weight = |LogReturn|
-    # 'hybrid': Weight = Balanced * |LogReturn|
     sample_weighting_mode: Literal['balanced', 'return_based', 'hybrid', 'none'] = 'balanced'
-    
-    # Calibration method: 'isotonic', 'sigmoid', or 'none'
     calibration_method: str = 'isotonic'
-    
-    # --- Threshold Optimization (New) ---
-    # If True, finds the optimal confidence threshold on validation data that maximizes Sharpe/PF
     optimize_entry_threshold: bool = True
 
 class AILSTMConfig(BaseModel):
@@ -165,41 +119,30 @@ class AIFeatureEngineeringConfig(BaseModel):
     use_triple_barrier: bool = False
     triple_barrier_tp_multiplier: float = 2.0
     triple_barrier_sl_multiplier: float = 2.0
+    lag_features: List[str] = []
+    lag_depth: int = 0
+    use_time_features: bool = False
+    use_price_action_features: bool = False
+    use_volatility_estimators: bool = False
+    use_microstructure_features: bool = False
+    use_frac_diff: bool = False
+    frac_diff_d: float = 0.4
+    frac_diff_thres: float = 1e-4
+    use_leader_features: bool = False
     
-    # --- Temporal Features ---
-    lag_features: List[str] = [] # List of column names to generate lags for
-    lag_depth: int = 0 # Number of past periods to include as features
-
-    # --- Advanced Features ---
-    use_time_features: bool = False # Cyclical encoding of Hour/Day
-    use_price_action_features: bool = False # Candle body/wick ratios
-
-    # --- Quantitative Features ---
-    use_volatility_estimators: bool = False # Garman-Klass Volatility
-    use_microstructure_features: bool = False # Amihud Illiquidity, Parkinson Volatility
-    use_frac_diff: bool = False # Fractional Differentiation
-    frac_diff_d: float = 0.4 # Differencing factor (0.0 = Raw, 1.0 = Returns)
-    frac_diff_thres: float = 1e-4 # Weight cutoff for FracDiff window
-
-    # --- Market Context Features ---
-    use_leader_features: bool = False # If True, injects returns/RSI from market_leader_symbol
-
-    # --- Feature Selection ---
+    # --- Order Book Features (New) ---
+    use_order_book_features: bool = False
+    
     use_feature_selection: bool = True
-    max_active_features: int = 20 # Cap the number of features fed to models to reduce noise
-    
-    # --- Scaling Method ---
-    # 'zscore': (x - mean) / std
-    # 'robust': (x - median) / IQR (Better for outliers)
+    max_active_features: int = 20
     scaling_method: Literal['zscore', 'robust'] = 'zscore'
 
 class AIPerformanceConfig(BaseModel):
     enabled: bool = True
     window_size: int = 50
     min_accuracy: float = 0.45
-    # --- New Lifecycle Params ---
     auto_rollback: bool = True
-    critical_accuracy_threshold: float = 0.30 # If accuracy drops below this, rollback immediately
+    critical_accuracy_threshold: float = 0.30
 
 class AIHyperparameters(BaseModel):
     xgboost: XGBoostConfig = XGBoostConfig()
@@ -227,10 +170,7 @@ class AIEnsembleStrategyParams(StrategyParamsBase):
     training_data_limit: int = 5000
     signal_cooldown_candles: int = 1
     inference_workers: int = 2
-    
-    # --- Market Context ---
-    market_leader_symbol: Optional[str] = "BTC/USDT" # Symbol to use as global market context
-
+    market_leader_symbol: Optional[str] = "BTC/USDT"
     features: AIFeatureEngineeringConfig
     training: AITrainingConfig = AITrainingConfig()
     hyperparameters: AIHyperparameters = AIHyperparameters()
@@ -253,38 +193,36 @@ class ExchangeConfig(BaseModel):
     retry: RetryConfig
     api_key: Optional[SecretStr] = Field(None, env="BOT_EXCHANGE_API_KEY")
     api_secret: Optional[SecretStr] = Field(None, env="BOT_EXCHANGE_API_SECRET")
-    # Fees for estimation if not returned by exchange
-    maker_fee_pct: float = 0.001 # 0.1%
-    taker_fee_pct: float = 0.001 # 0.1%
+    maker_fee_pct: float = 0.001
+    taker_fee_pct: float = 0.001
 
 class ExecutionConfig(BaseModel):
     default_order_type: str
-    # Offset Type: 'FIXED' (Percentage) or 'ATR' (Volatility Based)
     limit_offset_type: Literal['FIXED', 'ATR'] = 'FIXED'
     limit_price_offset_pct: float
     limit_offset_atr_multiplier: float = 1.0
-    
     order_fill_timeout_seconds: int
     use_order_chasing: bool
     chase_interval_seconds: int
     max_chase_attempts: int
     chase_aggressiveness_pct: float
-    max_chase_slippage_pct: float = 0.02 # Max 2% deviation from initial price during chase
+    max_chase_slippage_pct: float = 0.02
     execute_on_timeout: bool
-    
-    # --- New Execution Params ---
-    post_only: bool = False # If True, forces LIMIT orders to be Maker-only
-    max_entry_spread_pct: float = 0.001 # Max 0.1% spread allowed for entry. Abort if higher.
+    post_only: bool = False
+    max_entry_spread_pct: float = 0.001
 
 class DataHandlerConfig(BaseModel):
     history_limit: int
     update_interval_multiplier: float
+    ticker_update_interval_seconds: float = 2.0
+    # --- Order Book Settings (New) ---
+    order_book_depth: int = 20
 
 class StrategyConfig(BaseModel):
     symbols: List[str]
     interval_seconds: int
     timeframe: str
-    secondary_timeframes: List[str] = [] # List of higher timeframes (e.g., ['1h', '4h'])
+    secondary_timeframes: List[str] = []
     indicators: List[Dict[str, Any]]
     params: Union[AIEnsembleStrategyParams, SimpleMACrossoverStrategyParams] = Field(..., discriminator='name')
 
@@ -312,15 +250,13 @@ class CorrelationConfig(BaseModel):
 
 class BreakevenConfig(BaseModel):
     enabled: bool = False
-    activation_pct: float = 0.015 # 1.5% profit triggers BE
-    buffer_pct: float = 0.001 # Lock in 0.1% profit to cover fees
+    activation_pct: float = 0.015
+    buffer_pct: float = 0.001
 
 class RiskManagementConfig(BaseModel):
     max_position_size_usd: float
-    # Cap position size as a percentage of total portfolio equity
-    max_position_size_portfolio_pct: float = 1.0 
-    # Cap total portfolio risk (Sum of Open Risk) as a percentage of equity
-    max_portfolio_risk_pct: float = 0.05 # Default 5% total capital at risk
+    max_position_size_portfolio_pct: float = 1.0
+    max_portfolio_risk_pct: float = 0.05
     max_daily_loss_usd: float
     max_open_positions: int
     circuit_breaker_threshold: float
@@ -332,39 +268,23 @@ class RiskManagementConfig(BaseModel):
     reward_to_risk_ratio: float
     trailing_stop_activation_pct: float
     trailing_stop_pct: float
-    
-    # --- Stop Loss Type ---
-    # 'ATR': Volatility based (Entry +/- ATR * Multiplier)
-    # 'SWING': Structural (Recent Low/High +/- Buffer)
     stop_loss_type: Literal["ATR", "SWING"] = "ATR"
-    swing_lookback: int = 20 # Number of candles to look back for Swing High/Low
-    swing_buffer_atr_multiplier: float = 1.0 # Buffer added to Swing point (in ATR units)
-
-    # --- ATR Trailing Stop ---
+    swing_lookback: int = 20
+    swing_buffer_atr_multiplier: float = 1.0
     use_atr_for_trailing: bool = False
     atr_trailing_multiplier: float = 2.0
     atr_column_name: str = "atr"
-    
-    # --- Confidence-Based Sizing ---
     confidence_scaling_factor: float = 0.0
     max_confidence_risk_multiplier: float = 1.0
-    
-    # --- Confidence-Based Reward Targeting ---
     confidence_rr_scaling_factor: float = 0.0
     max_confidence_rr_multiplier: float = 1.5
-
-    # --- Kelly Criterion Sizing ---
     use_kelly_criterion: bool = False
-    kelly_fraction: float = 0.5 # Half-Kelly by default for safety
-
-    # --- Liquidity Constraints ---
-    max_volume_participation_pct: float = 0.01 # Limit trade to 1% of recent volume
+    kelly_fraction: float = 0.5
+    max_volume_participation_pct: float = 0.01
     volume_lookback_periods: int = 20
-
-    # --- Symbol Specific Risk (New) ---
-    max_consecutive_losses: int = 3 # Halt trading symbol after 3 losses in a row
-    consecutive_loss_cooldown_minutes: int = 60 # Cooldown duration
-
+    max_consecutive_losses: int = 3
+    consecutive_loss_cooldown_minutes: int = 60
+    monitor_interval_seconds: float = 2.0
     regime_based_risk: RegimeBasedRiskConfig
     time_based_exit: TimeBasedExitConfig = TimeBasedExitConfig()
     correlation: CorrelationConfig = CorrelationConfig()
@@ -385,23 +305,19 @@ class LoggingConfig(BaseModel):
 class BacktestConfig(BaseModel):
     enabled: bool = False
     initial_balance: float = 10000.0
-    maker_fee_pct: float = 0.001 # 0.1%
-    taker_fee_pct: float = 0.001 # 0.1%
-    slippage_pct: float = 0.0005 # 0.05% 
+    maker_fee_pct: float = 0.001
+    taker_fee_pct: float = 0.001
+    slippage_pct: float = 0.0005
     model_path: str = "backtest_models"
 
 class ExecutionOptimizerConfig(BaseModel):
     enabled: bool = True
-    target_fill_rate: float = 0.90 # Aim for 90% fill rate on entries
-    max_slippage_tolerance: float = 0.001 # 0.1% max acceptable slippage
-    
-    # Adjustment Steps
-    offset_adjustment_step: float = 0.0001 # 0.01% step
-    chase_adjustment_step: float = 0.0001 # 0.01% step
-    
-    # Bounds
-    min_limit_offset: float = -0.001 # Can go slightly negative (aggressive)
-    max_limit_offset: float = 0.005 # 0.5% max passive
+    target_fill_rate: float = 0.90
+    max_slippage_tolerance: float = 0.001
+    offset_adjustment_step: float = 0.0001
+    chase_adjustment_step: float = 0.0001
+    min_limit_offset: float = -0.001
+    max_limit_offset: float = 0.005
     min_chase_aggro: float = 0.0
     max_chase_aggro: float = 0.005
 
@@ -411,37 +327,23 @@ class OptimizerConfig(BaseModel):
     lookback_trades: int = 100
     min_trades_for_adjustment: int = 10
     state_file_path: str = "optimizer_state.json"
-    
-    # --- Performance Targets ---
     min_profit_factor: float = 1.0
     high_performance_pf: float = 1.5
-    
-    # --- Confidence Optimization ---
     adjustment_step: float = 0.02
     max_threshold_cap: float = 0.90
     min_threshold_floor: float = 0.55
-    
-    # --- Risk Parameter Optimization ---
     optimize_risk_params: bool = True
-    risk_adjustment_step: float = 0.1 # Step for R:R and ATR Multiplier
-    
-    # --- Risk Sizing Optimization ---
+    risk_adjustment_step: float = 0.1
     optimize_risk_sizing: bool = True
-    target_kelly_fraction: float = 0.25 # Conservative default (Quarter Kelly)
-    min_risk_pct: float = 0.005 # 0.5% floor
-    max_risk_pct: float = 0.05 # 5% cap
-    risk_size_step: float = 0.0025 # 0.25% step adjustment
-
-    # Bounds
+    target_kelly_fraction: float = 0.25
+    min_risk_pct: float = 0.005
+    max_risk_pct: float = 0.05
+    risk_size_step: float = 0.0025
     min_reward_to_risk: float = 1.0
     max_reward_to_risk: float = 3.0
     min_atr_multiplier: float = 1.5
     max_atr_multiplier: float = 4.0
-
-    # --- Execution Optimization ---
     execution: ExecutionOptimizerConfig = ExecutionOptimizerConfig()
-
-# --- Top-Level Bot Config ---
 
 class BotConfig(BaseModel):
     initial_capital: float
