@@ -15,6 +15,7 @@ from bot_core.config import AIEnsembleStrategyParams
 from bot_core.ai.models import LSTMPredictor, AttentionNetwork
 from bot_core.ai.feature_processor import FeatureProcessor
 from bot_core.ai.regime_detector import MarketRegimeDetector
+from bot_core.common import AIInferenceResult
 
 # ML Imports with safe fallbacks
 try:
@@ -519,10 +520,10 @@ class EnsembleLearner:
 
         return votes, model_predictions, individual_preds
 
-    def _predict_sync(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None, leader_df: Optional[pd.DataFrame] = None, custom_weights: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+    def _predict_sync(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None, leader_df: Optional[pd.DataFrame] = None, custom_weights: Optional[Dict[str, float]] = None) -> AIInferenceResult:
         entry = self.symbol_models.get(symbol)
         if not entry:
-            return {}
+            return AIInferenceResult(action='hold', confidence=0.0, model_version='none', active_weights={}, top_features={}, metrics={})
 
         models = entry['models']
         meta = entry['meta']
@@ -534,7 +535,7 @@ class EnsembleLearner:
             # 1. Feature Preparation
             X, X_seq, active_features = self._prepare_features(df, symbol, leader_df)
             if X is None:
-                return {}
+                return AIInferenceResult(action='hold', confidence=0.0, model_version='none', active_weights={}, top_features={}, metrics={})
 
             # 2. Drift Detection
             is_anomaly = False
@@ -568,7 +569,7 @@ class EnsembleLearner:
                 for k in votes:
                     votes[k] /= total_weight
             else:
-                return {'action': 'hold', 'confidence': 0.0}
+                return AIInferenceResult(action='hold', confidence=0.0, model_version=meta['timestamp'], active_weights={}, top_features={}, metrics={})
 
             # 5. Calibration
             if calibrator:
@@ -628,29 +629,37 @@ class EnsembleLearner:
             if regime and regime in regime_thresholds:
                 optimized_threshold = regime_thresholds[regime]
 
-            return {
-                'action': best_action,
-                'confidence': round(confidence, 4),
-                'model_version': meta['timestamp'],
-                'active_weights': votes,
-                'top_features': top_features,
-                'metrics': meta.get('metrics', {}),
-                'optimized_weights': active_weight_map if active_weight_map else None,
-                'is_anomaly': is_anomaly,
-                'anomaly_score': float(anomaly_score),
-                'optimized_threshold': optimized_threshold,
-                'individual_predictions': individual_preds,
-                'meta_probability': float(meta_prob) if meta_prob is not None else None
-            }
+            # Convert numpy arrays in individual_preds to lists for Pydantic serialization
+            serializable_preds = {}
+            for k, v in individual_preds.items():
+                if isinstance(v, np.ndarray):
+                    serializable_preds[k] = v.tolist()
+                else:
+                    serializable_preds[k] = v
+
+            return AIInferenceResult(
+                action=best_action,
+                confidence=round(confidence, 4),
+                model_version=meta['timestamp'],
+                active_weights=votes,
+                top_features=top_features,
+                metrics=meta.get('metrics', {}),
+                optimized_weights=active_weight_map if active_weight_map else None,
+                is_anomaly=is_anomaly,
+                anomaly_score=float(anomaly_score),
+                optimized_threshold=optimized_threshold,
+                individual_predictions=serializable_preds,
+                meta_probability=float(meta_prob) if meta_prob is not None else None
+            )
         except Exception as e:
             logger.error(f"Critical inference error for {symbol}: {e}", exc_info=True)
-            return {'action': 'hold', 'confidence': 0.0}
+            return AIInferenceResult(action='hold', confidence=0.0, model_version='error', active_weights={}, top_features={}, metrics={})
 
-    async def predict(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None, leader_df: Optional[pd.DataFrame] = None, custom_weights: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+    async def predict(self, df: pd.DataFrame, symbol: str, regime: Optional[str] = None, leader_df: Optional[pd.DataFrame] = None, custom_weights: Optional[Dict[str, float]] = None) -> AIInferenceResult:
         if symbol not in self.symbol_models:
             await self.reload_models(symbol)
             if symbol not in self.symbol_models:
-                return {}
+                return AIInferenceResult(action='hold', confidence=0.0, model_version='none', active_weights={}, top_features={}, metrics={})
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self.executor, self._predict_sync, df, symbol, regime, leader_df, custom_weights)
