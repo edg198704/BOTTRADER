@@ -97,7 +97,8 @@ class TradeExecutor:
 
         # 2. Risk Gatekeeper
         active_positions = await self.position_manager.get_all_active_positions()
-        allowed, reason = self.risk_manager.validate_entry(symbol, active_positions)
+        # Await the async risk check (which might save state)
+        allowed, reason = await self.risk_manager.validate_entry(symbol, active_positions)
         if not allowed:
             logger.info("Entry rejected by Risk Manager.", symbol=symbol, reason=reason)
             return None
@@ -291,7 +292,8 @@ class TradeExecutor:
                 if final_state['filled'] >= (position.quantity * 0.99):
                     closed_pos = await self.position_manager.close_position(position.symbol, avg_price, reason, actual_filled_qty=final_state['filled'], fees=fees)
                     if closed_pos:
-                        self.risk_manager.update_trade_outcome(closed_pos.symbol, closed_pos.pnl)
+                        # Await the async update
+                        await self.risk_manager.update_trade_outcome(closed_pos.symbol, closed_pos.pnl)
                 else:
                     await self.position_manager.reduce_position(position.symbol, final_state['filled'], avg_price, reason, fees=fees)
             else:
