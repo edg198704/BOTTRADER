@@ -17,20 +17,9 @@ from bot_core.ai.regime_detector import MarketRegimeDetector
 from bot_core.ai.feature_processor import FeatureProcessor
 from bot_core.position_manager import Position
 from bot_core.utils import Clock, AtomicJsonStore
+from bot_core.common import TradeSignal, AIInferenceResult
 
 logger = get_logger(__name__)
-
-class TradeSignal(BaseModel):
-    """
-    A standardized signal object enforcing type safety across the trading pipeline.
-    """
-    symbol: str
-    action: Literal['BUY', 'SELL']
-    regime: Optional[str] = None
-    confidence: float = 0.0
-    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    strategy_name: str
-    metadata: Dict[str, Any] = {}
 
 class StrategyStateManager:
     """
@@ -88,6 +77,11 @@ class StrategyStateManager:
                 self.model_performance_stats[k] = {m: deque(d, maxlen=window) for m, d in v.items()}
 
     def save(self):
+        def _serialize_pred(p):
+            if isinstance(p, np.ndarray): return p.tolist()
+            if isinstance(p, list): return p
+            return float(p)
+
         state = {
             'last_retrained_at': {k: v.isoformat() for k, v in self.last_retrained_at.items()},
             'last_signal_time': {k: v.isoformat() for k, v in self.last_signal_time.items()},
@@ -96,7 +90,7 @@ class StrategyStateManager:
             'accuracy_history': {k: list(v) for k, v in self.accuracy_history.items()},
             'prediction_logs': {k: [(ts.isoformat(), int(p)) for ts, p in v] for k, v in self.prediction_logs.items()},
             'individual_model_logs': {
-                k: [(ts.isoformat(), {m: p.tolist() if isinstance(p, np.ndarray) else float(p) for m, p in preds.items()}) 
+                k: [(ts.isoformat(), {m: _serialize_pred(p) for m, p in preds.items()}) 
                     for ts, preds in v[-50:]] 
                 for k, v in self.individual_model_logs.items()
             },
@@ -193,7 +187,7 @@ class AIEnsembleStrategy(TradingStrategy):
         self.ai_config = config
         self.state = StrategyStateManager(config)
         
-        try:
+        try: # Lazy import to avoid circular dependency issues during init if not used
             self.ensemble_learner = EnsembleLearner(self.ai_config)
             self.regime_detector = MarketRegimeDetector(self.ai_config)
             logger.info("AIEnsembleStrategy initialized")
@@ -261,11 +255,14 @@ class AIEnsembleStrategy(TradingStrategy):
             leader_df = self.data_fetcher.get_market_data(self.ai_config.market_leader_symbol)
 
         dynamic_weights = self._calculate_dynamic_weights(symbol)
-        prediction = await self.ensemble_learner.predict(df_enriched, symbol, regime=regime, leader_df=leader_df, custom_weights=dynamic_weights)
+        prediction: AIInferenceResult = await self.ensemble_learner.predict(df_enriched, symbol, regime=regime, leader_df=leader_df, custom_weights=dynamic_weights)
         
-        action = prediction.get('action')
-        confidence = prediction.get('confidence', 0.0)
-        is_anomaly = prediction.get('is_anomaly', False)
+        if not prediction.action: # Empty result
+            return None
+
+        action = prediction.action
+        confidence = prediction.confidence
+        is_anomaly = prediction.is_anomaly
 
         # 7. Drift Handling
         if is_anomaly:
@@ -281,8 +278,8 @@ class AIEnsembleStrategy(TradingStrategy):
             self.state.drift_counters[symbol] = 0
 
         # 8. Log Prediction
-        if self.ai_config.performance.enabled and action:
-            self.state.log_prediction(symbol, df.index[-1], action, prediction.get('individual_predictions'))
+        if self.ai_config.performance.enabled and action != 'hold':
+            self.state.log_prediction(symbol, df.index[-1], action, prediction.individual_predictions)
 
         # 9. Threshold Check
         is_exit = False
@@ -290,7 +287,7 @@ class AIEnsembleStrategy(TradingStrategy):
             if (position.side == 'BUY' and action == 'sell') or (position.side == 'SELL' and action == 'buy'):
                 is_exit = True
         
-        required_threshold = self._get_confidence_threshold(regime, is_exit, optimized_base=prediction.get('optimized_threshold'))
+        required_threshold = self._get_confidence_threshold(regime, is_exit, optimized_base=prediction.optimized_threshold)
         if confidence < required_threshold:
             return None
 
@@ -308,17 +305,16 @@ class AIEnsembleStrategy(TradingStrategy):
             self.state.save()
             
             strategy_metadata = {
-                'model_version': prediction.get('model_version'),
+                'model_version': prediction.model_version,
                 'confidence': float(confidence),
                 'effective_threshold': float(required_threshold),
                 'regime': regime,
                 'regime_confidence': float(regime_result.get('confidence', 0.0)),
-                'model_type': prediction.get('model_type'),
-                'active_weights': {k: float(v) for k, v in prediction.get('active_weights', {}).items()},
-                'top_features': {k: float(v) for k, v in prediction.get('top_features', {}).items()},
-                'metrics': prediction.get('metrics'),
+                'active_weights': {k: float(v) for k, v in prediction.active_weights.items()},
+                'top_features': {k: float(v) for k, v in prediction.top_features.items()},
+                'metrics': prediction.metrics,
                 'is_anomaly': is_anomaly,
-                'optimized_threshold': float(prediction.get('optimized_threshold')) if prediction.get('optimized_threshold') else None
+                'optimized_threshold': float(prediction.optimized_threshold) if prediction.optimized_threshold else None
             }
 
             logger.info(f"AI Signal: {final_action} {symbol} (Conf: {confidence:.2f} | Regime: {regime})")
