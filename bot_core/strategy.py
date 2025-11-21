@@ -177,6 +177,12 @@ class AIEnsembleStrategy(TradingStrategy):
             
         if pred.confidence < threshold: return None
 
+        # Meta-Model Check (Double Confirmation)
+        # If meta_probability is available and low, we might want to skip even if base confidence is high
+        if pred.meta_probability is not None and pred.meta_probability < self.ai_config.meta_labeling.probability_threshold:
+            logger.info(f"Signal rejected by Meta-Model for {symbol}", meta_prob=pred.meta_probability)
+            return None
+
         # Signal Generation
         final_action = None
         if position:
@@ -191,7 +197,8 @@ class AIEnsembleStrategy(TradingStrategy):
             asyncio.create_task(self.state.save())
             meta = {
                 'model_version': pred.model_version, 'confidence': pred.confidence, 
-                'regime': regime, 'metrics': pred.metrics, 'effective_threshold': threshold
+                'regime': regime, 'metrics': pred.metrics, 'effective_threshold': threshold,
+                'meta_prob': pred.meta_probability
             }
             return TradeSignal(symbol=symbol, action=final_action, regime=regime, confidence=pred.confidence, strategy_name=self.config.name, metadata=meta)
         return None
