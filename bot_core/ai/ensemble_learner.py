@@ -108,6 +108,14 @@ def _create_fresh_models(config: AIEnsembleStrategyParams, num_features: int, de
     }
 
     if ML_AVAILABLE and torch.cuda.is_available():
+        # Initialize on GPU if available, but move to CPU before saving
+        models['lstm'] = LSTMPredictor(
+            num_features, lstm_config.hidden_dim, lstm_config.num_layers, lstm_config.dropout
+        ).to(device)
+        models['attention'] = AttentionNetwork(
+            num_features, attn_config.hidden_dim, attn_config.num_layers, attn_config.nhead, attn_config.dropout
+        ).to(device)
+    elif ML_AVAILABLE:
         models['lstm'] = LSTMPredictor(
             num_features, lstm_config.hidden_dim, lstm_config.num_layers, lstm_config.dropout
         ).to(device)
@@ -201,6 +209,9 @@ def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.nd
             res = minimize(loss_func, x0, method='SLSQP', bounds=bounds, constraints=constraints, tol=1e-4)
             if res.success:
                 optimized_w = res.x / np.sum(res.x)
+                # Ensure non-negative and sum to 1 (numerical stability)
+                optimized_w = np.maximum(optimized_w, 0)
+                optimized_w /= optimized_w.sum()
                 best_weights = {name: float(optimized_w[i]) for i, name in enumerate(model_names)}
                 return best_weights
         except Exception:
@@ -226,12 +237,22 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         # Align features and labels
         common_index = df_proc.index.intersection(labels.index)
         if len(common_index) < 200:
+            with open("training_errors.log", "a") as f:
+                f.write(f"{datetime.now()} - Insufficient data for {symbol}: {len(common_index)} rows\n")
             return False
             
         X = df_proc.loc[common_index].values
         y = labels.loc[common_index].values.astype(int)
         
         X = InputSanitizer.sanitize(X)
+
+        # CRITICAL: Check for class diversity. 
+        # If the market has been flat, we might only have 'HOLD' labels.
+        unique_classes = np.unique(y)
+        if len(unique_classes) < 2:
+            with open("training_errors.log", "a") as f:
+                f.write(f"{datetime.now()} - Single class detected for {symbol} (Classes: {unique_classes}). Aborting training.\n")
+            return False
         
         # 2. Walk-Forward Split (Last 20% for Validation/Optimization)
         split_idx = int(len(X) * (1 - config.training.validation_split))
@@ -244,7 +265,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         X_val_seq, y_val_seq = FeatureProcessor.create_sequences(X_val, y_val, seq_len)
 
         # 3. Model Initialization
-        device = torch.device("cpu") # Force CPU for background process to avoid CUDA context issues
+        # Force CPU for background process to avoid CUDA context issues during multiprocessing
+        device = torch.device("cpu") 
         num_features = X.shape[1]
         models = _create_fresh_models(config, num_features, device)
         
@@ -259,6 +281,13 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         class_weights = None
         if config.training.use_class_weighting:
             counts = np.bincount(y_train)
+            # Handle missing classes in bincount if any
+            if len(counts) < 3:
+                # Pad counts to length 3 (Sell, Hold, Buy)
+                padded_counts = np.zeros(3)
+                padded_counts[:len(counts)] = counts
+                counts = padded_counts
+            
             weights = 1.0 / (counts + 1e-6)
             class_weights = torch.FloatTensor(weights / weights.sum()).to(device)
 
@@ -280,7 +309,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
                 # Pad predictions to match X_val length (sequences consume start data)
                 pad_len = len(X_val) - len(X_val_seq)
                 probs = F.softmax(logits, dim=1).numpy()
-                # Simple padding: repeat first prediction (suboptimal but keeps shapes aligned for weight opt)
+                # Simple padding: repeat first prediction
                 pad_arr = np.tile(probs[0], (pad_len, 1))
                 val_preds['lstm'] = np.vstack([pad_arr, probs])
 
@@ -307,7 +336,6 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         best_threshold = config.confidence_threshold
         best_score = -float('inf')
         
-        # Simple grid search for threshold
         if config.training.optimize_entry_threshold:
             returns = df['close'].pct_change().loc[common_index].values[split_idx:]
             # Handle length mismatch due to sequence generation or alignment
@@ -362,8 +390,11 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             joblib.dump(drift_detector, os.path.join(save_dir, "drift_detector.joblib"))
             
         if 'lstm' in models:
+            # Move to CPU before saving to ensure portability
+            models['lstm'].to('cpu')
             torch.save(models['lstm'].state_dict(), os.path.join(save_dir, "lstm.pth"))
         if 'attention' in models:
+            models['attention'].to('cpu')
             torch.save(models['attention'].state_dict(), os.path.join(save_dir, "attention.pth"))
             
         return True
