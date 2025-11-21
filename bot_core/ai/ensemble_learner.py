@@ -183,7 +183,6 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
         meta_metrics = {}
         if config.meta_labeling.enabled:
             # Construct Meta-Features: [Base_Probs (3 per model), Volatility, Trend]
-            # We extract Volatility and Trend from X_val if they exist in active_feats
             meta_feats_list = []
             for k in keys:
                 meta_feats_list.append(val_preds[k])
@@ -200,9 +199,6 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             ensemble_probs = sum(opt_weights[k] * val_preds[k] for k in keys)
             ensemble_preds = np.argmax(ensemble_probs, axis=1)
             
-            # Logic: If model said BUY (2) and y was BUY (2), Meta=1. 
-            # If model said SELL (0) and y was SELL (0), Meta=1.
-            # Else Meta=0.
             y_meta = np.zeros_like(y_val)
             y_meta[(ensemble_preds == 2) & (y_val == 2)] = 1
             y_meta[(ensemble_preds == 0) & (y_val == 0)] = 1
@@ -362,39 +358,79 @@ class EnsembleLearner:
         # 2. Meta-Model Filtering
         meta_prob = 1.0
         if 'meta' in models and self.config.meta_labeling.enabled:
-            # Reconstruct Meta-Features: [Base_Probs, Volatility, Trend]
             meta_feats_list = []
-            # Order must match training loop: gb, technical, lstm, attention
-            # We iterate keys from weights to ensure consistency if possible, but safer to use fixed list if known
-            # Here we rely on the fact that ind_preds contains all active models
-            # NOTE: This requires deterministic ordering. We use the keys from ind_preds sorted.
             sorted_keys = sorted(ind_preds.keys())
             for k in sorted_keys:
                 meta_feats_list.append(np.array(ind_preds[k]).reshape(1, -1))
             
-            # Add regime features
             regime_cols = ['regime_volatility', 'regime_trend']
             regime_indices = [feats.index(c) for c in regime_cols if c in feats]
             if regime_indices:
                 meta_feats_list.append(X[:, regime_indices])
             
             X_meta = np.hstack(meta_feats_list)
-            
-            # Predict: Class 1 = Trade Success
             meta_prob = models['meta'].predict_proba(X_meta)[0, 1]
             
-            # If Meta-Model is unsure (prob < threshold), we penalize the base confidence
             if meta_prob < self.config.meta_labeling.probability_threshold:
-                base_confidence *= 0.5 # Heavy penalty
+                base_confidence *= 0.5 
 
         return AIInferenceResult(
             action=best_action, 
             confidence=base_confidence, 
             model_version=meta['timestamp'], 
-            active_weights=votes, 
+            active_weights=weights, 
             top_features={}, 
             metrics=meta['metrics'], 
             optimized_threshold=meta.get('optimized_threshold'), 
             individual_predictions=ind_preds,
             meta_probability=meta_prob
         )
+
+    def update_weights(self, symbol: str, trade_pnl: float, individual_predictions: Dict[str, List[float]], side: str):
+        """
+        Online Learning: Adjusts ensemble weights based on the realized outcome of a trade.
+        """
+        if symbol not in self.symbol_models or not individual_predictions:
+            return
+
+        entry = self.symbol_models[symbol]
+        current_weights = entry['meta']['optimized_weights']
+        learning_rate = self.config.ensemble_weights.adaptive_weight_learning_rate
+
+        # Determine target vector based on outcome
+        # 0: Sell, 1: Hold, 2: Buy
+        if side == 'BUY':
+            target_idx = 2 if trade_pnl > 0 else 0 # If profitable buy, target was Buy. If loss, target was Sell.
+        else: # SELL
+            target_idx = 0 if trade_pnl > 0 else 2
+
+        new_weights = current_weights.copy()
+        total_weight = 0.0
+
+        for model_name, probs in individual_predictions.items():
+            if model_name not in current_weights: continue
+            
+            # Calculate error: (1 - prob_of_correct_class)
+            # If model predicted correct class with 0.9, error is 0.1. 
+            # If model predicted correct class with 0.2, error is 0.8.
+            prob_correct = probs[target_idx]
+            
+            # Simple Gradient-like update: Weight += LR * (Prob - 0.5)
+            # If Prob > 0.5 (confident & correct), increase weight.
+            # If Prob < 0.5 (unconfident or wrong), decrease weight.
+            adjustment = learning_rate * (prob_correct - 0.5)
+            
+            # Apply adjustment
+            w = current_weights[model_name] + adjustment
+            w = max(0.01, min(w, 1.0)) # Clamp
+            new_weights[model_name] = w
+            total_weight += w
+
+        # Normalize
+        if total_weight > 0:
+            for k in new_weights:
+                new_weights[k] /= total_weight
+
+        # Update state
+        entry['meta']['optimized_weights'] = new_weights
+        logger.info(f"Updated ensemble weights for {symbol}", weights=new_weights, pnl=trade_pnl)
