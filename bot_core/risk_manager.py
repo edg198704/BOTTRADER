@@ -1,6 +1,5 @@
+from abc import ABC, abstractmethod
 from typing import List, Optional, Any, Dict, TYPE_CHECKING, Tuple
-import json
-import os
 from datetime import datetime, timedelta
 
 from bot_core.config import RiskManagementConfig
@@ -15,11 +14,156 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+# --- Risk Rules (Chain of Responsibility) ---
+
+class RiskRule(ABC):
+    @abstractmethod
+    async def check(self, symbol: str, open_positions: List[Position], context: 'RiskManager') -> Tuple[bool, str]:
+        pass
+
+class CircuitBreakerRule(RiskRule):
+    async def check(self, symbol: str, open_positions: List[Position], context: 'RiskManager') -> Tuple[bool, str]:
+        if context.circuit_breaker_halted:
+            return False, "Circuit Breaker Active"
+        if context.daily_loss_halted:
+            return False, "Max Daily Loss Reached"
+        return True, "OK"
+
+class CooldownRule(RiskRule):
+    async def check(self, symbol: str, open_positions: List[Position], context: 'RiskManager') -> Tuple[bool, str]:
+        if symbol in context.symbol_cooldowns:
+            if Clock.now() < context.symbol_cooldowns[symbol]:
+                return False, f"Cooldown active until {context.symbol_cooldowns[symbol]}"
+            else:
+                # Cooldown expired, clear it
+                del context.symbol_cooldowns[symbol]
+                context.symbol_consecutive_losses[symbol] = 0
+                await context._save_symbol_state(symbol)
+        return True, "OK"
+
+class MaxPositionsRule(RiskRule):
+    async def check(self, symbol: str, open_positions: List[Position], context: 'RiskManager') -> Tuple[bool, str]:
+        if len(open_positions) >= context.config.max_open_positions:
+            return False, "Max open positions reached"
+        return True, "OK"
+
+class DuplicatePositionRule(RiskRule):
+    async def check(self, symbol: str, open_positions: List[Position], context: 'RiskManager') -> Tuple[bool, str]:
+        for pos in open_positions:
+            if pos.symbol == symbol:
+                return False, "Position already open"
+        return True, "OK"
+
+# --- Position Sizer Component ---
+
+class PositionSizer:
+    def __init__(self, config: RiskManagementConfig, data_handler: 'DataHandler'):
+        self.config = config
+        self.data_handler = data_handler
+
+    def calculate(self, 
+                  symbol: str, 
+                  equity: float, 
+                  entry_price: float, 
+                  stop_loss: float, 
+                  open_positions: List[Position], 
+                  regime: Optional[str],
+                  confidence: Optional[float],
+                  confidence_threshold: Optional[float],
+                  metrics: Optional[Dict]) -> float:
+        
+        if entry_price <= 0 or stop_loss <= 0: return 0.0
+        risk_per_unit = abs(entry_price - stop_loss)
+        if risk_per_unit == 0: return 0.0
+
+        # 1. Base Risk
+        base_risk_pct = self._get_regime_param('risk_per_trade_pct', regime)
+        
+        # 2. Kelly Criterion
+        risk_pct = self._apply_kelly(base_risk_pct, metrics)
+        
+        # 3. Confidence Scaling
+        risk_pct = self._apply_confidence(risk_pct, confidence, confidence_threshold)
+
+        # 4. Correlation Penalty
+        risk_pct = self._apply_correlation(symbol, risk_pct, open_positions)
+
+        # 5. Calculate USD Risk
+        risk_usd = equity * risk_pct
+
+        # 6. Portfolio Risk Cap
+        risk_usd = self._apply_portfolio_cap(risk_usd, equity, open_positions, entry_price, stop_loss)
+
+        # 7. Convert to Quantity
+        quantity = risk_usd / risk_per_unit
+
+        # 8. Hard Caps
+        quantity = self._apply_hard_caps(symbol, quantity, equity, entry_price)
+
+        return quantity
+
+    def _get_regime_param(self, param: str, regime: Optional[str]) -> Any:
+        default = getattr(self.config, param)
+        if regime and hasattr(self.config.regime_based_risk, regime):
+            override = getattr(getattr(self.config.regime_based_risk, regime), param)
+            if override is not None: return override
+        return default
+
+    def _apply_kelly(self, base_risk: float, metrics: Optional[Dict]) -> float:
+        if not self.config.use_kelly_criterion or not metrics:
+            return base_risk
+        ensemble = metrics.get('ensemble', metrics)
+        win_rate = ensemble.get('win_rate', 0.0)
+        profit_factor = ensemble.get('profit_factor', 0.0)
+        if win_rate <= 0 or profit_factor <= 0: return base_risk
+        if win_rate >= 1.0: return base_risk * 2.0
+        r_ratio = profit_factor * (1.0 - win_rate) / win_rate
+        if r_ratio <= 0: return base_risk
+        kelly = win_rate - (1.0 - win_rate) / r_ratio
+        return max(0.0, min(kelly * self.config.kelly_fraction, base_risk * 5.0, 0.05))
+
+    def _apply_confidence(self, risk_pct: float, confidence: Optional[float], threshold: Optional[float]) -> float:
+        if self.config.confidence_scaling_factor <= 0 or not confidence or not threshold:
+            return risk_pct
+        if confidence <= threshold: return risk_pct
+        surplus = confidence - threshold
+        scaler = 1.0 + (surplus * self.config.confidence_scaling_factor)
+        return risk_pct * min(scaler, self.config.max_confidence_risk_multiplier)
+
+    def _apply_correlation(self, symbol: str, risk_pct: float, open_positions: List[Position]) -> float:
+        if not self.config.correlation.enabled: return risk_pct
+        max_corr = 0.0
+        for pos in open_positions:
+            if pos.symbol == symbol: continue
+            c = self.data_handler.get_correlation(symbol, pos.symbol, self.config.correlation.lookback_periods)
+            if c > max_corr: max_corr = c
+        if max_corr > self.config.correlation.max_correlation:
+            return risk_pct * self.config.correlation.penalty_factor
+        return risk_pct
+
+    def _apply_portfolio_cap(self, risk_usd: float, equity: float, open_positions: List[Position], entry: float, sl: float) -> float:
+        if self.config.max_portfolio_risk_pct <= 0: return risk_usd
+        current_risk = sum(abs(p.entry_price - (p.stop_loss_price or p.entry_price)) * p.quantity for p in open_positions)
+        max_risk = equity * self.config.max_portfolio_risk_pct
+        return min(risk_usd, max(0.0, max_risk - current_risk))
+
+    def _apply_hard_caps(self, symbol: str, qty: float, equity: float, price: float) -> float:
+        max_by_pct = (equity * self.config.max_position_size_portfolio_pct) / price
+        max_by_usd = self.config.max_position_size_usd / price
+        liquidity_cap = float('inf')
+        if self.config.max_volume_participation_pct > 0:
+            df = self.data_handler.get_market_data(symbol)
+            if df is not None and 'volume' in df.columns:
+                avg_vol = df['volume'].iloc[-self.config.volume_lookback_periods:].mean()
+                liquidity_cap = avg_vol * self.config.max_volume_participation_pct
+        return min(qty, max_by_pct, max_by_usd, liquidity_cap)
+
+# --- Main Risk Manager ---
+
 class RiskManager:
     """
     Authoritative Gatekeeper for trading decisions.
-    Enforces portfolio constraints, circuit breakers, and dynamic position sizing.
-    Persists state via PositionManager (SQLite) for atomicity.
+    Uses a modular 'Risk Engine' architecture.
     """
     def __init__(self, config: RiskManagementConfig, position_manager: 'PositionManager', data_handler: 'DataHandler', alert_system: Optional['AlertSystem'] = None):
         self.config = config
@@ -32,14 +176,21 @@ class RiskManager:
         self.peak_portfolio_value = None
         self.current_drawdown = 0.0
         
-        # In-memory cache of risk state, backed by DB
         self.symbol_consecutive_losses: Dict[str, int] = {}
         self.symbol_cooldowns: Dict[str, datetime] = {}
         
         self.liquidation_needed = False
-        self.liquidation_triggered = False
         
-        logger.info("RiskManager initialized.")
+        # Initialize Components
+        self.sizer = PositionSizer(config, data_handler)
+        self.rules: List[RiskRule] = [
+            CircuitBreakerRule(),
+            CooldownRule(),
+            MaxPositionsRule(),
+            DuplicatePositionRule()
+        ]
+        
+        logger.info("RiskManager initialized with modular Risk Engine.")
 
     async def initialize(self):
         state = await self.position_manager.get_portfolio_state()
@@ -71,28 +222,11 @@ class RiskManager:
         return self.circuit_breaker_halted or self.daily_loss_halted
 
     async def validate_entry(self, symbol: str, open_positions: List[Position]) -> Tuple[bool, str]:
-        """
-        Checks if a new trade entry is permitted.
-        """
-        if self.circuit_breaker_halted: return False, "Circuit Breaker Active"
-        if self.daily_loss_halted: return False, "Max Daily Loss Reached"
-
-        if symbol in self.symbol_cooldowns:
-            if Clock.now() < self.symbol_cooldowns[symbol]:
-                return False, f"Cooldown active until {self.symbol_cooldowns[symbol]}"
-            else:
-                # Cooldown expired, clear it
-                del self.symbol_cooldowns[symbol]
-                self.symbol_consecutive_losses[symbol] = 0
-                await self._save_symbol_state(symbol)
-
-        if len(open_positions) >= self.config.max_open_positions:
-            return False, "Max open positions reached"
-
-        for pos in open_positions:
-            if pos.symbol == symbol:
-                return False, "Position already open"
-
+        """Executes the chain of risk rules."""
+        for rule in self.rules:
+            passed, reason = await rule.check(symbol, open_positions, self)
+            if not passed:
+                return False, reason
         return True, "OK"
 
     def calculate_position_size(self, 
@@ -106,107 +240,16 @@ class RiskManager:
                                 confidence_threshold: Optional[float] = None,
                                 model_metrics: Optional[Dict[str, Any]] = None) -> float:
         
-        if entry_price <= 0 or stop_loss_price <= 0: return 0.0
-        risk_per_unit = abs(entry_price - stop_loss_price)
-        if risk_per_unit == 0: return 0.0
-
-        # 1. Base Risk
-        base_risk_pct = self._get_regime_param('risk_per_trade_pct', market_regime)
+        qty = self.sizer.calculate(
+            symbol, portfolio_equity, entry_price, stop_loss_price, 
+            open_positions, market_regime, confidence, confidence_threshold, model_metrics
+        )
         
-        # 2. Kelly Criterion Adjustment
-        risk_pct = self._apply_kelly_criterion(base_risk_pct, model_metrics)
-        
-        # 3. Drawdown Scaling (Reduce risk in drawdown)
+        # Drawdown Scaling (Global override)
         if self.current_drawdown < -0.05:
-            risk_pct *= 0.75
-
-        # 4. Confidence Scaling
-        risk_pct = self._apply_confidence_scaling(risk_pct, confidence, confidence_threshold)
-
-        # 5. Correlation Penalty
-        risk_pct = self._apply_correlation_penalty(symbol, risk_pct, open_positions)
-
-        # 6. Calculate USD Risk
-        risk_amount_usd = portfolio_equity * risk_pct
-
-        # 7. Portfolio Risk Cap
-        risk_amount_usd = self._apply_portfolio_risk_cap(risk_amount_usd, portfolio_equity, open_positions)
-
-        # 8. Convert to Quantity
-        quantity = risk_amount_usd / risk_per_unit
-
-        # 9. Hard Caps (Max Size, Liquidity)
-        quantity = self._apply_hard_caps(symbol, quantity, portfolio_equity, entry_price)
-
-        return quantity
-
-    def _apply_kelly_criterion(self, base_risk: float, metrics: Optional[Dict]) -> float:
-        if not self.config.use_kelly_criterion or not metrics:
-            return base_risk
-        
-        ensemble = metrics.get('ensemble', metrics)
-        win_rate = ensemble.get('win_rate', 0.0)
-        profit_factor = ensemble.get('profit_factor', 0.0)
-        
-        if win_rate <= 0 or profit_factor <= 0: return base_risk
-        
-        if win_rate >= 1.0: return base_risk * 2.0
-        
-        r_ratio = profit_factor * (1.0 - win_rate) / win_rate
-        if r_ratio <= 0: return base_risk
-        
-        kelly = win_rate - (1.0 - win_rate) / r_ratio
-        kelly_fraction = kelly * self.config.kelly_fraction
-        
-        return max(0.0, min(kelly_fraction, base_risk * 5.0, 0.05))
-
-    def _apply_confidence_scaling(self, risk_pct: float, confidence: Optional[float], threshold: Optional[float]) -> float:
-        if self.config.confidence_scaling_factor <= 0 or not confidence or not threshold:
-            return risk_pct
-        if confidence <= threshold: return risk_pct
-        
-        surplus = confidence - threshold
-        scaler = 1.0 + (surplus * self.config.confidence_scaling_factor)
-        scaler = min(scaler, self.config.max_confidence_risk_multiplier)
-        return risk_pct * scaler
-
-    def _apply_correlation_penalty(self, symbol: str, risk_pct: float, open_positions: List[Position]) -> float:
-        if not self.config.correlation.enabled: return risk_pct
-        
-        max_corr = 0.0
-        for pos in open_positions:
-            if pos.symbol == symbol: continue
-            c = self.data_handler.get_correlation(symbol, pos.symbol, self.config.correlation.lookback_periods)
-            if c > max_corr: max_corr = c
+            qty *= 0.75
             
-        if max_corr > self.config.correlation.max_correlation:
-            return risk_pct * self.config.correlation.penalty_factor
-        return risk_pct
-
-    def _apply_portfolio_risk_cap(self, risk_usd: float, equity: float, open_positions: List[Position]) -> float:
-        if self.config.max_portfolio_risk_pct <= 0: return risk_usd
-        
-        current_risk = 0.0
-        for pos in open_positions:
-            if pos.stop_loss_price:
-                current_risk += abs(pos.entry_price - pos.stop_loss_price) * pos.quantity
-        
-        max_risk = equity * self.config.max_portfolio_risk_pct
-        remaining = max(0.0, max_risk - current_risk)
-        return min(risk_usd, remaining)
-
-    def _apply_hard_caps(self, symbol: str, qty: float, equity: float, price: float) -> float:
-        max_by_pct = (equity * self.config.max_position_size_portfolio_pct) / price
-        max_by_usd = self.config.max_position_size_usd / price
-        
-        liquidity_cap = float('inf')
-        if self.config.max_volume_participation_pct > 0:
-            df = self.data_handler.get_market_data(symbol)
-            if df is not None and 'volume' in df.columns:
-                avg_vol = df['volume'].iloc[-self.config.volume_lookback_periods:].mean()
-                liquidity_cap = avg_vol * self.config.max_volume_participation_pct
-        
-        return min(qty, max_by_pct, max_by_usd, liquidity_cap)
+        return qty
 
     def calculate_stop_loss(self, side: str, entry_price: float, df: Any, market_regime: Optional[str] = None) -> float:
         atr = 0.0
@@ -223,14 +266,13 @@ class RiskManager:
                 else:
                     return max(entry_price * 1.01, window['high'].max() + buffer)
 
-        mult = self._get_regime_param('atr_stop_multiplier', market_regime)
+        mult = self.sizer._get_regime_param('atr_stop_multiplier', market_regime)
         dist = (atr * mult) if atr > 0 else (entry_price * self.config.stop_loss_fallback_pct)
-        
         return entry_price - dist if side == 'BUY' else entry_price + dist
 
     def calculate_take_profit(self, side: str, entry: float, sl: float, market_regime: Optional[str], confidence: Optional[float], confidence_threshold: Optional[float]) -> float:
         risk = abs(entry - sl)
-        rr = self._get_regime_param('reward_to_risk_ratio', market_regime)
+        rr = self.sizer._get_regime_param('reward_to_risk_ratio', market_regime)
         
         if self.config.confidence_rr_scaling_factor > 0 and confidence and confidence_threshold and confidence > confidence_threshold:
             surplus = confidence - confidence_threshold
@@ -241,9 +283,6 @@ class RiskManager:
         return entry + dist if side == 'BUY' else entry - dist
 
     async def update_trade_outcome(self, symbol: str, pnl: float):
-        """
-        Updates risk state based on trade outcome. Persists to DB.
-        """
         if pnl < 0:
             self.symbol_consecutive_losses[symbol] = self.symbol_consecutive_losses.get(symbol, 0) + 1
             if self.symbol_consecutive_losses[symbol] >= self.config.max_consecutive_losses:
@@ -251,7 +290,6 @@ class RiskManager:
                 logger.warning(f"Symbol {symbol} halted due to consecutive losses.")
         else:
             self.symbol_consecutive_losses[symbol] = 0
-        
         await self._save_symbol_state(symbol)
 
     async def update_portfolio_risk(self, portfolio_value: float, daily_pnl: float):
@@ -276,70 +314,38 @@ class RiskManager:
                 self.liquidation_needed = self.config.close_positions_on_halt
                 logger.critical("MAX DAILY LOSS REACHED.")
 
-    def _get_regime_param(self, param: str, regime: Optional[str]) -> Any:
-        default = getattr(self.config, param)
-        if regime and hasattr(self.config.regime_based_risk, regime):
-            override = getattr(getattr(self.config.regime_based_risk, regime), param)
-            if override is not None: return override
-        return default
-
     def calculate_dynamic_trailing_stop(self, pos: Position, current_price: float, atr: float, regime: str) -> Tuple[Optional[float], Optional[float], bool]:
         if not self.config.use_trailing_stop:
             return None, None, False
 
         base_multiplier = self.config.atr_trailing_multiplier
-        if regime == 'volatile':
-            base_multiplier *= 1.5
-        elif regime == 'bull' and pos.side == 'BUY':
-            base_multiplier *= 0.8
-        elif regime == 'bear' and pos.side == 'SELL':
-            base_multiplier *= 0.8
+        if regime == 'volatile': base_multiplier *= 1.5
+        elif regime == 'bull' and pos.side == 'BUY': base_multiplier *= 0.8
+        elif regime == 'bear' and pos.side == 'SELL': base_multiplier *= 0.8
 
         roi_pct = 0.0
         if pos.entry_price > 0:
-            if pos.side == 'BUY':
-                roi_pct = (current_price - pos.entry_price) / pos.entry_price
-            else:
-                roi_pct = (pos.entry_price - current_price) / pos.entry_price
+            roi_pct = (current_price - pos.entry_price) / pos.entry_price if pos.side == 'BUY' else (pos.entry_price - current_price) / pos.entry_price
         
         acceleration = max(0.0, (roi_pct * 100) * 0.1)
         final_multiplier = max(1.0, base_multiplier - acceleration)
+        distance = (atr * final_multiplier) if atr > 0 else (current_price * self.config.trailing_stop_pct)
 
-        if atr > 0:
-            distance = atr * final_multiplier
-        else:
-            distance = current_price * self.config.trailing_stop_pct
-
-        new_stop = None
-        new_ref = None
+        new_stop, new_ref = None, None
         current_ref = pos.trailing_ref_price or pos.entry_price
 
         if pos.side == 'BUY':
-            if current_price > current_ref:
-                new_ref = current_price
-            else:
-                new_ref = current_ref
-            
+            new_ref = max(current_ref, current_price)
             potential_stop = new_ref - distance
-            current_stop = pos.stop_loss_price or 0.0
-            if potential_stop > current_stop:
+            if potential_stop > (pos.stop_loss_price or 0.0):
                 new_stop = potential_stop
-
-        else: # SELL
-            if current_price < current_ref:
-                new_ref = current_price
-            else:
-                new_ref = current_ref
-            
+        else:
+            new_ref = min(current_ref, current_price)
             potential_stop = new_ref + distance
-            current_stop = pos.stop_loss_price or float('inf')
-            if potential_stop < current_stop:
+            if potential_stop < (pos.stop_loss_price or float('inf')):
                 new_stop = potential_stop
 
-        activated = pos.trailing_stop_active
-        if not activated and roi_pct >= self.config.trailing_stop_activation_pct:
-            activated = True
-
+        activated = pos.trailing_stop_active or (roi_pct >= self.config.trailing_stop_activation_pct)
         if not activated:
             return None, new_ref, False
 
