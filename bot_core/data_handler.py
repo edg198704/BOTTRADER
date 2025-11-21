@@ -86,6 +86,7 @@ class DataHandler:
     """
     Manages market data lifecycle and acts as the primary Event Producer for the system.
     Implements a drift-correcting polling loop for precise data fetching and Latency Tracking.
+    Supports Order Book Imbalance (OBI) tracking.
     """
     def __init__(self, exchange_api: ExchangeAPI, config: BotConfig, shared_latest_prices: Dict[str, float], event_bus: Optional[EventBus] = None):
         self.exchange_api = exchange_api
@@ -120,7 +121,8 @@ class DataHandler:
         
         self._dataframes: Dict[str, pd.DataFrame] = {}
         self._raw_buffers: Dict[str, pd.DataFrame] = {}
-        self._latencies: Dict[str, float] = {}  # Stores latency in seconds
+        self._latest_order_books: Dict[str, Dict[str, Any]] = {}
+        self._latencies: Dict[str, float] = {}
         self._buffer_lock = asyncio.Lock()
         
         self._shared_latest_prices = shared_latest_prices
@@ -143,7 +145,12 @@ class DataHandler:
         self.analysis_window = max(self.history_limit * 2, 500)
         self._executor = ThreadPoolExecutor(max_workers=min(len(self.symbols) + 2, 8))
         
-        logger.info("DataHandler initialized.", event_bus_connected=self.event_bus is not None)
+        # Check if we need to fetch order books
+        self.use_order_book = False
+        if isinstance(config.strategy.params, AIEnsembleStrategyParams):
+            self.use_order_book = config.strategy.params.features.use_order_book_features
+
+        logger.info("DataHandler initialized.", event_bus_connected=self.event_bus is not None, use_order_book=self.use_order_book)
 
     async def initialize_data(self):
         logger.info("Initializing historical data...", symbols=self.symbols)
@@ -204,11 +211,7 @@ class DataHandler:
         logger.info("DataHandler stopped.")
 
     async def _maintain_symbol_data(self, symbol: str):
-        """
-        Continuously updates data for a symbol using a drift-correcting loop.
-        """
         next_tick = time.time()
-        
         while self._running:
             try:
                 await self.update_symbol_data(symbol)
@@ -217,10 +220,8 @@ class DataHandler:
             except Exception as e:
                 logger.error(f"Error in data loop for {symbol}", error=str(e))
             
-            # Drift correction logic
             now = time.time()
             next_tick += self.update_interval
-            
             if next_tick < now:
                 next_tick = now + self.update_interval
             
@@ -255,6 +256,7 @@ class DataHandler:
 
     async def update_symbol_data(self, symbol: str):
         try:
+            # 1. Fetch OHLCV
             async with self._buffer_lock:
                 current_buffer = self._raw_buffers.get(symbol)
             
@@ -286,8 +288,21 @@ class DataHandler:
             latest_df = create_dataframe(latest_ohlcv)
             if latest_df is None or latest_df.empty: return
 
-            # --- Latency Calculation ---
-            # Compare the close time of the last candle with current wall clock
+            # 2. Fetch Order Book (if enabled)
+            obi_val = 0.0
+            if self.use_order_book:
+                try:
+                    ob = await self.exchange_api.fetch_order_book(symbol, limit=self.config.data_handler.order_book_depth)
+                    if ob and 'bids' in ob and 'asks' in ob:
+                        self._latest_order_books[symbol] = ob
+                        bids_vol = sum(b[1] for b in ob['bids'])
+                        asks_vol = sum(a[1] for a in ob['asks'])
+                        if (bids_vol + asks_vol) > 0:
+                            obi_val = (bids_vol - asks_vol) / (bids_vol + asks_vol)
+                except Exception as e:
+                    logger.warning("Failed to fetch order book", symbol=symbol, error=str(e))
+
+            # 3. Latency Calculation
             last_candle_ts = latest_df.index[-1]
             if last_candle_ts.tzinfo is None: 
                 last_candle_ts = last_candle_ts.tz_localize(timezone.utc)
@@ -295,8 +310,8 @@ class DataHandler:
             now_utc = Clock.now()
             latency = (now_utc - last_candle_ts).total_seconds()
             self._latencies[symbol] = latency
-            # ---------------------------
 
+            # 4. Merge Data
             async with self._buffer_lock:
                 if is_recovery:
                     if current_buffer is not None:
@@ -316,6 +331,13 @@ class DataHandler:
                         self._raw_buffers[symbol] = combined_df
                     else:
                         self._raw_buffers[symbol] = latest_df
+                
+                # Inject OBI into the raw buffer (last row only, forward fill previous)
+                if self.use_order_book:
+                    if 'obi' not in self._raw_buffers[symbol].columns:
+                        self._raw_buffers[symbol]['obi'] = 0.0
+                    # Update the last candle's OBI
+                    self._raw_buffers[symbol].iloc[-1, self._raw_buffers[symbol].columns.get_loc('obi')] = obi_val
 
             await self._process_analysis_window(symbol)
 
@@ -326,7 +348,6 @@ class DataHandler:
         async with self._buffer_lock:
             raw_df = self._raw_buffers.get(symbol)
             if raw_df is None or raw_df.empty: return
-            # Optimization: Only process what we need for indicators
             if len(raw_df) > self.analysis_window:
                 analysis_slice = raw_df.iloc[-self.analysis_window:].copy()
             else:
@@ -334,11 +355,9 @@ class DataHandler:
 
         processed_df = await self._calculate_indicators_async(analysis_slice)
         
-        # Atomic swap of processed dataframe
         self._dataframes[symbol] = processed_df
         self._update_latest_price(symbol, processed_df)
 
-        # Event Emission Logic
         closed_df = self.get_market_data(symbol, include_forming=False)
         if closed_df is not None and not closed_df.empty:
             last_closed_ts = closed_df.index[-1]
@@ -351,7 +370,6 @@ class DataHandler:
 
     async def _calculate_indicators_async(self, df: pd.DataFrame) -> pd.DataFrame:
         loop = asyncio.get_running_loop() 
-        # Pass pure function and config to executor
         return await loop.run_in_executor(
             self._executor, 
             calculate_indicators_pure, 
@@ -369,7 +387,6 @@ class DataHandler:
         df = self._dataframes.get(symbol)
         if df is None or df.empty: return None
         
-        # Optimization: Avoid copy if not needed, but safety first for consumers
         df_copy = df.copy()
         if not include_forming:
             last_ts = df_copy.index[-1]
@@ -382,8 +399,10 @@ class DataHandler:
         
         return df_copy if not df_copy.empty else None
 
+    def get_latest_order_book(self, symbol: str) -> Optional[Dict[str, Any]]:
+        return self._latest_order_books.get(symbol)
+
     def get_latency(self, symbol: str) -> float:
-        """Returns the latency of the latest data point in seconds."""
         return self._latencies.get(symbol, 0.0)
 
     def get_correlation(self, symbol_a: str, symbol_b: str, lookback: int = 50) -> float:
@@ -425,7 +444,7 @@ class DataHandler:
         path = os.path.join(self.cache_dir, f"{safe_symbol}.csv")
         loop = asyncio.get_running_loop()
         try:
-            raw_cols = ['open', 'high', 'low', 'close', 'volume']
+            raw_cols = ['open', 'high', 'low', 'close', 'volume', 'obi']
             valid_cols = [c for c in raw_cols if c in df.columns]
             to_save = df[valid_cols]
             await loop.run_in_executor(self._executor, to_save.to_csv, path)
