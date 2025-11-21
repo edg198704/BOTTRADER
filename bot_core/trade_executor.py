@@ -276,18 +276,31 @@ class TradeExecutor:
             'error': error
         }
         
+        # 1. Try JSON file
         filename = f"recovery/recovery_{order_id}.json"
         try:
             with open(filename, 'w') as f:
                 json.dump(recovery_data, f, indent=2)
             logger.info(f"Recovery data saved to {filename}")
-            await self.alert_system.send_alert(
-                'critical', 
-                f"DB Failure for {symbol}. Recovery file created.", 
-                details={'file': filename, 'order_id': order_id}
-            )
         except Exception as e:
-            logger.critical("Failed to write recovery file! Position is effectively orphaned.", error=str(e))
+            logger.critical("Failed to write recovery JSON!", error=str(e))
+
+        # 2. Try appending to CSV (Redundancy)
+        try:
+            csv_path = "recovery/emergency_ledger.csv"
+            exists = os.path.exists(csv_path)
+            with open(csv_path, 'a') as f:
+                if not exists:
+                    f.write("timestamp,symbol,order_id,side,quantity,price,error\n")
+                f.write(f"{recovery_data['timestamp']},{symbol},{order_id},{side},{qty},{price},{error}\n")
+        except Exception as e:
+            logger.critical("Failed to write to emergency CSV!", error=str(e))
+
+        await self.alert_system.send_alert(
+            'critical', 
+            f"DB Failure for {symbol}. Recovery file created.", 
+            details={'file': filename, 'order_id': order_id}
+        )
 
     async def close_position(self, position: Position, reason: str):
         async with self._get_lock(position.symbol):
