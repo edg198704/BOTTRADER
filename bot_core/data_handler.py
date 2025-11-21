@@ -19,28 +19,27 @@ logger = get_logger(__name__)
 
 def calculate_indicators_pure(df: pd.DataFrame, indicators_config: List[Dict[str, Any]], secondary_timeframes: List[str], timeframe: str) -> pd.DataFrame:
     """
-    Pure function to calculate technical indicators. 
+    Pure function to calculate technical indicators.
     Can be run in a separate thread/process without object state.
     """
-    if df is None or len(df) < 50: return df
+    if df is None or len(df) < 20: return df
     
     # Enforce Continuity
     try:
-        if not df.index.is_monotonic_increasing: df = df.sort_index()
-        tf_seconds = parse_timeframe_to_seconds(timeframe)
-        if tf_seconds > 0:
-            start, end = df.index[0], df.index[-1]
-            full_index = pd.date_range(start=start, end=end, freq=f"{tf_seconds}s")
-            if len(full_index) != len(df.index):
-                df_continuous = df.reindex(full_index)
-                cols_to_ffill = [c for c in ['open', 'high', 'low', 'close'] if c in df_continuous.columns]
-                df_continuous[cols_to_ffill] = df_continuous[cols_to_ffill].ffill()
-                if 'volume' in df_continuous.columns: df_continuous['volume'] = df_continuous['volume'].fillna(0)
-                df_continuous.dropna(inplace=True)
-                df_continuous.index.name = 'timestamp'
-                df = df_continuous
-    except Exception:
-        pass
+        if not df.index.is_monotonic_increasing: 
+            df = df.sort_index()
+        
+        # Ensure we have a valid DatetimeIndex
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+
+        # Basic data validation
+        if df['close'].isnull().any():
+            df = df.dropna(subset=['close'])
+
+    except Exception as e:
+        # If preprocessing fails, return original to avoid crashing worker
+        return df
 
     df_out = df.copy()
     ta_strategy = ta.Strategy(name="BotTrader", ta=indicators_config)
@@ -55,9 +54,17 @@ def calculate_indicators_pure(df: pd.DataFrame, indicators_config: List[Dict[str
         for tf in secondary_timeframes:
             try:
                 tf_seconds = parse_timeframe_to_seconds(tf)
-                resampled = df.resample(f"{tf_seconds}s").agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
-                if len(resampled) < 20: continue
+                if tf_seconds == 0: continue
+                
+                # Resample logic
+                resampled = df.resample(f"{tf_seconds}s").agg(
+                    {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+                ).dropna()
+                
+                if len(resampled) < 10: continue
+                
                 resampled.ta.strategy(ta_strategy)
+                
                 htf_cols = []
                 for col in resampled.columns:
                     if col not in ['open', 'high', 'low', 'close', 'volume']:
@@ -65,7 +72,12 @@ def calculate_indicators_pure(df: pd.DataFrame, indicators_config: List[Dict[str
                         new_name = f"{tf}_{base_name}"
                         resampled.rename(columns={col: new_name}, inplace=True)
                         htf_cols.append(new_name)
+                
+                # Merge back to lower timeframe
+                # Shift by 1 to avoid lookahead bias (using closed HTF candle)
                 resampled_shifted = resampled[htf_cols].shift(1)
+                
+                # Reindex to match original DF and forward fill
                 resampled_aligned = resampled_shifted.reindex(df_out.index).ffill()
                 df_out = df_out.join(resampled_aligned)
             except Exception:
@@ -77,6 +89,7 @@ def calculate_indicators_pure(df: pd.DataFrame, indicators_config: List[Dict[str
     except ValueError:
         pass
     
+    # Drop NaN values created by indicators (warmup period)
     df_out.dropna(inplace=True)
     return df_out
 
@@ -85,8 +98,7 @@ def calculate_indicators_pure(df: pd.DataFrame, indicators_config: List[Dict[str
 class DataHandler:
     """
     Manages market data lifecycle and acts as the primary Event Producer for the system.
-    Implements a drift-correcting polling loop for precise data fetching and Latency Tracking.
-    Supports Order Book Imbalance (OBI) tracking.
+    Implements a drift-correcting polling loop and Optimized Incremental Updates.
     """
     def __init__(self, exchange_api: ExchangeAPI, config: BotConfig, shared_latest_prices: Dict[str, float], event_bus: Optional[EventBus] = None):
         self.exchange_api = exchange_api
@@ -104,6 +116,7 @@ class DataHandler:
         self.timeframe = config.strategy.timeframe
         self.secondary_timeframes = config.strategy.secondary_timeframes
         
+        # Calculate history requirements
         min_required = calculate_min_history_depth(config.strategy.indicators)
         scale_factor = 1.0
         if self.secondary_timeframes:
@@ -119,12 +132,13 @@ class DataHandler:
         self.update_interval = config.strategy.interval_seconds * config.data_handler.update_interval_multiplier
         self.indicators_config = config.strategy.indicators
         
-        self._dataframes: Dict[str, pd.DataFrame] = {}
-        self._raw_buffers: Dict[str, pd.DataFrame] = {}
+        # Buffers
+        self._dataframes: Dict[str, pd.DataFrame] = {} # Processed DFs (with indicators)
+        self._raw_buffers: Dict[str, pd.DataFrame] = {} # Raw OHLCV DFs
         self._latest_order_books: Dict[str, Dict[str, Any]] = {}
         self._latencies: Dict[str, float] = {}
-        self._buffer_lock = asyncio.Lock()
         
+        self._buffer_lock = asyncio.Lock()
         self._shared_latest_prices = shared_latest_prices
         self._running = False
         
@@ -142,15 +156,20 @@ class DataHandler:
         if hasattr(config.strategy.params, 'training_data_limit'):
              self.max_training_buffer = int(config.strategy.params.training_data_limit * 1.2)
 
+        # Analysis window is the subset sent to indicator calculation
         self.analysis_window = max(self.history_limit * 2, 500)
+        
+        # Thread pool for heavy indicator math
         self._executor = ThreadPoolExecutor(max_workers=min(len(self.symbols) + 2, 8))
         
-        # Check if we need to fetch order books
         self.use_order_book = False
         if isinstance(config.strategy.params, AIEnsembleStrategyParams):
             self.use_order_book = config.strategy.params.features.use_order_book_features
 
-        logger.info("DataHandler initialized.", event_bus_connected=self.event_bus is not None, use_order_book=self.use_order_book)
+        logger.info("DataHandler initialized.", 
+                    symbols=self.symbols, 
+                    history_limit=self.history_limit, 
+                    analysis_window=self.analysis_window)
 
     async def initialize_data(self):
         logger.info("Initializing historical data...", symbols=self.symbols)
@@ -161,12 +180,15 @@ class DataHandler:
     async def _initialize_symbol(self, symbol: str):
         try:
             cached_df = await self._load_from_cache(symbol)
+            
+            # Fetch fresh data to fill gaps or start fresh
             ohlcv_data = await self.exchange_api.get_market_data(symbol, self.timeframe, self.history_limit)
             fresh_df = create_dataframe(ohlcv_data)
             
             async with self._buffer_lock:
                 if cached_df is not None and not cached_df.empty:
                     if fresh_df is not None and not fresh_df.empty:
+                        # Merge and deduplicate
                         combined = pd.concat([cached_df, fresh_df])
                         combined = combined[~combined.index.duplicated(keep='last')]
                         combined.sort_index(inplace=True)
@@ -211,6 +233,7 @@ class DataHandler:
         logger.info("DataHandler stopped.")
 
     async def _maintain_symbol_data(self, symbol: str):
+        """Drift-correcting loop for fetching data."""
         next_tick = time.time()
         while self._running:
             try:
@@ -223,6 +246,7 @@ class DataHandler:
             now = time.time()
             next_tick += self.update_interval
             if next_tick < now:
+                # We are lagging, skip ticks to catch up
                 next_tick = now + self.update_interval
             
             sleep_duration = next_tick - now
@@ -249,6 +273,7 @@ class DataHandler:
             try:
                 await asyncio.sleep(self.auto_save_interval)
                 async with self._buffer_lock:
+                    # Snapshot for saving
                     save_tasks = [self._save_to_cache(symbol, df.copy()) for symbol, df in self._raw_buffers.items()]
                 await asyncio.gather(*save_tasks)
             except asyncio.CancelledError:
@@ -256,22 +281,25 @@ class DataHandler:
 
     async def update_symbol_data(self, symbol: str):
         try:
-            # 1. Fetch OHLCV (Network I/O - No Lock)
-            # We only read the buffer length to decide strategy, which is safe enough
+            # 1. Determine fetch requirements
             current_len = 0
+            last_ts = None
+            
+            # Read-only check (safe without lock for simple len/index access usually, but lock is safer)
+            # We'll grab lock briefly or assume eventual consistency for the check
             if symbol in self._raw_buffers:
                 current_len = len(self._raw_buffers[symbol])
-            
-            required_history = self.history_limit
+                if current_len > 0:
+                    last_ts = self._raw_buffers[symbol].index[-1]
+
             fetch_limit = 5
             is_recovery = False
 
-            if current_len < (required_history * 0.9):
-                fetch_limit = required_history
+            # Recovery Logic
+            if current_len < (self.history_limit * 0.9):
+                fetch_limit = self.history_limit
                 is_recovery = True
-            elif current_len > 0:
-                # Check timestamp gap
-                last_ts = self._raw_buffers[symbol].index[-1]
+            elif last_ts is not None:
                 now = pd.Timestamp(Clock.now()).tz_localize(None)
                 if last_ts.tzinfo is not None: last_ts = last_ts.tz_convert(None)
                 
@@ -280,18 +308,17 @@ class DataHandler:
                 if tf_seconds > 0:
                     missed_candles = int(time_diff / tf_seconds)
                     if missed_candles > 5:
-                        fetch_limit = missed_candles + 5
-                if fetch_limit > required_history:
-                    fetch_limit = required_history
-                    is_recovery = True
+                        fetch_limit = min(missed_candles + 5, self.history_limit)
+                        is_recovery = True
 
+            # 2. Network I/O (No Lock)
             latest_ohlcv = await self.exchange_api.get_market_data(symbol, self.timeframe, fetch_limit)
             if not latest_ohlcv: return
 
             latest_df = create_dataframe(latest_ohlcv)
             if latest_df is None or latest_df.empty: return
 
-            # 2. Fetch Order Book (if enabled)
+            # 3. Fetch Order Book (Optional)
             obi_val = 0.0
             if self.use_order_book:
                 try:
@@ -305,7 +332,7 @@ class DataHandler:
                 except Exception as e:
                     logger.warning("Failed to fetch order book", symbol=symbol, error=str(e))
 
-            # 3. Latency Calculation
+            # 4. Latency Calculation
             last_candle_ts = latest_df.index[-1]
             if last_candle_ts.tzinfo is None: 
                 last_candle_ts = last_candle_ts.tz_localize(timezone.utc)
@@ -314,11 +341,14 @@ class DataHandler:
             latency = (now_utc - last_candle_ts).total_seconds()
             self._latencies[symbol] = latency
 
-            # 4. Merge Data (Critical Section - Fast)
+            # 5. Incremental Merge (Critical Section)
             async with self._buffer_lock:
                 current_buffer = self._raw_buffers.get(symbol)
-                if is_recovery or current_buffer is None:
-                    if current_buffer is not None:
+                
+                if is_recovery or current_buffer is None or current_buffer.empty:
+                    # Full replacement/initialization
+                    if current_buffer is not None and not current_buffer.empty:
+                        # Merge carefully if we have some data
                         combined_df = pd.concat([current_buffer, latest_df])
                         combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
                         combined_df.sort_index(inplace=True)
@@ -326,16 +356,40 @@ class DataHandler:
                     else:
                         self._raw_buffers[symbol] = latest_df
                 else:
-                    combined_df = pd.concat([current_buffer, latest_df])
-                    combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
-                    if len(combined_df) > self.max_training_buffer:
-                        combined_df = combined_df.iloc[-self.max_training_buffer:]
-                    self._raw_buffers[symbol] = combined_df
-                
+                    # OPTIMIZED INCREMENTAL UPDATE
+                    # Only append rows that are strictly newer than what we have,
+                    # or update the last row if it matches (forming candle update).
+                    
+                    last_buffer_ts = current_buffer.index[-1]
+                    
+                    # 1. New candles (strictly greater timestamp)
+                    new_rows = latest_df[latest_df.index > last_buffer_ts]
+                    
+                    # 2. Update forming candle (timestamp matches last buffer ts)
+                    if last_buffer_ts in latest_df.index:
+                        # Update the last row in place using .iloc for speed
+                        # Note: We must ensure columns match. 
+                        # Assuming standard OHLCV columns.
+                        forming_row = latest_df.loc[last_buffer_ts]
+                        idx_loc = len(current_buffer) - 1
+                        
+                        # Update values directly
+                        current_buffer.iloc[idx_loc] = forming_row
+                    
+                    # 3. Append new rows if any
+                    if not new_rows.empty:
+                        self._raw_buffers[symbol] = pd.concat([current_buffer, new_rows])
+                    
+                    # 4. Prune if too large (Ring Buffer logic)
+                    if len(self._raw_buffers[symbol]) > self.max_training_buffer:
+                        # Slice from the end
+                        self._raw_buffers[symbol] = self._raw_buffers[symbol].iloc[-self.max_training_buffer:]
+
                 # Inject OBI
                 if self.use_order_book:
                     if 'obi' not in self._raw_buffers[symbol].columns:
                         self._raw_buffers[symbol]['obi'] = 0.0
+                    # Update the last row's OBI
                     self._raw_buffers[symbol].iloc[-1, self._raw_buffers[symbol].columns.get_loc('obi')] = obi_val
 
             await self._process_analysis_window(symbol)
@@ -348,6 +402,8 @@ class DataHandler:
         async with self._buffer_lock:
             raw_df = self._raw_buffers.get(symbol)
             if raw_df is None or raw_df.empty: return
+            
+            # Only take what we need for indicators
             if len(raw_df) > self.analysis_window:
                 analysis_slice = raw_df.iloc[-self.analysis_window:].copy()
             else:
@@ -361,6 +417,7 @@ class DataHandler:
         self._update_latest_price(symbol, processed_df)
 
         # Emit event if new candle closed
+        # We check if the last closed candle timestamp has changed
         closed_df = self.get_market_data(symbol, include_forming=False)
         if closed_df is not None and not closed_df.empty:
             last_closed_ts = closed_df.index[-1]
@@ -369,6 +426,7 @@ class DataHandler:
             if last_emitted is None or last_closed_ts > last_emitted:
                 self._last_emitted_candle_ts[symbol] = last_closed_ts
                 if self.event_bus:
+                    # Fire and forget event
                     await self.event_bus.publish(MarketDataEvent(symbol=symbol, data=closed_df))
 
     async def _calculate_indicators_async(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -390,12 +448,14 @@ class DataHandler:
         df = self._dataframes.get(symbol)
         if df is None or df.empty: return None
         
+        # Return a copy to prevent external mutation
         df_copy = df.copy()
         if not include_forming:
             last_ts = df_copy.index[-1]
             tf_seconds = parse_timeframe_to_seconds(self.timeframe)
             now = pd.Timestamp(Clock.now()).tz_localize(None)
             if last_ts.tzinfo is not None: last_ts = last_ts.tz_convert(None)
+            
             candle_end_time = last_ts + pd.Timedelta(seconds=tf_seconds)
             if now < candle_end_time:
                 df_copy = df_copy.iloc[:-1]
@@ -414,6 +474,7 @@ class DataHandler:
         if df_a is None or df_b is None or df_a.empty or df_b.empty: return 0.0
         try:
             if len(df_a) < lookback or len(df_b) < lookback: return 0.0
+            # Use tail for correlation
             series_a = df_a['close'].pct_change().tail(lookback)
             series_b = df_b['close'].pct_change().tail(lookback)
             correlation = series_a.corr(series_b)
@@ -422,6 +483,7 @@ class DataHandler:
             return 0.0
 
     async def fetch_full_history_for_symbol(self, symbol: str, limit: int) -> Optional[pd.DataFrame]:
+        """Fetches deep history for training, bypassing the analysis window."""
         async with self._buffer_lock:
             raw_df = self._raw_buffers.get(symbol)
             target_df = None
@@ -469,11 +531,15 @@ def create_dataframe(ohlcv_data: list) -> pd.DataFrame | None:
         if not ohlcv_data: return None
         df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', errors='coerce')
-        for col in ['open', 'high', 'low', 'close', 'volume']: df[col] = pd.to_numeric(df[col], errors='coerce')
+        for col in ['open', 'high', 'low', 'close', 'volume']: 
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df.dropna(subset=['timestamp', 'close'], inplace=True)
         df['volume'].fillna(0, inplace=True)
-        if len(df) < 20: return None
+        
+        if len(df) < 5: return None
+        
         df.set_index('timestamp', inplace=True)
         return df
     except Exception:
