@@ -291,8 +291,89 @@ class RiskManager:
         return default
 
     def calculate_dynamic_trailing_stop(self, pos: Position, current_price: float, atr: float, regime: str) -> Tuple[Optional[float], Optional[float], bool]:
-        # Placeholder for full implementation
-        return None, None, False
+        """
+        Calculates a dynamic trailing stop price based on volatility (ATR) and trade maturity.
+        Implements a 'ratchet' mechanism that tightens as profit increases.
+        """
+        if not self.config.use_trailing_stop:
+            return None, None, False
+
+        # 1. Determine Base Multiplier based on Regime
+        base_multiplier = self.config.atr_trailing_multiplier
+        if regime == 'volatile':
+            base_multiplier *= 1.5 # Loosen stop in volatility
+        elif regime == 'bull' and pos.side == 'BUY':
+            base_multiplier *= 0.8 # Tighten in trend
+        elif regime == 'bear' and pos.side == 'SELL':
+            base_multiplier *= 0.8
+
+        # 2. Calculate ROI for Acceleration
+        # As profit increases, we reduce the multiplier to lock in gains (Parabolic SAR style)
+        roi_pct = 0.0
+        if pos.entry_price > 0:
+            if pos.side == 'BUY':
+                roi_pct = (current_price - pos.entry_price) / pos.entry_price
+            else:
+                roi_pct = (pos.entry_price - current_price) / pos.entry_price
+        
+        # Acceleration factor: Reduce multiplier by 0.1 for every 1% gain, up to a limit
+        acceleration = max(0.0, (roi_pct * 100) * 0.1)
+        final_multiplier = max(1.0, base_multiplier - acceleration)
+
+        # 3. Calculate Trailing Distance
+        # If ATR is 0 or unavailable, fallback to percentage
+        if atr > 0:
+            distance = atr * final_multiplier
+        else:
+            distance = current_price * self.config.trailing_stop_pct
+
+        # 4. Determine New Stop Price
+        new_stop = None
+        new_ref = None
+        
+        # Current reference price (Highest High for Buy, Lowest Low for Sell)
+        # We use the tracked trailing_ref_price from DB/Cache
+        current_ref = pos.trailing_ref_price or pos.entry_price
+
+        if pos.side == 'BUY':
+            # Update Reference (High Water Mark)
+            if current_price > current_ref:
+                new_ref = current_price
+            else:
+                new_ref = current_ref
+            
+            potential_stop = new_ref - distance
+            
+            # Ratchet: Never move stop down
+            current_stop = pos.stop_loss_price or 0.0
+            if potential_stop > current_stop:
+                new_stop = potential_stop
+
+        else: # SELL
+            # Update Reference (Low Water Mark)
+            if current_price < current_ref:
+                new_ref = current_price
+            else:
+                new_ref = current_ref
+            
+            potential_stop = new_ref + distance
+            
+            # Ratchet: Never move stop up
+            current_stop = pos.stop_loss_price or float('inf')
+            if potential_stop < current_stop:
+                new_stop = potential_stop
+
+        # 5. Activation Check
+        # Only activate if ROI > activation_pct
+        activated = pos.trailing_stop_active
+        if not activated and roi_pct >= self.config.trailing_stop_activation_pct:
+            activated = True
+
+        # If not activated yet, we don't update the stop, but we might update the ref price
+        if not activated:
+            return None, new_ref, False
+
+        return new_stop, new_ref, True
 
     def check_time_based_exit(self, pos: Position, price: float) -> bool:
         if not self.config.time_based_exit.enabled: return False
