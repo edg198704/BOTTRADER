@@ -207,42 +207,53 @@ class FeatureProcessor:
         atr_col = config.market_regime.volatility_col
         vol = df[atr_col].values if atr_col in df.columns else close * 0.01
         
+        # Pre-calculate barriers
+        upper_barriers = close + (vol * tp_mult)
+        lower_barriers = close - (vol * sl_mult)
+        
         labels = np.ones(len(df), dtype=int)
         t1_arr = np.full(len(df), np.nan, dtype='object')
         
-        # Vectorized-like loop (optimized)
-        # We iterate start points, but check barriers using array slicing
+        # Optimized Window Search
+        # We iterate through the array, but we limit the inner loop scope
+        # For very large datasets, this is still O(N*Horizon), but much faster than pandas iterrows
+        
         limit = len(df) - horizon
         
         for i in range(limit):
-            curr_close = close[i]
-            curr_vol = vol[i]
-            if np.isnan(curr_vol) or curr_vol == 0: continue
+            if np.isnan(vol[i]) or vol[i] == 0: continue
             
-            upper = curr_close + (curr_vol * tp_mult)
-            lower = curr_close - (curr_vol * sl_mult)
+            # Define window
+            end_idx = i + horizon
+            window_high = high[i+1 : end_idx+1]
+            window_low = low[i+1 : end_idx+1]
+            window_times = timestamps[i+1 : end_idx+1]
             
-            # Window slices
-            w_high = high[i+1 : i+1+horizon]
-            w_low = low[i+1 : i+1+horizon]
-            w_time = timestamps[i+1 : i+1+horizon]
+            # Check touches
+            # np.argmax returns the index of the first True. If no True, returns 0.
+            # We must check if any are True.
             
-            # Find first hit
-            hit_upper = w_high >= upper
-            hit_lower = w_low <= lower
+            hit_upper_mask = window_high >= upper_barriers[i]
+            hit_lower_mask = window_low <= lower_barriers[i]
             
-            first_upper = np.argmax(hit_upper) if hit_upper.any() else horizon + 1
-            first_lower = np.argmax(hit_lower) if hit_lower.any() else horizon + 1
+            has_upper = hit_upper_mask.any()
+            has_lower = hit_lower_mask.any()
             
-            if first_upper < first_lower and first_upper < horizon:
-                labels[i] = 2
-                t1_arr[i] = w_time[first_upper]
-            elif first_lower < first_upper and first_lower < horizon:
-                labels[i] = 0
-                t1_arr[i] = w_time[first_lower]
-            else:
+            if not has_upper and not has_lower:
+                # Vertical Barrier
                 labels[i] = 1
-                t1_arr[i] = w_time[-1] # Vertical barrier
+                t1_arr[i] = window_times[-1]
+                continue
+                
+            first_upper = np.argmax(hit_upper_mask) if has_upper else 999999
+            first_lower = np.argmax(hit_lower_mask) if has_lower else 999999
+            
+            if first_upper < first_lower:
+                labels[i] = 2 # Buy Signal (Hit Upper)
+                t1_arr[i] = window_times[first_upper]
+            else:
+                labels[i] = 0 # Sell Signal (Hit Lower)
+                t1_arr[i] = window_times[first_lower]
                 
         return pd.Series(labels, index=df.index).iloc[:-horizon], pd.Series(t1_arr, index=df.index).iloc[:-horizon]
 
