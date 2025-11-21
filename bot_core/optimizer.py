@@ -6,44 +6,31 @@ from typing import List, Dict, Any, Optional
 from bot_core.logger import get_logger
 from bot_core.config import BotConfig, OptimizerConfig
 from bot_core.position_manager import PositionManager, Position, PositionStatus
+from bot_core.utils import AsyncAtomicJsonStore
 
 logger = get_logger(__name__)
 
 class StrategyOptimizer:
     """
-    Periodically analyzes trade history to optimize strategy parameters:
-    1. Confidence Thresholds (Entry Strictness)
-    2. Reward-to-Risk Ratios (Exit Targets)
-    3. ATR Stop Multipliers (Risk Width)
-    4. Risk Per Trade % (Position Sizing via Realized Kelly)
-    5. Execution Parameters (Limit Offsets, Chase Aggressiveness)
-    
-    Adjustments are based on realized performance (Win Rate & Profit Factor) per market regime.
+    Periodically analyzes trade history to optimize strategy parameters.
+    Uses async I/O for state persistence.
     """
     def __init__(self, config: BotConfig, position_manager: PositionManager):
         self.config = config
         self.opt_config = config.optimizer
         self.position_manager = position_manager
         self.running = False
-        
-        # Load saved state on init to restore learned thresholds
-        self._load_state()
+        self.state_store = AsyncAtomicJsonStore(self.opt_config.state_file_path)
         
         logger.info("StrategyOptimizer initialized.")
 
-    def _get_state_path(self) -> str:
-        return self.opt_config.state_file_path
-
-    def _load_state(self):
+    async def _load_state(self):
         """Loads optimized parameters from the state file and applies them to the config."""
-        path = self._get_state_path()
-        if not os.path.exists(path):
-            return
-
         try:
-            with open(path, 'r') as f:
-                state = json.load(f)
-            
+            state = await self.state_store.load()
+            if not state:
+                return
+
             updates = 0
             
             # 1. Restore Confidence Thresholds
@@ -80,14 +67,13 @@ class StrategyOptimizer:
                 updates += 1
 
             if updates > 0:
-                logger.info(f"Restored {updates} optimized parameters from state file.", path=path)
+                logger.info(f"Restored {updates} optimized parameters from state file.", path=self.opt_config.state_file_path)
                 
         except Exception as e:
             logger.error("Failed to load optimizer state", error=str(e))
 
-    def _save_state(self):
+    async def _save_state(self):
         """Saves the current optimized parameters to the state file."""
-        path = self._get_state_path()
         mr_config = self.config.strategy.params.market_regime
         rm_config = self.config.risk_management.regime_based_risk
         exec_config = self.config.execution
@@ -130,9 +116,8 @@ class StrategyOptimizer:
         }
         
         try:
-            with open(path, 'w') as f:
-                json.dump(state, f, indent=2)
-            logger.debug("Optimizer state saved.", path=path)
+            await self.state_store.save(state)
+            logger.debug("Optimizer state saved.", path=self.opt_config.state_file_path)
         except Exception as e:
             logger.error("Failed to save optimizer state", error=str(e))
 
@@ -141,6 +126,9 @@ class StrategyOptimizer:
         if not self.opt_config.enabled:
             logger.info("Optimizer disabled in config.")
             return
+
+        # Load saved state on init
+        await self._load_state()
 
         self.running = True
         logger.info("Starting StrategyOptimizer loop.")
@@ -336,7 +324,7 @@ class StrategyOptimizer:
                         logger.info(f"Optimizer DECREASED {regime} Risk Size (Poor Perf).", old=current_risk, new=new_risk)
 
         if any_changes:
-            self._save_state()
+            await self._save_state()
 
     async def optimize_execution_parameters(self):
         """Analyzes fill rates and slippage to optimize execution settings."""
@@ -414,7 +402,7 @@ class StrategyOptimizer:
                 logger.info("Optimizer DECREASED Limit Aggressiveness (Higher Offset).", old=old_offset, new=new_offset, reason="High Slippage")
 
         if any_changes:
-            self._save_state()
+            await self._save_state()
 
     async def stop(self):
         self.running = False
