@@ -22,6 +22,7 @@ from bot_core.trade_executor import TradeExecutor
 from bot_core.utils import Clock
 from bot_core.reporting import PerformanceAnalyzer
 from bot_core.config import AIEnsembleStrategyParams
+from bot_core.event_system import EventBus
 
 logger = get_logger(__name__)
 
@@ -95,6 +96,7 @@ async def run_backtest():
     # 3. Initialize Components
     shared_latest_prices = {}
     alert_system = AlertSystem()
+    event_bus = EventBus()
     
     data_handler = DataHandler(exchange_api, config, shared_latest_prices)
     
@@ -119,12 +121,13 @@ async def run_backtest():
         config, exchange_api, position_manager, risk_manager, order_sizer, 
         order_lifecycle_manager, alert_system, shared_latest_prices, 
         market_details={}, # Will be loaded in setup
-        data_handler=data_handler # Injected for ATR calculation
+        data_handler=data_handler, # Injected for ATR calculation
+        event_bus=event_bus
     )
 
     bot = TradingBot(
         config, exchange_api, data_handler, strategy, position_manager, risk_manager,
-        health_checker, position_monitor, trade_executor, alert_system, shared_latest_prices
+        health_checker, position_monitor, trade_executor, alert_system, shared_latest_prices, event_bus
     )
     
     position_monitor.set_close_position_callback(bot._close_position)
