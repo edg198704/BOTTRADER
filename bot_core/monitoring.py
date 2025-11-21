@@ -2,16 +2,14 @@ import asyncio
 import time
 import os
 from datetime import datetime, timezone
-from collections import deque
-from typing import Dict, Any, Callable
-
+from typing import Dict, Any, Callable, Optional, Awaitable
 import psutil
 
 from bot_core.logger import get_logger
 
 # Safe import for InfluxDB
 try:
-    from influxdb_client import InfluxDBClient, Point, WritePrecision
+    from influxdb_client import InfluxDBClient, Point
     from influxdb_client.client.write_api import ASYNCHRONOUS
     INFLUXDB_AVAILABLE = True
 except ImportError:
@@ -50,7 +48,6 @@ class InfluxDBMetrics:
                 point.field(key, value)
             
             self.write_api.write(bucket=self.bucket, record=point)
-            logger.debug("Metric written to InfluxDB", measurement=measurement)
         except Exception as e:
             logger.error("Failed to write metric to InfluxDB", measurement=measurement, error=str(e))
 
@@ -106,3 +103,84 @@ class HealthChecker:
             'uptime_seconds': uptime_seconds,
             'issues': issues
         }
+
+class SystemCircuitBreaker:
+    """Tracks global error rates and triggers a system halt if thresholds are exceeded."""
+    def __init__(self, max_errors_per_minute: int = 10):
+        self.max_errors = max_errors_per_minute
+        self.error_timestamps = []
+        self.tripped = False
+
+    def record_error(self):
+        now = time.time()
+        self.error_timestamps.append(now)
+        self._cleanup(now)
+        if len(self.error_timestamps) > self.max_errors:
+            self.tripped = True
+            return True
+        return False
+
+    def _cleanup(self, now: float):
+        # Remove errors older than 1 minute
+        self.error_timestamps = [t for t in self.error_timestamps if now - t < 60]
+
+class Watchdog:
+    """
+    Proactive system monitor. Tracks symbol heartbeats, system health, and manages the circuit breaker.
+    """
+    def __init__(self, 
+                 symbols: list[str], 
+                 alert_system: AlertSystem, 
+                 stop_callback: Callable[[], Awaitable[None]],
+                 health_checker: HealthChecker,
+                 timeout_seconds: int = 300):
+        self.symbols = symbols
+        self.alert_system = alert_system
+        self.stop_callback = stop_callback
+        self.health_checker = health_checker
+        self.timeout_seconds = timeout_seconds
+        
+        self._heartbeats: Dict[str, float] = {s: time.time() for s in symbols}
+        self._circuit_breaker = SystemCircuitBreaker()
+        self.running = False
+
+    def register_heartbeat(self, symbol: str):
+        self._heartbeats[symbol] = time.time()
+
+    def record_error(self, source: str):
+        if self._circuit_breaker.record_error():
+            logger.critical("System Circuit Breaker Tripped! Too many errors.", source=source)
+            asyncio.create_task(self._emergency_stop())
+
+    async def _emergency_stop(self):
+        await self.alert_system.send_alert("CRITICAL", "System Circuit Breaker Tripped. Shutting down.")
+        await self.stop_callback()
+
+    async def run(self):
+        self.running = True
+        logger.info("Watchdog service started.")
+        while self.running:
+            try:
+                now = time.time()
+                # 1. Check Heartbeats
+                for symbol in self.symbols:
+                    last_beat = self._heartbeats.get(symbol, 0)
+                    if (now - last_beat) > self.timeout_seconds:
+                        logger.warning("Watchdog Alert: Symbol stalled.", symbol=symbol, last_beat=last_beat)
+                        await self.alert_system.send_alert('warning', f"Watchdog: No data for {symbol} in {self.timeout_seconds}s.")
+                
+                # 2. Check System Health
+                health = self.health_checker.get_health_status()
+                if health['status'] != 'healthy':
+                    logger.warning("System Health Warning", issues=health['issues'])
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Watchdog loop error", error=str(e))
+            
+            await asyncio.sleep(60)
+
+    async def stop(self):
+        self.running = False
+        logger.info("Watchdog service stopped.")
