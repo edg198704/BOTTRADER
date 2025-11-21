@@ -177,7 +177,7 @@ class TelegramBot:
         pnl_emoji = "🟢" if daily_pnl >= 0 else "🔴"
 
         # Escape for MarkdownV2
-        def esc(t): return str(t).replace('.', '\.')
+        def esc(t): return str(t).replace('.', '\.').replace('-', '\-')
 
         message = (
             f"🤖 *Bot Status*\n\n"
@@ -256,4 +256,26 @@ class TelegramBot:
         entry = learner.symbol_models.get(symbol)
         
         if not entry:
-            await update.message.reply_text(f
+            await update.message.reply_text(f"⚠️ No trained model found for `{symbol}`.", parse_mode=ParseMode.MARKDOWN_V2)
+            return
+
+        meta = entry.get('meta', {})
+        metrics = meta.get('metrics', {})
+        weights = meta.get('optimized_weights', {})
+        
+        # Get current regime from strategy
+        regime = strategy.get_latest_regime(symbol) or "UNKNOWN"
+        
+        def esc(t): return str(t).replace('.', '\.').replace('-', '\-').replace('_', '\_')
+
+        msg = f"🧠 *AI Model Insights: {esc(symbol)}*\n\n"
+        msg += f"*Regime*: `{esc(regime.upper())}`\n"
+        msg += f"*Model Age*: `{esc(meta.get('timestamp', 'N/A'))}`\n"
+        msg += f"*PSR Score*: `{esc(f'{metrics.get('psr', 0):.2f}')}`\n"
+        msg += f"*Meta F1*: `{esc(f'{metrics.get('meta', {}).get('f1', 0):.2f}')}`\n\n"
+        
+        msg += "*Ensemble Weights:*\n"
+        for k, v in weights.items():
+            msg += f"• {esc(k)}: `{esc(f'{v:.2f}')}`\n"
+            
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
