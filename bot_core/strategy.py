@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import json
 import os
-from typing import Dict, Any, Optional, List, Tuple, Literal, Deque
+from typing import Dict, Any, Optional, List, Tuple, Literal, Deque, Set
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import Executor
 from collections import deque
@@ -49,7 +49,14 @@ class StrategyStateManager:
         state = self.persistence.load()
         if not state: return
 
-        def parse_dt_dict(d): return {k: datetime.fromisoformat(v) for k, v in d.items()}
+        def parse_dt_dict(d):
+            res = {}
+            for k, v in d.items():
+                try:
+                    res[k] = datetime.fromisoformat(v)
+                except ValueError:
+                    pass
+            return res
         
         self.last_retrained_at = parse_dt_dict(state.get('last_retrained_at', {}))
         self.last_signal_time = parse_dt_dict(state.get('last_signal_time', {}))
@@ -62,14 +69,20 @@ class StrategyStateManager:
         
         if 'prediction_logs' in state:
             for k, v in state['prediction_logs'].items():
-                self.prediction_logs[k] = [(datetime.fromisoformat(ts), p) for ts, p in v]
+                try:
+                    self.prediction_logs[k] = [(datetime.fromisoformat(ts), p) for ts, p in v]
+                except ValueError:
+                    continue
 
         if 'individual_model_logs' in state:
             for k, v in state['individual_model_logs'].items():
-                self.individual_model_logs[k] = [
-                    (datetime.fromisoformat(ts), {m: np.array(p) for m, p in preds.items()}) 
-                    for ts, preds in v
-                ]
+                try:
+                    self.individual_model_logs[k] = [
+                        (datetime.fromisoformat(ts), {m: np.array(p) for m, p in preds.items()}) 
+                        for ts, preds in v
+                    ]
+                except ValueError:
+                    continue
 
         if 'model_performance_stats' in state:
             window = self.config.ensemble_weights.dynamic_window
@@ -186,6 +199,7 @@ class AIEnsembleStrategy(TradingStrategy):
         super().__init__(config)
         self.ai_config = config
         self.state = StrategyStateManager(config)
+        self._training_in_progress: Set[str] = set()
         
         try: # Lazy import to avoid circular dependency issues during init if not used
             self.ensemble_learner = EnsembleLearner(self.ai_config)
@@ -442,7 +456,12 @@ class AIEnsembleStrategy(TradingStrategy):
         self.state.individual_model_logs[symbol] = remaining_ind_logs
 
     async def retrain(self, symbol: str, df: pd.DataFrame, executor: Executor):
+        if symbol in self._training_in_progress:
+            logger.info("Training already in progress for symbol, skipping.", symbol=symbol)
+            return
+
         logger.info("Strategy is triggering model retraining via ProcessPool.", symbol=symbol)
+        self._training_in_progress.add(symbol)
         loop = asyncio.get_running_loop()
         try:
             df_enriched = self.regime_detector.add_regime_features(df)
@@ -460,8 +479,12 @@ class AIEnsembleStrategy(TradingStrategy):
                 logger.warning("Model training failed or rejected.", symbol=symbol)
         except Exception as e:
             logger.error("Error during async model retraining", symbol=symbol, error=str(e))
+        finally:
+            self._training_in_progress.discard(symbol)
 
     def needs_retraining(self, symbol: str) -> bool:
+        if symbol in self._training_in_progress:
+            return False
         if not self.ensemble_learner.has_valid_model(symbol):
             return True
         if self.state.force_retrain_flags.get(symbol, False):
