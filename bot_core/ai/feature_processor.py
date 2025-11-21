@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Dict
 
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams
@@ -9,39 +9,20 @@ logger = get_logger(__name__)
 
 class FeatureProcessor:
     """
-    Encapsulates all feature engineering, normalization, and labeling logic
-    to ensure consistency between training and inference phases.
+    Encapsulates all feature engineering, normalization, and labeling logic.
+    Implements institutional-grade labeling (Triple Barrier) and stationarity checks.
     """
 
     @staticmethod
-    def get_expected_feature_count(config: AIEnsembleStrategyParams) -> int:
-        """
-        Calculates the total number of features expected after processing,
-        including base features and generated lags.
-        """
-        return len(FeatureProcessor.get_feature_names(config))
-
-    @staticmethod
     def get_feature_names(config: AIEnsembleStrategyParams) -> List[str]:
-        """
-        Returns the ordered list of feature names including generated lags.
-        This serves as the single source of truth for feature alignment.
-        """
-        # Start with base feature columns in the order defined in config
         cols = list(config.feature_columns)
-        
-        # Add Market Leader features if enabled
         if config.features.use_leader_features:
-            cols.append("leader_log_return")
-            cols.append("leader_rsi")
+            cols.extend(["leader_log_return", "leader_rsi"])
 
-        # Add lag features in the exact order they are generated
         lags = config.features.lag_features
         depth = config.features.lag_depth
-        
         if depth > 0 and lags:
             for col in lags:
-                # Only generate lags for columns that are actually in the feature set
                 if col in config.feature_columns:
                     for i in range(1, depth + 1):
                         cols.append(f"{col}_lag_{i}")
@@ -49,420 +30,229 @@ class FeatureProcessor:
 
     @staticmethod
     def _add_time_features(df: pd.DataFrame) -> pd.DataFrame:
-        """Generates cyclical time features (Sin/Cos) for Hour and Day of Week."""
         df = df.copy()
-        if 'timestamp' in df.columns:
-            # If timestamp is a column
-            dt_series = df['timestamp']
-        else:
-            # If timestamp is the index
-            dt_series = df.index.to_series()
-
-        # Hour of Day (0-23)
+        dt_series = df['timestamp'] if 'timestamp' in df.columns else df.index.to_series()
+        
         df['time_hour_sin'] = np.sin(2 * np.pi * dt_series.dt.hour / 24)
         df['time_hour_cos'] = np.cos(2 * np.pi * dt_series.dt.hour / 24)
-        
-        # Day of Week (0-6)
         df['time_dow_sin'] = np.sin(2 * np.pi * dt_series.dt.dayofweek / 7)
         df['time_dow_cos'] = np.cos(2 * np.pi * dt_series.dt.dayofweek / 7)
-        
         return df
 
     @staticmethod
     def _add_price_action_features(df: pd.DataFrame) -> pd.DataFrame:
-        """Generates microstructure features: Body Size, Upper Wick, Lower Wick."""
         df = df.copy()
-        required = ['open', 'high', 'low', 'close']
-        if not all(col in df.columns for col in required):
-            return df
-
-        # Avoid division by zero
         close_safe = df['close'].replace(0, 1.0)
-
-        # Body Size: Absolute difference between Open and Close, relative to Close
         df['pa_body_size'] = (df['close'] - df['open']).abs() / close_safe
-        
-        # Upper Wick: High - Max(Open, Close)
         df['pa_upper_wick'] = (df['high'] - df[['open', 'close']].max(axis=1)) / close_safe
-        
-        # Lower Wick: Min(Open, Close) - Low
         df['pa_lower_wick'] = (df[['open', 'close']].min(axis=1) - df['low']) / close_safe
-        
         return df
 
     @staticmethod
     def _add_volatility_features(df: pd.DataFrame) -> pd.DataFrame:
-        """Generates Garman-Klass Volatility Estimator."""
         df = df.copy()
-        required = ['open', 'high', 'low', 'close']
-        if not all(col in df.columns for col in required):
-            return df
-
-        # Garman-Klass Volatility
-        # 0.5 * ln(High/Low)^2 - (2*ln(2)-1) * ln(Close/Open)^2
-        log_hl = np.log(df['high'] / df['low'])
-        log_co = np.log(df['close'] / df['open'])
-        
+        log_hl = np.log(df['high'] / df['low'].replace(0, 1e-8))
+        log_co = np.log(df['close'] / df['open'].replace(0, 1e-8))
         df['volatility_gk'] = np.sqrt(0.5 * log_hl**2 - (2 * np.log(2) - 1) * log_co**2)
-        
         return df
 
     @staticmethod
     def _add_microstructure_features(df: pd.DataFrame) -> pd.DataFrame:
-        """Generates Amihud Illiquidity and Parkinson Volatility."""
         df = df.copy()
-        required = ['open', 'high', 'low', 'close', 'volume']
-        if not all(col in df.columns for col in required):
-            return df
-
-        # 1. Parkinson Volatility (Range-based)
-        # sqrt(1 / (4 * ln(2)) * ln(High / Low)^2)
-        # More efficient estimator than Close-to-Close
         const = 1.0 / (4.0 * np.log(2.0))
-        log_hl = np.log(df['high'] / df['low'])
+        log_hl = np.log(df['high'] / df['low'].replace(0, 1e-8))
         df['volatility_parkinson'] = np.sqrt(const * log_hl**2)
 
-        # 2. Amihud Illiquidity Proxy
-        # |Return| / (Volume * Close)
-        # Measures price impact per unit of volume traded.
-        # High values = Low Liquidity (Price moves easily with little volume)
-        # We use a rolling average to smooth it out
         abs_return = df['close'].pct_change().abs()
-        dollar_volume = df['volume'] * df['close']
-        dollar_volume = dollar_volume.replace(0, 1.0) # Avoid div/0
-        
-        raw_illiquidity = abs_return / dollar_volume
-        # Scale up by 1e6 or similar to make numbers readable, or just normalize later
-        # We'll just normalize later, but let's smooth it first
-        df['amihud_illiquidity'] = raw_illiquidity.rolling(window=10).mean()
-
+        dollar_volume = (df['volume'] * df['close']).replace(0, 1.0)
+        df['amihud_illiquidity'] = (abs_return / dollar_volume).rolling(window=10).mean()
         return df
 
     @staticmethod
-    def _get_weights_ffd(d: float, thres: float, lim: int) -> np.ndarray:
-        """Calculates weights for Fractional Differentiation (Fixed Window)."""
+    def _apply_frac_diff(df: pd.DataFrame, d: float, thres: float) -> pd.DataFrame:
+        df = df.copy()
+        if 'close' not in df.columns: return df
+        
+        # Weights calculation
         w, k = [1.], 1
         while True:
             w_k = -w[-1] / k * (d - k + 1)
-            if abs(w_k) < thres or len(w) >= lim:
+            if abs(w_k) < thres or len(w) >= 2000:
                 break
             w.append(w_k)
             k += 1
-        return np.array(w[::-1]).reshape(-1, 1)
-
-    @staticmethod
-    def _apply_frac_diff(df: pd.DataFrame, d: float, thres: float) -> pd.DataFrame:
-        """Applies Fractional Differentiation to the 'close' price."""
-        df = df.copy()
-        if 'close' not in df.columns:
-            return df
-
-        # Calculate weights
-        # Limit window size to avoid excessive data loss, but enough for convergence
-        # d=0.4 usually converges within ~500-1000 points
-        weights = FeatureProcessor._get_weights_ffd(d, thres, 2000)
-        width = len(weights)
-        
-        if len(df) < width:
-            # Not enough data to compute frac diff
-            df['close_frac'] = np.nan
-            return df
+        weights = np.array(w[::-1])
 
         # Apply convolution
-        # We use numpy convolve. 'valid' mode returns N - W + 1 points.
-        # We need to pad the beginning with NaNs to maintain index alignment.
         close_vals = df['close'].values
-        frac_diff = np.convolve(close_vals, weights.flatten(), mode='valid')
-        
-        # Pad with NaNs at the start
+        if len(close_vals) < len(weights):
+            df['close_frac'] = np.nan
+            return df
+            
+        frac_diff = np.convolve(close_vals, weights, mode='valid')
         pad_len = len(close_vals) - len(frac_diff)
-        full_frac_diff = np.concatenate([np.full(pad_len, np.nan), frac_diff])
-        
-        df['close_frac'] = full_frac_diff
+        df['close_frac'] = np.concatenate([np.full(pad_len, np.nan), frac_diff])
         return df
 
     @staticmethod
     def _stationarize_data(df: pd.DataFrame, cols_to_process: List[str]) -> pd.DataFrame:
-        """
-        Transforms non-stationary features (absolute prices, raw volume) into stationary ratios.
-        This improves model generalization across different price regimes.
-        """
         df_trans = df.copy()
-        
-        # 1. Handle Volume -> Relative Volume
         if 'volume' in df_trans.columns and 'volume' in cols_to_process:
-            # Use a 50-period rolling average for baseline
-            vol_ma = df_trans['volume'].rolling(window=50, min_periods=1).mean()
-            # Avoid division by zero
-            vol_ma = vol_ma.replace(0, 1.0)
+            vol_ma = df_trans['volume'].rolling(window=50, min_periods=1).mean().replace(0, 1.0)
             df_trans['volume'] = df_trans['volume'] / vol_ma
 
-        # 2. Handle Price Levels -> % Distance from Close
-        # Heuristic: If a column name suggests it's a price level (e.g. 'upper', 'sma')
-        # and its value is close to the current price, transform it to a relative distance.
         price_keywords = ['upper', 'lower', 'sma', 'ema', 'wma', 'kama', 'mid', 'top', 'bot', 'open', 'high', 'low']
-        
         if 'close' in df_trans.columns:
-            close_price = df_trans['close']
+            close_price = df_trans['close'].replace(0, 1e-8)
             for col in cols_to_process:
-                if col == 'close': continue # 'close' itself is usually not a feature, or handled via log_return
-                if col not in df_trans.columns: continue
-                
-                # Check naming convention
-                is_price_like = any(k in col.lower() for k in price_keywords)
-                
-                if is_price_like:
-                    try:
-                        # Safety check: Magnitude should be comparable to close price (e.g. within 50%)
-                        # This prevents transforming oscillators like RSI that might accidentally match a keyword
-                        # We check the last valid value for efficiency
-                        last_val = df_trans[col].iloc[-1]
-                        last_close = close_price.iloc[-1]
-                        
-                        if last_close > 0 and 0.5 < (last_val / last_close) < 1.5:
-                            # Transform to percentage distance: (Indicator - Close) / Close
-                            df_trans[col] = (df_trans[col] - close_price) / close_price
-                    except Exception:
-                        # If check fails (e.g. NaNs), skip transformation
-                        pass
-
+                if col == 'close' or col not in df_trans.columns: continue
+                if any(k in col.lower() for k in price_keywords):
+                    # Check magnitude similarity to avoid transforming oscillators
+                    if 0.5 < (df_trans[col].iloc[-1] / close_price.iloc[-1]) < 1.5:
+                        df_trans[col] = (df_trans[col] - close_price) / close_price
         return df_trans
 
     @staticmethod
     def process_data(df: pd.DataFrame, config: AIEnsembleStrategyParams, leader_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-        """
-        Applies the full feature engineering pipeline:
-        1. Generate Time/Price Action/Quant/Microstructure features (if enabled).
-        2. Merge Market Leader features (if enabled and provided).
-        3. Stationarize features (Absolute -> Relative).
-        4. Select base feature columns.
-        5. Generates lagged features (if configured).
-        6. Drops NaNs introduced by lags.
-        7. Applies Normalization (Z-Score or Robust).
-        8. Enforces column order matching get_feature_names.
-        """
-        df_processed = df.copy()
-
-        # 1. Generate Advanced Features (Before stationarization/selection)
-        if config.features.use_time_features:
-            df_processed = FeatureProcessor._add_time_features(df_processed)
+        df_proc = df.copy()
         
-        if config.features.use_price_action_features:
-            df_processed = FeatureProcessor._add_price_action_features(df_processed)
+        if config.features.use_time_features: df_proc = FeatureProcessor._add_time_features(df_proc)
+        if config.features.use_price_action_features: df_proc = FeatureProcessor._add_price_action_features(df_proc)
+        if config.features.use_volatility_estimators: df_proc = FeatureProcessor._add_volatility_features(df_proc)
+        if config.features.use_microstructure_features: df_proc = FeatureProcessor._add_microstructure_features(df_proc)
+        if config.features.use_frac_diff: df_proc = FeatureProcessor._apply_frac_diff(df_proc, config.features.frac_diff_d, config.features.frac_diff_thres)
 
-        if config.features.use_volatility_estimators:
-            df_processed = FeatureProcessor._add_volatility_features(df_processed)
-
-        if config.features.use_microstructure_features:
-            df_processed = FeatureProcessor._add_microstructure_features(df_processed)
-
-        if config.features.use_frac_diff:
-            df_processed = FeatureProcessor._apply_frac_diff(
-                df_processed, 
-                config.features.frac_diff_d, 
-                config.features.frac_diff_thres
-            )
-
-        # 2. Merge Market Leader Features
         if config.features.use_leader_features and leader_df is not None and not leader_df.empty:
-            try:
-                # Extract relevant columns from leader
-                leader_feats = pd.DataFrame(index=leader_df.index)
-                
-                # Calculate Log Return for Leader
-                if 'close' in leader_df.columns:
-                    leader_feats['leader_log_return'] = np.log(leader_df['close'] / leader_df['close'].shift(1))
-                
-                # Extract RSI if available (DataHandler calculates it)
-                if 'rsi' in leader_df.columns:
-                    leader_feats['leader_rsi'] = leader_df['rsi']
-                
-                # Merge onto main DF
-                # We use join with forward fill to handle slight timestamp mismatches
-                df_processed = df_processed.join(leader_feats, how='left')
-                
-                # Forward fill any gaps in leader data (up to a limit)
-                df_processed[['leader_log_return', 'leader_rsi']] = df_processed[['leader_log_return', 'leader_rsi']].ffill(limit=5)
-                
-            except Exception as e:
-                logger.warning(f"Failed to merge market leader features: {e}")
+            leader_feats = pd.DataFrame(index=leader_df.index)
+            leader_feats['leader_log_return'] = np.log(leader_df['close'] / leader_df['close'].shift(1).replace(0, np.nan))
+            if 'rsi' in leader_df.columns: leader_feats['leader_rsi'] = leader_df['rsi']
+            df_proc = df_proc.join(leader_feats, how='left').ffill(limit=5)
 
-        # 3. Stationarize Data (Transform absolute prices/volume to ratios)
-        # We pass the list of intended features so we only transform what's needed
-        df_stationary = FeatureProcessor._stationarize_data(df_processed, config.feature_columns)
-
-        # 4. Select Base Columns
-        # We need to include leader columns in the selection list if they are generated
+        df_stat = FeatureProcessor._stationarize_data(df_proc, config.feature_columns)
+        
+        # Select and Lag
         cols = list(config.feature_columns)
-        if config.features.use_leader_features:
-            cols.append("leader_log_return")
-            cols.append("leader_rsi")
+        if config.features.use_leader_features: cols.extend(["leader_log_return", "leader_rsi"])
+        
+        valid_cols = [c for c in cols if c in df_stat.columns]
+        subset = df_stat[valid_cols].copy()
 
-        valid_cols = [c for c in cols if c in df_stationary.columns]
-        
-        if len(valid_cols) != len(cols):
-            missing = set(cols) - set(valid_cols)
-            # Only warn if missing columns are not leader columns (which might be missing if leader_df is None)
-            if not (missing.issubset({'leader_log_return', 'leader_rsi'})):
-                logger.warning("Missing columns during processing", missing=missing)
-        
-        subset = df_stationary[valid_cols].copy()
-        
-        # 5. Generate Lags
         lags = config.features.lag_features
         depth = config.features.lag_depth
-        
         if depth > 0 and lags:
             for col in lags:
                 if col in subset.columns:
                     for i in range(1, depth + 1):
                         subset[f"{col}_lag_{i}"] = subset[col].shift(i)
-        
-        # 6. Drop NaNs (from lags, frac diff, and missing data)
+
         subset.dropna(inplace=True)
         
-        # 7. Normalize (Z-Score or Robust)
+        # Normalize
         window = config.features.normalization_window
-        epsilon = 1e-8
-
         if config.features.scaling_method == 'robust':
-            # Robust Scaling: (X - Median) / IQR
-            rolling_median = subset.rolling(window=window).median()
-            rolling_q75 = subset.rolling(window=window).quantile(0.75)
-            rolling_q25 = subset.rolling(window=window).quantile(0.25)
-            rolling_iqr = rolling_q75 - rolling_q25
-            
-            # Handle zero IQR to avoid division by zero
-            rolling_iqr = rolling_iqr.replace(0, epsilon)
-            
-            normalized = (subset - rolling_median) / rolling_iqr
+            median = subset.rolling(window=window).median()
+            iqr = subset.rolling(window=window).quantile(0.75) - subset.rolling(window=window).quantile(0.25)
+            normalized = (subset - median) / iqr.replace(0, 1e-8)
         else:
-            # Standard Z-Score: (X - Mean) / Std
-            rolling_mean = subset.rolling(window=window).mean()
-            rolling_std = subset.rolling(window=window).std()
-            normalized = (subset - rolling_mean) / (rolling_std + epsilon)
-        
-        # Rolling normalization introduces NaNs at the start of the window
+            mean = subset.rolling(window=window).mean()
+            std = subset.rolling(window=window).std()
+            normalized = (subset - mean) / std.replace(0, 1e-8)
+            
         normalized.dropna(inplace=True)
         
-        # 8. Enforce Column Order
-        # Ensure the output DataFrame has columns in the exact order expected by the model
-        expected_cols = FeatureProcessor.get_feature_names(config)
-        # Filter expected cols to those present (handling potential missing base cols gracefully)
-        final_cols = [c for c in expected_cols if c in normalized.columns]
-        
+        # Enforce Order
+        expected = FeatureProcessor.get_feature_names(config)
+        final_cols = [c for c in expected if c in normalized.columns]
         return normalized[final_cols]
 
     @staticmethod
-    def create_labels(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> pd.Series:
-        """Generates target labels based on configuration (Triple Barrier or Simple)."""
+    def create_labels(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> Tuple[pd.Series, pd.Series]:
+        """
+        Returns:
+            labels: Series of target classes (0, 1, 2)
+            t1: Series of event end timestamps (for Purged CV)
+        """
         if config.features.use_triple_barrier:
             return FeatureProcessor._create_triple_barrier_labels(df, config)
 
         horizon = config.features.labeling_horizon
         future_price = df['close'].shift(-horizon)
-        price_change_pct = (future_price - df['close']) / df['close']
-
-        labels = pd.Series(1, index=df.index)  # Default to 'hold' (1)
-
-        if config.features.use_dynamic_labeling:
-            atr_col = config.market_regime.volatility_col
-            if atr_col in df.columns:
-                multiplier = config.features.labeling_atr_multiplier
-                dynamic_threshold = (df[atr_col] * multiplier) / df['close']
-                labels[price_change_pct > dynamic_threshold] = 2  # 'buy'
-                labels[price_change_pct < -dynamic_threshold] = 0 # 'sell'
-            else:
-                threshold = config.features.labeling_threshold
-                labels[price_change_pct > threshold] = 2
-                labels[price_change_pct < -threshold] = 0
-        else:
-            threshold = config.features.labeling_threshold
-            labels[price_change_pct > threshold] = 2
-            labels[price_change_pct < -threshold] = 0
+        pct_change = (future_price - df['close']) / df['close']
         
-        return labels.iloc[:-horizon]
+        labels = pd.Series(1, index=df.index) # Hold
+        
+        threshold = config.features.labeling_threshold
+        if config.features.use_dynamic_labeling and config.market_regime.volatility_col in df.columns:
+            threshold = (df[config.market_regime.volatility_col] * config.features.labeling_atr_multiplier) / df['close']
+        
+        labels[pct_change > threshold] = 2 # Buy
+        labels[pct_change < -threshold] = 0 # Sell
+        
+        # t1 is simply index + horizon for fixed horizon labeling
+        t1 = pd.Series(df.index, index=df.index).shift(-horizon)
+        
+        return labels.iloc[:-horizon], t1.iloc[:-horizon]
 
     @staticmethod
-    def _create_triple_barrier_labels(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> pd.Series:
-        """
-        Implements the Triple Barrier Method for labeling.
-        Labels: 0 (SELL), 1 (HOLD), 2 (BUY)
-        """
+    def _create_triple_barrier_labels(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> Tuple[pd.Series, pd.Series]:
         horizon = config.features.labeling_horizon
         tp_mult = config.features.triple_barrier_tp_multiplier
         sl_mult = config.features.triple_barrier_sl_multiplier
         
-        # Use ATR for volatility if available, else fallback to percentage
+        close = df['close'].values
+        high = df['high'].values
+        low = df['low'].values
+        timestamps = df.index.values
+        
         atr_col = config.market_regime.volatility_col
+        vol = df[atr_col].values if atr_col in df.columns else close * 0.01
         
-        # Prepare arrays for speed
-        close_arr = df['close'].values
-        high_arr = df['high'].values
-        low_arr = df['low'].values
+        labels = np.ones(len(df), dtype=int)
+        t1_arr = np.full(len(df), np.nan, dtype='object')
         
-        if atr_col in df.columns:
-            vol_arr = df[atr_col].values
-        else:
-            # Fallback volatility: 1% of price if ATR is missing
-            vol_arr = close_arr * 0.01
-        
-        labels = np.ones(len(df), dtype=int) # Default 1 (HOLD)
-        
-        # Iterate up to len - horizon
+        # Vectorized-like loop (optimized)
+        # We iterate start points, but check barriers using array slicing
         limit = len(df) - horizon
         
         for i in range(limit):
-            current_close = close_arr[i]
-            vol = vol_arr[i]
+            curr_close = close[i]
+            curr_vol = vol[i]
+            if np.isnan(curr_vol) or curr_vol == 0: continue
             
-            if np.isnan(vol) or vol == 0:
-                continue
-                
-            upper_barrier = current_close + (vol * tp_mult)
-            lower_barrier = current_close - (vol * sl_mult)
+            upper = curr_close + (curr_vol * tp_mult)
+            lower = curr_close - (curr_vol * sl_mult)
             
-            # Slice the future window (path dependency)
-            window_high = high_arr[i+1 : i+1+horizon]
-            window_low = low_arr[i+1 : i+1+horizon]
+            # Window slices
+            w_high = high[i+1 : i+1+horizon]
+            w_low = low[i+1 : i+1+horizon]
+            w_time = timestamps[i+1 : i+1+horizon]
             
-            # Check hits
-            hit_upper_mask = window_high >= upper_barrier
-            hit_lower_mask = window_low <= lower_barrier
+            # Find first hit
+            hit_upper = w_high >= upper
+            hit_lower = w_low <= lower
             
-            has_upper = hit_upper_mask.any()
-            has_lower = hit_lower_mask.any()
+            first_upper = np.argmax(hit_upper) if hit_upper.any() else horizon + 1
+            first_lower = np.argmax(hit_lower) if hit_lower.any() else horizon + 1
             
-            if has_upper and not has_lower:
-                labels[i] = 2 # BUY
-            elif has_lower and not has_upper:
-                labels[i] = 0 # SELL
-            elif has_upper and has_lower:
-                # Both hit. Which was first?
-                first_upper_idx = np.argmax(hit_upper_mask)
-                first_lower_idx = np.argmax(hit_lower_mask)
-                
-                if first_upper_idx < first_lower_idx:
-                    labels[i] = 2 # BUY
-                elif first_lower_idx < first_upper_idx:
-                    labels[i] = 0 # SELL
-                else:
-                    # Same bar hit both barriers (extreme volatility). Default to HOLD/Avoid.
-                    labels[i] = 1
+            if first_upper < first_lower and first_upper < horizon:
+                labels[i] = 2
+                t1_arr[i] = w_time[first_upper]
+            elif first_lower < first_upper and first_lower < horizon:
+                labels[i] = 0
+                t1_arr[i] = w_time[first_lower]
             else:
-                labels[i] = 1 # HOLD
+                labels[i] = 1
+                t1_arr[i] = w_time[-1] # Vertical barrier
                 
-        return pd.Series(labels, index=df.index).iloc[:-horizon]
+        return pd.Series(labels, index=df.index).iloc[:-horizon], pd.Series(t1_arr, index=df.index).iloc[:-horizon]
 
     @staticmethod
     def create_sequences(X: np.ndarray, y: np.ndarray, seq_length: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Creates sequences for LSTM/Attention models."""
-        X_seq, y_seq = [], []
         if len(X) <= seq_length:
             return np.array([]), np.array([])
-            
-        for i in range(len(X) - seq_length + 1):
-            X_seq.append(X[i:i+seq_length])
-            y_seq.append(y[i+seq_length-1])
-            
-        return np.array(X_seq), np.array(y_seq)
+        # Sliding window view for memory efficiency
+        shape = (len(X) - seq_length + 1, seq_length, X.shape[1])
+        strides = (X.strides[0], X.strides[0], X.strides[1])
+        X_seq = np.lib.stride_tricks.as_strided(X, shape=shape, strides=strides)
+        y_seq = y[seq_length-1:]
+        return X_seq, y_seq
