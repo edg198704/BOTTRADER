@@ -19,12 +19,14 @@ class FeatureProcessor:
         cols = list(config.feature_columns)
         if config.features.use_leader_features:
             cols.extend(["leader_log_return", "leader_rsi"])
+        if config.features.use_order_book_features:
+            cols.append("obi")
 
         lags = config.features.lag_features
         depth = config.features.lag_depth
         if depth > 0 and lags:
             for col in lags:
-                if col in config.feature_columns:
+                if col in config.feature_columns or col == "obi":
                     for i in range(1, depth + 1):
                         cols.append(f"{col}_lag_{i}")
         return cols
@@ -70,6 +72,14 @@ class FeatureProcessor:
         return df
 
     @staticmethod
+    def _add_order_book_features(df: pd.DataFrame) -> pd.DataFrame:
+        # OBI is already injected by DataHandler if enabled, but we ensure it exists
+        if 'obi' not in df.columns:
+            df = df.copy()
+            df['obi'] = 0.0
+        return df
+
+    @staticmethod
     def _apply_frac_diff(df: pd.DataFrame, d: float, thres: float) -> pd.DataFrame:
         df = df.copy()
         if 'close' not in df.columns: return df
@@ -107,9 +117,10 @@ class FeatureProcessor:
             close_price = df_trans['close'].replace(0, 1e-8)
             for col in cols_to_process:
                 if col == 'close' or col not in df_trans.columns: continue
+                # Skip OBI as it is already a ratio (-1 to 1)
+                if col == 'obi': continue
+                
                 if any(k in col.lower() for k in price_keywords):
-                    # Check magnitude similarity to avoid transforming oscillators
-                    # Use np.errstate to suppress divide by zero warnings safely
                     with np.errstate(divide='ignore', invalid='ignore'):
                         ratio = df_trans[col].iloc[-1] / close_price.iloc[-1]
                         if 0.5 < ratio < 1.5:
@@ -124,6 +135,7 @@ class FeatureProcessor:
         if config.features.use_price_action_features: df_proc = FeatureProcessor._add_price_action_features(df_proc)
         if config.features.use_volatility_estimators: df_proc = FeatureProcessor._add_volatility_features(df_proc)
         if config.features.use_microstructure_features: df_proc = FeatureProcessor._add_microstructure_features(df_proc)
+        if config.features.use_order_book_features: df_proc = FeatureProcessor._add_order_book_features(df_proc)
         if config.features.use_frac_diff: df_proc = FeatureProcessor._apply_frac_diff(df_proc, config.features.frac_diff_d, config.features.frac_diff_thres)
 
         if config.features.use_leader_features and leader_df is not None and not leader_df.empty:
@@ -137,6 +149,7 @@ class FeatureProcessor:
         # Select and Lag
         cols = list(config.feature_columns)
         if config.features.use_leader_features: cols.extend(["leader_log_return", "leader_rsi"])
+        if config.features.use_order_book_features: cols.append("obi")
         
         valid_cols = [c for c in cols if c in df_stat.columns]
         subset = df_stat[valid_cols].copy()
@@ -171,11 +184,6 @@ class FeatureProcessor:
 
     @staticmethod
     def create_labels(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> Tuple[pd.Series, pd.Series]:
-        """
-        Returns:
-            labels: Series of target classes (0, 1, 2)
-            t1: Series of event end timestamps (for Purged CV)
-        """
         if config.features.use_triple_barrier:
             return FeatureProcessor._create_triple_barrier_labels(df, config)
 
@@ -192,17 +200,12 @@ class FeatureProcessor:
         labels[pct_change > threshold] = 2 # Buy
         labels[pct_change < -threshold] = 0 # Sell
         
-        # t1 is simply index + horizon for fixed horizon labeling
         t1 = pd.Series(df.index, index=df.index).shift(-horizon)
         
         return labels.iloc[:-horizon], t1.iloc[:-horizon]
 
     @staticmethod
     def _create_triple_barrier_labels(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> Tuple[pd.Series, pd.Series]:
-        """
-        Vectorized Triple Barrier Method using NumPy sliding windows.
-        Significantly faster than iterative approaches for large datasets.
-        """
         horizon = config.features.labeling_horizon
         tp_mult = config.features.triple_barrier_tp_multiplier
         sl_mult = config.features.triple_barrier_sl_multiplier
@@ -215,7 +218,6 @@ class FeatureProcessor:
         atr_col = config.market_regime.volatility_col
         vol = df[atr_col].values if atr_col in df.columns else close * 0.01
         
-        # Pre-calculate barriers
         upper_barriers = close + (vol * tp_mult)
         lower_barriers = close - (vol * sl_mult)
         
@@ -223,37 +225,24 @@ class FeatureProcessor:
         if n_samples <= horizon:
             return pd.Series(1, index=df.index), pd.Series(df.index, index=df.index)
 
-        # Create sliding windows: Shape (N - Horizon + 1, Horizon)
-        # This creates a view, not a copy, so it's memory efficient
         high_windows = sliding_window_view(high, window_shape=horizon)
         low_windows = sliding_window_view(low, window_shape=horizon)
         time_windows = sliding_window_view(timestamps, window_shape=horizon)
         
-        # We only care about the first (N - Horizon + 1) barriers to match the windows
-        # Reshape to (N, 1) for broadcasting against (N, Horizon)
         upper_barriers_aligned = upper_barriers[:high_windows.shape[0]].reshape(-1, 1)
         lower_barriers_aligned = lower_barriers[:low_windows.shape[0]].reshape(-1, 1)
         
-        # Boolean masks for touches: Shape (N, Horizon)
         hit_upper = high_windows >= upper_barriers_aligned
         hit_lower = low_windows <= lower_barriers_aligned
         
-        # Find first occurrence indices
-        # np.argmax returns the index of the first True. If all False, it returns 0.
         upper_indices = np.argmax(hit_upper, axis=1)
         lower_indices = np.argmax(hit_lower, axis=1)
         
-        # Check if there was actually a hit (since argmax returns 0 for all False)
         any_upper = np.any(hit_upper, axis=1)
         any_lower = np.any(hit_lower, axis=1)
         
-        # Initialize labels as 1 (Hold/Vertical Barrier)
         labels = np.ones(len(high_windows), dtype=int)
-        t1_vals = time_windows[:, -1].copy() # Default to vertical barrier time (end of window)
-        
-        # Logic:
-        # If Upper hit AND (Lower not hit OR Upper hit sooner), then BUY (2)
-        # If Lower hit AND (Upper not hit OR Lower hit sooner), then SELL (0)
+        t1_vals = time_windows[:, -1].copy()
         
         buy_mask = any_upper & (~any_lower | (upper_indices < lower_indices))
         sell_mask = any_lower & (~any_upper | (lower_indices < upper_indices))
@@ -261,13 +250,10 @@ class FeatureProcessor:
         labels[buy_mask] = 2
         labels[sell_mask] = 0
         
-        # Update t1 timestamps to the exact time the barrier was hit
         row_indices = np.arange(len(labels))
         t1_vals[buy_mask] = time_windows[row_indices[buy_mask], upper_indices[buy_mask]]
         t1_vals[sell_mask] = time_windows[row_indices[sell_mask], lower_indices[sell_mask]]
         
-        # The sliding window reduces the size of the array by (horizon - 1)
-        # We align this with the original index, dropping the last (horizon - 1) points
         result_index = df.index[:len(labels)]
         
         return pd.Series(labels, index=result_index), pd.Series(t1_vals, index=result_index)
@@ -276,7 +262,6 @@ class FeatureProcessor:
     def create_sequences(X: np.ndarray, y: np.ndarray, seq_length: int) -> Tuple[np.ndarray, np.ndarray]:
         if len(X) <= seq_length:
             return np.array([]), np.array([])
-        # Sliding window view for memory efficiency
         shape = (len(X) - seq_length + 1, seq_length, X.shape[1])
         strides = (X.strides[0], X.strides[0], X.strides[1])
         X_seq = np.lib.stride_tricks.as_strided(X, shape=shape, strides=strides)
