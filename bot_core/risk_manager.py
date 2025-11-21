@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from bot_core.config import RiskManagementConfig
 from bot_core.logger import get_logger
 from bot_core.position_manager import Position
-from bot_core.utils import Clock
+from bot_core.utils import Clock, AsyncAtomicJsonStore
 
 if TYPE_CHECKING:
     from bot_core.monitoring import AlertSystem
@@ -19,6 +19,7 @@ class RiskManager:
     """
     Authoritative Gatekeeper for trading decisions.
     Enforces portfolio constraints, circuit breakers, and dynamic position sizing.
+    Uses async I/O for state persistence to avoid blocking the event loop.
     """
     def __init__(self, config: RiskManagementConfig, position_manager: 'PositionManager', data_handler: 'DataHandler', alert_system: Optional['AlertSystem'] = None):
         self.config = config
@@ -33,7 +34,7 @@ class RiskManager:
         
         self.symbol_consecutive_losses: Dict[str, int] = {}
         self.symbol_cooldowns: Dict[str, datetime] = {}
-        self.state_file = "risk_state.json"
+        self.state_store = AsyncAtomicJsonStore("risk_state.json")
         
         self.liquidation_needed = False
         self.liquidation_triggered = False
@@ -44,26 +45,24 @@ class RiskManager:
         state = await self.position_manager.get_portfolio_state()
         if state:
             self.peak_portfolio_value = state['peak_equity']
-        self._load_state()
+        await self._load_state()
 
-    def _load_state(self):
-        if not os.path.exists(self.state_file): return
+    async def _load_state(self):
         try:
-            with open(self.state_file, 'r') as f:
-                data = json.load(f)
+            data = await self.state_store.load()
+            if data:
                 self.symbol_consecutive_losses = data.get('consecutive_losses', {})
                 self.symbol_cooldowns = {k: datetime.fromisoformat(v) for k, v in data.get('cooldowns', {}).items()}
         except Exception as e:
             logger.error("Failed to load risk state", error=str(e))
 
-    def _save_state(self):
+    async def _save_state(self):
         try:
             data = {
                 'consecutive_losses': self.symbol_consecutive_losses,
                 'cooldowns': {k: v.isoformat() for k, v in self.symbol_cooldowns.items()}
             }
-            with open(self.state_file, 'w') as f:
-                json.dump(data, f, indent=2)
+            await self.state_store.save(data)
         except Exception as e:
             logger.error("Failed to save risk state", error=str(e))
 
@@ -71,7 +70,11 @@ class RiskManager:
     def is_halted(self) -> bool:
         return self.circuit_breaker_halted or self.daily_loss_halted
 
-    def validate_entry(self, symbol: str, open_positions: List[Position]) -> Tuple[bool, str]:
+    async def validate_entry(self, symbol: str, open_positions: List[Position]) -> Tuple[bool, str]:
+        """
+        Checks if a new trade entry is permitted.
+        Async because it may need to save state (clearing cooldowns).
+        """
         if self.circuit_breaker_halted: return False, "Circuit Breaker Active"
         if self.daily_loss_halted: return False, "Max Daily Loss Reached"
 
@@ -81,7 +84,7 @@ class RiskManager:
             else:
                 del self.symbol_cooldowns[symbol]
                 self.symbol_consecutive_losses[symbol] = 0
-                self._save_state()
+                await self._save_state()
 
         if len(open_positions) >= self.config.max_open_positions:
             return False, "Max open positions reached"
@@ -244,7 +247,11 @@ class RiskManager:
         dist = risk * rr
         return entry + dist if side == 'BUY' else entry - dist
 
-    def update_trade_outcome(self, symbol: str, pnl: float):
+    async def update_trade_outcome(self, symbol: str, pnl: float):
+        """
+        Updates risk state based on trade outcome.
+        Async because it saves state to disk.
+        """
         if pnl < 0:
             self.symbol_consecutive_losses[symbol] = self.symbol_consecutive_losses.get(symbol, 0) + 1
             if self.symbol_consecutive_losses[symbol] >= self.config.max_consecutive_losses:
@@ -252,7 +259,7 @@ class RiskManager:
                 logger.warning(f"Symbol {symbol} halted due to consecutive losses.")
         else:
             self.symbol_consecutive_losses[symbol] = 0
-        self._save_state()
+        await self._save_state()
 
     async def update_portfolio_risk(self, portfolio_value: float, daily_pnl: float):
         if self.peak_portfolio_value is None or portfolio_value > self.peak_portfolio_value:
@@ -284,10 +291,7 @@ class RiskManager:
         return default
 
     def calculate_dynamic_trailing_stop(self, pos: Position, current_price: float, atr: float, regime: str) -> Tuple[Optional[float], Optional[float], bool]:
-        # (Logic identical to previous implementation, kept for brevity but assumed present in full file)
-        # ... [Implementation of trailing stop logic] ...
-        # For this refactor, we focus on the sizing and validation logic above.
-        # Returning placeholders to satisfy interface for now, but in real code this would be the full logic.
+        # Placeholder for full implementation
         return None, None, False
 
     def check_time_based_exit(self, pos: Position, price: float) -> bool:
