@@ -156,8 +156,8 @@ class TradingBot:
             # Drop tick if busy (Backpressure)
             return
 
+        tick_start = time.perf_counter()
         async with lock:
-            tick_start = time.perf_counter()
             try:
                 # 2. Data Freshness Check
                 last_processed = self.processed_candles.get(symbol)
