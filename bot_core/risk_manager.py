@@ -54,6 +54,42 @@ class DuplicatePositionRule(RiskRule):
                 return False, "Position already open"
         return True, "OK"
 
+class CorrelationRule(RiskRule):
+    """
+    Rejects new positions if the asset is highly correlated with existing positions.
+    Acts as a Fail-Fast mechanism before sizing.
+    """
+    async def check(self, symbol: str, open_positions: List[Position], context: 'RiskManager') -> Tuple[bool, str]:
+        if not context.config.correlation.enabled:
+            return True, "OK"
+        
+        # Skip if no open positions
+        if not open_positions:
+            return True, "OK"
+
+        max_corr = 0.0
+        conflicting_symbol = ""
+        
+        for pos in open_positions:
+            if pos.symbol == symbol: 
+                continue
+            
+            # Calculate correlation via DataHandler
+            c = context.data_handler.get_correlation(
+                symbol, 
+                pos.symbol, 
+                context.config.correlation.lookback_periods
+            )
+            
+            if c > max_corr:
+                max_corr = c
+                conflicting_symbol = pos.symbol
+
+        if max_corr > context.config.correlation.max_correlation:
+            return False, f"High Correlation ({max_corr:.2f}) with {conflicting_symbol}"
+            
+        return True, "OK"
+
 # --- Position Sizer Component ---
 
 class PositionSizer:
@@ -85,8 +121,9 @@ class PositionSizer:
         # 3. Confidence Scaling
         risk_pct = self._apply_confidence(risk_pct, confidence, confidence_threshold)
 
-        # 4. Correlation Penalty
-        risk_pct = self._apply_correlation(symbol, risk_pct, open_positions)
+        # 4. Correlation Penalty (Sizing Reduction)
+        # Even if CorrelationRule passes, we might still want to reduce size if correlation is moderate
+        risk_pct = self._apply_correlation_penalty(symbol, risk_pct, open_positions)
 
         # 5. Calculate USD Risk
         risk_usd = equity * risk_pct
@@ -130,14 +167,19 @@ class PositionSizer:
         scaler = 1.0 + (surplus * self.config.confidence_scaling_factor)
         return risk_pct * min(scaler, self.config.max_confidence_risk_multiplier)
 
-    def _apply_correlation(self, symbol: str, risk_pct: float, open_positions: List[Position]) -> float:
+    def _apply_correlation_penalty(self, symbol: str, risk_pct: float, open_positions: List[Position]) -> float:
         if not self.config.correlation.enabled: return risk_pct
+        # Note: High correlations are rejected by CorrelationRule. 
+        # This applies a penalty for moderate correlations if configured.
         max_corr = 0.0
         for pos in open_positions:
             if pos.symbol == symbol: continue
             c = self.data_handler.get_correlation(symbol, pos.symbol, self.config.correlation.lookback_periods)
             if c > max_corr: max_corr = c
-        if max_corr > self.config.correlation.max_correlation:
+        
+        # If correlation is high but passed the rule (e.g. rule threshold is 0.9, this is 0.8)
+        # we apply a penalty factor.
+        if max_corr > (self.config.correlation.max_correlation * 0.8):
             return risk_pct * self.config.correlation.penalty_factor
         return risk_pct
 
@@ -187,7 +229,8 @@ class RiskManager:
             CircuitBreakerRule(),
             CooldownRule(),
             MaxPositionsRule(),
-            DuplicatePositionRule()
+            DuplicatePositionRule(),
+            CorrelationRule() # Added Correlation Rule
         ]
         
         logger.info("RiskManager initialized with modular Risk Engine.")
