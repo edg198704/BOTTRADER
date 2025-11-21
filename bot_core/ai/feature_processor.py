@@ -108,23 +108,38 @@ class FeatureProcessor:
     @staticmethod
     def _stationarize_data(df: pd.DataFrame, cols_to_process: List[str]) -> pd.DataFrame:
         df_trans = df.copy()
+        
+        # Vectorized Volume Normalization
         if 'volume' in df_trans.columns and 'volume' in cols_to_process:
             vol_ma = df_trans['volume'].rolling(window=50, min_periods=1).mean().replace(0, 1.0)
             df_trans['volume'] = df_trans['volume'] / vol_ma
 
         price_keywords = ['upper', 'lower', 'sma', 'ema', 'wma', 'kama', 'mid', 'top', 'bot', 'open', 'high', 'low']
+        
         if 'close' in df_trans.columns:
             close_price = df_trans['close'].replace(0, 1e-8)
-            for col in cols_to_process:
-                if col == 'close' or col not in df_trans.columns: continue
-                # Skip OBI as it is already a ratio (-1 to 1)
-                if col == 'obi': continue
+            
+            # Identify columns that look like prices
+            price_cols = [c for c in cols_to_process 
+                          if c in df_trans.columns 
+                          and c != 'close' 
+                          and c != 'obi'
+                          and any(k in c.lower() for k in price_keywords)]
+            
+            # Vectorized Stationarization for Price Columns
+            if price_cols:
+                # Check if columns are roughly in the same magnitude as price (within 50%)
+                # We use the last value to check magnitude to avoid full series comparison overhead
+                last_close = close_price.iloc[-1]
+                valid_price_cols = []
+                for col in price_cols:
+                    last_val = df_trans[col].iloc[-1]
+                    if 0.5 < (last_val / last_close) < 1.5:
+                        valid_price_cols.append(col)
                 
-                if any(k in col.lower() for k in price_keywords):
-                    with np.errstate(divide='ignore', invalid='ignore'):
-                        ratio = df_trans[col].iloc[-1] / close_price.iloc[-1]
-                        if 0.5 < ratio < 1.5:
-                            df_trans[col] = (df_trans[col] - close_price) / close_price
+                if valid_price_cols:
+                    df_trans[valid_price_cols] = df_trans[valid_price_cols].div(close_price, axis=0) - 1.0
+
         return df_trans
 
     @staticmethod
