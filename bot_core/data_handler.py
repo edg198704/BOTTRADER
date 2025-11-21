@@ -85,7 +85,7 @@ def calculate_indicators_pure(df: pd.DataFrame, indicators_config: List[Dict[str
 class DataHandler:
     """
     Manages market data lifecycle and acts as the primary Event Producer for the system.
-    Implements a drift-correcting polling loop for precise data fetching.
+    Implements a drift-correcting polling loop for precise data fetching and Latency Tracking.
     """
     def __init__(self, exchange_api: ExchangeAPI, config: BotConfig, shared_latest_prices: Dict[str, float], event_bus: Optional[EventBus] = None):
         self.exchange_api = exchange_api
@@ -120,6 +120,7 @@ class DataHandler:
         
         self._dataframes: Dict[str, pd.DataFrame] = {}
         self._raw_buffers: Dict[str, pd.DataFrame] = {}
+        self._latencies: Dict[str, float] = {}  # Stores latency in seconds
         self._buffer_lock = asyncio.Lock()
         
         self._shared_latest_prices = shared_latest_prices
@@ -285,6 +286,17 @@ class DataHandler:
             latest_df = create_dataframe(latest_ohlcv)
             if latest_df is None or latest_df.empty: return
 
+            # --- Latency Calculation ---
+            # Compare the close time of the last candle with current wall clock
+            last_candle_ts = latest_df.index[-1]
+            if last_candle_ts.tzinfo is None: 
+                last_candle_ts = last_candle_ts.tz_localize(timezone.utc)
+            
+            now_utc = Clock.now()
+            latency = (now_utc - last_candle_ts).total_seconds()
+            self._latencies[symbol] = latency
+            # ---------------------------
+
             async with self._buffer_lock:
                 if is_recovery:
                     if current_buffer is not None:
@@ -369,6 +381,10 @@ class DataHandler:
                 df_copy = df_copy.iloc[:-1]
         
         return df_copy if not df_copy.empty else None
+
+    def get_latency(self, symbol: str) -> float:
+        """Returns the latency of the latest data point in seconds."""
+        return self._latencies.get(symbol, 0.0)
 
     def get_correlation(self, symbol_a: str, symbol_b: str, lookback: int = 50) -> float:
         df_a = self._dataframes.get(symbol_a)
