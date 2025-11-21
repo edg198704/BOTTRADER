@@ -4,7 +4,7 @@ import enum
 import json
 from typing import List, Optional, Dict, Any, TYPE_CHECKING
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLAlchemyEnum, func, Boolean, cast, Date, text, inspect, event, Index
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLAlchemyEnum, func, Boolean, cast, Date, text, inspect, event
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.dialects.sqlite import insert
 
@@ -15,6 +15,7 @@ from bot_core.utils import Clock
 if TYPE_CHECKING:
     from bot_core.monitoring import AlertSystem
     from bot_core.config import BreakevenConfig
+    from bot_core.exchange_api import ExchangeAPI
 
 logger = get_logger(__name__)
 Base = declarative_base()
@@ -83,7 +84,7 @@ class PositionManager:
         def set_sqlite_pragma(dbapi_connection, connection_record):
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA synchronous=NORMAL") # Faster writes with reasonable safety
+            cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.close()
 
         Base.metadata.create_all(self.engine)
@@ -94,8 +95,7 @@ class PositionManager:
         self.alert_system = alert_system
         self._db_lock = asyncio.Lock()
         
-        # --- In-Memory Caches ---
-        self._position_cache: Dict[str, Position] = {} # Map symbol -> Active Position (OPEN/PENDING)
+        self._position_cache: Dict[str, Position] = {}
         self._portfolio_state_cache: Optional[Dict[str, float]] = None
         
         logger.info("PositionManager initialized (WAL mode, Write-Through Cache enabled).")
@@ -104,7 +104,6 @@ class PositionManager:
         try:
             insp = inspect(self.engine)
             with self.engine.connect() as conn:
-                # Positions Table Updates
                 if insp.has_table('positions'):
                     columns = [c['name'] for c in insp.get_columns('positions')]
                     if 'strategy_metadata' not in columns:
@@ -126,7 +125,6 @@ class PositionManager:
                     if 'slippage_pct' not in columns:
                         conn.execute(text("ALTER TABLE positions ADD COLUMN slippage_pct FLOAT"))
                 
-                # Risk State Table Creation (if missing)
                 if not insp.has_table('risk_state'):
                     RiskState.__table__.create(self.engine)
 
@@ -134,15 +132,10 @@ class PositionManager:
             logger.warning(f"Schema update check failed: {e}")
 
     async def initialize(self):
-        """Loads initial state from DB into memory cache."""
         async with self._db_lock:
             self._realized_pnl = await self._run_in_executor(self._calculate_initial_realized_pnl_sync)
-            
-            # Initialize Portfolio State Cache
             await self._run_in_executor(self._initialize_portfolio_state_sync)
             self._portfolio_state_cache = await self._run_in_executor(self._get_portfolio_state_sync)
-            
-            # Initialize Position Cache
             active_positions = await self._run_in_executor(self._get_all_active_positions_sync)
             self._position_cache = {p.symbol: p for p in active_positions}
             
@@ -150,11 +143,47 @@ class PositionManager:
                     realized_pnl=self._realized_pnl, 
                     cached_positions=len(self._position_cache))
 
+    async def reconcile_positions(self, exchange_api: 'ExchangeAPI', latest_prices: Dict[str, float]):
+        """
+        Reconciles local database state with the exchange.
+        Detects phantom positions (in DB but not on exchange) and handles them.
+        """
+        logger.info("Starting position reconciliation...")
+        
+        # 1. Clear stuck PENDING positions
+        pending = await self.get_pending_positions()
+        for pos in pending:
+            # If pending for > 5 minutes, mark failed
+            if (Clock.now() - pos.creation_timestamp).total_seconds() > 300:
+                await self.mark_position_failed(pos.symbol, pos.order_id, "Reconciliation Timeout")
+
+        # 2. Check OPEN positions against Exchange Balances
+        open_positions = await self.get_all_open_positions()
+        if not open_positions: 
+            return
+
+        try:
+            balances = await exchange_api.get_balance()
+            for pos in open_positions:
+                base_asset = pos.symbol.split('/')[0]
+                # Check if we actually hold the asset (for LONGs)
+                if pos.side == 'BUY':
+                    held_balance = balances.get(base_asset, {}).get('total', 0.0)
+                    # Allow 10% tolerance for fees/dust
+                    if held_balance < (pos.quantity * 0.90):
+                        logger.critical("Phantom position detected! Closing in DB.", symbol=pos.symbol, db_qty=pos.quantity, exchange_qty=held_balance)
+                        price = latest_prices.get(pos.symbol, pos.entry_price)
+                        await self.close_position(pos.symbol, price, reason="Reconciliation: Phantom Position")
+                        if self.alert_system:
+                            await self.alert_system.send_alert("CRITICAL", f"Phantom position closed for {pos.symbol}")
+        except Exception as e:
+            logger.error("Error during reconciliation", error=str(e))
+
     async def _run_in_executor(self, func, *args):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, func, *args)
 
-    # --- Synchronous DB Helpers (Executed in ThreadPool) ---
+    # --- Synchronous DB Helpers ---
 
     def _calculate_initial_realized_pnl_sync(self) -> float:
         session = self.SessionLocal()
@@ -244,7 +273,6 @@ class PositionManager:
     def _update_risk_state_sync(self, symbol: str, consecutive_losses: int, cooldown_until: Optional[datetime.datetime]):
         session = self.SessionLocal()
         try:
-            # Upsert logic using SQLite dialect
             stmt = insert(RiskState).values(
                 symbol=symbol, 
                 consecutive_losses=consecutive_losses, 
