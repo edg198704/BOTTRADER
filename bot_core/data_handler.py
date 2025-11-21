@@ -3,7 +3,7 @@ import os
 import time
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 import pandas_ta as ta
 from concurrent.futures import ThreadPoolExecutor
 
@@ -14,6 +14,73 @@ from bot_core.utils import generate_indicator_rename_map, parse_timeframe_to_sec
 from bot_core.event_system import EventBus, MarketDataEvent
 
 logger = get_logger(__name__)
+
+# --- Pure Function for Indicator Calculation (Picklable) ---
+
+def calculate_indicators_pure(df: pd.DataFrame, indicators_config: List[Dict[str, Any]], secondary_timeframes: List[str], timeframe: str) -> pd.DataFrame:
+    """
+    Pure function to calculate technical indicators. 
+    Can be run in a separate thread/process without object state.
+    """
+    if df is None or len(df) < 50: return df
+    
+    # Enforce Continuity
+    try:
+        if not df.index.is_monotonic_increasing: df = df.sort_index()
+        tf_seconds = parse_timeframe_to_seconds(timeframe)
+        if tf_seconds > 0:
+            start, end = df.index[0], df.index[-1]
+            full_index = pd.date_range(start=start, end=end, freq=f"{tf_seconds}s")
+            if len(full_index) != len(df.index):
+                df_continuous = df.reindex(full_index)
+                cols_to_ffill = [c for c in ['open', 'high', 'low', 'close'] if c in df_continuous.columns]
+                df_continuous[cols_to_ffill] = df_continuous[cols_to_ffill].ffill()
+                if 'volume' in df_continuous.columns: df_continuous['volume'] = df_continuous['volume'].fillna(0)
+                df_continuous.dropna(inplace=True)
+                df_continuous.index.name = 'timestamp'
+                df = df_continuous
+    except Exception:
+        pass
+
+    df_out = df.copy()
+    ta_strategy = ta.Strategy(name="BotTrader", ta=indicators_config)
+    
+    try:
+        df_out.ta.strategy(ta_strategy)
+    except Exception:
+        return df_out
+
+    if secondary_timeframes:
+        rename_map = generate_indicator_rename_map(indicators_config)
+        for tf in secondary_timeframes:
+            try:
+                tf_seconds = parse_timeframe_to_seconds(tf)
+                resampled = df.resample(f"{tf_seconds}s").agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
+                if len(resampled) < 20: continue
+                resampled.ta.strategy(ta_strategy)
+                htf_cols = []
+                for col in resampled.columns:
+                    if col not in ['open', 'high', 'low', 'close', 'volume']:
+                        base_name = rename_map.get(col, col)
+                        new_name = f"{tf}_{base_name}"
+                        resampled.rename(columns={col: new_name}, inplace=True)
+                        htf_cols.append(new_name)
+                resampled_shifted = resampled[htf_cols].shift(1)
+                resampled_aligned = resampled_shifted.reindex(df_out.index).ffill()
+                df_out = df_out.join(resampled_aligned)
+            except Exception:
+                pass
+
+    try:
+        rename_map = generate_indicator_rename_map(indicators_config)
+        df_out.rename(columns=rename_map, inplace=True, errors='ignore')
+    except ValueError:
+        pass
+    
+    df_out.dropna(inplace=True)
+    return df_out
+
+# ---------------------------------------------------------
 
 class DataHandler:
     """
@@ -272,7 +339,15 @@ class DataHandler:
 
     async def _calculate_indicators_async(self, df: pd.DataFrame) -> pd.DataFrame:
         loop = asyncio.get_running_loop() 
-        return await loop.run_in_executor(self._executor, self.calculate_technical_indicators, df)
+        # Pass pure function and config to executor
+        return await loop.run_in_executor(
+            self._executor, 
+            calculate_indicators_pure, 
+            df, 
+            self.indicators_config, 
+            self.secondary_timeframes, 
+            self.timeframe
+        )
 
     def _update_latest_price(self, symbol: str, df: pd.DataFrame):
         if df is not None and not df.empty:
@@ -350,64 +425,6 @@ class DataHandler:
             return await loop.run_in_executor(self._executor, pd.read_csv, path, {'index_col': 'timestamp', 'parse_dates': True})
         except Exception:
             return None
-
-    def _enforce_data_continuity(self, df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or df.empty: return df
-        try:
-            if not df.index.is_monotonic_increasing: df = df.sort_index()
-            tf_seconds = parse_timeframe_to_seconds(self.timeframe)
-            if tf_seconds <= 0: return df
-            start, end = df.index[0], df.index[-1]
-            full_index = pd.date_range(start=start, end=end, freq=f"{tf_seconds}s")
-            if len(full_index) == len(df.index): return df
-            df_continuous = df.reindex(full_index)
-            cols_to_ffill = [c for c in ['open', 'high', 'low', 'close'] if c in df_continuous.columns]
-            df_continuous[cols_to_ffill] = df_continuous[cols_to_ffill].ffill()
-            if 'volume' in df_continuous.columns: df_continuous['volume'] = df_continuous['volume'].fillna(0)
-            df_continuous.dropna(inplace=True)
-            df_continuous.index.name = 'timestamp'
-            return df_continuous
-        except Exception:
-            return df
-
-    def calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or len(df) < 50: return df
-        df_continuous = self._enforce_data_continuity(df)
-        df_out = df_continuous.copy()
-        ta_strategy = ta.Strategy(name="BotTrader", ta=self.indicators_config)
-        try:
-            df_out.ta.strategy(ta_strategy)
-        except Exception:
-            return df_out
-
-        if self.secondary_timeframes:
-            rename_map = generate_indicator_rename_map(self.indicators_config)
-            for tf in self.secondary_timeframes:
-                try:
-                    tf_seconds = parse_timeframe_to_seconds(tf)
-                    resampled = df_continuous.resample(f"{tf_seconds}s").agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).dropna()
-                    if len(resampled) < 20: continue
-                    resampled.ta.strategy(ta_strategy)
-                    htf_cols = []
-                    for col in resampled.columns:
-                        if col not in ['open', 'high', 'low', 'close', 'volume']:
-                            base_name = rename_map.get(col, col)
-                            new_name = f"{tf}_{base_name}"
-                            resampled.rename(columns={col: new_name}, inplace=True)
-                            htf_cols.append(new_name)
-                    resampled_shifted = resampled[htf_cols].shift(1)
-                    resampled_aligned = resampled_shifted.reindex(df_out.index).ffill()
-                    df_out = df_out.join(resampled_aligned)
-                except Exception:
-                    pass
-
-        try:
-            rename_map = generate_indicator_rename_map(self.indicators_config)
-            df_out.rename(columns=rename_map, inplace=True, errors='ignore')
-        except ValueError:
-            pass
-        df_out.dropna(inplace=True)
-        return df_out
 
 def create_dataframe(ohlcv_data: list) -> pd.DataFrame | None:
     try:
