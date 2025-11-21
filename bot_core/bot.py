@@ -140,8 +140,18 @@ class TradingBot:
         asyncio.create_task(self.process_symbol_tick(event.symbol))
 
     async def process_symbol_tick(self, symbol: str):
-        # 1. Fast Fail on Risk Halt
-        if self.risk_manager.is_halted: return
+        # 1. Fast Fail on Risk Halt or Circuit Breaker
+        if self.risk_manager.is_halted or self.watchdog._circuit_breaker.tripped:
+            return
+
+        # 2. Latency Guard
+        # If data is stale (> 10 seconds lag), skip processing to avoid bad fills
+        latency = self.data_handler.get_latency(symbol)
+        if latency > 10.0:
+            logger.warning("Skipping tick due to high latency", symbol=symbol, latency=f"{latency:.2f}s")
+            if self.metrics_writer:
+                await self.metrics_writer.write_metric('data_latency_skip', fields={'latency': latency}, tags={'symbol': symbol})
+            return
 
         lock = self._get_symbol_lock(symbol)
         if lock.locked():
@@ -162,7 +172,7 @@ class TradingBot:
             self.watchdog.record_error("TickError")
 
     async def _process_tick_logic(self, symbol: str, tick_start: float):
-        # 2. Data Freshness Check
+        # 3. Data Freshness Check (Redundant but safe)
         last_processed = self.processed_candles.get(symbol)
         df = self.data_handler.get_market_data(symbol, include_forming=False)
         if df is None or df.empty: return
@@ -172,7 +182,7 @@ class TradingBot:
 
         if symbol not in self.latest_prices: return
 
-        # 3. Strategy Execution
+        # 4. Strategy Execution
         position = await self.position_manager.get_open_position(symbol)
         
         signal = await self.strategy.analyze_market(symbol, df, position)
@@ -184,7 +194,7 @@ class TradingBot:
         
         self.processed_candles[symbol] = last_ts
         
-        # 4. Metrics
+        # 5. Metrics
         duration_ms = (time.perf_counter() - tick_start) * 1000
         if self.metrics_writer:
             await self.metrics_writer.write_metric('tick_latency', fields={'duration_ms': duration_ms}, tags={'symbol': symbol})
