@@ -4,8 +4,9 @@ import enum
 import json
 from typing import List, Optional, Dict, Any, TYPE_CHECKING
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLAlchemyEnum, func, Boolean, cast, Date, text, inspect, event
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLAlchemyEnum, func, Boolean, cast, Date, text, inspect, event, Index
 from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.dialects.sqlite import insert
 
 from bot_core.logger import get_logger
 from bot_core.config import DatabaseConfig
@@ -27,12 +28,12 @@ class PositionStatus(enum.Enum):
 class Position(Base):
     __tablename__ = 'positions'
     id = Column(Integer, primary_key=True)
-    symbol = Column(String, nullable=False)
+    symbol = Column(String, nullable=False, index=True)
     side = Column(String, nullable=False)
     quantity = Column(Float, nullable=False)
     entry_price = Column(Float, nullable=False)
-    status = Column(SQLAlchemyEnum(PositionStatus), default=PositionStatus.OPEN, nullable=False)
-    order_id = Column(String, nullable=True)
+    status = Column(SQLAlchemyEnum(PositionStatus), default=PositionStatus.OPEN, nullable=False, index=True)
+    order_id = Column(String, nullable=True, index=True)
     trade_id = Column(String, nullable=True)
     stop_loss_price = Column(Float, nullable=True)
     take_profit_price = Column(Float, nullable=True)
@@ -63,9 +64,16 @@ class PortfolioState(Base):
     peak_equity = Column(Float, nullable=False)
     last_update = Column(DateTime, default=Clock.now, onupdate=Clock.now)
 
+class RiskState(Base):
+    __tablename__ = 'risk_state'
+    symbol = Column(String, primary_key=True)
+    consecutive_losses = Column(Integer, default=0)
+    cooldown_until = Column(DateTime, nullable=True)
+    last_updated = Column(DateTime, default=Clock.now, onupdate=Clock.now)
+
 class PositionManager:
     """
-    Manages trading positions with a high-performance Write-Through Cache.
+    Manages trading positions and risk state with a high-performance Write-Through Cache.
     Reads are served from memory (O(1)). Writes are persisted to DB and updated in cache.
     """
     def __init__(self, config: DatabaseConfig, initial_capital: float, alert_system: Optional['AlertSystem'] = None):
@@ -95,9 +103,10 @@ class PositionManager:
     def _ensure_schema_updates(self):
         try:
             insp = inspect(self.engine)
-            if insp.has_table('positions'):
-                columns = [c['name'] for c in insp.get_columns('positions')]
-                with self.engine.connect() as conn:
+            with self.engine.connect() as conn:
+                # Positions Table Updates
+                if insp.has_table('positions'):
+                    columns = [c['name'] for c in insp.get_columns('positions')]
                     if 'strategy_metadata' not in columns:
                         conn.execute(text("ALTER TABLE positions ADD COLUMN strategy_metadata TEXT"))
                     if 'trade_id' not in columns:
@@ -116,6 +125,11 @@ class PositionManager:
                         conn.execute(text("ALTER TABLE positions ADD COLUMN execution_latency_ms FLOAT"))
                     if 'slippage_pct' not in columns:
                         conn.execute(text("ALTER TABLE positions ADD COLUMN slippage_pct FLOAT"))
+                
+                # Risk State Table Creation (if missing)
+                if not insp.has_table('risk_state'):
+                    RiskState.__table__.create(self.engine)
+
         except Exception as e:
             logger.warning(f"Schema update check failed: {e}")
 
@@ -198,51 +212,90 @@ class PositionManager:
             positions = session.query(Position).filter(
                 Position.status.in_([PositionStatus.OPEN, PositionStatus.PENDING])
             ).all()
-            # Expunge to detach from session so they can be cached safely
             for p in positions:
                 session.expunge(p)
             return positions
         finally:
             session.close()
 
+    # --- Risk State Management ---
+
+    async def get_all_risk_states(self) -> Dict[str, Dict[str, Any]]:
+        async with self._db_lock:
+            return await self._run_in_executor(self._get_all_risk_states_sync)
+
+    def _get_all_risk_states_sync(self) -> Dict[str, Dict[str, Any]]:
+        session = self.SessionLocal()
+        try:
+            states = session.query(RiskState).all()
+            return {
+                s.symbol: {
+                    'consecutive_losses': s.consecutive_losses,
+                    'cooldown_until': s.cooldown_until
+                } for s in states
+            }
+        finally:
+            session.close()
+
+    async def update_risk_state(self, symbol: str, consecutive_losses: int, cooldown_until: Optional[datetime.datetime]):
+        async with self._db_lock:
+            await self._run_in_executor(self._update_risk_state_sync, symbol, consecutive_losses, cooldown_until)
+
+    def _update_risk_state_sync(self, symbol: str, consecutive_losses: int, cooldown_until: Optional[datetime.datetime]):
+        session = self.SessionLocal()
+        try:
+            # Upsert logic using SQLite dialect
+            stmt = insert(RiskState).values(
+                symbol=symbol, 
+                consecutive_losses=consecutive_losses, 
+                cooldown_until=cooldown_until,
+                last_updated=Clock.now()
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=['symbol'],
+                set_=dict(
+                    consecutive_losses=stmt.excluded.consecutive_losses,
+                    cooldown_until=stmt.excluded.cooldown_until,
+                    last_updated=Clock.now()
+                )
+            )
+            session.execute(stmt)
+            session.commit()
+        except Exception as e:
+            logger.error("Failed to update risk state", symbol=symbol, error=str(e))
+            session.rollback()
+        finally:
+            session.close()
+
     # --- Public Async Interface (Cached Reads) ---
 
     async def get_portfolio_state(self) -> Optional[Dict[str, float]]:
-        # Served from cache
         return self._portfolio_state_cache
 
     async def update_portfolio_high_water_mark(self, new_peak: float):
-        # Update cache immediately
         if self._portfolio_state_cache:
             self._portfolio_state_cache['peak_equity'] = max(self._portfolio_state_cache['peak_equity'], new_peak)
         else:
             self._portfolio_state_cache = {'initial_capital': self._initial_capital, 'peak_equity': new_peak}
-            
-        # Persist async
         async with self._db_lock:
             await self._run_in_executor(self._update_portfolio_high_water_mark_sync, new_peak)
 
     async def get_open_position(self, symbol: str) -> Optional[Position]:
-        # Served from cache (Instant)
         pos = self._position_cache.get(symbol)
         if pos and pos.status == PositionStatus.OPEN:
             return pos
         return None
 
     async def get_all_open_positions(self) -> List[Position]:
-        # Served from cache
         return [p for p in self._position_cache.values() if p.status == PositionStatus.OPEN]
 
     async def get_all_active_positions(self) -> List[Position]:
-        # Served from cache
         return list(self._position_cache.values())
 
     async def get_pending_positions(self) -> List[Position]:
-        # Served from cache
         return [p for p in self._position_cache.values() if p.status == PositionStatus.PENDING]
 
     async def get_aggregated_open_positions(self) -> Dict[str, float]:
-        # Served from cache
         agg = {}
         for p in self._position_cache.values():
             if p.status == PositionStatus.OPEN:
@@ -261,7 +314,6 @@ class PositionManager:
     def _create_pending_position_sync(self, symbol: str, side: str, order_id: str, trade_id: str, decision_price: float, strategy_metadata: Optional[Dict[str, Any]]) -> Optional[Position]:
         session = self.SessionLocal()
         try:
-            # Double check DB to be safe, though cache should prevent this
             existing = session.query(Position).filter(
                 Position.symbol == symbol, 
                 Position.status.in_([PositionStatus.OPEN, PositionStatus.PENDING])
@@ -281,7 +333,7 @@ class PositionManager:
             session.add(new_position)
             session.commit()
             session.refresh(new_position)
-            session.expunge(new_position) # Detach for cache
+            session.expunge(new_position)
             return new_position
         except Exception as e:
             logger.error("Failed to create pending position", symbol=symbol, error=str(e))
@@ -320,7 +372,6 @@ class PositionManager:
             updated_pos = await self._run_in_executor(self._confirm_position_open_sync, symbol, order_id, quantity, entry_price, stop_loss, take_profit, fees)
             if updated_pos:
                 self._position_cache[symbol] = updated_pos
-                
                 if self.alert_system:
                     asyncio.run_coroutine_threadsafe(self.alert_system.send_alert(
                         level='info',
@@ -373,7 +424,6 @@ class PositionManager:
     async def mark_position_failed(self, symbol: str, order_id: str, reason: str):
         async with self._db_lock:
             await self._run_in_executor(self._mark_position_failed_sync, symbol, order_id, reason)
-            # Remove from cache if failed
             if symbol in self._position_cache and self._position_cache[symbol].order_id == order_id:
                 del self._position_cache[symbol]
 
@@ -399,10 +449,8 @@ class PositionManager:
             closed_pos = await self._run_in_executor(self._close_position_sync, symbol, close_price, reason, actual_filled_qty, fees)
             if closed_pos:
                 self._realized_pnl += closed_pos.pnl
-                # Remove from active cache
                 if symbol in self._position_cache:
                     del self._position_cache[symbol]
-                
                 if self.alert_system:
                     pnl_emoji = "🟢" if closed_pos.pnl >= 0 else "🔴"
                     asyncio.run_coroutine_threadsafe(self.alert_system.send_alert(
@@ -471,7 +519,6 @@ class PositionManager:
             total_chunk_fees = entry_fees_chunk + fees
             net_pnl = gross_pnl - total_chunk_fees
 
-            # Create closed chunk record
             closed_chunk = Position(
                 symbol=symbol, side=position.side, quantity=quantity, entry_price=position.entry_price,
                 status=PositionStatus.CLOSED, order_id=position.order_id, trade_id=position.trade_id,
@@ -480,7 +527,6 @@ class PositionManager:
             )
             session.add(closed_chunk)
 
-            # Update remaining position
             position.quantity -= quantity
             position.fees -= entry_fees_chunk
             self._realized_pnl += net_pnl
@@ -528,7 +574,6 @@ class PositionManager:
         if not be_config.enabled or pos.breakeven_active:
             return pos
         
-        # Logic check in memory first to avoid DB hit
         should_update = False
         new_sl = pos.stop_loss_price
         
@@ -574,7 +619,6 @@ class PositionManager:
             session.close()
 
     async def get_daily_realized_pnl(self) -> float:
-        # This is an aggregate query, must hit DB. Not on critical path.
         async with self._db_lock:
             return await self._run_in_executor(self._calculate_daily_pnl_sync)
 
