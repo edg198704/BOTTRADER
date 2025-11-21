@@ -16,7 +16,7 @@ from bot_core.monitoring import HealthChecker, InfluxDBMetrics, AlertSystem, Wat
 from bot_core.position_monitor import PositionMonitor
 from bot_core.trade_executor import TradeExecutor
 from bot_core.optimizer import StrategyOptimizer
-from bot_core.event_system import EventBus, MarketDataEvent
+from bot_core.event_system import EventBus, MarketDataEvent, TradeCompletedEvent
 from bot_core.services import ServiceManager
 
 logger = get_logger(__name__)
@@ -101,7 +101,10 @@ class TradingBot:
         logger.info("Warming up strategy...")
         await self.strategy.warmup(self.config.strategy.symbols)
         
+        # Event Subscriptions
         self.event_bus.subscribe(MarketDataEvent, self.on_market_data)
+        self.event_bus.subscribe(TradeCompletedEvent, self.strategy.on_trade_complete)
+        
         logger.info("TradingBot setup complete.")
 
     async def _load_market_details(self):
