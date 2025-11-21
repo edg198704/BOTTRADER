@@ -13,7 +13,7 @@ from bot_core.order_sizer import OrderSizer
 from bot_core.order_lifecycle_manager import OrderLifecycleManager
 from bot_core.monitoring import AlertSystem
 from bot_core.data_handler import DataHandler
-from bot_core.strategy import TradeSignal
+from bot_core.common import TradeSignal
 
 logger = get_logger(__name__)
 
