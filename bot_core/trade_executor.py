@@ -1,6 +1,7 @@
 import uuid
 import asyncio
 from typing import Dict, Any, Optional, Tuple
+from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel
 
 from bot_core.logger import get_logger
@@ -65,6 +66,12 @@ class TradeExecutor:
         """
         Router for trade signals. Ensures atomic execution per symbol.
         """
+        # 0. Signal TTL Check
+        signal_age = datetime.now(timezone.utc) - signal.generated_at
+        if signal_age > timedelta(seconds=60):
+            logger.warning("Signal rejected: TTL expired.", symbol=signal.symbol, age_seconds=signal_age.total_seconds())
+            return None
+
         symbol = signal.symbol
         async with self._get_lock(symbol):
             current_price = self.latest_prices.get(symbol)
