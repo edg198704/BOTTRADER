@@ -320,20 +320,26 @@ class TradeExecutor:
     # --- Helpers ---
 
     async def _check_liquidity(self, symbol: str, current_price: float) -> bool:
-        try:
-            book = await self.exchange_api.fetch_order_book(symbol, limit=5)
-            if not book or not book.get('bids') or not book.get('asks'):
+        # Optimization: Use cached order book from DataHandler instead of blocking network call
+        book = self.data_handler.get_latest_order_book(symbol)
+        if not book:
+            # Fallback to fetch if cache is empty (rare)
+            try:
+                book = await self.exchange_api.fetch_order_book(symbol, limit=5)
+            except Exception:
                 return False
-            best_bid = book['bids'][0][0]
-            best_ask = book['asks'][0][0]
-            spread = (best_ask - best_bid) / current_price
-            
-            if spread > self.config.execution.max_entry_spread_pct:
-                logger.warning("Spread too high.", symbol=symbol, spread=f"{spread:.4%}")
-                return False
-            return True
-        except Exception:
+        
+        if not book or not book.get('bids') or not book.get('asks'):
             return False
+            
+        best_bid = book['bids'][0][0]
+        best_ask = book['asks'][0][0]
+        spread = (best_ask - best_bid) / current_price
+        
+        if spread > self.config.execution.max_entry_spread_pct:
+            logger.warning("Spread too high.", symbol=symbol, spread=f"{spread:.4%}")
+            return False
+        return True
 
     async def _get_purchasing_power_qty(self, symbol: str, side: str, price: float) -> float:
         """Calculates max quantity affordable with FREE balance."""
