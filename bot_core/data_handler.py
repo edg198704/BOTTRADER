@@ -256,19 +256,22 @@ class DataHandler:
 
     async def update_symbol_data(self, symbol: str):
         try:
-            # 1. Fetch OHLCV
-            async with self._buffer_lock:
-                current_buffer = self._raw_buffers.get(symbol)
+            # 1. Fetch OHLCV (Network I/O - No Lock)
+            # We only read the buffer length to decide strategy, which is safe enough
+            current_len = 0
+            if symbol in self._raw_buffers:
+                current_len = len(self._raw_buffers[symbol])
             
             required_history = self.history_limit
             fetch_limit = 5
             is_recovery = False
 
-            if current_buffer is None or len(current_buffer) < (required_history * 0.9):
+            if current_len < (required_history * 0.9):
                 fetch_limit = required_history
                 is_recovery = True
-            elif current_buffer is not None and not current_buffer.empty:
-                last_ts = current_buffer.index[-1]
+            elif current_len > 0:
+                # Check timestamp gap
+                last_ts = self._raw_buffers[symbol].index[-1]
                 now = pd.Timestamp(Clock.now()).tz_localize(None)
                 if last_ts.tzinfo is not None: last_ts = last_ts.tz_convert(None)
                 
@@ -311,9 +314,10 @@ class DataHandler:
             latency = (now_utc - last_candle_ts).total_seconds()
             self._latencies[symbol] = latency
 
-            # 4. Merge Data
+            # 4. Merge Data (Critical Section - Fast)
             async with self._buffer_lock:
-                if is_recovery:
+                current_buffer = self._raw_buffers.get(symbol)
+                if is_recovery or current_buffer is None:
                     if current_buffer is not None:
                         combined_df = pd.concat([current_buffer, latest_df])
                         combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
@@ -322,21 +326,16 @@ class DataHandler:
                     else:
                         self._raw_buffers[symbol] = latest_df
                 else:
-                    if symbol in self._raw_buffers:
-                        current_raw = self._raw_buffers[symbol]
-                        combined_df = pd.concat([current_raw, latest_df])
-                        combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
-                        if len(combined_df) > self.max_training_buffer:
-                            combined_df = combined_df.iloc[-self.max_training_buffer:]
-                        self._raw_buffers[symbol] = combined_df
-                    else:
-                        self._raw_buffers[symbol] = latest_df
+                    combined_df = pd.concat([current_buffer, latest_df])
+                    combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
+                    if len(combined_df) > self.max_training_buffer:
+                        combined_df = combined_df.iloc[-self.max_training_buffer:]
+                    self._raw_buffers[symbol] = combined_df
                 
-                # Inject OBI into the raw buffer (last row only, forward fill previous)
+                # Inject OBI
                 if self.use_order_book:
                     if 'obi' not in self._raw_buffers[symbol].columns:
                         self._raw_buffers[symbol]['obi'] = 0.0
-                    # Update the last candle's OBI
                     self._raw_buffers[symbol].iloc[-1, self._raw_buffers[symbol].columns.get_loc('obi')] = obi_val
 
             await self._process_analysis_window(symbol)
@@ -345,6 +344,7 @@ class DataHandler:
             logger.warning("Failed to update market data", symbol=symbol, error=str(e))
 
     async def _process_analysis_window(self, symbol: str):
+        # Snapshot the buffer for processing to avoid holding lock during heavy calculation
         async with self._buffer_lock:
             raw_df = self._raw_buffers.get(symbol)
             if raw_df is None or raw_df.empty: return
@@ -353,11 +353,14 @@ class DataHandler:
             else:
                 analysis_slice = raw_df.copy()
 
+        # Heavy calculation runs in thread pool
         processed_df = await self._calculate_indicators_async(analysis_slice)
         
+        # Atomic update of the processed dataframe
         self._dataframes[symbol] = processed_df
         self._update_latest_price(symbol, processed_df)
 
+        # Emit event if new candle closed
         closed_df = self.get_market_data(symbol, include_forming=False)
         if closed_df is not None and not closed_df.empty:
             last_closed_ts = closed_df.index[-1]
