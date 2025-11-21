@@ -226,6 +226,7 @@ class TradingBot:
 
     async def _monitoring_loop(self):
         reconcile_counter = 0
+        summary_counter = 0
         while not self.service_manager._shutdown_event.is_set():
             try:
                 # Periodic Reconciliation (every 2 minutes)
@@ -254,6 +255,12 @@ class TradingBot:
                 
                 if self.metrics_writer:
                     await self.metrics_writer.write_metric('portfolio', fields={'equity': val, 'daily_pnl': pnl, 'open_positions': len(open_pos)})
+
+                # System Summary Log (Every 5 minutes)
+                summary_counter += 1
+                if summary_counter >= 5:
+                    logger.info("System Summary", equity=f"${val:.2f}", daily_pnl=f"${pnl:.2f}", positions=len(open_pos))
+                    summary_counter = 0
 
             except asyncio.CancelledError:
                 break
