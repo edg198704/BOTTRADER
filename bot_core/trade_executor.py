@@ -14,6 +14,7 @@ from bot_core.order_lifecycle_manager import OrderLifecycleManager
 from bot_core.monitoring import AlertSystem
 from bot_core.data_handler import DataHandler
 from bot_core.common import TradeSignal
+from bot_core.event_system import EventBus, TradeCompletedEvent
 
 logger = get_logger(__name__)
 
@@ -42,7 +43,8 @@ class TradeExecutor:
                  alert_system: AlertSystem,
                  shared_latest_prices: Dict[str, float],
                  market_details: Dict[str, Dict[str, Any]],
-                 data_handler: DataHandler):
+                 data_handler: DataHandler,
+                 event_bus: EventBus):
         self.config = config
         self.exchange_api = exchange_api
         self.position_manager = position_manager
@@ -53,6 +55,7 @@ class TradeExecutor:
         self.latest_prices = shared_latest_prices
         self.market_details = market_details
         self.data_handler = data_handler
+        self.event_bus = event_bus
         
         self._symbol_locks: Dict[str, asyncio.Lock] = {}
         logger.info("TradeExecutor initialized with strict risk enforcement.")
@@ -301,6 +304,8 @@ class TradeExecutor:
                     if closed_pos:
                         # Await the async update
                         await self.risk_manager.update_trade_outcome(closed_pos.symbol, closed_pos.pnl)
+                        # Emit Event for Online Learning
+                        await self.event_bus.publish(TradeCompletedEvent(position=closed_pos))
                 else:
                     await self.position_manager.reduce_position(position.symbol, final_state['filled'], avg_price, reason, fees=fees)
             else:
