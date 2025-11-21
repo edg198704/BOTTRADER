@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from bot_core.config import RiskManagementConfig
 from bot_core.logger import get_logger
 from bot_core.position_manager import Position
-from bot_core.utils import Clock, AsyncAtomicJsonStore
+from bot_core.utils import Clock
 
 if TYPE_CHECKING:
     from bot_core.monitoring import AlertSystem
@@ -19,7 +19,7 @@ class RiskManager:
     """
     Authoritative Gatekeeper for trading decisions.
     Enforces portfolio constraints, circuit breakers, and dynamic position sizing.
-    Uses async I/O for state persistence to avoid blocking the event loop.
+    Persists state via PositionManager (SQLite) for atomicity.
     """
     def __init__(self, config: RiskManagementConfig, position_manager: 'PositionManager', data_handler: 'DataHandler', alert_system: Optional['AlertSystem'] = None):
         self.config = config
@@ -32,9 +32,9 @@ class RiskManager:
         self.peak_portfolio_value = None
         self.current_drawdown = 0.0
         
+        # In-memory cache of risk state, backed by DB
         self.symbol_consecutive_losses: Dict[str, int] = {}
         self.symbol_cooldowns: Dict[str, datetime] = {}
-        self.state_store = AsyncAtomicJsonStore("risk_state.json")
         
         self.liquidation_needed = False
         self.liquidation_triggered = False
@@ -49,22 +49,22 @@ class RiskManager:
 
     async def _load_state(self):
         try:
-            data = await self.state_store.load()
-            if data:
-                self.symbol_consecutive_losses = data.get('consecutive_losses', {})
-                self.symbol_cooldowns = {k: datetime.fromisoformat(v) for k, v in data.get('cooldowns', {}).items()}
+            risk_states = await self.position_manager.get_all_risk_states()
+            for symbol, state in risk_states.items():
+                self.symbol_consecutive_losses[symbol] = state['consecutive_losses']
+                if state['cooldown_until']:
+                    self.symbol_cooldowns[symbol] = state['cooldown_until']
+            logger.info("Risk state loaded from database.")
         except Exception as e:
             logger.error("Failed to load risk state", error=str(e))
 
-    async def _save_state(self):
+    async def _save_symbol_state(self, symbol: str):
         try:
-            data = {
-                'consecutive_losses': self.symbol_consecutive_losses,
-                'cooldowns': {k: v.isoformat() for k, v in self.symbol_cooldowns.items()}
-            }
-            await self.state_store.save(data)
+            losses = self.symbol_consecutive_losses.get(symbol, 0)
+            cooldown = self.symbol_cooldowns.get(symbol)
+            await self.position_manager.update_risk_state(symbol, losses, cooldown)
         except Exception as e:
-            logger.error("Failed to save risk state", error=str(e))
+            logger.error("Failed to save risk state", symbol=symbol, error=str(e))
 
     @property
     def is_halted(self) -> bool:
@@ -73,7 +73,6 @@ class RiskManager:
     async def validate_entry(self, symbol: str, open_positions: List[Position]) -> Tuple[bool, str]:
         """
         Checks if a new trade entry is permitted.
-        Async because it may need to save state (clearing cooldowns).
         """
         if self.circuit_breaker_halted: return False, "Circuit Breaker Active"
         if self.daily_loss_halted: return False, "Max Daily Loss Reached"
@@ -82,9 +81,10 @@ class RiskManager:
             if Clock.now() < self.symbol_cooldowns[symbol]:
                 return False, f"Cooldown active until {self.symbol_cooldowns[symbol]}"
             else:
+                # Cooldown expired, clear it
                 del self.symbol_cooldowns[symbol]
                 self.symbol_consecutive_losses[symbol] = 0
-                await self._save_state()
+                await self._save_symbol_state(symbol)
 
         if len(open_positions) >= self.config.max_open_positions:
             return False, "Max open positions reached"
@@ -150,9 +150,6 @@ class RiskManager:
         
         if win_rate <= 0 or profit_factor <= 0: return base_risk
         
-        # Kelly = W - (1-W)/R
-        # R approx Profit Factor * (1-W)/W ? No, R is AvgWin/AvgLoss.
-        # We approximate R from PF and WR: PF = (W*AvgWin) / ((1-W)*AvgLoss) => R = PF * (1-W)/W
         if win_rate >= 1.0: return base_risk * 2.0
         
         r_ratio = profit_factor * (1.0 - win_rate) / win_rate
@@ -161,7 +158,6 @@ class RiskManager:
         kelly = win_rate - (1.0 - win_rate) / r_ratio
         kelly_fraction = kelly * self.config.kelly_fraction
         
-        # Safety clamp: Never exceed 5x base risk or 5% total equity
         return max(0.0, min(kelly_fraction, base_risk * 5.0, 0.05))
 
     def _apply_confidence_scaling(self, risk_pct: float, confidence: Optional[float], threshold: Optional[float]) -> float:
@@ -217,7 +213,6 @@ class RiskManager:
         if df is not None and self.config.atr_column_name in df.columns:
             atr = df[self.config.atr_column_name].iloc[-1]
             
-        # Swing Low/High Logic
         if self.config.stop_loss_type == 'SWING' and df is not None:
             lookback = self.config.swing_lookback
             if len(df) >= lookback:
@@ -228,7 +223,6 @@ class RiskManager:
                 else:
                     return max(entry_price * 1.01, window['high'].max() + buffer)
 
-        # ATR Logic
         mult = self._get_regime_param('atr_stop_multiplier', market_regime)
         dist = (atr * mult) if atr > 0 else (entry_price * self.config.stop_loss_fallback_pct)
         
@@ -238,7 +232,6 @@ class RiskManager:
         risk = abs(entry - sl)
         rr = self._get_regime_param('reward_to_risk_ratio', market_regime)
         
-        # Dynamic RR based on confidence
         if self.config.confidence_rr_scaling_factor > 0 and confidence and confidence_threshold and confidence > confidence_threshold:
             surplus = confidence - confidence_threshold
             scaler = 1.0 + (surplus * self.config.confidence_rr_scaling_factor)
@@ -249,8 +242,7 @@ class RiskManager:
 
     async def update_trade_outcome(self, symbol: str, pnl: float):
         """
-        Updates risk state based on trade outcome.
-        Async because it saves state to disk.
+        Updates risk state based on trade outcome. Persists to DB.
         """
         if pnl < 0:
             self.symbol_consecutive_losses[symbol] = self.symbol_consecutive_losses.get(symbol, 0) + 1
@@ -259,7 +251,8 @@ class RiskManager:
                 logger.warning(f"Symbol {symbol} halted due to consecutive losses.")
         else:
             self.symbol_consecutive_losses[symbol] = 0
-        await self._save_state()
+        
+        await self._save_symbol_state(symbol)
 
     async def update_portfolio_risk(self, portfolio_value: float, daily_pnl: float):
         if self.peak_portfolio_value is None or portfolio_value > self.peak_portfolio_value:
@@ -291,24 +284,17 @@ class RiskManager:
         return default
 
     def calculate_dynamic_trailing_stop(self, pos: Position, current_price: float, atr: float, regime: str) -> Tuple[Optional[float], Optional[float], bool]:
-        """
-        Calculates a dynamic trailing stop price based on volatility (ATR) and trade maturity.
-        Implements a 'ratchet' mechanism that tightens as profit increases.
-        """
         if not self.config.use_trailing_stop:
             return None, None, False
 
-        # 1. Determine Base Multiplier based on Regime
         base_multiplier = self.config.atr_trailing_multiplier
         if regime == 'volatile':
-            base_multiplier *= 1.5 # Loosen stop in volatility
+            base_multiplier *= 1.5
         elif regime == 'bull' and pos.side == 'BUY':
-            base_multiplier *= 0.8 # Tighten in trend
+            base_multiplier *= 0.8
         elif regime == 'bear' and pos.side == 'SELL':
             base_multiplier *= 0.8
 
-        # 2. Calculate ROI for Acceleration
-        # As profit increases, we reduce the multiplier to lock in gains (Parabolic SAR style)
         roi_pct = 0.0
         if pos.entry_price > 0:
             if pos.side == 'BUY':
@@ -316,60 +302,44 @@ class RiskManager:
             else:
                 roi_pct = (pos.entry_price - current_price) / pos.entry_price
         
-        # Acceleration factor: Reduce multiplier by 0.1 for every 1% gain, up to a limit
         acceleration = max(0.0, (roi_pct * 100) * 0.1)
         final_multiplier = max(1.0, base_multiplier - acceleration)
 
-        # 3. Calculate Trailing Distance
-        # If ATR is 0 or unavailable, fallback to percentage
         if atr > 0:
             distance = atr * final_multiplier
         else:
             distance = current_price * self.config.trailing_stop_pct
 
-        # 4. Determine New Stop Price
         new_stop = None
         new_ref = None
-        
-        # Current reference price (Highest High for Buy, Lowest Low for Sell)
-        # We use the tracked trailing_ref_price from DB/Cache
         current_ref = pos.trailing_ref_price or pos.entry_price
 
         if pos.side == 'BUY':
-            # Update Reference (High Water Mark)
             if current_price > current_ref:
                 new_ref = current_price
             else:
                 new_ref = current_ref
             
             potential_stop = new_ref - distance
-            
-            # Ratchet: Never move stop down
             current_stop = pos.stop_loss_price or 0.0
             if potential_stop > current_stop:
                 new_stop = potential_stop
 
         else: # SELL
-            # Update Reference (Low Water Mark)
             if current_price < current_ref:
                 new_ref = current_price
             else:
                 new_ref = current_ref
             
             potential_stop = new_ref + distance
-            
-            # Ratchet: Never move stop up
             current_stop = pos.stop_loss_price or float('inf')
             if potential_stop < current_stop:
                 new_stop = potential_stop
 
-        # 5. Activation Check
-        # Only activate if ROI > activation_pct
         activated = pos.trailing_stop_active
         if not activated and roi_pct >= self.config.trailing_stop_activation_pct:
             activated = True
 
-        # If not activated yet, we don't update the stop, but we might update the ref price
         if not activated:
             return None, new_ref, False
 
