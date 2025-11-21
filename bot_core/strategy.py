@@ -16,6 +16,7 @@ from bot_core.ai.regime_detector import MarketRegimeDetector
 from bot_core.position_manager import Position
 from bot_core.utils import Clock, AsyncAtomicJsonStore
 from bot_core.common import TradeSignal, AIInferenceResult
+from bot_core.event_system import TradeCompletedEvent
 
 logger = get_logger(__name__)
 
@@ -58,6 +59,7 @@ class TradingStrategy(abc.ABC):
     def get_latest_regime(self, symbol: str) -> Optional[str]: pass
     async def close(self): pass
     async def warmup(self, symbols: List[str]): pass
+    async def on_trade_complete(self, event: TradeCompletedEvent): pass
     def get_training_data_limit(self) -> int: return 0
 
 class SimpleMACrossoverStrategy(TradingStrategy):
@@ -178,7 +180,6 @@ class AIEnsembleStrategy(TradingStrategy):
         if pred.confidence < threshold: return None
 
         # Meta-Model Check (Double Confirmation)
-        # If meta_probability is available and low, we might want to skip even if base confidence is high
         if pred.meta_probability is not None and pred.meta_probability < self.ai_config.meta_labeling.probability_threshold:
             logger.info(f"Signal rejected by Meta-Model for {symbol}", meta_prob=pred.meta_probability)
             return None
@@ -198,7 +199,23 @@ class AIEnsembleStrategy(TradingStrategy):
             meta = {
                 'model_version': pred.model_version, 'confidence': pred.confidence, 
                 'regime': regime, 'metrics': pred.metrics, 'effective_threshold': threshold,
-                'meta_prob': pred.meta_probability
+                'meta_prob': pred.meta_probability,
+                'individual_predictions': pred.individual_predictions # Pass for online learning
             }
             return TradeSignal(symbol=symbol, action=final_action, regime=regime, confidence=pred.confidence, strategy_name=self.config.name, metadata=meta)
         return None
+
+    async def on_trade_complete(self, event: TradeCompletedEvent):
+        """Callback for Online Learning"""
+        if not self.ai_config.ensemble_weights.use_dynamic_weighting: return
+        
+        pos = event.position
+        if not pos.strategy_metadata: return
+        
+        try:
+            meta = json.loads(pos.strategy_metadata)
+            ind_preds = meta.get('individual_predictions')
+            if ind_preds:
+                self.ensemble_learner.update_weights(pos.symbol, pos.pnl, ind_preds, pos.side)
+        except Exception as e:
+            logger.error(f"Failed to process trade completion for AI learning: {e}")
