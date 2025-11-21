@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams
-from bot_core.ai.models import LSTMPredictor, AttentionNetwork
+from bot_core.ai.models import TCNPredictor, AttentionNetwork
 from bot_core.ai.feature_processor import FeatureProcessor
 from bot_core.common import AIInferenceResult
 
@@ -76,7 +76,7 @@ def _create_fresh_models(config: AIEnsembleStrategyParams, num_features: int, de
     xgb_config = hp.xgboost
     rf_config = hp.random_forest
     lr_config = hp.logistic_regression
-    lstm_config = hp.lstm
+    lstm_config = hp.lstm # Reusing config struct for TCN params
     attn_config = hp.attention
 
     cw_option = 'balanced' if config.training.use_class_weighting else None
@@ -107,18 +107,17 @@ def _create_fresh_models(config: AIEnsembleStrategyParams, num_features: int, de
         ], voting='soft')
     }
 
-    if ML_AVAILABLE and torch.cuda.is_available():
-        # Initialize on GPU if available, but move to CPU before saving
-        models['lstm'] = LSTMPredictor(
-            num_features, lstm_config.hidden_dim, lstm_config.num_layers, lstm_config.dropout
+    if ML_AVAILABLE:
+        # TCN Configuration: Create channel list [hidden, hidden, ...] based on num_layers
+        num_channels = [lstm_config.hidden_dim] * lstm_config.num_layers
+        
+        models['lstm'] = TCNPredictor(
+            num_inputs=num_features, 
+            num_channels=num_channels,
+            kernel_size=2,
+            dropout=lstm_config.dropout
         ).to(device)
-        models['attention'] = AttentionNetwork(
-            num_features, attn_config.hidden_dim, attn_config.num_layers, attn_config.nhead, attn_config.dropout
-        ).to(device)
-    elif ML_AVAILABLE:
-        models['lstm'] = LSTMPredictor(
-            num_features, lstm_config.hidden_dim, lstm_config.num_layers, lstm_config.dropout
-        ).to(device)
+        
         models['attention'] = AttentionNetwork(
             num_features, attn_config.hidden_dim, attn_config.num_layers, attn_config.nhead, attn_config.dropout
         ).to(device)
@@ -436,12 +435,24 @@ def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyP
         if 'lstm' in config.ensemble_weights.dict():
             path = os.path.join(load_dir, "lstm.pth")
             if os.path.exists(path):
-                lstm = LSTMPredictor(saved_num_features, config.hyperparameters.lstm.hidden_dim, 
-                                     config.hyperparameters.lstm.num_layers, 
-                                     config.hyperparameters.lstm.dropout).to(device)
-                lstm.load_state_dict(torch.load(path, map_location=device))
-                lstm.eval()
-                models['lstm'] = lstm
+                # Reconstruct TCN architecture
+                num_channels = [config.hyperparameters.lstm.hidden_dim] * config.hyperparameters.lstm.num_layers
+                tcn = TCNPredictor(saved_num_features, num_channels, 
+                                   kernel_size=2, 
+                                   dropout=config.hyperparameters.lstm.dropout).to(device)
+                tcn.load_state_dict(torch.load(path, map_location=device))
+                tcn.eval()
+                
+                # Dynamic Quantization for CPU inference speedup
+                if device.type == 'cpu':
+                    try:
+                        tcn = torch.quantization.quantize_dynamic(
+                            tcn, {torch.nn.Linear, torch.nn.Conv1d}, dtype=torch.qint8
+                        )
+                    except Exception as e:
+                        logger.warning(f"Quantization failed for TCN: {e}")
+                
+                models['lstm'] = tcn
 
         if 'attention' in config.ensemble_weights.dict():
             path = os.path.join(load_dir, "attention.pth")
@@ -452,6 +463,15 @@ def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyP
                                         config.hyperparameters.attention.dropout).to(device)
                 attn.load_state_dict(torch.load(path, map_location=device))
                 attn.eval()
+                
+                if device.type == 'cpu':
+                    try:
+                        attn = torch.quantization.quantize_dynamic(
+                            attn, {torch.nn.Linear}, dtype=torch.qint8
+                        )
+                    except Exception as e:
+                        logger.warning(f"Quantization failed for Attention: {e}")
+
                 models['attention'] = attn
 
         return {
@@ -459,7 +479,8 @@ def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyP
             'drift_detector': drift_detector,
             'meta': meta
         }
-    except Exception:
+    except Exception as e:
+        logger.error(f"Failed to load models for {symbol}: {e}")
         return None
 
 # --- Main Class ---
