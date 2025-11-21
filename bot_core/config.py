@@ -38,6 +38,10 @@ class EnsembleWeightsConfig(BaseModel):
     use_dynamic_weighting: bool = True
     dynamic_window: int = 25
     dynamic_smoothing_factor: float = 0.1 # EMA smoothing for weights
+    
+    # --- Online Learning (New) ---
+    # Learning rate for adjusting weights based on realized trade PnL
+    adaptive_weight_learning_rate: float = 0.05
 
 class MetaLabelingConfig(BaseModel):
     enabled: bool = True
