@@ -16,7 +16,7 @@ from bot_core.ai.ensemble_learner import EnsembleLearner, train_ensemble_task
 from bot_core.ai.regime_detector import MarketRegimeDetector
 from bot_core.ai.feature_processor import FeatureProcessor
 from bot_core.position_manager import Position
-from bot_core.utils import Clock, AtomicJsonStore
+from bot_core.utils import Clock, AsyncAtomicJsonStore
 from bot_core.common import TradeSignal, AIInferenceResult
 
 logger = get_logger(__name__)
@@ -25,10 +25,11 @@ class StrategyStateManager:
     """
     Manages persistence and in-memory state for the AI Strategy.
     Handles accuracy history, prediction logs, and retraining flags.
+    Uses AsyncAtomicJsonStore for non-blocking I/O.
     """
     def __init__(self, config: AIEnsembleStrategyParams):
         self.config = config
-        self.persistence = AtomicJsonStore(os.path.join(config.model_path, "strategy_state.json"))
+        self.persistence = AsyncAtomicJsonStore(os.path.join(config.model_path, "strategy_state.json"))
         
         # State Containers
         self.last_retrained_at: Dict[str, datetime] = {}
@@ -43,10 +44,8 @@ class StrategyStateManager:
         self.individual_model_logs: Dict[str, List[Tuple[datetime, Dict[str, Any]]]] = {}
         self.model_performance_stats: Dict[str, Dict[str, Deque[int]]] = {}
 
-        self._load()
-
-    def _load(self):
-        state = self.persistence.load()
+    async def load(self):
+        state = await self.persistence.load()
         if not state: return
 
         def parse_dt_dict(d):
@@ -89,7 +88,7 @@ class StrategyStateManager:
             for k, v in state['model_performance_stats'].items():
                 self.model_performance_stats[k] = {m: deque(d, maxlen=window) for m, d in v.items()}
 
-    def save(self):
+    async def save(self):
         def _serialize_pred(p):
             if isinstance(p, np.ndarray): return p.tolist()
             if isinstance(p, list): return p
@@ -111,7 +110,7 @@ class StrategyStateManager:
                 k: {m: list(d) for m, d in v.items()} for k, v in self.model_performance_stats.items()
             }
         }
-        self.persistence.save(state)
+        await self.persistence.save(state)
 
     def log_prediction(self, symbol: str, timestamp: datetime, action: str, individual_preds: Optional[Dict] = None):
         action_map = {'sell': 0, 'hold': 1, 'buy': 2}
@@ -121,7 +120,9 @@ class StrategyStateManager:
         if individual_preds:
             if symbol not in self.individual_model_logs: self.individual_model_logs[symbol] = []
             self.individual_model_logs[symbol].append((timestamp, individual_preds))
-        self.save()
+        
+        # Fire and forget save to avoid blocking hot path
+        asyncio.create_task(self.save())
 
     def clear_symbol_state(self, symbol: str):
         self.force_retrain_flags[symbol] = False
@@ -130,7 +131,7 @@ class StrategyStateManager:
         if symbol in self.accuracy_history: self.accuracy_history[symbol].clear()
         self.individual_model_logs[symbol] = []
         if symbol in self.model_performance_stats: self.model_performance_stats[symbol].clear()
-        self.save()
+        asyncio.create_task(self.save())
 
 class TradingStrategy(abc.ABC):
     def __init__(self, config: StrategyParamsBase):
@@ -210,11 +211,12 @@ class AIEnsembleStrategy(TradingStrategy):
             raise
 
     async def close(self):
-        self.state.save()
+        await self.state.save()
         await self.ensemble_learner.close()
 
     async def warmup(self, symbols: List[str]):
         logger.info("Warming up AI Ensemble Strategy...")
+        await self.state.load()
         await self.ensemble_learner.warmup_models(symbols)
 
     def _in_cooldown(self, symbol: str) -> bool:
@@ -242,10 +244,11 @@ class AIEnsembleStrategy(TradingStrategy):
             logger.debug("Skipping entry due to force_retrain flag.", symbol=symbol)
             return None
 
-        # 3. Regime Detection
-        df_enriched = self.regime_detector.add_regime_features(df)
-        regime_result = await self.regime_detector.detect_regime(symbol, df_enriched)
+        # 3. Regime Detection (Async & Offloaded)
+        # detect_regime now returns enriched_df which we must use to avoid re-calculating features
+        regime_result = await self.regime_detector.detect_regime(symbol, df)
         regime = regime_result.get('regime')
+        df_enriched = regime_result.get('enriched_df', df)
         
         prev_regime = self.state.last_detected_regime.get(symbol)
         if prev_regime and prev_regime != regime:
@@ -285,7 +288,7 @@ class AIEnsembleStrategy(TradingStrategy):
                 self.state.force_retrain_flags[symbol] = True
                 self.state.drift_counters[symbol] = 0
             if self.ai_config.drift.block_trade:
-                self.state.save()
+                asyncio.create_task(self.state.save())
                 return None
             confidence = max(0.0, confidence - self.ai_config.drift.confidence_penalty)
         else:
@@ -316,7 +319,7 @@ class AIEnsembleStrategy(TradingStrategy):
 
         if final_action:
             self.state.last_signal_time[symbol] = Clock.now()
-            self.state.save()
+            asyncio.create_task(self.state.save())
             
             strategy_metadata = {
                 'model_version': prediction.model_version,
@@ -405,7 +408,8 @@ class AIEnsembleStrategy(TradingStrategy):
                     remaining_logs.append((ts, pred_int))
             
             self.state.prediction_logs[symbol] = remaining_logs
-            if evaluated_count > 0: self.state.save()
+            if evaluated_count > 0: 
+                asyncio.create_task(self.state.save())
 
             # Check Accuracy Thresholds
             if len(self.state.accuracy_history[symbol]) >= 10:
@@ -422,7 +426,7 @@ class AIEnsembleStrategy(TradingStrategy):
                 if accuracy < self.ai_config.performance.min_accuracy and not self.state.force_retrain_flags.get(symbol, False):
                     logger.warning("Model accuracy dropped below threshold. Forcing retrain.", symbol=symbol, accuracy=f"{accuracy:.2%}")
                     self.state.force_retrain_flags[symbol] = True
-                    self.state.save()
+                    asyncio.create_task(self.state.save())
 
             # Dynamic Weights Monitoring
             if self.ai_config.ensemble_weights.use_dynamic_weighting:
@@ -464,7 +468,16 @@ class AIEnsembleStrategy(TradingStrategy):
         self._training_in_progress.add(symbol)
         loop = asyncio.get_running_loop()
         try:
-            df_enriched = self.regime_detector.add_regime_features(df)
+            # We must enrich the DF before sending to process, or let the process do it.
+            # Since detect_regime now offloads enrichment, we can use that helper or just let the training task handle it.
+            # The training task (train_ensemble_task) calls FeatureProcessor.process_data internally.
+            # However, it does NOT call RegimeDetector.add_regime_features unless we pass it.
+            # We should enrich it here to ensure consistency.
+            
+            # Use the offloaded helper to get enriched DF without blocking
+            regime_result = await self.regime_detector.detect_regime(symbol, df)
+            df_enriched = regime_result.get('enriched_df', df)
+
             leader_df = None
             if self.ai_config.market_leader_symbol and self.data_fetcher:
                 leader_df = await self.data_fetcher.fetch_full_history_for_symbol(self.ai_config.market_leader_symbol, len(df))
