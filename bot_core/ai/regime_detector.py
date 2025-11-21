@@ -1,6 +1,7 @@
 from enum import Enum
 import pandas as pd
 import numpy as np
+import asyncio
 from typing import Dict, Any
 
 from bot_core.logger import get_logger
@@ -187,10 +188,16 @@ class MarketRegimeDetector:
         """
         Analyzes the provided DataFrame to determine the market regime.
         Uses a sliding window voting mechanism (Hysteresis) to prevent signal flickering.
+        Offloads heavy calculation to an executor.
         """
         if len(df) < 50:
             return {'regime': MarketRegime.UNKNOWN.value, 'confidence': 0.0}
         
+        loop = asyncio.get_running_loop()
+        # Offload the heavy lifting (feature calc + regime logic) to a thread
+        return await loop.run_in_executor(None, self._detect_regime_sync, symbol, df)
+
+    def _detect_regime_sync(self, symbol: str, df: pd.DataFrame) -> Dict[str, Any]:
         mr_config = self.config.market_regime
         rsi_col = mr_config.rsi_col
 
@@ -221,7 +228,6 @@ class MarketRegimeDetector:
             # We need the raw metrics of the last candle to determine how strong the signal is right now
             last_row = df.iloc[-1]
             trend_strength = last_row['regime_trend']
-            vol_ratio = last_row['regime_volatility']
             efficiency = last_row['regime_efficiency']
             hurst = last_row['regime_hurst']
             rsi_val = last_row[rsi_col] if rsi_col in df.columns else 50
@@ -264,11 +270,12 @@ class MarketRegimeDetector:
             result = {
                 'regime': regime.value, 
                 'confidence': round(confidence, 2),
-                'thresholds': {'trend': round(trend_thresh, 5), 'vol': round(vol_thresh, 3), 'eff': round(eff_thresh, 2), 'hurst': round(hurst, 2)}
+                'thresholds': {'trend': round(trend_thresh, 5), 'vol': round(vol_thresh, 3), 'eff': round(eff_thresh, 2), 'hurst': round(hurst, 2)},
+                'enriched_df': df # Return enriched DF for downstream use
             }
-            logger.debug("Market regime detected", symbol=symbol, result=result)
+            logger.debug("Market regime detected", symbol=symbol, result={k:v for k,v in result.items() if k != 'enriched_df'})
             return result
             
         except Exception as e:
             logger.error("Error in regime detection", symbol=symbol, error=str(e))
-            return {'regime': MarketRegime.UNKNOWN.value, 'confidence': 0.0}
+            return {'regime': MarketRegime.UNKNOWN.value, 'confidence': 0.0, 'enriched_df': df}
