@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Dict, Callable, Awaitable, Type, Any, Union
 from bot_core.logger import get_logger
+from bot_core.common import TradeSignal
 
 logger = get_logger(__name__)
 
@@ -17,7 +18,7 @@ class MarketDataEvent(Event):
 
 @dataclass
 class SignalEvent(Event):
-    signal: Any  # Carries the TradeSignal object
+    signal: TradeSignal
 
 class EventBus:
     """
