@@ -1,5 +1,7 @@
 import uuid
 import asyncio
+import json
+import os
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel
@@ -58,6 +60,10 @@ class TradeExecutor:
         self.event_bus = event_bus
         
         self._symbol_locks: Dict[str, asyncio.Lock] = {}
+        
+        # Ensure recovery directory exists
+        os.makedirs("recovery", exist_ok=True)
+        
         logger.info("TradeExecutor initialized with strict risk enforcement.")
 
     def _get_lock(self, symbol: str) -> asyncio.Lock:
@@ -233,9 +239,15 @@ class TradeExecutor:
                 confidence=signal.confidence, confidence_threshold=signal.metadata.get('effective_threshold')
             )
 
-            await self.position_manager.confirm_position_open(
-                symbol, order_id, confirmed_qty, avg_price, stop_loss, take_profit, fees=fees
-            )
+            try:
+                await self.position_manager.confirm_position_open(
+                    symbol, order_id, confirmed_qty, avg_price, stop_loss, take_profit, fees=fees
+                )
+            except Exception as e:
+                # CRITICAL: Order filled on exchange but DB update failed.
+                # We must persist this state to disk to avoid a zombie position.
+                await self._handle_db_failure(symbol, order_id, confirmed_qty, avg_price, side, str(e))
+                return None
 
             return TradeExecutionResult(
                 symbol=symbol, action=side, quantity=confirmed_qty, price=avg_price,
@@ -249,6 +261,33 @@ class TradeExecutor:
         else:
             await self.position_manager.mark_position_failed(symbol, order_id, f"Failed: {status}")
             return None
+
+    async def _handle_db_failure(self, symbol: str, order_id: str, qty: float, price: float, side: str, error: str):
+        """Persists trade details to a recovery file if DB update fails."""
+        logger.critical("DB Update Failed for Filled Order! Initiating Recovery Protocol.", order_id=order_id, error=error)
+        
+        recovery_data = {
+            'symbol': symbol,
+            'order_id': order_id,
+            'side': side,
+            'quantity': qty,
+            'price': price,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'error': error
+        }
+        
+        filename = f"recovery/recovery_{order_id}.json"
+        try:
+            with open(filename, 'w') as f:
+                json.dump(recovery_data, f, indent=2)
+            logger.info(f"Recovery data saved to {filename}")
+            await self.alert_system.send_alert(
+                'critical', 
+                f"DB Failure for {symbol}. Recovery file created.", 
+                details={'file': filename, 'order_id': order_id}
+            )
+        except Exception as e:
+            logger.critical("Failed to write recovery file! Position is effectively orphaned.", error=str(e))
 
     async def close_position(self, position: Position, reason: str):
         async with self._get_lock(position.symbol):
