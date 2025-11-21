@@ -128,7 +128,8 @@ async def main():
         alert_system=alert_system,
         shared_latest_prices=latest_prices,
         market_details={},
-        data_handler=data_handler
+        data_handler=data_handler,
+        event_bus=event_bus
     )
 
     bot = TradingBot(
