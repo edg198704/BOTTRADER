@@ -14,7 +14,6 @@ from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams
 from bot_core.ai.models import LSTMPredictor, AttentionNetwork
 from bot_core.ai.feature_processor import FeatureProcessor
-from bot_core.ai.regime_detector import MarketRegimeDetector
 from bot_core.common import AIInferenceResult
 
 # ML Imports with safe fallbacks
@@ -26,13 +25,11 @@ try:
     from torch.utils.data import TensorDataset, DataLoader
     from sklearn.ensemble import VotingClassifier, RandomForestClassifier, IsolationForest
     from sklearn.linear_model import LogisticRegression
-    from sklearn.metrics import precision_score, classification_report, log_loss
-    from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit, cross_val_predict
-    from sklearn.utils.class_weight import compute_class_weight, compute_sample_weight
+    from sklearn.metrics import precision_score, log_loss, accuracy_score
+    from sklearn.model_selection import TimeSeriesSplit
     from sklearn.isotonic import IsotonicRegression
     from xgboost import XGBClassifier
     from scipy.optimize import minimize
-    from scipy.stats import skew, kurtosis, norm
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
@@ -41,22 +38,13 @@ except ImportError:
     class RandomForestClassifier: pass
     class LogisticRegression: pass
     class XGBClassifier: pass
-    class RandomizedSearchCV: pass
     class TimeSeriesSplit: pass
     class IsotonicRegression: pass
     class IsolationForest: pass
     def precision_score(*args, **kwargs): return 0.0
     def log_loss(*args, **kwargs): return 0.0
-    def classification_report(*args, **kwargs): return ""
-    def compute_class_weight(*args, **kwargs): return []
-    def compute_sample_weight(*args, **kwargs): return []
+    def accuracy_score(*args, **kwargs): return 0.0
     def minimize(*args, **kwargs): return None
-    def skew(*args, **kwargs): return 0.0
-    def kurtosis(*args, **kwargs): return 0.0
-    def cross_val_predict(*args, **kwargs): return []
-    class norm:
-        @staticmethod
-        def cdf(x): return 0.5
     class nn:
         class Module: pass
     class optim: pass
@@ -81,35 +69,7 @@ class InputSanitizer:
         X_clean = np.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
         return X_clean
 
-class MulticlassCalibrator:
-    """Calibrates probabilities for multiclass classification using One-vs-Rest Isotonic Regression."""
-    def __init__(self, method='isotonic'):
-        self.method = method
-        self.calibrators = {} # class_idx -> regressor
-
-    def fit(self, X_probs, y):
-        n_classes = X_probs.shape[1]
-        for i in range(n_classes):
-            y_binary = (y == i).astype(int)
-            X_col = X_probs[:, i]
-            reg = IsotonicRegression(out_of_bounds='clip')
-            reg.fit(X_col, y_binary)
-            self.calibrators[i] = reg
-            
-    def predict(self, X_probs):
-        n_samples, n_classes = X_probs.shape
-        calibrated = np.zeros_like(X_probs)
-        for i in range(n_classes):
-            if i in self.calibrators:
-                calibrated[:, i] = self.calibrators[i].predict(X_probs[:, i])
-            else:
-                calibrated[:, i] = X_probs[:, i]
-        
-        row_sums = calibrated.sum(axis=1, keepdims=True)
-        row_sums[row_sums == 0] = 1.0
-        return calibrated / row_sums
-
-# --- Standalone Helper Functions (Pickle-safe) ---
+# --- Standalone Helper Functions (Pickle-safe for ProcessPoolExecutor) ---
 
 def _create_fresh_models(config: AIEnsembleStrategyParams, num_features: int, device) -> Dict[str, Any]:
     hp = config.hyperparameters
@@ -166,7 +126,6 @@ def _train_torch_model(model, X_train, y_train, X_val, y_val, config, device, cl
     lr = config.training.learning_rate
     patience = config.training.early_stopping_patience
     
-    # Sanitize inputs
     X_train = InputSanitizer.sanitize(X_train)
     X_val = InputSanitizer.sanitize(X_val)
     
@@ -214,21 +173,25 @@ def _train_torch_model(model, X_train, y_train, X_val, y_val, config, device, cl
     
     return model
 
-def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.ndarray, method: str = 'slsqp', sample_weights: Optional[np.ndarray] = None) -> Dict[str, float]:
+def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.ndarray, method: str = 'slsqp') -> Dict[str, float]:
     model_names = list(predictions.keys())
     if not model_names:
         return {}
     
     n_models = len(model_names)
     pred_stack = np.array([predictions[name] for name in model_names])
+    
+    # Default to equal weights
     best_weights = {name: 1.0/n_models for name in model_names}
 
     def loss_func(weights):
         w = np.array(weights)
         w = w / np.sum(w)
+        # Weighted average of probabilities
         ensemble_probs = np.tensordot(w, pred_stack, axes=([0],[0]))
+        # Clip to avoid log(0)
         ensemble_probs = np.clip(ensemble_probs, 1e-15, 1 - 1e-15)
-        return log_loss(y_true, ensemble_probs, sample_weight=sample_weights)
+        return log_loss(y_true, ensemble_probs)
 
     if method == 'slsqp' and ML_AVAILABLE:
         try:
@@ -243,16 +206,173 @@ def _optimize_ensemble_weights(predictions: Dict[str, np.ndarray], y_true: np.nd
         except Exception:
             pass
 
-    # Fallback: Random Search
-    best_score = float('inf')
-    for _ in range(500):
-        w = np.random.dirichlet(np.ones(n_models))
-        score = loss_func(w)
-        if score < best_score:
-            best_score = score
-            best_weights = {name: float(w[i]) for i, name in enumerate(model_names)}
-            
     return best_weights
+
+# --- The Critical Training Task (Process Safe) ---
+
+def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrategyParams, leader_df: Optional[pd.DataFrame] = None) -> bool:
+    """
+    Top-level function to be run in a ProcessPoolExecutor.
+    Performs the full training pipeline: Feature Eng -> Labeling -> Training -> Optimization -> Saving.
+    """
+    if not ML_AVAILABLE:
+        return False
+
+    try:
+        # 1. Feature Engineering
+        df_proc = FeatureProcessor.process_data(df, config, leader_df=leader_df)
+        labels = FeatureProcessor.create_labels(df, config)
+        
+        # Align features and labels
+        common_index = df_proc.index.intersection(labels.index)
+        if len(common_index) < 200:
+            return False
+            
+        X = df_proc.loc[common_index].values
+        y = labels.loc[common_index].values.astype(int)
+        
+        X = InputSanitizer.sanitize(X)
+        
+        # 2. Walk-Forward Split (Last 20% for Validation/Optimization)
+        split_idx = int(len(X) * (1 - config.training.validation_split))
+        X_train, X_val = X[:split_idx], X[split_idx:]
+        y_train, y_val = y[:split_idx], y[split_idx:]
+        
+        # Sequence generation for LSTM/Attention
+        seq_len = config.features.sequence_length
+        X_train_seq, y_train_seq = FeatureProcessor.create_sequences(X_train, y_train, seq_len)
+        X_val_seq, y_val_seq = FeatureProcessor.create_sequences(X_val, y_val, seq_len)
+
+        # 3. Model Initialization
+        device = torch.device("cpu") # Force CPU for background process to avoid CUDA context issues
+        num_features = X.shape[1]
+        models = _create_fresh_models(config, num_features, device)
+        
+        # 4. Training Loop
+        # Train XGBoost
+        models['gb'].fit(X_train, y_train)
+        
+        # Train Technical Ensemble
+        models['technical'].fit(X_train, y_train)
+        
+        # Train PyTorch Models
+        class_weights = None
+        if config.training.use_class_weighting:
+            counts = np.bincount(y_train)
+            weights = 1.0 / (counts + 1e-6)
+            class_weights = torch.FloatTensor(weights / weights.sum()).to(device)
+
+        if 'lstm' in models and len(X_train_seq) > 0:
+            models['lstm'] = _train_torch_model(models['lstm'], X_train_seq, y_train_seq, X_val_seq, y_val_seq, config, device, class_weights)
+            
+        if 'attention' in models and len(X_train_seq) > 0:
+            models['attention'] = _train_torch_model(models['attention'], X_train_seq, y_train_seq, X_val_seq, y_val_seq, config, device, class_weights)
+
+        # 5. Validation & Weight Optimization
+        val_preds = {}
+        val_preds['gb'] = models['gb'].predict_proba(X_val)
+        val_preds['technical'] = models['technical'].predict_proba(X_val)
+        
+        if 'lstm' in models and len(X_val_seq) > 0:
+            models['lstm'].eval()
+            with torch.no_grad():
+                logits = models['lstm'](torch.FloatTensor(X_val_seq).to(device))
+                # Pad predictions to match X_val length (sequences consume start data)
+                pad_len = len(X_val) - len(X_val_seq)
+                probs = F.softmax(logits, dim=1).numpy()
+                # Simple padding: repeat first prediction (suboptimal but keeps shapes aligned for weight opt)
+                pad_arr = np.tile(probs[0], (pad_len, 1))
+                val_preds['lstm'] = np.vstack([pad_arr, probs])
+
+        if 'attention' in models and len(X_val_seq) > 0:
+            models['attention'].eval()
+            with torch.no_grad():
+                logits = models['attention'](torch.FloatTensor(X_val_seq).to(device))
+                pad_len = len(X_val) - len(X_val_seq)
+                probs = F.softmax(logits, dim=1).numpy()
+                pad_arr = np.tile(probs[0], (pad_len, 1))
+                val_preds['attention'] = np.vstack([pad_arr, probs])
+
+        # Optimize Weights
+        optimized_weights = _optimize_ensemble_weights(val_preds, y_val, method=config.ensemble_weights.optimization_method)
+        
+        # 6. Threshold Optimization (Maximize Sharpe on Validation)
+        # Calculate weighted ensemble probabilities
+        ensemble_probs = np.zeros((len(X_val), 3))
+        for name, w in optimized_weights.items():
+            if name in val_preds:
+                ensemble_probs += w * val_preds[name]
+        
+        # Find best threshold
+        best_threshold = config.confidence_threshold
+        best_score = -float('inf')
+        
+        # Simple grid search for threshold
+        if config.training.optimize_entry_threshold:
+            returns = df['close'].pct_change().loc[common_index].values[split_idx:]
+            # Handle length mismatch due to sequence generation or alignment
+            min_len = min(len(ensemble_probs), len(returns))
+            ensemble_probs = ensemble_probs[-min_len:]
+            returns = returns[-min_len:]
+            
+            for thresh in np.arange(0.5, 0.9, 0.05):
+                signals = np.zeros(len(ensemble_probs))
+                signals[ensemble_probs[:, 2] > thresh] = 1 # Buy
+                signals[ensemble_probs[:, 0] > thresh] = -1 # Sell
+                
+                strategy_returns = signals * returns
+                if np.std(strategy_returns) > 0:
+                    sharpe = np.mean(strategy_returns) / np.std(strategy_returns)
+                    if sharpe > best_score:
+                        best_score = sharpe
+                        best_threshold = float(thresh)
+
+        # 7. Drift Detector Training (Isolation Forest)
+        drift_detector = None
+        if config.drift.enabled:
+            drift_detector = IsolationForest(contamination=config.drift.contamination, random_state=42)
+            drift_detector.fit(X_train)
+
+        # 8. Persistence
+        safe_symbol = symbol.replace('/', '_')
+        save_dir = os.path.join(config.model_path, safe_symbol)
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Save Metadata
+        meta = {
+            'timestamp': datetime.now().isoformat(),
+            'feature_columns': FeatureProcessor.get_feature_names(config),
+            'active_feature_columns': list(df_proc.columns),
+            'num_features': num_features,
+            'optimized_weights': optimized_weights,
+            'optimized_threshold': best_threshold,
+            'metrics': {
+                'validation_accuracy': float(accuracy_score(y_val, np.argmax(ensemble_probs, axis=1))),
+                'validation_sharpe': float(best_score) if best_score != -float('inf') else 0.0
+            }
+        }
+        
+        with open(os.path.join(save_dir, "metadata.json"), 'w') as f:
+            json.dump(meta, f, indent=2)
+            
+        # Save Models
+        joblib.dump(models['gb'], os.path.join(save_dir, "gb.joblib"))
+        joblib.dump(models['technical'], os.path.join(save_dir, "technical.joblib"))
+        if drift_detector:
+            joblib.dump(drift_detector, os.path.join(save_dir, "drift_detector.joblib"))
+            
+        if 'lstm' in models:
+            torch.save(models['lstm'].state_dict(), os.path.join(save_dir, "lstm.pth"))
+        if 'attention' in models:
+            torch.save(models['attention'].state_dict(), os.path.join(save_dir, "attention.pth"))
+            
+        return True
+
+    except Exception as e:
+        # Log to a file since we are in a separate process
+        with open("training_errors.log", "a") as f:
+            f.write(f"{datetime.now()} - Error training {symbol}: {str(e)}\n")
+        return False
 
 def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyParams, device) -> Optional[Dict[str, Any]]:
     safe_symbol = symbol.replace('/', '_')
@@ -269,32 +389,18 @@ def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyP
             meta = json.load(f)
 
         saved_active_features = meta.get('active_feature_columns', meta.get('feature_columns', []))
-        current_available_features = FeatureProcessor.get_feature_names(config)
-        
-        if not set(saved_active_features).issubset(set(current_available_features)):
-            return None
-        
         saved_num_features = meta.get('num_features', len(saved_active_features))
+        
         models = {}
         for name in ['gb', 'technical']:
             path = os.path.join(load_dir, f"{name}.joblib")
             if os.path.exists(path):
                 models[name] = joblib.load(path)
 
-        calibrator = None
-        calib_path = os.path.join(load_dir, "calibrator.joblib")
-        if os.path.exists(calib_path):
-            calibrator = joblib.load(calib_path)
-
         drift_detector = None
         drift_path = os.path.join(load_dir, "drift_detector.joblib")
         if os.path.exists(drift_path):
             drift_detector = joblib.load(drift_path)
-            
-        meta_model = None
-        meta_path = os.path.join(load_dir, "meta_model.joblib")
-        if os.path.exists(meta_path):
-            meta_model = joblib.load(meta_path)
 
         if 'lstm' in config.ensemble_weights.dict():
             path = os.path.join(load_dir, "lstm.pth")
@@ -319,9 +425,7 @@ def _load_saved_models(symbol: str, model_path: str, config: AIEnsembleStrategyP
 
         return {
             'models': models,
-            'calibrator': calibrator,
             'drift_detector': drift_detector,
-            'meta_model': meta_model,
             'meta': meta
         }
     except Exception:
@@ -432,8 +536,10 @@ class EnsembleLearner:
         df_proc = FeatureProcessor.process_data(df, self.config, leader_df=leader_df)
         active_features = meta.get('active_feature_columns', meta.get('feature_columns'))
         
-        if not set(active_features).issubset(set(df_proc.columns)):
-            logger.error(f"Inference failed: Missing features for {symbol}. Model expects {active_features}")
+        # Ensure columns match training
+        missing = set(active_features) - set(df_proc.columns)
+        if missing:
+            logger.error(f"Inference failed: Missing features for {symbol}. Missing: {missing}")
             return None, None, []
             
         df_proc = df_proc[active_features]
@@ -527,9 +633,7 @@ class EnsembleLearner:
 
         models = entry['models']
         meta = entry['meta']
-        calibrator = entry.get('calibrator')
         drift_detector = entry.get('drift_detector')
-        meta_model = entry.get('meta_model')
         
         try:
             # 1. Feature Preparation
@@ -551,13 +655,10 @@ class EnsembleLearner:
             # 3. Weight Resolution
             config_weights = self.config.ensemble_weights
             optimized_weights = meta.get('optimized_weights')
-            regime_weights = meta.get('regime_weights', {})
             
             active_weight_map = {}
             if custom_weights:
                 active_weight_map = custom_weights
-            elif config_weights.use_regime_specific_weights and regime and regime in regime_weights:
-                active_weight_map = regime_weights[regime]
             elif config_weights.auto_tune and optimized_weights:
                 active_weight_map = optimized_weights
 
@@ -571,21 +672,10 @@ class EnsembleLearner:
             else:
                 return AIInferenceResult(action='hold', confidence=0.0, model_version=meta['timestamp'], active_weights={}, top_features={}, metrics={})
 
-            # 5. Calibration
-            if calibrator:
-                try:
-                    raw_probs = np.array([[votes['sell'], votes['hold'], votes['buy']]])
-                    calibrated_probs = calibrator.predict(raw_probs)[0]
-                    votes['sell'] = calibrated_probs[0]
-                    votes['hold'] = calibrated_probs[1]
-                    votes['buy'] = calibrated_probs[2]
-                except Exception as e:
-                    logger.warning(f"Calibration failed for {symbol}: {e}")
-
             best_action = max(votes, key=votes.get)
             confidence = votes[best_action]
 
-            # 6. Disagreement Penalty
+            # 5. Disagreement Penalty
             if model_predictions and config_weights.disagreement_penalty > 0:
                 action_map = {'sell': 0, 'hold': 1, 'buy': 2}
                 best_action_idx = action_map[best_action]
@@ -595,25 +685,7 @@ class EnsembleLearner:
                     penalty = std_dev * config_weights.disagreement_penalty
                     confidence = max(0.0, confidence - penalty)
 
-            # 7. Meta-Labeling
-            meta_prob = None
-            if meta_model and self.config.meta_labeling.enabled and best_action != 'hold':
-                try:
-                    X_meta = X
-                    if self.config.meta_labeling.use_primary_confidence_feature:
-                        raw_conf = votes[best_action]
-                        X_meta = np.hstack([X, np.array([[raw_conf]])])
-                    
-                    meta_probs = meta_model.predict_proba(X_meta)[0]
-                    meta_prob = meta_probs[1] # Probability of success (Class 1)
-                    
-                    if meta_prob < self.config.meta_labeling.probability_threshold:
-                        best_action = 'hold'
-                        confidence = 0.0
-                except Exception as e:
-                    logger.error(f"Meta-model inference failed: {e}")
-
-            # 8. Feature Importance Extraction
+            # 6. Feature Importance Extraction
             top_features = {}
             if 'gb' in models and hasattr(models['gb'], 'feature_importances_'):
                 imps = models['gb'].feature_importances_
@@ -624,10 +696,6 @@ class EnsembleLearner:
                         top_features[cols[idx]] = float(imps[idx])
 
             optimized_threshold = meta.get('optimized_threshold')
-            regime_thresholds = meta.get('regime_thresholds', {})
-            
-            if regime and regime in regime_thresholds:
-                optimized_threshold = regime_thresholds[regime]
 
             # Convert numpy arrays in individual_preds to lists for Pydantic serialization
             serializable_preds = {}
@@ -648,8 +716,7 @@ class EnsembleLearner:
                 is_anomaly=is_anomaly,
                 anomaly_score=float(anomaly_score),
                 optimized_threshold=optimized_threshold,
-                individual_predictions=serializable_preds,
-                meta_probability=float(meta_prob) if meta_prob is not None else None
+                individual_predictions=serializable_preds
             )
         except Exception as e:
             logger.error(f"Critical inference error for {symbol}: {e}", exc_info=True)
