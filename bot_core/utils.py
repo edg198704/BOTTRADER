@@ -38,15 +38,22 @@ class Clock:
         """Resets the clock to system time."""
         cls._mock_time = None
 
-class AtomicJsonStore:
+class AsyncAtomicJsonStore:
     """
-    Helper class to handle atomic JSON state persistence.
-    Ensures that state files are not corrupted if the process crashes during a write.
+    Asynchronous helper class to handle atomic JSON state persistence.
+    Offloads blocking I/O to an executor to prevent freezing the event loop.
     """
     def __init__(self, path: str):
         self.path = path
+        self._lock = asyncio.Lock()
 
-    def save(self, state: Dict[str, Any]):
+    async def save(self, state: Dict[str, Any]):
+        """Saves state to disk asynchronously."""
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._save_sync, state)
+
+    def _save_sync(self, state: Dict[str, Any]):
         try:
             dir_name = os.path.dirname(self.path)
             if dir_name:
@@ -56,6 +63,9 @@ class AtomicJsonStore:
             with tempfile.NamedTemporaryFile('w', dir=dir_name if dir_name else '.', delete=False) as tf:
                 json.dump(state, tf, indent=2, default=str)
                 temp_name = tf.name
+                # Flush and sync to ensure data is on disk
+                tf.flush()
+                os.fsync(tf.fileno())
             
             # Atomic rename
             os.replace(temp_name, self.path)
@@ -64,7 +74,12 @@ class AtomicJsonStore:
             if 'temp_name' in locals() and os.path.exists(temp_name):
                 os.remove(temp_name)
 
-    def load(self) -> Dict[str, Any]:
+    async def load(self) -> Dict[str, Any]:
+        """Loads state from disk asynchronously."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._load_sync)
+
+    def _load_sync(self) -> Dict[str, Any]:
         if not os.path.exists(self.path):
             return {}
         try:
@@ -73,6 +88,15 @@ class AtomicJsonStore:
         except Exception as e:
             logger.error(f"Failed to load state from {self.path}", error=str(e))
             return {}
+
+# Legacy synchronous version kept for non-async contexts if needed, 
+# but AsyncAtomicJsonStore is preferred.
+class AtomicJsonStore(AsyncAtomicJsonStore):
+    def save(self, state: Dict[str, Any]):
+        self._save_sync(state)
+    
+    def load(self) -> Dict[str, Any]:
+        return self._load_sync()
 
 def async_retry(max_attempts: int = 3, delay_seconds: float = 1.0, backoff_factor: float = 2.0, exceptions: Tuple[Type[Exception], ...] = (Exception,)):
     """
