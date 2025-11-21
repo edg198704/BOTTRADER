@@ -162,8 +162,14 @@ class TradeExecutor:
 
         try:
             extra_params = {'clientOrderId': trade_id}
-            if self.config.execution.post_only and order_type == 'LIMIT':
+            
+            # --- Adaptive Execution Logic ---
+            # If confidence is high (> 0.8), we are aggressive and allow Taker orders (disable postOnly)
+            # Otherwise, we respect the config's post_only setting.
+            is_aggressive = signal.confidence >= 0.8
+            if self.config.execution.post_only and order_type == 'LIMIT' and not is_aggressive:
                 extra_params['postOnly'] = True
+            # --------------------------------
 
             order_result = await self.exchange_api.place_order(
                 symbol, side, order_type, final_quantity, price=limit_price, extra_params=extra_params
