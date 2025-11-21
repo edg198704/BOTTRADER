@@ -42,6 +42,9 @@ class InputSanitizer:
         return np.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
 
 class PurgedTimeSeriesSplit:
+    """
+    Time Series Split with Embargo to prevent leakage.
+    """
     def __init__(self, n_splits: int = 5, embargo_pct: float = 0.01):
         self.n_splits = n_splits
         self.embargo_pct = embargo_pct
@@ -49,14 +52,20 @@ class PurgedTimeSeriesSplit:
     def split(self, X, y=None, groups=None):
         n_samples = len(X)
         indices = np.arange(n_samples)
+        # Standard TimeSeriesSplit logic but with purging
         test_size = n_samples // (self.n_splits + 1)
         embargo = int(n_samples * self.embargo_pct)
 
         for i in range(self.n_splits):
+            # Moving window
             train_end = n_samples - (self.n_splits - i) * test_size
             test_start = train_end
             test_end = test_start + test_size
+            
+            # Purge/Embargo: Remove samples immediately preceding the test set
+            # if they overlap via labels (handled by groups/t1 if provided, here we use simple embargo)
             effective_train_end = train_end - embargo
+            
             if effective_train_end > 0:
                 yield indices[:effective_train_end], indices[test_start:test_end]
 
@@ -175,7 +184,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             ens = sum(w[i] * val_preds[k] for i, k in enumerate(val_preds.keys()))
             return log_loss(y_val, np.clip(ens, 1e-15, 1-1e-15))
 
-        keys = list(val_preds.keys())
+        keys = list(val_preds.keys()) # Ensure consistent order
         res = minimize(loss_func, np.ones(len(keys))/len(keys), method='SLSQP', bounds=[(0,1)]*len(keys), constraints={'type':'eq', 'fun': lambda w: np.sum(w)-1})
         opt_weights = {k: float(res.x[i]) for i, k in enumerate(keys)}
 
@@ -241,7 +250,8 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
             'num_features': X.shape[1], 
             'optimized_weights': opt_weights, 
             'optimized_threshold': best_thresh, 
-            'metrics': {'psr': float(best_metric), 'meta': meta_metrics}
+            'metrics': {'psr': float(best_metric), 'meta': meta_metrics},
+            'weight_momentum': {k: 0.0 for k in opt_weights} # Initialize momentum state
         }
         with open(os.path.join(save_dir, "metadata.json"), 'w') as f: json.dump(meta, f, indent=2)
         joblib.dump(models['gb'], os.path.join(save_dir, "gb.joblib"))
@@ -407,15 +417,22 @@ class EnsembleLearner:
 
     def update_weights(self, symbol: str, trade_pnl: float, individual_predictions: Dict[str, List[float]], side: str):
         """
-        Online Learning: Adjusts ensemble weights based on the realized outcome of a trade.
+        Online Learning with Momentum: Adjusts ensemble weights based on the realized outcome of a trade.
+        Uses a momentum term to smooth out updates and prevent oscillation.
         """
         with self._lock:
             if symbol not in self.symbol_models or not individual_predictions:
                 return
 
             entry = self.symbol_models[symbol]
-            current_weights = entry['meta']['optimized_weights']
+            meta = entry['meta']
+            current_weights = meta['optimized_weights']
+            
+            # Initialize momentum state if not present
+            momentum = meta.get('weight_momentum', {k: 0.0 for k in current_weights})
+            
             learning_rate = self.config.ensemble_weights.adaptive_weight_learning_rate
+            beta = 0.9 # Momentum factor
 
             # Determine target vector based on outcome
             # 0: Sell, 1: Hold, 2: Buy
@@ -430,18 +447,19 @@ class EnsembleLearner:
             for model_name, probs in individual_predictions.items():
                 if model_name not in current_weights: continue
                 
-                # Calculate error: (1 - prob_of_correct_class)
-                # If model predicted correct class with 0.9, error is 0.1. 
-                # If model predicted correct class with 0.2, error is 0.8.
+                # Calculate error gradient: (Prob_Correct - 0.5)
+                # If model predicted correct class with 0.9, grad is 0.4 (Increase weight)
+                # If model predicted correct class with 0.2, grad is -0.3 (Decrease weight)
                 prob_correct = probs[target_idx]
+                grad = learning_rate * (prob_correct - 0.5)
                 
-                # Simple Gradient-like update: Weight += LR * (Prob - 0.5)
-                # If Prob > 0.5 (confident & correct), increase weight.
-                # If Prob < 0.5 (unconfident or wrong), decrease weight.
-                adjustment = learning_rate * (prob_correct - 0.5)
+                # Update Momentum: v_t = beta * v_{t-1} + (1 - beta) * grad
+                v = momentum.get(model_name, 0.0)
+                new_v = beta * v + (1 - beta) * grad
+                momentum[model_name] = new_v
                 
-                # Apply adjustment
-                w = current_weights[model_name] + adjustment
+                # Apply Update
+                w = current_weights[model_name] + new_v
                 w = max(0.01, min(w, 1.0)) # Clamp
                 new_weights[model_name] = w
                 total_weight += w
@@ -452,5 +470,6 @@ class EnsembleLearner:
                     new_weights[k] /= total_weight
 
             # Update state
-            entry['meta']['optimized_weights'] = new_weights
-            logger.info(f"Updated ensemble weights for {symbol}", weights=new_weights, pnl=trade_pnl)
+            meta['optimized_weights'] = new_weights
+            meta['weight_momentum'] = momentum
+            logger.info(f"Updated ensemble weights for {symbol} (Momentum)", weights=new_weights, pnl=trade_pnl)
