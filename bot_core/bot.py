@@ -1,7 +1,6 @@
 import asyncio
 import time
-import signal
-from typing import Dict, Any, Optional, Set, List, Coroutine
+from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor
@@ -10,7 +9,8 @@ from bot_core.logger import get_logger, set_correlation_id
 from bot_core.exchange_api import ExchangeAPI
 from bot_core.position_manager import PositionManager, Position
 from bot_core.risk_manager import RiskManager
-from bot_core.strategy import TradingStrategy, AIEnsembleStrategy, TradeSignal
+from bot_core.strategy import TradingStrategy, AIEnsembleStrategy
+from bot_core.common import TradeSignal
 from bot_core.config import BotConfig
 from bot_core.data_handler import DataHandler
 from bot_core.monitoring import HealthChecker, InfluxDBMetrics, AlertSystem
@@ -18,88 +18,9 @@ from bot_core.position_monitor import PositionMonitor
 from bot_core.trade_executor import TradeExecutor
 from bot_core.optimizer import StrategyOptimizer
 from bot_core.event_system import EventBus, MarketDataEvent
+from bot_core.services import ServiceManager
 
 logger = get_logger(__name__)
-
-class ServiceManager:
-    """
-     robustly manages the lifecycle of background services (tasks).
-    Supports critical/non-critical services, health monitoring, and graceful shutdowns.
-    """
-    def __init__(self):
-        self.services: Dict[str, asyncio.Task] = {}
-        self.critical_services: Set[str] = set()
-        self._shutdown_event = asyncio.Event()
-        self._service_coroutines: Dict[str, Coroutine] = {}
-
-    def register(self, name: str, coroutine: Coroutine, critical: bool = False):
-        """Registers a service coroutine to be managed."""
-        self._service_coroutines[name] = coroutine
-        if critical:
-            self.critical_services.add(name)
-
-    def start_all(self):
-        """Starts all registered services."""
-        for name, coro in self._service_coroutines.items():
-            self._start_service(name, coro)
-
-    def _start_service(self, name: str, coro: Coroutine):
-        if name in self.services and not self.services[name].done():
-            return
-
-        async def wrapped_service():
-            try:
-                logger.info(f"Service '{name}' started.")
-                await coro
-                logger.info(f"Service '{name}' stopped gracefully.")
-            except asyncio.CancelledError:
-                logger.info(f"Service '{name}' cancelled.")
-            except Exception as e:
-                logger.error(f"Service '{name}' crashed.", error=str(e), exc_info=True)
-                raise
-
-        self.services[name] = asyncio.create_task(wrapped_service(), name=name)
-
-    async def monitor(self):
-        """Monitors services and handles failures."""
-        while not self._shutdown_event.is_set():
-            for name, task in list(self.services.items()):
-                if task.done():
-                    try:
-                        exc = task.exception()
-                        if exc:
-                            logger.error(f"Service '{name}' failed.", error=str(exc))
-                            if name in self.critical_services:
-                                logger.critical(f"Critical service '{name}' failed. Initiating system shutdown.")
-                                self._shutdown_event.set()
-                            else:
-                                logger.warning(f"Non-critical service '{name}' stopped. Attempting restart in 5s...")
-                                # Logic to restart could be added here if coroutine factory is provided
-                                # For now, we just log it.
-                        else:
-                            logger.info(f"Service '{name}' finished normally.")
-                    except asyncio.CancelledError:
-                        pass
-                    
-                    if name in self.services:
-                        del self.services[name]
-            
-            await asyncio.sleep(1)
-
-    async def stop_all(self):
-        """Stops all registered services."""
-        self._shutdown_event.set()
-        logger.info("Stopping all services...")
-        
-        tasks_to_cancel = [t for t in self.services.values() if not t.done()]
-        for t in tasks_to_cancel:
-            t.cancel()
-        
-        if tasks_to_cancel:
-            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
-        
-        self.services.clear()
-        logger.info("All services stopped.")
 
 class TradingBot:
     def __init__(self, config: BotConfig, exchange_api: ExchangeAPI, data_handler: DataHandler, 
