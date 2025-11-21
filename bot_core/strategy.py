@@ -58,6 +58,7 @@ class TradingStrategy(abc.ABC):
     def get_latest_regime(self, symbol: str) -> Optional[str]: pass
     async def close(self): pass
     async def warmup(self, symbols: List[str]): pass
+    def get_training_data_limit(self) -> int: return 0
 
 class SimpleMACrossoverStrategy(TradingStrategy):
     def __init__(self, config: SimpleMACrossoverStrategyParams):
@@ -105,6 +106,9 @@ class AIEnsembleStrategy(TradingStrategy):
 
     def get_latest_regime(self, symbol: str) -> Optional[str]:
         return self.last_regime.get(symbol)
+
+    def get_training_data_limit(self) -> int:
+        return self.ai_config.training_data_limit
 
     def needs_retraining(self, symbol: str) -> bool:
         if symbol in self._training_in_progress: return False
