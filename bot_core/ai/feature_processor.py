@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from typing import Tuple, Optional, List, Dict
+from numpy.lib.stride_tricks import sliding_window_view
 
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams
@@ -108,8 +109,11 @@ class FeatureProcessor:
                 if col == 'close' or col not in df_trans.columns: continue
                 if any(k in col.lower() for k in price_keywords):
                     # Check magnitude similarity to avoid transforming oscillators
-                    if 0.5 < (df_trans[col].iloc[-1] / close_price.iloc[-1]) < 1.5:
-                        df_trans[col] = (df_trans[col] - close_price) / close_price
+                    # Use np.errstate to suppress divide by zero warnings safely
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        ratio = df_trans[col].iloc[-1] / close_price.iloc[-1]
+                        if 0.5 < ratio < 1.5:
+                            df_trans[col] = (df_trans[col] - close_price) / close_price
         return df_trans
 
     @staticmethod
@@ -195,6 +199,10 @@ class FeatureProcessor:
 
     @staticmethod
     def _create_triple_barrier_labels(df: pd.DataFrame, config: AIEnsembleStrategyParams) -> Tuple[pd.Series, pd.Series]:
+        """
+        Vectorized Triple Barrier Method using NumPy sliding windows.
+        Significantly faster than iterative approaches for large datasets.
+        """
         horizon = config.features.labeling_horizon
         tp_mult = config.features.triple_barrier_tp_multiplier
         sl_mult = config.features.triple_barrier_sl_multiplier
@@ -211,51 +219,58 @@ class FeatureProcessor:
         upper_barriers = close + (vol * tp_mult)
         lower_barriers = close - (vol * sl_mult)
         
-        labels = np.ones(len(df), dtype=int)
-        t1_arr = np.full(len(df), np.nan, dtype='object')
+        n_samples = len(df)
+        if n_samples <= horizon:
+            return pd.Series(1, index=df.index), pd.Series(df.index, index=df.index)
+
+        # Create sliding windows: Shape (N - Horizon + 1, Horizon)
+        # This creates a view, not a copy, so it's memory efficient
+        high_windows = sliding_window_view(high, window_shape=horizon)
+        low_windows = sliding_window_view(low, window_shape=horizon)
+        time_windows = sliding_window_view(timestamps, window_shape=horizon)
         
-        # Optimized Window Search
-        # We iterate through the array, but we limit the inner loop scope
-        # For very large datasets, this is still O(N*Horizon), but much faster than pandas iterrows
+        # We only care about the first (N - Horizon + 1) barriers to match the windows
+        # Reshape to (N, 1) for broadcasting against (N, Horizon)
+        upper_barriers_aligned = upper_barriers[:high_windows.shape[0]].reshape(-1, 1)
+        lower_barriers_aligned = lower_barriers[:low_windows.shape[0]].reshape(-1, 1)
         
-        limit = len(df) - horizon
+        # Boolean masks for touches: Shape (N, Horizon)
+        hit_upper = high_windows >= upper_barriers_aligned
+        hit_lower = low_windows <= lower_barriers_aligned
         
-        for i in range(limit):
-            if np.isnan(vol[i]) or vol[i] == 0: continue
-            
-            # Define window
-            end_idx = i + horizon
-            window_high = high[i+1 : end_idx+1]
-            window_low = low[i+1 : end_idx+1]
-            window_times = timestamps[i+1 : end_idx+1]
-            
-            # Check touches
-            # np.argmax returns the index of the first True. If no True, returns 0.
-            # We must check if any are True.
-            
-            hit_upper_mask = window_high >= upper_barriers[i]
-            hit_lower_mask = window_low <= lower_barriers[i]
-            
-            has_upper = hit_upper_mask.any()
-            has_lower = hit_lower_mask.any()
-            
-            if not has_upper and not has_lower:
-                # Vertical Barrier
-                labels[i] = 1
-                t1_arr[i] = window_times[-1]
-                continue
-                
-            first_upper = np.argmax(hit_upper_mask) if has_upper else 999999
-            first_lower = np.argmax(hit_lower_mask) if has_lower else 999999
-            
-            if first_upper < first_lower:
-                labels[i] = 2 # Buy Signal (Hit Upper)
-                t1_arr[i] = window_times[first_upper]
-            else:
-                labels[i] = 0 # Sell Signal (Hit Lower)
-                t1_arr[i] = window_times[first_lower]
-                
-        return pd.Series(labels, index=df.index).iloc[:-horizon], pd.Series(t1_arr, index=df.index).iloc[:-horizon]
+        # Find first occurrence indices
+        # np.argmax returns the index of the first True. If all False, it returns 0.
+        upper_indices = np.argmax(hit_upper, axis=1)
+        lower_indices = np.argmax(hit_lower, axis=1)
+        
+        # Check if there was actually a hit (since argmax returns 0 for all False)
+        any_upper = np.any(hit_upper, axis=1)
+        any_lower = np.any(hit_lower, axis=1)
+        
+        # Initialize labels as 1 (Hold/Vertical Barrier)
+        labels = np.ones(len(high_windows), dtype=int)
+        t1_vals = time_windows[:, -1].copy() # Default to vertical barrier time (end of window)
+        
+        # Logic:
+        # If Upper hit AND (Lower not hit OR Upper hit sooner), then BUY (2)
+        # If Lower hit AND (Upper not hit OR Lower hit sooner), then SELL (0)
+        
+        buy_mask = any_upper & (~any_lower | (upper_indices < lower_indices))
+        sell_mask = any_lower & (~any_upper | (lower_indices < upper_indices))
+        
+        labels[buy_mask] = 2
+        labels[sell_mask] = 0
+        
+        # Update t1 timestamps to the exact time the barrier was hit
+        row_indices = np.arange(len(labels))
+        t1_vals[buy_mask] = time_windows[row_indices[buy_mask], upper_indices[buy_mask]]
+        t1_vals[sell_mask] = time_windows[row_indices[sell_mask], lower_indices[sell_mask]]
+        
+        # The sliding window reduces the size of the array by (horizon - 1)
+        # We align this with the original index, dropping the last (horizon - 1) points
+        result_index = df.index[:len(labels)]
+        
+        return pd.Series(labels, index=result_index), pd.Series(t1_vals, index=result_index)
 
     @staticmethod
     def create_sequences(X: np.ndarray, y: np.ndarray, seq_length: int) -> Tuple[np.ndarray, np.ndarray]:
