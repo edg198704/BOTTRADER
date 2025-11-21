@@ -5,6 +5,7 @@ import logging
 import numpy as np
 import pandas as pd
 import asyncio
+import threading
 from typing import Dict, Any, Tuple, Optional, List
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -259,11 +260,18 @@ class EnsembleLearner:
         self.symbol_models = {}
         self.device = torch.device("cuda" if ML_AVAILABLE and torch.cuda.is_available() else "cpu")
         self.executor = ThreadPoolExecutor(max_workers=4)
+        self._lock = threading.RLock() # Thread safety for model access
 
     async def close(self): self.executor.shutdown(wait=True)
+    
     @property
-    def is_trained(self) -> bool: return bool(self.symbol_models)
-    def has_valid_model(self, symbol: str) -> bool: return symbol in self.symbol_models
+    def is_trained(self) -> bool: 
+        with self._lock:
+            return bool(self.symbol_models)
+            
+    def has_valid_model(self, symbol: str) -> bool: 
+        with self._lock:
+            return symbol in self.symbol_models
     
     def get_last_training_time(self, symbol: str) -> Optional[datetime]:
         try:
@@ -277,7 +285,9 @@ class EnsembleLearner:
         if not ML_AVAILABLE: return
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(self.executor, self._load_models_sync, symbol)
-        if data: self.symbol_models[symbol] = data
+        if data: 
+            with self._lock:
+                self.symbol_models[symbol] = data
 
     def _load_models_sync(self, symbol: str):
         path = os.path.join(self.config.model_path, symbol.replace('/', '_'))
@@ -309,12 +319,21 @@ class EnsembleLearner:
         await asyncio.gather(*[self.reload_models(s) for s in symbols])
 
     async def predict(self, df: pd.DataFrame, symbol: str, regime: str = None, leader_df: pd.DataFrame = None, custom_weights: Dict = None) -> AIInferenceResult:
-        if symbol not in self.symbol_models: return AIInferenceResult(action='hold', confidence=0.0, model_version='none', active_weights={}, top_features={}, metrics={})
+        with self._lock:
+            if symbol not in self.symbol_models: 
+                return AIInferenceResult(action='hold', confidence=0.0, model_version='none', active_weights={}, top_features={}, metrics={})
+        
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self.executor, self._predict_sync, df, symbol, leader_df, custom_weights)
 
     def _predict_sync(self, df, symbol, leader_df, custom_weights):
-        entry = self.symbol_models[symbol]
+        # Acquire lock briefly to get the model reference, then release to allow updates
+        with self._lock:
+            entry = self.symbol_models.get(symbol)
+            
+        if not entry:
+            return AIInferenceResult(action='hold', confidence=0.0, model_version='none', active_weights={}, top_features={}, metrics={})
+
         models, meta = entry['models'], entry['meta']
         
         required_history = self.config.features.normalization_window + self.config.features.sequence_length + 50
@@ -390,47 +409,48 @@ class EnsembleLearner:
         """
         Online Learning: Adjusts ensemble weights based on the realized outcome of a trade.
         """
-        if symbol not in self.symbol_models or not individual_predictions:
-            return
+        with self._lock:
+            if symbol not in self.symbol_models or not individual_predictions:
+                return
 
-        entry = self.symbol_models[symbol]
-        current_weights = entry['meta']['optimized_weights']
-        learning_rate = self.config.ensemble_weights.adaptive_weight_learning_rate
+            entry = self.symbol_models[symbol]
+            current_weights = entry['meta']['optimized_weights']
+            learning_rate = self.config.ensemble_weights.adaptive_weight_learning_rate
 
-        # Determine target vector based on outcome
-        # 0: Sell, 1: Hold, 2: Buy
-        if side == 'BUY':
-            target_idx = 2 if trade_pnl > 0 else 0 # If profitable buy, target was Buy. If loss, target was Sell.
-        else: # SELL
-            target_idx = 0 if trade_pnl > 0 else 2
+            # Determine target vector based on outcome
+            # 0: Sell, 1: Hold, 2: Buy
+            if side == 'BUY':
+                target_idx = 2 if trade_pnl > 0 else 0 # If profitable buy, target was Buy. If loss, target was Sell.
+            else: # SELL
+                target_idx = 0 if trade_pnl > 0 else 2
 
-        new_weights = current_weights.copy()
-        total_weight = 0.0
+            new_weights = current_weights.copy()
+            total_weight = 0.0
 
-        for model_name, probs in individual_predictions.items():
-            if model_name not in current_weights: continue
-            
-            # Calculate error: (1 - prob_of_correct_class)
-            # If model predicted correct class with 0.9, error is 0.1. 
-            # If model predicted correct class with 0.2, error is 0.8.
-            prob_correct = probs[target_idx]
-            
-            # Simple Gradient-like update: Weight += LR * (Prob - 0.5)
-            # If Prob > 0.5 (confident & correct), increase weight.
-            # If Prob < 0.5 (unconfident or wrong), decrease weight.
-            adjustment = learning_rate * (prob_correct - 0.5)
-            
-            # Apply adjustment
-            w = current_weights[model_name] + adjustment
-            w = max(0.01, min(w, 1.0)) # Clamp
-            new_weights[model_name] = w
-            total_weight += w
+            for model_name, probs in individual_predictions.items():
+                if model_name not in current_weights: continue
+                
+                # Calculate error: (1 - prob_of_correct_class)
+                # If model predicted correct class with 0.9, error is 0.1. 
+                # If model predicted correct class with 0.2, error is 0.8.
+                prob_correct = probs[target_idx]
+                
+                # Simple Gradient-like update: Weight += LR * (Prob - 0.5)
+                # If Prob > 0.5 (confident & correct), increase weight.
+                # If Prob < 0.5 (unconfident or wrong), decrease weight.
+                adjustment = learning_rate * (prob_correct - 0.5)
+                
+                # Apply adjustment
+                w = current_weights[model_name] + adjustment
+                w = max(0.01, min(w, 1.0)) # Clamp
+                new_weights[model_name] = w
+                total_weight += w
 
-        # Normalize
-        if total_weight > 0:
-            for k in new_weights:
-                new_weights[k] /= total_weight
+            # Normalize
+            if total_weight > 0:
+                for k in new_weights:
+                    new_weights[k] /= total_weight
 
-        # Update state
-        entry['meta']['optimized_weights'] = new_weights
-        logger.info(f"Updated ensemble weights for {symbol}", weights=new_weights, pnl=trade_pnl)
+            # Update state
+            entry['meta']['optimized_weights'] = new_weights
+            logger.info(f"Updated ensemble weights for {symbol}", weights=new_weights, pnl=trade_pnl)
