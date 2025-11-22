@@ -48,11 +48,20 @@ class DriftDetectionConfig(BaseModel):
     block_trade: bool = False
     max_consecutive_anomalies: int = 12
 
+class TechnicalGuardrailsConfig(BaseModel):
+    enabled: bool = True
+    rsi_overbought: float = 85.0
+    rsi_oversold: float = 15.0
+    min_volume_percentile: float = 0.10
+    max_spread_pct: float = 0.002
+    adx_min_strength: float = 15.0
+    require_trend_alignment: bool = False
+
 class MarketRegimeConfig(BaseModel):
     trend_strength_threshold: float = 0.015
     volatility_multiplier: float = 1.5
     trend_fast_ma_col: str = "sma_fast"
-    trend_slow_ma_col: str = "sma_slow"
+    trend_slow_ma_col: "sma_slow"
     volatility_col: str = "atr"
     rsi_col: str = "rsi"
     use_adx_filter: bool = False
@@ -176,6 +185,7 @@ class AIEnsembleStrategyParams(StrategyParamsBase):
     performance: AIPerformanceConfig = AIPerformanceConfig()
     drift: DriftDetectionConfig = DriftDetectionConfig()
     meta_labeling: MetaLabelingConfig = MetaLabelingConfig()
+    guardrails: TechnicalGuardrailsConfig = TechnicalGuardrailsConfig()
 
 # --- Core Component Configs ---
 
@@ -253,7 +263,7 @@ class VaRConfig(BaseModel):
     enabled: bool = True
     confidence_level: float = 0.95
     lookback_periods: int = 100
-    max_portfolio_var_pct: float = 0.02  # Max acceptable Portfolio VaR (e.g., 2% of equity)
+    max_portfolio_var_pct: float = 0.02
     method: Literal['historical', 'parametric'] = 'historical'
 
 class RiskManagementConfig(BaseModel):
