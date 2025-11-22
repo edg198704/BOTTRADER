@@ -314,6 +314,7 @@ class RiskManagementConfig(BaseModel):
     max_portfolio_risk_pct: float = 0.05
     max_daily_loss_usd: float
     max_open_positions: int
+    max_pending_orders: int = 3
     circuit_breaker_threshold: float
     close_positions_on_halt: bool = True
     use_trailing_stop: bool
