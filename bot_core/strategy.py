@@ -193,6 +193,11 @@ class AIEnsembleStrategy(TradingStrategy):
             logger.warning(f"Strategy Circuit Breaker active for {symbol}. Skipping inference.")
             return None
 
+        # Data Sufficiency Check
+        min_required = self.ai_config.features.normalization_window + self.ai_config.features.sequence_length
+        if len(df) < min_required:
+            return None
+
         regime_res = await self.regime_detector.detect_regime(symbol, df)
         regime = regime_res.get('regime')
         self.last_regime[symbol] = regime
