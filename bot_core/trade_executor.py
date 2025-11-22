@@ -30,7 +30,7 @@ class TradeExecutionResult(BaseModel):
 class TradeExecutor:
     """
     Institutional-grade execution engine.
-    Enforces strict pre-trade checks and delegates lifecycle management to an async service.
+    Enforces strict pre-trade checks, atomic execution locking, and delegates lifecycle management.
     """
     def __init__(self,
                  config: BotConfig,
@@ -55,42 +55,57 @@ class TradeExecutor:
         self.data_handler = data_handler
         
         self._symbol_locks: Dict[str, asyncio.Lock] = {}
-        logger.info("TradeExecutor initialized with non-blocking execution.")
+        logger.info("TradeExecutor initialized with atomic execution engine.")
 
     def _get_lock(self, symbol: str) -> asyncio.Lock:
         if symbol not in self._symbol_locks:
             self._symbol_locks[symbol] = asyncio.Lock()
         return self._symbol_locks[symbol]
 
-    async def execute_trade_signal(self, signal: TradeSignal, df_with_indicators: Any, position: Optional[Position]) -> Optional[TradeExecutionResult]:
+    async def execute_trade_signal(self, signal: TradeSignal, df_with_indicators: Any, position_snapshot: Optional[Position]) -> Optional[TradeExecutionResult]:
         """
-        Router for trade signals. Ensures atomic execution per symbol.
+        Router for trade signals. Ensures atomic execution per symbol using Double-Check Locking.
         """
         # 0. Signal TTL Check
         signal_age = datetime.now(timezone.utc) - signal.generated_at
         if signal_age > timedelta(seconds=60):
-            logger.warning("Signal rejected: TTL expired.", symbol=signal.symbol)
+            logger.warning("Signal rejected: TTL expired.", symbol=signal.symbol, age_seconds=signal_age.total_seconds())
             return None
 
         symbol = signal.symbol
+        
+        # 1. Data Freshness Check (Critical for HFT/Algorithmic trading)
+        latency = self.data_handler.get_latency(symbol)
+        max_latency = 5.0 # Max allowable latency in seconds
+        if latency > max_latency:
+            logger.warning("Execution skipped: Data stale.", symbol=symbol, latency=latency, threshold=max_latency)
+            return None
+
         async with self._get_lock(symbol):
+            # 2. Re-fetch State (Double-Check Locking)
+            # The snapshot passed from the pipeline might be stale by the time we acquire the lock.
+            # We must query the authoritative source (PositionManager) inside the critical section.
+            current_position = await self.position_manager.get_open_position(symbol)
+            
+            # 3. Re-fetch Price
             current_price = self.latest_prices.get(symbol)
             if not current_price:
                 logger.warning("Execution skipped: No price data available.", symbol=symbol)
                 return None
 
             # --- Entry Logic ---
-            if not position:
+            if not current_position:
                 if signal.action in ['BUY', 'SELL']:
                     return await self._handle_entry(signal, current_price, df_with_indicators)
             
             # --- Exit Logic ---
-            elif position:
-                is_close_long = (signal.action == 'SELL') and position.side == 'BUY'
-                is_close_short = (signal.action == 'BUY') and position.side == 'SELL'
+            elif current_position:
+                # Check if signal contradicts current position
+                is_close_long = (signal.action == 'SELL') and current_position.side == 'BUY'
+                is_close_short = (signal.action == 'BUY') and current_position.side == 'SELL'
                 
                 if is_close_long or is_close_short:
-                    await self.close_position(position, "Strategy Signal")
+                    await self.close_position(current_position, "Strategy Signal")
                     return None
         return None
 
@@ -98,11 +113,12 @@ class TradeExecutor:
         symbol = signal.symbol
         side = signal.action
 
-        # 1. Market Pre-Flight Check (Spread)
+        # 1. Market Pre-Flight Check (Spread & Depth)
         if not await self._check_liquidity(symbol, current_price):
             return None
 
         # 2. Risk Gatekeeper
+        # Re-fetch active positions inside lock to ensure global limits (e.g. Max Open Positions) are respected atomically
         active_positions = await self.position_manager.get_all_active_positions()
         allowed, reason = await self.risk_manager.validate_entry(symbol, active_positions)
         if not allowed:
@@ -137,10 +153,11 @@ class TradeExecutor:
         final_quantity = self.order_sizer.adjust_order_quantity(symbol, capped_quantity, current_price, market_details)
         
         if final_quantity <= 0:
-            logger.info("Quantity adjusted to zero.", symbol=symbol)
+            logger.info("Quantity adjusted to zero (below limits or insufficient funds).", symbol=symbol)
             return None
 
         # 5. Impact Cost Check (Depth)
+        # Perform this check with the FINAL calculated quantity
         if not await self._check_impact_cost(symbol, side, final_quantity, current_price):
             logger.warning("Entry rejected: High estimated impact cost.", symbol=symbol, qty=final_quantity)
             return None
@@ -153,6 +170,7 @@ class TradeExecutor:
 
         # 7. Execution (Initial Placement)
         trade_id = str(uuid.uuid4())
+        # Create pending position record BEFORE placing order to handle partial fills/crashes
         await self.position_manager.create_pending_position(
             symbol, side, trade_id, trade_id, 
             decision_price=current_price, 
@@ -161,6 +179,7 @@ class TradeExecutor:
 
         try:
             extra_params = {'clientOrderId': trade_id}
+            # Aggressive signals might skip Post-Only to ensure fill
             is_aggressive = signal.confidence >= 0.8
             if self.config.execution.post_only and order_type == 'LIMIT' and not is_aggressive:
                 extra_params['postOnly'] = True
@@ -200,6 +219,7 @@ class TradeExecutor:
 
     async def close_position(self, position: Position, reason: str):
         async with self._get_lock(position.symbol):
+            # Re-fetch to ensure we don't double close
             fresh_pos = await self.position_manager.get_open_position(position.symbol)
             if not fresh_pos: return
 
@@ -229,7 +249,6 @@ class TradeExecutor:
                 close_trade_id = f"close_{position.trade_id}_{int(datetime.now().timestamp())}"
                 exchange_order_id = order_result.get('orderId')
                 
-                # Register the closing order ID with the position for tracking
                 if exchange_order_id:
                     await self.position_manager.register_closing_order(position.symbol, exchange_order_id)
                 
@@ -254,17 +273,24 @@ class TradeExecutor:
 
     async def _check_liquidity(self, symbol: str, current_price: float) -> bool:
         book = self.data_handler.get_latest_order_book(symbol)
-        if not book or not book.get('bids') or not book.get('asks'): return False
+        if not book or not book.get('bids') or not book.get('asks'): 
+            logger.warning("Liquidity check failed: Empty order book.", symbol=symbol)
+            return False
+        
         spread = (book['asks'][0][0] - book['bids'][0][0]) / current_price
         if spread > self.config.execution.max_entry_spread_pct:
-            logger.warning("Spread too high.", symbol=symbol, spread=f"{spread:.4%}")
+            logger.warning("Spread too high.", symbol=symbol, spread=f"{spread:.4%}", limit=f"{self.config.execution.max_entry_spread_pct:.4%}")
             return False
         return True
 
     async def _check_impact_cost(self, symbol: str, side: str, quantity: float, current_price: float) -> bool:
         """Calculates estimated slippage based on order book depth."""
         book = self.data_handler.get_latest_order_book(symbol)
-        if not book: return True # Fail open if no book, or False to be safe. Let's fail open but log.
+        if not book: 
+            # Fail open if no book to avoid stalling, but log warning. 
+            # In strict HFT, this should fail closed.
+            logger.warning("Impact check skipped: No order book.", symbol=symbol)
+            return True 
         
         levels = book['asks'] if side == 'BUY' else book['bids']
         if not levels: return False
@@ -279,8 +305,7 @@ class TradeExecutor:
             if remaining_qty <= 0: break
             
         if remaining_qty > 0:
-            # Not enough liquidity in the fetched levels
-            logger.warning("Insufficient depth for order size.", symbol=symbol, qty=quantity)
+            logger.warning("Insufficient depth for order size.", symbol=symbol, qty=quantity, remaining=remaining_qty)
             return False
             
         avg_fill_price = weighted_price_sum / quantity
@@ -298,6 +323,7 @@ class TradeExecutor:
             balances = await self.exchange_api.get_balance()
             if side == 'BUY':
                 free_quote = balances.get(quote, {}).get('free', 0.0)
+                # Reserve fees
                 return (free_quote / (1 + self.config.exchange.taker_fee_pct)) / price if free_quote > 0 else 0.0
             else:
                 return balances.get(base, {}).get('free', 0.0)
@@ -308,4 +334,6 @@ class TradeExecutor:
         ticker = await self.exchange_api.get_ticker_data(symbol)
         ref_price = ticker.get('bid' if side == 'BUY' else 'ask') or current_price
         offset = ref_price * self.config.execution.limit_price_offset_pct
+        # For BUY: Bid - Offset (Passive) or Bid + Offset (Aggressive - if offset is negative)
+        # Config usually defines positive offset as 'better' price (more passive)
         return ref_price - offset if side == 'BUY' else ref_price + offset
