@@ -56,7 +56,6 @@ services:
       - ./backtest_data:/app/backtest_data
       - ./position_ledger.db:/app/position_ledger.db
       - ./optimizer_state.json:/app/optimizer_state.json
-      # Mount config to allow hot-reloading if implemented, or easy editing
       - ./config_enterprise.yaml:/app/config_enterprise.yaml
     networks:
       - quantum_net
