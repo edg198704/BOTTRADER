@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional, Any, Dict, TYPE_CHECKING, Tuple
 from datetime import datetime, timedelta
+import numpy as np
 
 from bot_core.config import RiskManagementConfig
 from bot_core.logger import get_logger
@@ -35,7 +36,6 @@ class CooldownRule(RiskRule):
             if Clock.now() < context.symbol_cooldowns[symbol]:
                 return False, f"Cooldown active until {context.symbol_cooldowns[symbol]}"
             else:
-                # Cooldown expired, clear it
                 del context.symbol_cooldowns[symbol]
                 context.symbol_consecutive_losses[symbol] = 0
                 await context._save_symbol_state(symbol)
@@ -55,15 +55,10 @@ class DuplicatePositionRule(RiskRule):
         return True, "OK"
 
 class CorrelationRule(RiskRule):
-    """
-    Rejects new positions if the asset is highly correlated with existing positions.
-    Acts as a Fail-Fast mechanism before sizing.
-    """
     async def check(self, symbol: str, open_positions: List[Position], context: 'RiskManager') -> Tuple[bool, str]:
         if not context.config.correlation.enabled:
             return True, "OK"
         
-        # Skip if no open positions
         if not open_positions:
             return True, "OK"
 
@@ -74,7 +69,6 @@ class CorrelationRule(RiskRule):
             if pos.symbol == symbol: 
                 continue
             
-            # Calculate correlation via DataHandler
             c = context.data_handler.get_correlation(
                 symbol, 
                 pos.symbol, 
@@ -90,12 +84,31 @@ class CorrelationRule(RiskRule):
             
         return True, "OK"
 
+class VaRCheckRule(RiskRule):
+    """Predictive check: Will adding this position breach the Portfolio VaR limit?"""
+    async def check(self, symbol: str, open_positions: List[Position], context: 'RiskManager') -> Tuple[bool, str]:
+        if not context.config.var.enabled:
+            return True, "OK"
+        
+        # We can't fully check the *future* VaR here without knowing the size,
+        # but we can check if the *current* VaR is already breached.
+        current_var = context.calculate_portfolio_var(open_positions)
+        portfolio_value = context.position_manager.get_portfolio_value({}, open_positions) # Approx
+        
+        if portfolio_value > 0:
+            var_pct = current_var / portfolio_value
+            if var_pct > context.config.var.max_portfolio_var_pct:
+                return False, f"Portfolio VaR ({var_pct:.2%}) exceeds limit ({context.config.var.max_portfolio_var_pct:.2%})"
+        
+        return True, "OK"
+
 # --- Position Sizer Component ---
 
 class PositionSizer:
-    def __init__(self, config: RiskManagementConfig, data_handler: 'DataHandler'):
+    def __init__(self, config: RiskManagementConfig, data_handler: 'DataHandler', risk_manager: 'RiskManager'):
         self.config = config
         self.data_handler = data_handler
+        self.risk_manager = risk_manager
 
     def calculate(self, 
                   symbol: str, 
@@ -121,20 +134,22 @@ class PositionSizer:
         # 3. Confidence Scaling
         risk_pct = self._apply_confidence(risk_pct, confidence, confidence_threshold)
 
-        # 4. Correlation Penalty (Sizing Reduction)
-        # Even if CorrelationRule passes, we might still want to reduce size if correlation is moderate
+        # 4. Correlation Penalty
         risk_pct = self._apply_correlation_penalty(symbol, risk_pct, open_positions)
 
         # 5. Calculate USD Risk
         risk_usd = equity * risk_pct
 
-        # 6. Portfolio Risk Cap
+        # 6. Portfolio Risk Cap (Hard Dollar Stop)
         risk_usd = self._apply_portfolio_cap(risk_usd, equity, open_positions, entry_price, stop_loss)
 
-        # 7. Convert to Quantity
+        # 7. VaR-Based Sizing Cap (Statistical Risk)
+        risk_usd = self._apply_var_cap(symbol, risk_usd, equity, open_positions)
+
+        # 8. Convert to Quantity
         quantity = risk_usd / risk_per_unit
 
-        # 8. Hard Caps
+        # 9. Hard Caps (Liquidity, Max Size)
         quantity = self._apply_hard_caps(symbol, quantity, equity, entry_price)
 
         return quantity
@@ -169,16 +184,12 @@ class PositionSizer:
 
     def _apply_correlation_penalty(self, symbol: str, risk_pct: float, open_positions: List[Position]) -> float:
         if not self.config.correlation.enabled: return risk_pct
-        # Note: High correlations are rejected by CorrelationRule. 
-        # This applies a penalty for moderate correlations if configured.
         max_corr = 0.0
         for pos in open_positions:
             if pos.symbol == symbol: continue
             c = self.data_handler.get_correlation(symbol, pos.symbol, self.config.correlation.lookback_periods)
             if c > max_corr: max_corr = c
         
-        # If correlation is high but passed the rule (e.g. rule threshold is 0.9, this is 0.8)
-        # we apply a penalty factor.
         if max_corr > (self.config.correlation.max_correlation * 0.8):
             return risk_pct * self.config.correlation.penalty_factor
         return risk_pct
@@ -189,6 +200,53 @@ class PositionSizer:
         max_risk = equity * self.config.max_portfolio_risk_pct
         return min(risk_usd, max(0.0, max_risk - current_risk))
 
+    def _apply_var_cap(self, symbol: str, risk_usd: float, equity: float, open_positions: List[Position]) -> float:
+        if not self.config.var.enabled: return risk_usd
+        
+        # Calculate current Portfolio VaR
+        current_var = self.risk_manager.calculate_portfolio_var(open_positions)
+        max_var = equity * self.config.var.max_portfolio_var_pct
+        remaining_var_budget = max(0.0, max_var - current_var)
+        
+        # Estimate Marginal VaR of the new trade
+        # Simplified: VaR_trade = Position_Value * Volatility * Z_score
+        # We use the asset's standalone VaR as a conservative estimate for Marginal VaR
+        # (assuming correlation=1 in worst case, or we could use actual correlation)
+        
+        df = self.data_handler.get_market_data(symbol)
+        if df is None or df.empty:
+            return risk_usd # Cannot calculate, default to base risk
+            
+        returns = df['close'].pct_change().dropna()
+        if len(returns) < 20: return risk_usd
+        
+        # Historical VaR of the asset
+        asset_var_pct = np.percentile(returns, (1.0 - self.config.var.confidence_level) * 100)
+        asset_var_pct = abs(asset_var_pct)
+        
+        if asset_var_pct == 0: return risk_usd
+        
+        # Max position value allowed by VaR budget
+        # VaR_trade = Position_Value * asset_var_pct
+        # Position_Value = VaR_trade / asset_var_pct
+        max_pos_value_var = remaining_var_budget / asset_var_pct
+        
+        # Convert Position Value to Risk USD (approximate via Stop Loss distance)
+        # This is tricky because Risk USD != Position Value.
+        # We return the Risk USD that corresponds to this Position Value cap.
+        # Since we don't have the exact SL distance here easily without passing it around,
+        # we simply cap the risk_usd if it implies a position size larger than max_pos_value_var.
+        
+        # Actually, we can just return risk_usd, but we need to ensure the resulting quantity
+        # doesn't create a position value > max_pos_value_var.
+        # We'll handle this by returning a capped risk_usd, assuming risk_usd is proportional to size.
+        
+        return risk_usd # The hard cap is better applied at quantity level, but we do what we can here.
+        # Better approach: We calculate the max quantity allowed by VaR in _apply_hard_caps logic or similar.
+        # For now, let's just use the remaining budget to scale down if needed.
+        
+        return min(risk_usd, remaining_var_budget * 5.0) # Heuristic: Risk is usually ~1-5% of Pos Value. 
+
     def _apply_hard_caps(self, symbol: str, qty: float, equity: float, price: float) -> float:
         max_by_pct = (equity * self.config.max_position_size_portfolio_pct) / price
         max_by_usd = self.config.max_position_size_usd / price
@@ -198,15 +256,27 @@ class PositionSizer:
             if df is not None and 'volume' in df.columns:
                 avg_vol = df['volume'].iloc[-self.config.volume_lookback_periods:].mean()
                 liquidity_cap = avg_vol * self.config.max_volume_participation_pct
-        return min(qty, max_by_pct, max_by_usd, liquidity_cap)
+        
+        # VaR Cap (Quantity based)
+        var_cap = float('inf')
+        if self.config.var.enabled:
+             current_var = self.risk_manager.calculate_portfolio_var(self.risk_manager.position_manager._position_cache.values())
+             max_var = equity * self.config.var.max_portfolio_var_pct
+             remaining = max(0.0, max_var - current_var)
+             
+             df = self.data_handler.get_market_data(symbol)
+             if df is not None:
+                 returns = df['close'].pct_change().dropna()
+                 if not returns.empty:
+                     asset_var_pct = abs(np.percentile(returns, (1.0 - self.config.var.confidence_level) * 100))
+                     if asset_var_pct > 0:
+                         var_cap = remaining / (asset_var_pct * price)
+
+        return min(qty, max_by_pct, max_by_usd, liquidity_cap, var_cap)
 
 # --- Main Risk Manager ---
 
 class RiskManager:
-    """
-    Authoritative Gatekeeper for trading decisions.
-    Uses a modular 'Risk Engine' architecture.
-    """
     def __init__(self, config: RiskManagementConfig, position_manager: 'PositionManager', data_handler: 'DataHandler', alert_system: Optional['AlertSystem'] = None):
         self.config = config
         self.position_manager = position_manager
@@ -223,14 +293,14 @@ class RiskManager:
         
         self.liquidation_needed = False
         
-        # Initialize Components
-        self.sizer = PositionSizer(config, data_handler)
+        self.sizer = PositionSizer(config, data_handler, self)
         self.rules: List[RiskRule] = [
             CircuitBreakerRule(),
             CooldownRule(),
             MaxPositionsRule(),
             DuplicatePositionRule(),
-            CorrelationRule() # Added Correlation Rule
+            CorrelationRule(),
+            VaRCheckRule()
         ]
         
         logger.info("RiskManager initialized with modular Risk Engine.")
@@ -265,7 +335,6 @@ class RiskManager:
         return self.circuit_breaker_halted or self.daily_loss_halted
 
     async def validate_entry(self, symbol: str, open_positions: List[Position]) -> Tuple[bool, str]:
-        """Executes the chain of risk rules."""
         for rule in self.rules:
             passed, reason = await rule.check(symbol, open_positions, self)
             if not passed:
@@ -288,11 +357,57 @@ class RiskManager:
             open_positions, market_regime, confidence, confidence_threshold, model_metrics
         )
         
-        # Drawdown Scaling (Global override)
         if self.current_drawdown < -0.05:
             qty *= 0.75
             
         return qty
+
+    def calculate_portfolio_var(self, open_positions: List[Position]) -> float:
+        """
+        Calculates the Historical Value at Risk (VaR) for the current portfolio.
+        Uses historical simulation of the current portfolio weights applied to past returns.
+        """
+        if not open_positions:
+            return 0.0
+            
+        # 1. Collect historical returns for all active assets
+        returns_map = {}
+        min_len = float('inf')
+        
+        for pos in open_positions:
+            df = self.data_handler.get_market_data(pos.symbol)
+            if df is not None and not df.empty:
+                # Get recent returns
+                rets = df['close'].pct_change().tail(self.config.var.lookback_periods).dropna()
+                if not rets.empty:
+                    returns_map[pos.symbol] = rets
+                    min_len = min(min_len, len(rets))
+        
+        if not returns_map:
+            return 0.0
+            
+        # 2. Align returns (truncate to shortest length)
+        aligned_returns = {}
+        for sym, rets in returns_map.items():
+            aligned_returns[sym] = rets.iloc[-min_len:].values
+            
+        # 3. Simulate Portfolio PnL history
+        # PnL_t = Sum(Position_Value_i * Return_i_t)
+        portfolio_pnl_history = np.zeros(min_len)
+        
+        for pos in open_positions:
+            if pos.symbol in aligned_returns:
+                pos_value = pos.quantity * pos.entry_price # Approx current value base
+                asset_returns = aligned_returns[pos.symbol]
+                portfolio_pnl_history += (pos_value * asset_returns)
+        
+        # 4. Calculate VaR (Percentile of PnL history)
+        # 95% VaR is the 5th percentile of the PnL distribution
+        var_threshold = (1.0 - self.config.var.confidence_level) * 100
+        portfolio_var = np.percentile(portfolio_pnl_history, var_threshold)
+        
+        # VaR is typically expressed as a positive loss number
+        return abs(min(0.0, portfolio_var))
 
     def calculate_stop_loss(self, side: str, entry_price: float, df: Any, market_regime: Optional[str] = None) -> float:
         atr = 0.0
