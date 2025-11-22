@@ -232,8 +232,8 @@ class RiskManager:
         
         self.circuit_breaker_halted = False
         self.daily_loss_halted = False
-        self.peak_portfolio_value = None
-        self.current_drawdown = 0.0
+        self.peak_portfolio_value: Optional[Decimal] = None
+        self.current_drawdown: Decimal = ZERO
         
         self.symbol_consecutive_losses: Dict[str, int] = {}
         self.symbol_cooldowns: Dict[str, datetime] = {}
@@ -260,7 +260,7 @@ class RiskManager:
     async def initialize(self):
         state = await self.position_manager.get_portfolio_state()
         if state:
-            self.peak_portfolio_value = float(state['peak_equity'])
+            self.peak_portfolio_value = state['peak_equity']
         await self._load_state()
 
     async def _load_state(self):
@@ -380,7 +380,7 @@ class RiskManager:
             open_positions, market_regime, confidence, confidence_threshold, model_metrics
         )
         
-        if self.current_drawdown < -0.05:
+        if self.current_drawdown < Dec("-0.05"):
             qty *= Dec("0.75")
             
         return qty
@@ -429,14 +429,13 @@ class RiskManager:
         await self._save_symbol_state(symbol)
 
     async def update_portfolio_risk(self, portfolio_value: Decimal, daily_pnl: Decimal):
-        pv_float = float(portfolio_value)
-        if self.peak_portfolio_value is None or pv_float > self.peak_portfolio_value:
-            self.peak_portfolio_value = pv_float
+        if self.peak_portfolio_value is None or portfolio_value > self.peak_portfolio_value:
+            self.peak_portfolio_value = portfolio_value
             await self.position_manager.update_portfolio_high_water_mark(portfolio_value)
             
-        self.current_drawdown = (pv_float - self.peak_portfolio_value) / self.peak_portfolio_value
+        self.current_drawdown = (portfolio_value - self.peak_portfolio_value) / self.peak_portfolio_value
         
-        if self.current_drawdown < self.config.circuit_breaker_threshold:
+        if self.current_drawdown < to_decimal(self.config.circuit_breaker_threshold):
             if not self.circuit_breaker_halted:
                 self.circuit_breaker_halted = True
                 self.liquidation_needed = self.config.close_positions_on_halt
