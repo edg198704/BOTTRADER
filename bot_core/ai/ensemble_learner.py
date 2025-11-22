@@ -18,6 +18,7 @@ from bot_core.config import AIEnsembleStrategyParams
 from bot_core.ai.models import TCNPredictor, AttentionNetwork
 from bot_core.ai.feature_processor import FeatureProcessor
 from bot_core.common import AIInferenceResult
+from bot_core.utils import AsyncAtomicJsonStore
 
 # ML Imports with safe fallbacks
 try:
@@ -238,11 +239,13 @@ class TorchAdapter(BaseModelAdapter):
 # --- Main Classes ---
 
 class EnsembleModel:
-    """Container for loaded model artifacts."""
-    def __init__(self, adapters: Dict[str, BaseModelAdapter], meta: Dict[str, Any], meta_model: Any = None):
+    """Container for loaded model artifacts and dynamic state."""
+    def __init__(self, adapters: Dict[str, BaseModelAdapter], meta: Dict[str, Any], meta_model: Any = None, dynamic_state: Dict[str, Any] = None):
         self.adapters = adapters
         self.meta = meta
         self.meta_model = meta_model
+        # dynamic_state holds regime-specific weights: {'bull': {...}, 'bear': {...}, ...}
+        self.dynamic_state = dynamic_state or {}
 
 class EnsembleTrainer:
     """
@@ -313,7 +316,7 @@ class EnsembleTrainer:
                 adapter.fit(X_train, y_train, X_val, y_val)
                 val_preds[name] = adapter.predict_proba(X_val)
 
-            # Optimize Weights
+            # Optimize Weights (Static Base Weights)
             def loss_func(w):
                 ens = sum(w[i] * val_preds[k] for i, k in enumerate(val_preds.keys()))
                 return log_loss(y_val, np.clip(ens, 1e-15, 1-1e-15))
@@ -367,9 +370,8 @@ class EnsembleTrainer:
             
             meta = {
                 'timestamp': datetime.now().isoformat(), 'active_feature_columns': active_feats, 
-                'num_features': X.shape[1], 'optimized_weights': opt_weights, 
-                'optimized_threshold': best_thresh, 'metrics': {'psr': float(best_metric), 'meta': meta_metrics},
-                'weight_momentum': {k: 0.0 for k in opt_weights}
+                'num_features': X.shape[1], 'base_weights': opt_weights, 
+                'optimized_threshold': best_thresh, 'metrics': {'psr': float(best_metric), 'meta': meta_metrics}
             }
             
             with open(os.path.join(save_dir, "metadata.json"), 'w') as f: json.dump(meta, f, indent=2)
@@ -396,6 +398,7 @@ class EnsembleLearner:
         self.device = torch.device("cuda" if ML_AVAILABLE and torch.cuda.is_available() else "cpu")
         self.executor = ThreadPoolExecutor(max_workers=4)
         self._lock = threading.RLock()
+        self._state_stores: Dict[str, AsyncAtomicJsonStore] = {}
 
     async def close(self): self.executor.shutdown(wait=True)
     
@@ -416,11 +419,25 @@ class EnsembleLearner:
         except: pass
         return None
 
+    def _get_state_store(self, symbol: str) -> AsyncAtomicJsonStore:
+        if symbol not in self._state_stores:
+            path = os.path.join(self.config.model_path, symbol.replace('/', '_'), "dynamic_state.json")
+            self._state_stores[symbol] = AsyncAtomicJsonStore(path)
+        return self._state_stores[symbol]
+
     async def reload_models(self, symbol: str):
         if not ML_AVAILABLE: return
         loop = asyncio.get_running_loop()
+        
+        # Load static artifacts
         model_data = await loop.run_in_executor(self.executor, self._load_models_sync, symbol)
+        
+        # Load dynamic state (online weights)
+        store = self._get_state_store(symbol)
+        dynamic_state = await store.load()
+        
         if model_data: 
+            model_data.dynamic_state = dynamic_state
             with self._lock:
                 self.symbol_models[symbol] = model_data
 
@@ -461,7 +478,7 @@ class EnsembleLearner:
     async def warmup_models(self, symbols: List[str]):
         await asyncio.gather(*[self.reload_models(s) for s in symbols])
 
-    async def predict(self, df: pd.DataFrame, symbol: str, regime: str = None, leader_df: pd.DataFrame = None, custom_weights: Dict = None) -> AIInferenceResult:
+    async def predict(self, df: pd.DataFrame, symbol: str, regime: str = 'unknown', leader_df: pd.DataFrame = None, custom_weights: Dict = None) -> AIInferenceResult:
         entry = None
         with self._lock:
             entry = self.symbol_models.get(symbol)
@@ -470,9 +487,9 @@ class EnsembleLearner:
             return AIInferenceResult(action='hold', confidence=0.0, model_version='none', active_weights={}, top_features={}, metrics={})
         
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self.executor, self._predict_sync, df, entry, leader_df, custom_weights)
+        return await loop.run_in_executor(self.executor, self._predict_sync, df, entry, regime, leader_df, custom_weights)
 
-    def _predict_sync(self, df: pd.DataFrame, entry: EnsembleModel, leader_df: pd.DataFrame, custom_weights: Dict) -> AIInferenceResult:
+    def _predict_sync(self, df: pd.DataFrame, entry: EnsembleModel, regime: str, leader_df: pd.DataFrame, custom_weights: Dict) -> AIInferenceResult:
         adapters, meta, meta_model = entry.adapters, entry.meta, entry.meta_model
         
         # Data Prep
@@ -494,8 +511,15 @@ class EnsembleLearner:
         
         X = InputSanitizer.sanitize(df_proc[feats].iloc[-1:].values)
         
+        # Determine Weights: Custom -> Regime Specific -> Base Static
+        weights = custom_weights
+        if not weights:
+            if self.config.ensemble_weights.use_regime_specific_weights and regime in entry.dynamic_state:
+                weights = entry.dynamic_state[regime]
+            else:
+                weights = meta['base_weights']
+
         votes = {'buy': 0.0, 'sell': 0.0, 'hold': 0.0}
-        weights = custom_weights or meta['optimized_weights']
         ind_preds = {}
         feature_importances = {}
 
@@ -537,36 +561,85 @@ class EnsembleLearner:
             optimized_threshold=meta.get('optimized_threshold'), individual_predictions=ind_preds, meta_probability=meta_prob
         )
 
-    def update_weights(self, symbol: str, trade_pnl: float, individual_predictions: Dict[str, List[float]], side: str):
+    def update_weights(self, symbol: str, trade_pnl: float, individual_predictions: Dict[str, List[float]], side: str, regime: str = 'unknown'):
+        """
+        Updates ensemble weights using Exponentiated Gradient or Momentum.
+        Persists the new state asynchronously.
+        """
         with self._lock:
             if symbol not in self.symbol_models or not individual_predictions: return
             entry = self.symbol_models[symbol]
-            meta = entry.meta
-            current_weights = meta['optimized_weights']
-            momentum = meta.get('weight_momentum', {k: 0.0 for k in current_weights})
+            
+            # Determine which weight vector to update
+            target_regime = regime if self.config.ensemble_weights.use_regime_specific_weights else 'global'
+            current_weights = entry.dynamic_state.get(target_regime, entry.meta['base_weights']).copy()
             
             learning_rate = self.config.ensemble_weights.adaptive_weight_learning_rate
-            beta = 0.9
-            target_idx = 2 if (side == 'BUY' and trade_pnl > 0) or (side == 'SELL' and trade_pnl < 0) else 0
-            if side == 'SELL' and trade_pnl > 0: target_idx = 0
+            
+            # Calculate Reward (1 for correct direction, -1 for wrong)
+            # We use PnL sign as the ground truth
+            reward = 1.0 if trade_pnl > 0 else -1.0
+            
+            # Target Index: 0=Sell, 2=Buy. 
+            # If we bought (side=BUY), we look at index 2. If we sold, index 0.
+            target_idx = 2 if side == 'BUY' else 0
 
-            new_weights = current_weights.copy()
+            new_weights = {}
             total_weight = 0.0
+            
+            if self.config.ensemble_weights.learning_algorithm == 'exponentiated_gradient':
+                # Exponentiated Gradient Update: w_{t+1} = w_t * exp(eta * reward_t)
+                # Here reward_t for a model is: Did it predict the right direction?
+                # We use the model's probability of the taken action as a proxy for its 'conviction'
+                
+                for model_name, probs in individual_predictions.items():
+                    if model_name not in current_weights: continue
+                    
+                    model_prob = probs[target_idx]
+                    # If trade won, reward models with high prob. If lost, penalize models with high prob.
+                    # Scaled reward: reward * (model_prob - 0.5) * 2  -> Range [-1, 1]
+                    model_reward = reward * (model_prob - 0.5) * 2
+                    
+                    w = current_weights[model_name] * np.exp(learning_rate * model_reward)
+                    new_weights[model_name] = w
+                    total_weight += w
+            else:
+                # Momentum Update (Legacy)
+                momentum_key = f"{target_regime}_momentum"
+                momentum = entry.dynamic_state.get(momentum_key, {k: 0.0 for k in current_weights})
+                beta = 0.9
+                
+                for model_name, probs in individual_predictions.items():
+                    if model_name not in current_weights: continue
+                    prob_correct = probs[target_idx]
+                    # Gradient points towards 1.0 if won, 0.0 if lost
+                    target = 1.0 if trade_pnl > 0 else 0.0
+                    grad = learning_rate * (target - prob_correct)
+                    
+                    v = momentum.get(model_name, 0.0)
+                    new_v = beta * v + (1 - beta) * grad
+                    momentum[model_name] = new_v
+                    
+                    w = max(0.01, min(current_weights[model_name] + new_v, 1.0))
+                    new_weights[model_name] = w
+                    total_weight += w
+                
+                entry.dynamic_state[momentum_key] = momentum
 
-            for model_name, probs in individual_predictions.items():
-                if model_name not in current_weights: continue
-                prob_correct = probs[target_idx]
-                grad = learning_rate * (prob_correct - 0.5)
-                v = momentum.get(model_name, 0.0)
-                new_v = beta * v + (1 - beta) * grad
-                momentum[model_name] = new_v
-                w = max(0.01, min(current_weights[model_name] + new_v, 1.0))
-                new_weights[model_name] = w
-                total_weight += w
-
+            # Normalize
             if total_weight > 0:
                 for k in new_weights: new_weights[k] /= total_weight
+            else:
+                # Fallback to uniform if weights collapse
+                uni = 1.0 / len(new_weights)
+                for k in new_weights: new_weights[k] = uni
 
-            meta['optimized_weights'] = new_weights
-            meta['weight_momentum'] = momentum
-            logger.info(f"Updated ensemble weights for {symbol} (Momentum)", weights=new_weights, pnl=trade_pnl)
+            # Update State
+            entry.dynamic_state[target_regime] = new_weights
+            
+            # Persist
+            store = self._get_state_store(symbol)
+            asyncio.create_task(store.save(entry.dynamic_state))
+            
+            logger.info(f"Updated {target_regime} ensemble weights for {symbol}", 
+                        weights=new_weights, pnl=trade_pnl, algo=self.config.ensemble_weights.learning_algorithm)
