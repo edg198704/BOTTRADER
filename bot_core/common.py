@@ -1,44 +1,21 @@
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
 from datetime import datetime, timezone
 from typing import Literal, Optional, Dict, Any, List, Union
-from decimal import Decimal, ROUND_HALF_UP, Context
-from enum import Enum
+from decimal import Decimal, getcontext, ROUND_DOWN, ROUND_HALF_UP
 
-# --- Financial Types ---
+# --- Global Precision Settings ---
+getcontext().prec = 28
 
-class OrderSide(str, Enum):
-    BUY = "BUY"
-    SELL = "SELL"
+ZERO = Decimal("0")
+ONE = Decimal("1")
 
-class OrderType(str, Enum):
-    LIMIT = "LIMIT"
-    MARKET = "MARKET"
-    STOP_LOSS = "STOP_LOSS"
-    STOP_LOSS_LIMIT = "STOP_LOSS_LIMIT"
-    TAKE_PROFIT = "TAKE_PROFIT"
-    TAKE_PROFIT_LIMIT = "TAKE_PROFIT_LIMIT"
-
-class Arith:
-    """Centralized arithmetic operations for financial precision."""
-    CTX = Context(prec=28, rounding=ROUND_HALF_UP)
-
-    @staticmethod
-    def quantize(value: Union[Decimal, float, str], precision: Union[Decimal, float, str]) -> Decimal:
-        """Quantizes a value to a specific precision (step size)."""
-        if not isinstance(value, Decimal):
-            value = Decimal(str(value))
-        if not isinstance(precision, Decimal):
-            precision = Decimal(str(precision))
-        return value.quantize(precision, context=Arith.CTX)
-
-    @staticmethod
-    def decimal(value: Union[float, str, int, Decimal]) -> Decimal:
-        """Safe conversion to Decimal."""
-        if isinstance(value, Decimal):
-            return value
+def to_decimal(value: Union[float, str, int, Decimal]) -> Decimal:
+    """Safely converts a value to Decimal, handling float artifacts via string conversion."""
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, float):
         return Decimal(str(value))
-
-# --- Data Models ---
+    return Decimal(value)
 
 class TradeSignal(BaseModel):
     """
@@ -53,9 +30,6 @@ class TradeSignal(BaseModel):
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     strategy_name: str
     metadata: Dict[str, Any] = {}
-
-    class Config:
-        arbitrary_types_allowed = True
 
 class AIInferenceResult(BaseModel):
     """
