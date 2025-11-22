@@ -2,7 +2,8 @@ import asyncio
 import time
 import os
 from datetime import datetime, timezone
-from typing import Dict, Any, Callable, Optional, Awaitable
+from typing import Dict, Any, Callable, Optional, Awaitable, Union
+from decimal import Decimal
 import psutil
 
 from bot_core.logger import get_logger
@@ -36,6 +37,12 @@ class InfluxDBMetrics:
         else:
             logger.info("InfluxDB credentials not fully provided. Metrics disabled.")
 
+    def _sanitize_field(self, value: Any) -> Union[float, int, str, bool]:
+        """Converts Decimal to float for InfluxDB compatibility."""
+        if isinstance(value, Decimal):
+            return float(value)
+        return value
+
     async def write_metric(self, measurement: str, fields: Dict[str, Any], tags: Dict[str, str] = None):
         if not self.enabled:
             return
@@ -43,9 +50,10 @@ class InfluxDBMetrics:
             point = Point(measurement).time(datetime.now(timezone.utc))
             if tags:
                 for key, value in tags.items():
-                    point.tag(key, value)
+                    point.tag(key, str(value))
             for key, value in fields.items():
-                point.field(key, value)
+                sanitized_value = self._sanitize_field(value)
+                point.field(key, sanitized_value)
             
             self.write_api.write(bucket=self.bucket, record=point)
         except Exception as e:
