@@ -1,29 +1,30 @@
 from typing import Dict, Any
-import ccxt
-
+from decimal import Decimal, ROUND_DOWN
 from bot_core.logger import get_logger
+from bot_core.common import to_decimal, ZERO
 
 logger = get_logger(__name__)
 
 class OrderSizer:
     """
     Adjusts order quantities to conform to exchange-specific trading rules (precision, limits).
+    Uses Decimal for all calculations to ensure precision.
     """
     def __init__(self):
         logger.info("OrderSizer initialized.")
 
-    def adjust_order_quantity(self, symbol: str, quantity: float, price: float, market_details: Dict[str, Any]) -> float:
+    def adjust_order_quantity(self, symbol: str, quantity: Decimal, price: Decimal, market_details: Dict[str, Any]) -> Decimal:
         """
         Adjusts the desired quantity to meet the exchange's precision and limit rules.
 
         Args:
             symbol: The trading symbol.
-            quantity: The desired quantity calculated by the risk manager.
-            price: The current price of the asset, used for cost calculation.
+            quantity: The desired quantity calculated by the risk manager (Decimal).
+            price: The current price of the asset (Decimal).
             market_details: The market details fetched from the exchange API.
 
         Returns:
-            The adjusted quantity, or 0.0 if the desired quantity is below minimums.
+            The adjusted quantity (Decimal), or ZERO if the desired quantity is below minimums.
         """
         if not market_details:
             logger.warning("No market details available for sizing, returning original quantity.", symbol=symbol)
@@ -38,29 +39,37 @@ class OrderSizer:
             return quantity
 
         # 1. Adjust for precision (step size)
-        adjusted_quantity = float(ccxt.Exchange.amount_to_precision(symbol, quantity, precision_amount))
+        # CCXT precision is often a float (e.g. 0.0001 or 1e-5). Convert to Decimal.
+        prec_dec = to_decimal(precision_amount)
+        
+        # Quantize down to ensure we don't round up into insufficient funds
+        adjusted_quantity = quantity.quantize(prec_dec, rounding=ROUND_DOWN)
+        
         logger.debug("Quantity adjusted for precision.", 
-                     original=quantity, 
-                     adjusted=adjusted_quantity, 
-                     precision=precision_amount,
+                     original=str(quantity), 
+                     adjusted=str(adjusted_quantity), 
+                     precision=str(prec_dec),
                      symbol=symbol)
 
         # 2. Check against minimum order size (amount)
-        if limits_amount_min is not None and adjusted_quantity < limits_amount_min:
-            logger.warning("Desired quantity is below the exchange's minimum order size.",
-                         symbol=symbol,
-                         desired_quantity=adjusted_quantity,
-                         min_quantity=limits_amount_min)
-            return 0.0
+        if limits_amount_min is not None:
+            min_qty = to_decimal(limits_amount_min)
+            if adjusted_quantity < min_qty:
+                logger.warning("Desired quantity is below the exchange's minimum order size.",
+                             symbol=symbol,
+                             desired_quantity=str(adjusted_quantity),
+                             min_quantity=str(min_qty))
+                return ZERO
 
         # 3. Check against minimum cost (notional value)
-        if limits_cost_min is not None and price > 0:
+        if limits_cost_min is not None and price > ZERO:
+            min_cost = to_decimal(limits_cost_min)
             cost = adjusted_quantity * price
-            if cost < limits_cost_min:
+            if cost < min_cost:
                 logger.warning("Desired position value is below the exchange's minimum cost.",
                              symbol=symbol,
-                             cost=cost,
-                             min_cost=limits_cost_min)
-                return 0.0
+                             cost=str(cost),
+                             min_cost=str(min_cost))
+                return ZERO
 
         return adjusted_quantity
