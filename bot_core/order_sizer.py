@@ -43,7 +43,12 @@ class OrderSizer:
         prec_dec = to_decimal(precision_amount)
         
         # Quantize down to ensure we don't round up into insufficient funds
-        adjusted_quantity = quantity.quantize(prec_dec, rounding=ROUND_DOWN)
+        # If precision is 1e-5, we quantize to 5 decimal places
+        try:
+            adjusted_quantity = quantity.quantize(prec_dec, rounding=ROUND_DOWN)
+        except Exception:
+            # Fallback if precision is not a standard exponent (rare)
+            adjusted_quantity = quantity
         
         logger.debug("Quantity adjusted for precision.", 
                      original=str(quantity), 
