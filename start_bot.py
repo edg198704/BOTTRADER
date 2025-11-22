@@ -17,7 +17,7 @@ from bot_core.monitoring import HealthChecker, InfluxDBMetrics, AlertSystem
 from bot_core.data_handler import DataHandler
 from bot_core.order_sizer import OrderSizer
 from bot_core.position_monitor import PositionMonitor
-from bot_core.order_lifecycle_manager import OrderLifecycleManager
+from bot_core.order_lifecycle_manager import OrderLifecycleService
 from bot_core.trade_executor import TradeExecutor
 from bot_core.utils import generate_indicator_rename_map
 from bot_core.event_system import EventBus
@@ -112,8 +112,10 @@ async def main():
         shared_latest_prices=latest_prices
     )
 
-    order_lifecycle_manager = OrderLifecycleManager(
+    order_lifecycle_service = OrderLifecycleService(
         exchange_api=exchange_api,
+        position_manager=position_manager,
+        event_bus=event_bus,
         exec_config=config.execution,
         shared_latest_prices=latest_prices
     )
@@ -124,12 +126,11 @@ async def main():
         position_manager=position_manager,
         risk_manager=risk_manager,
         order_sizer=order_sizer,
-        order_lifecycle_manager=order_lifecycle_manager,
+        order_lifecycle_service=order_lifecycle_service,
         alert_system=alert_system,
         shared_latest_prices=latest_prices,
         market_details={},
-        data_handler=data_handler,
-        event_bus=event_bus
+        data_handler=data_handler
     )
 
     bot = TradingBot(
@@ -145,6 +146,7 @@ async def main():
         alert_system=alert_system,
         shared_latest_prices=latest_prices,
         event_bus=event_bus,
+        order_lifecycle_service=order_lifecycle_service,
         metrics_writer=metrics_writer,
         shared_bot_state=shared_bot_state
     )
