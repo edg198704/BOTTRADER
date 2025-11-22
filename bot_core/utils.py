@@ -60,6 +60,7 @@ class AsyncAtomicJsonStore:
                 os.makedirs(dir_name, exist_ok=True)
             
             # Write to temp file first
+            # We use the same directory to ensure atomic rename works across filesystems
             with tempfile.NamedTemporaryFile('w', dir=dir_name if dir_name else '.', delete=False) as tf:
                 json.dump(state, tf, indent=2, default=str)
                 temp_name = tf.name
