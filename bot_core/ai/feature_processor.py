@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from typing import Tuple, Optional, List, Dict
 from numpy.lib.stride_tricks import sliding_window_view
+from functools import lru_cache
 
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams
@@ -12,6 +13,7 @@ class FeatureProcessor:
     """
     Encapsulates all feature engineering, normalization, and labeling logic.
     Implements institutional-grade labeling (Triple Barrier) and stationarity checks.
+    Optimized with LRU caching for expensive weight calculations.
     """
 
     @staticmethod
@@ -79,24 +81,32 @@ class FeatureProcessor:
         return df
 
     @staticmethod
-    def _apply_frac_diff(df: pd.DataFrame, d: float, thres: float) -> pd.DataFrame:
+    @lru_cache(maxsize=32)
+    def _get_frac_diff_weights(d: float, thres: float, max_len: int = 2000) -> np.ndarray:
         """
-        Applies Fractional Differentiation to the 'close' column.
-        Preserves memory by computing weights once and using convolution.
+        Calculates weights for fractional differentiation.
+        Cached to prevent re-computation on every tick.
         """
-        df = df.copy()
-        if 'close' not in df.columns: return df
-        
-        # 1. Calculate Weights
         w = [1.0]
         k = 1
         while True:
             w_k = -w[-1] / k * (d - k + 1)
-            if abs(w_k) < thres or k >= 2000:
+            if abs(w_k) < thres or k >= max_len:
                 break
             w.append(w_k)
             k += 1
-        weights = np.array(w[::-1]) # Reverse for convolution
+        return np.array(w[::-1]) # Reverse for convolution
+
+    @staticmethod
+    def _apply_frac_diff(df: pd.DataFrame, d: float, thres: float) -> pd.DataFrame:
+        """
+        Applies Fractional Differentiation to the 'close' column.
+        Uses cached weights for performance.
+        """
+        df = df.copy()
+        if 'close' not in df.columns: return df
+        
+        weights = FeatureProcessor._get_frac_diff_weights(d, thres)
 
         # 2. Apply Convolution
         close_vals = df['close'].values
