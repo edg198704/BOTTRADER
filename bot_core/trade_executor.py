@@ -98,7 +98,7 @@ class TradeExecutor:
         symbol = signal.symbol
         side = signal.action
 
-        # 1. Market Pre-Flight Check
+        # 1. Market Pre-Flight Check (Spread)
         if not await self._check_liquidity(symbol, current_price):
             return None
 
@@ -140,13 +140,18 @@ class TradeExecutor:
             logger.info("Quantity adjusted to zero.", symbol=symbol)
             return None
 
-        # 5. Order Construction
+        # 5. Impact Cost Check (Depth)
+        if not await self._check_impact_cost(symbol, side, final_quantity, current_price):
+            logger.warning("Entry rejected: High estimated impact cost.", symbol=symbol, qty=final_quantity)
+            return None
+
+        # 6. Order Construction
         order_type = self.config.execution.default_order_type
         limit_price = None
         if order_type == 'LIMIT':
             limit_price = await self._calculate_limit_price(symbol, side, current_price, df)
 
-        # 6. Execution (Initial Placement)
+        # 7. Execution (Initial Placement)
         trade_id = str(uuid.uuid4())
         await self.position_manager.create_pending_position(
             symbol, side, trade_id, trade_id, 
@@ -172,7 +177,7 @@ class TradeExecutor:
         if exchange_order_id != trade_id:
             await self.position_manager.update_pending_order_id(symbol, trade_id, exchange_order_id)
 
-        # 7. Handoff to Lifecycle Service
+        # 8. Handoff to Lifecycle Service
         ctx = ActiveOrderContext(
             trade_id=trade_id,
             symbol=symbol,
@@ -254,6 +259,37 @@ class TradeExecutor:
         if spread > self.config.execution.max_entry_spread_pct:
             logger.warning("Spread too high.", symbol=symbol, spread=f"{spread:.4%}")
             return False
+        return True
+
+    async def _check_impact_cost(self, symbol: str, side: str, quantity: float, current_price: float) -> bool:
+        """Calculates estimated slippage based on order book depth."""
+        book = self.data_handler.get_latest_order_book(symbol)
+        if not book: return True # Fail open if no book, or False to be safe. Let's fail open but log.
+        
+        levels = book['asks'] if side == 'BUY' else book['bids']
+        if not levels: return False
+        
+        remaining_qty = quantity
+        weighted_price_sum = 0.0
+        
+        for price, vol in levels:
+            take = min(remaining_qty, vol)
+            weighted_price_sum += take * price
+            remaining_qty -= take
+            if remaining_qty <= 0: break
+            
+        if remaining_qty > 0:
+            # Not enough liquidity in the fetched levels
+            logger.warning("Insufficient depth for order size.", symbol=symbol, qty=quantity)
+            return False
+            
+        avg_fill_price = weighted_price_sum / quantity
+        impact_pct = abs(avg_fill_price - current_price) / current_price
+        
+        if impact_pct > self.config.execution.max_impact_cost_pct:
+            logger.warning("High impact cost detected.", symbol=symbol, impact=f"{impact_pct:.4%}", limit=f"{self.config.execution.max_impact_cost_pct:.4%}")
+            return False
+            
         return True
 
     async def _get_purchasing_power_qty(self, symbol: str, side: str, price: float) -> float:
