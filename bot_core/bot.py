@@ -112,7 +112,7 @@ class TradingBot:
         self.service_manager.register("Watchdog", self.watchdog.run(), critical=True)
         self.service_manager.register("RiskMetrics", self.risk_manager.run_metrics_loop(), critical=False)
         self.service_manager.register("PortfolioMonitor", self._portfolio_monitoring_service(), critical=False)
-        self.service_manager.register("ModelRetrainer", self._model_retraining_service(), critical=False)
+        self.service_manager.register("ModelMonitor", self._model_monitor_service(), critical=False)
         self.service_manager.register("Optimizer", self.optimizer.run(), critical=False)
 
         self.service_manager.start_all()
@@ -155,23 +155,26 @@ class TradingBot:
         open_pos = await self.position_manager.get_all_open_positions()
         await asyncio.gather(*[self.trade_executor.close_position(pos, reason) for pos in open_pos])
 
-    async def _model_retraining_service(self):
-        """Service to handle periodic AI model retraining."""
-        await asyncio.sleep(60) # Initial delay
+    async def _model_monitor_service(self):
+        """Service to check for updated model files and trigger hot-swaps."""
+        if not isinstance(self.strategy, AIEnsembleStrategy):
+            return
+            
+        logger.info("Model Monitor Service started.")
+        interval = self.config.strategy.params.model_monitor_interval_seconds
+        
         while True:
             try:
                 for symbol in self.config.strategy.symbols:
-                    if self.strategy.needs_retraining(symbol):
-                        limit = self.strategy.get_training_data_limit()
-                        df = await self.data_handler.fetch_full_history_for_symbol(symbol, limit)
-                        if df is not None and not df.empty:
-                            await self.strategy.retrain(symbol, df, self.process_executor)
-                await asyncio.sleep(300)
+                    if self.strategy.should_reload(symbol):
+                        logger.info(f"New model detected for {symbol}. Initiating hot-swap...")
+                        await self.strategy.reload_models(symbol)
+                await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Error in ModelRetrainer service", error=str(e))
-                await asyncio.sleep(300)
+                logger.error("Error in ModelMonitor service", error=str(e))
+                await asyncio.sleep(interval)
 
     async def _close_position(self, position: Position, reason: str):
         await self.trade_executor.close_position(position, reason)
