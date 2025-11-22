@@ -1,6 +1,7 @@
 import abc
 import time
 import random
+import asyncio
 from typing import Dict, Any, List, Optional, Deque
 from collections import deque
 import pandas as pd
@@ -26,6 +27,27 @@ class BotInsufficientFundsError(BotExchangeError):
 class BotInvalidOrderError(BotExchangeError):
     """Raised when the order parameters are invalid (e.g. size too small/large)."""
     pass
+
+# --- Caching Utilities ---
+
+class BalanceCache:
+    """Simple TTL cache for balance data to prevent rate limit exhaustion."""
+    def __init__(self, ttl_seconds: float = 2.0):
+        self.ttl = ttl_seconds
+        self.last_update = 0.0
+        self.data: Dict[str, Any] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            if time.time() - self.last_update < self.ttl:
+                return self.data
+            return None
+
+    async def update(self, data: Dict[str, Any]):
+        async with self._lock:
+            self.data = data
+            self.last_update = time.time()
 
 # ----------------------------------
 
@@ -387,6 +409,9 @@ class CCXTExchangeAPI(ExchangeAPI):
         self._cache_max_size = 1000
         self._cache_keys: Deque[str] = deque()
 
+        # --- Balance Cache ---
+        self._balance_cache = BalanceCache(ttl_seconds=2.0)
+
         # --- Circuit Breaker ---
         self._circuit_open = False
         self._circuit_open_until = 0.0
@@ -411,7 +436,7 @@ class CCXTExchangeAPI(ExchangeAPI):
         methods = [
             'get_market_data', 'get_ticker_data', 'get_tickers', 'fetch_order_book',
             'place_order', 'fetch_order', 'fetch_open_orders', 'fetch_recent_orders',
-            'cancel_order', 'cancel_all_orders', 'get_balance', 'fetch_market_details'
+            'cancel_order', 'cancel_all_orders', 'fetch_market_details'
         ]
         for method in methods:
             setattr(self, method, self._circuit_breaker_guard(retry_decorator(getattr(self, method))))
@@ -582,8 +607,16 @@ class CCXTExchangeAPI(ExchangeAPI):
         return results
 
     async def get_balance(self) -> Dict[str, Any]:
+        # Use Cache
+        cached = await self._balance_cache.get()
+        if cached:
+            return cached
+        
+        # Fetch and Update Cache
         balance = await self.exchange.fetch_balance()
-        return balance.get('total', {})
+        total = balance.get('total', {})
+        await self._balance_cache.update(total)
+        return total
 
     async def close(self):
         await self.exchange.close()
