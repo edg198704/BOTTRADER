@@ -7,7 +7,7 @@ from decimal import Decimal
 
 from bot_core.config import RiskManagementConfig
 from bot_core.logger import get_logger
-from bot_core.position_manager import Position
+from bot_core.position_manager import Position, PositionStatus
 from bot_core.utils import Clock
 from bot_core.common import to_decimal, ZERO, ONE, Dec
 
@@ -46,15 +46,23 @@ class CooldownRule(RiskRule):
 
 class MaxPositionsRule(RiskRule):
     async def check(self, symbol: str, open_positions: List[Position], context: 'RiskManager') -> Tuple[bool, str]:
+        # open_positions includes PENDING and OPEN
         if len(open_positions) >= context.config.max_open_positions:
             return False, "Max open positions reached"
+        return True, "OK"
+
+class PendingOrdersRule(RiskRule):
+    async def check(self, symbol: str, open_positions: List[Position], context: 'RiskManager') -> Tuple[bool, str]:
+        pending_count = sum(1 for p in open_positions if p.status == PositionStatus.PENDING)
+        if pending_count >= context.config.max_pending_orders:
+            return False, f"Max pending orders ({pending_count}) reached"
         return True, "OK"
 
 class DuplicatePositionRule(RiskRule):
     async def check(self, symbol: str, open_positions: List[Position], context: 'RiskManager') -> Tuple[bool, str]:
         for pos in open_positions:
             if pos.symbol == symbol:
-                return False, "Position already open"
+                return False, "Position already open or pending"
         return True, "OK"
 
 class CorrelationRule(RiskRule):
@@ -63,9 +71,11 @@ class CorrelationRule(RiskRule):
             return True, "OK"
         
         cached_corrs = context.cached_correlations.get(symbol, {})
-        for pos_symbol, corr_value in cached_corrs.items():
+        for pos in open_positions:
+            if pos.symbol == symbol: continue
+            corr_value = cached_corrs.get(pos.symbol, 0.0)
             if corr_value > context.config.correlation.max_correlation:
-                return False, f"High Correlation ({corr_value:.2f}) with {pos_symbol}"
+                return False, f"High Correlation ({corr_value:.2f}) with {pos.symbol}"
             
         return True, "OK"
 
@@ -250,6 +260,7 @@ class RiskManager:
             CircuitBreakerRule(),
             CooldownRule(),
             MaxPositionsRule(),
+            PendingOrdersRule(),
             DuplicatePositionRule(),
             CorrelationRule(),
             VaRCheckRule()
