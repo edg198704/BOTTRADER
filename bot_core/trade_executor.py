@@ -163,6 +163,7 @@ class TradeExecutor:
             current_position = await self.position_manager.get_open_position(symbol)
             
             # Convert latest price to Decimal for execution logic
+            # Note: latest_prices contains floats from DataHandler. We convert here for precision math.
             price_float = self.latest_prices.get(symbol)
             if not price_float:
                 logger.warning("Execution skipped: No price data available.", symbol=symbol)
@@ -357,9 +358,9 @@ class TradeExecutor:
 
     async def _calculate_limit_price(self, symbol: str, side: str, current_price: Decimal, offset_pct: float) -> Decimal:
         ticker = await self.exchange_api.get_ticker_data(symbol)
-        # Ticker data is float, convert
-        bid = to_decimal(ticker.get('bid')) if ticker.get('bid') else None
-        ask = to_decimal(ticker.get('ask')) if ticker.get('ask') else None
+        # Ticker data is Decimal, safe to use
+        bid = ticker.get('bid')
+        ask = ticker.get('ask')
         
         ref_price = bid if side == 'BUY' and bid else (ask if side == 'SELL' and ask else current_price)
         offset = ref_price * to_decimal(offset_pct)
