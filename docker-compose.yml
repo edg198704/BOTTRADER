@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  influxdb:
+    image: influxdb:2.7
+    container_name: quantum_influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=quantum_secure_password
+      - DOCKER_INFLUXDB_INIT_ORG=quantum_org
+      - DOCKER_INFLUXDB_INIT_BUCKET=bot_metrics
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=my-super-secret-auth-token
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+    networks:
+      - quantum_net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: quantum_grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - influxdb
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    networks:
+      - quantum_net
+
+  trading_bot:
+    build: .
+    container_name: quantum_bot
+    depends_on:
+      - influxdb
+    environment:
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=my-super-secret-auth-token
+      - INFLUXDB_ORG=quantum_org
+      - INFLUXDB_BUCKET=bot_metrics
+      # Pass through API keys from host env or set here
+      - BOT_EXCHANGE_API_KEY=${BOT_EXCHANGE_API_KEY}
+      - BOT_EXCHANGE_API_SECRET=${BOT_EXCHANGE_API_SECRET}
+      - BOT_TELEGRAM_BOT_TOKEN=${BOT_TELEGRAM_BOT_TOKEN}
+    volumes:
+      - ./logs:/app/logs
+      - ./models:/app/models
+      - ./position_ledger.db:/app/position_ledger.db
+    networks:
+      - quantum_net
+
+volumes:
+  influxdb_data:
+  grafana_data:
+
+networks:
+  quantum_net:
+    driver: bridge
