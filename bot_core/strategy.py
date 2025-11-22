@@ -65,6 +65,8 @@ class TradingStrategy(abc.ABC):
     async def warmup(self, symbols: List[str]): pass
     async def on_trade_complete(self, event: TradeCompletedEvent): pass
     def get_training_data_limit(self) -> int: return 0
+    def should_reload(self, symbol: str) -> bool: return False
+    async def reload_models(self, symbol: str): pass
 
 class SimpleMACrossoverStrategy(TradingStrategy):
     def __init__(self, config: SimpleMACrossoverStrategyParams):
@@ -97,11 +99,11 @@ class AIEnsembleStrategy(TradingStrategy):
         super().__init__(config)
         self.ai_config = config
         self.state = StrategyStateManager(config)
-        self._training_in_progress = set()
         self.ensemble_learner = EnsembleLearner(config)
         self.regime_detector = MarketRegimeDetector(config)
         self.last_regime = {}
         self._circuit_breaker_failures = {}
+        self._last_model_ts = {}
 
     async def close(self):
         await self.state.save()
@@ -110,6 +112,30 @@ class AIEnsembleStrategy(TradingStrategy):
     async def warmup(self, symbols: List[str]):
         await self.state.load()
         await self.ensemble_learner.warmup_models(symbols)
+        # Initialize timestamps for hot-swapping
+        for symbol in symbols:
+            self._update_model_ts(symbol)
+
+    def _update_model_ts(self, symbol: str):
+        path = os.path.join(self.ai_config.model_path, symbol.replace('/', '_'), "metadata.json")
+        if os.path.exists(path):
+            self._last_model_ts[symbol] = os.path.getmtime(path)
+
+    def should_reload(self, symbol: str) -> bool:
+        path = os.path.join(self.ai_config.model_path, symbol.replace('/', '_'), "metadata.json")
+        if not os.path.exists(path):
+            return False
+        
+        current_mtime = os.path.getmtime(path)
+        last_mtime = self._last_model_ts.get(symbol, 0)
+        return current_mtime > last_mtime
+
+    async def reload_models(self, symbol: str):
+        await self.ensemble_learner.reload_models(symbol)
+        self._update_model_ts(symbol)
+        self.state.last_retrained_at[symbol] = Clock.now()
+        self._circuit_breaker_failures[symbol] = 0
+        logger.info(f"Models reloaded for {symbol}")
 
     def get_latest_regime(self, symbol: str) -> Optional[str]:
         return self.last_regime.get(symbol)
@@ -118,41 +144,12 @@ class AIEnsembleStrategy(TradingStrategy):
         return self.ai_config.training_data_limit
 
     def needs_retraining(self, symbol: str) -> bool:
-        if symbol in self._training_in_progress: return False
-        if not self.ensemble_learner.has_valid_model(symbol): return True
-        if self.state.force_retrain_flags.get(symbol, False): return True
-        last = self.state.last_retrained_at.get(symbol)
-        if not last: 
-            last = self.ensemble_learner.get_last_training_time(symbol)
-            if last: self.state.last_retrained_at[symbol] = last
-            else: return True
-        return (Clock.now() - last) >= timedelta(hours=self.ai_config.retrain_interval_hours)
+        # Deprecated in favor of external training
+        return False
 
     async def retrain(self, symbol: str, df: pd.DataFrame, executor: Executor):
-        if symbol in self._training_in_progress: return
-        self._training_in_progress.add(symbol)
-        try:
-            regime_res = await self.regime_detector.detect_regime(symbol, df)
-            df_enriched = regime_res.get('enriched_df', df)
-            
-            leader_df = None
-            if self.ai_config.market_leader_symbol and self.data_fetcher:
-                leader_df = await self.data_fetcher.fetch_full_history_for_symbol(self.ai_config.market_leader_symbol, len(df))
-
-            loop = asyncio.get_running_loop()
-            success = await loop.run_in_executor(executor, train_ensemble_task, symbol, df_enriched, self.ai_config, leader_df)
-            
-            if success:
-                self.state.last_retrained_at[symbol] = Clock.now()
-                self.state.force_retrain_flags[symbol] = False
-                if symbol in self.state.accuracy_history:
-                    self.state.accuracy_history[symbol].clear()
-                self._circuit_breaker_failures[symbol] = 0
-                await self.ensemble_learner.reload_models(symbol)
-                logger.info(f"Retraining successful for {symbol}")
-        finally:
-            self._training_in_progress.discard(symbol)
-            asyncio.create_task(self.state.save())
+        # Deprecated in favor of external training
+        logger.warning("Internal retraining called but is deprecated. Use train_bot.py instead.")
 
     def _check_technical_guardrails(self, symbol: str, df: pd.DataFrame, action: str) -> bool:
         if not self.ai_config.guardrails.enabled:
@@ -281,6 +278,5 @@ class AIEnsembleStrategy(TradingStrategy):
             if len(history) >= 10:
                 accuracy = sum(history) / len(history)
                 if accuracy < self.ai_config.performance.min_accuracy:
-                    logger.warning(f"Drift Detected for {symbol}. Accuracy: {accuracy:.2f}. Triggering Retrain.")
-                    self.state.force_retrain_flags[symbol] = True
-                    asyncio.create_task(self.state.save())
+                    logger.warning(f"Drift Detected for {symbol}. Accuracy: {accuracy:.2f}. Consider retraining.")
+                    # We no longer trigger retrain here, just log. External monitor handles retraining schedules.
