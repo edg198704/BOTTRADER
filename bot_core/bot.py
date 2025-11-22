@@ -17,49 +17,10 @@ from bot_core.trade_executor import TradeExecutor
 from bot_core.optimizer import StrategyOptimizer
 from bot_core.event_system import EventBus, MarketDataEvent, TradeCompletedEvent
 from bot_core.services import ServiceManager
-from bot_core.tick_pipeline import TickPipeline
+from bot_core.tick_pipeline import TickPipeline, SymbolProcessor
 from bot_core.order_lifecycle_manager import OrderLifecycleService
 
 logger = get_logger(__name__)
-
-class SymbolProcessor:
-    def __init__(self, symbol: str, pipeline: TickPipeline):
-        self.symbol = symbol
-        self.pipeline = pipeline
-        self._queue = asyncio.Queue(maxsize=1) 
-        self._task: Optional[asyncio.Task] = None
-        self._running = False
-
-    async def start(self):
-        if self._running: return
-        self._running = True
-        self._task = asyncio.create_task(self._process_loop(), name=f"Processor-{self.symbol}")
-
-    async def stop(self):
-        self._running = False
-        if self._task:
-            self._task.cancel()
-            try: await self._task
-            except asyncio.CancelledError: pass
-
-    def on_tick(self):
-        if not self._running: return
-        try:
-            if self._queue.full():
-                try: self._queue.get_nowait(); self._queue.task_done()
-                except asyncio.QueueEmpty: pass
-            self._queue.put_nowait(time.perf_counter())
-        except Exception: pass
-
-    async def _process_loop(self):
-        while self._running:
-            try:
-                start_time = await self._queue.get()
-                await self.pipeline.run(self.symbol, start_time)
-                self._queue.task_done()
-            except asyncio.CancelledError: break
-            except Exception as e:
-                logger.error(f"Error in processor loop for {self.symbol}", error=str(e))
 
 class TradingBot:
     def __init__(self, config: BotConfig, exchange_api: ExchangeAPI, data_handler: DataHandler, 
