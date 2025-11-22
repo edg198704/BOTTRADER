@@ -10,6 +10,7 @@ services:
       - .env
     volumes:
       - influxdb_data:/var/lib/influxdb2
+      - influxdb_config:/etc/influxdb2
     networks:
       - quantum_net
     restart: unless-stopped
@@ -40,7 +41,9 @@ services:
     restart: unless-stopped
 
   trading_bot:
-    build: .
+    build: 
+      context: .
+      dockerfile: Dockerfile
     container_name: quantum_bot
     depends_on:
       influxdb:
@@ -50,18 +53,23 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./models:/app/models
+      - ./backtest_data:/app/backtest_data
       - ./position_ledger.db:/app/position_ledger.db
       - ./optimizer_state.json:/app/optimizer_state.json
+      # Mount config to allow hot-reloading if implemented, or easy editing
+      - ./config_enterprise.yaml:/app/config_enterprise.yaml
     networks:
       - quantum_net
     restart: unless-stopped
     deploy:
       resources:
         limits:
-          memory: 2G
+          memory: 4G
+          cpus: '2.0'
 
 volumes:
   influxdb_data:
+  influxdb_config:
   grafana_data:
 
 networks:
