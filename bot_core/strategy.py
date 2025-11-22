@@ -12,7 +12,7 @@ from collections import deque
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams, SimpleMACrossoverStrategyParams, StrategyParamsBase
 from bot_core.ai.ensemble_learner import EnsembleLearner, train_ensemble_task
-from bot_core.ai.regime_detector import MarketRegimeDetector
+from bot_core.ai.regime_detector import RegimeTracker
 from bot_core.position_manager import Position
 from bot_core.utils import Clock, AsyncAtomicJsonStore
 from bot_core.common import TradeSignal, AIInferenceResult
@@ -52,6 +52,7 @@ class TradingStrategy(abc.ABC):
     def __init__(self, config: StrategyParamsBase):
         self.config = config
         self.data_fetcher = None
+        self.regime_tracker: Optional[RegimeTracker] = None
 
     @abc.abstractmethod
     async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[TradeSignal]: pass
@@ -60,7 +61,7 @@ class TradingStrategy(abc.ABC):
     @abc.abstractmethod
     def needs_retraining(self, symbol: str) -> bool: pass
     @abc.abstractmethod
-    def get_latest_regime(self, symbol: str) -> Optional[str]: pass
+    async def get_latest_regime(self, symbol: str) -> Optional[str]: pass
     async def close(self): pass
     async def warmup(self, symbols: List[str]): pass
     async def on_trade_complete(self, event: TradeCompletedEvent): pass
@@ -92,7 +93,7 @@ class SimpleMACrossoverStrategy(TradingStrategy):
 
     async def retrain(self, symbol, df, executor): pass
     def needs_retraining(self, symbol): return False
-    def get_latest_regime(self, symbol): return None
+    async def get_latest_regime(self, symbol): return None
 
 class AIEnsembleStrategy(TradingStrategy):
     def __init__(self, config: AIEnsembleStrategyParams):
@@ -100,8 +101,6 @@ class AIEnsembleStrategy(TradingStrategy):
         self.ai_config = config
         self.state = StrategyStateManager(config)
         self.ensemble_learner = EnsembleLearner(config)
-        self.regime_detector = MarketRegimeDetector(config)
-        self.last_regime = {}
         self._circuit_breaker_failures = {}
         self._last_model_ts = {}
 
@@ -136,8 +135,11 @@ class AIEnsembleStrategy(TradingStrategy):
         self._circuit_breaker_failures[symbol] = 0
         logger.info(f"Models reloaded for {symbol}")
 
-    def get_latest_regime(self, symbol: str) -> Optional[str]:
-        return self.last_regime.get(symbol)
+    async def get_latest_regime(self, symbol: str) -> Optional[str]:
+        if self.regime_tracker:
+            res = await self.regime_tracker.get_regime(symbol)
+            return res.get('regime')
+        return None
 
     def get_training_data_limit(self) -> int:
         return self.ai_config.training_data_limit
@@ -207,10 +209,19 @@ class AIEnsembleStrategy(TradingStrategy):
         if len(df) < min_required:
             return None
 
-        regime_res = await self.regime_detector.detect_regime(symbol, df)
-        regime = regime_res.get('regime')
-        self.last_regime[symbol] = regime
-        df_enriched = regime_res.get('enriched_df', df)
+        # --- Non-Blocking Regime Retrieval ---
+        regime_res = {'regime': 'unknown', 'confidence': 0.0, 'enriched_df': df}
+        if self.regime_tracker:
+            regime_res = await self.regime_tracker.get_regime(symbol)
+            # If enriched_df is missing in tracker result (it might be just metadata), use current df
+            # Ideally tracker should return enriched df, but for now we assume strategy can re-enrich or use raw
+            # To be safe, we use the df passed in, as it's the latest tick data.
+            # The tracker runs on its own schedule.
+        
+        regime = regime_res.get('regime', 'unknown')
+        
+        # We need to ensure features are present. If tracker didn't enrich THIS df, we might need to.
+        # But FeatureProcessor handles raw DFs fine.
 
         last_sig = self.state.last_signal_time.get(symbol)
         if last_sig and (Clock.now() - last_sig).total_seconds() < (self.ai_config.signal_cooldown_candles * 300):
@@ -220,7 +231,7 @@ class AIEnsembleStrategy(TradingStrategy):
         if self.ai_config.market_leader_symbol and self.data_fetcher:
             leader_df = self.data_fetcher.get_market_data(self.ai_config.market_leader_symbol)
             
-        pred = await self.ensemble_learner.predict(df_enriched, symbol, regime, leader_df)
+        pred = await self.ensemble_learner.predict(df, symbol, regime, leader_df)
         
         if pred.model_version == 'error':
             self._circuit_breaker_failures[symbol] = self._circuit_breaker_failures.get(symbol, 0) + 1
