@@ -97,11 +97,27 @@ class TradingBot:
         # 4. Strategy Warmup
         await self.strategy.warmup(self.config.strategy.symbols)
         
-        # 5. Initialize Processors
+        # 5. AI Readiness Check
+        if isinstance(self.strategy, AIEnsembleStrategy):
+            if not self.strategy.ensemble_learner.is_trained:
+                logger.warning("""
+                ****************************************************************
+                * WARNING: AI MODELS NOT FOUND!                                *
+                * The bot is running but will NOT trade until models are       *
+                * trained.                                                     *
+                *                                                              *
+                * ACTION REQUIRED:                                             *
+                * Run 'python train_bot.py' (or via docker-compose exec)       *
+                ****************************************************************
+                """)
+                if self.alert_system:
+                    await self.alert_system.send_alert("WARNING", "AI Models missing. Bot is idle.")
+        
+        # 6. Initialize Processors
         for symbol in self.config.strategy.symbols:
             self.processors[symbol] = SymbolProcessor(symbol, self.tick_pipeline)
         
-        # 6. Event Subscriptions
+        # 7. Event Subscriptions
         self.event_bus.subscribe(MarketDataEvent, self.on_market_data)
         self.event_bus.subscribe(TradeCompletedEvent, self.strategy.on_trade_complete)
 
