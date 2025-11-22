@@ -205,9 +205,11 @@ class TradingBot:
         for proc in self.processors.values():
             await proc.start()
 
+        # Register Services
         self.service_manager.register("DataHandler", self.data_handler.run(), critical=True)
         self.service_manager.register("PositionMonitor", self.position_monitor.run(), critical=True)
         self.service_manager.register("Watchdog", self.watchdog.run(), critical=True)
+        self.service_manager.register("RiskMetrics", self.risk_manager.run_metrics_loop(), critical=False)
         self.service_manager.register("Monitoring", self._monitoring_loop(), critical=False)
         self.service_manager.register("Retraining", self._retraining_loop(), critical=False)
         self.service_manager.register("Optimizer", self.optimizer.run(), critical=False)
@@ -308,6 +310,7 @@ class TradingBot:
         await self.watchdog.stop()
         await self.data_handler.stop()
         await self.position_monitor.stop()
+        await self.risk_manager.stop()
         await self.optimizer.stop()
         await self.strategy.close()
         if self.exchange_api: await self.exchange_api.close()
