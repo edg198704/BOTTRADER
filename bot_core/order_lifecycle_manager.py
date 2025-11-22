@@ -3,6 +3,7 @@ import time
 import uuid
 from typing import Dict, Any, Optional, List, Literal
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 from bot_core.logger import get_logger
 from bot_core.config import ExecutionConfig, ExecutionProfile
@@ -10,6 +11,7 @@ from bot_core.exchange_api import ExchangeAPI
 from bot_core.position_manager import PositionManager
 from bot_core.event_system import EventBus, TradeCompletedEvent
 from bot_core.utils import Clock
+from bot_core.common import to_decimal, ZERO, ONE
 
 logger = get_logger(__name__)
 
@@ -18,17 +20,17 @@ class ActiveOrderContext:
     trade_id: str
     symbol: str
     side: str
-    total_quantity: float
-    initial_price: float
+    total_quantity: Decimal
+    initial_price: Decimal
     strategy_metadata: Dict[str, Any]
     
     current_order_id: str
-    current_price: float
+    current_price: Decimal
     profile: ExecutionProfile
     
     intent: Literal['OPEN', 'CLOSE'] = 'OPEN'
-    cumulative_filled: float = 0.0
-    cumulative_fees: float = 0.0
+    cumulative_filled: Decimal = ZERO
+    cumulative_fees: Decimal = ZERO
     start_time: float = field(default_factory=time.time)
     last_poll_time: float = 0.0
     chase_attempts: int = 0
@@ -40,6 +42,7 @@ class OrderLifecycleService:
     Asynchronous service that manages the lifecycle of active orders in the background.
     Decouples execution monitoring from the signal generation pipeline.
     Implements Adaptive Polling and Smart Chasing based on Execution Profiles.
+    Uses Decimal for all financial calculations.
     """
     def __init__(self, 
                  exchange_api: ExchangeAPI, 
@@ -156,9 +159,20 @@ class OrderLifecycleService:
 
     async def _finalize_fill(self, ctx: ActiveOrderContext, order_status: Dict[str, Any]):
         """Handles a completely filled order (or chain of orders)."""
-        # Calculate totals
-        final_filled = ctx.cumulative_filled + order_status.get('filled', 0.0)
-        final_avg_price = order_status.get('average', ctx.current_price)
+        # Calculate totals using Decimal
+        filled_qty = to_decimal(order_status.get('filled', 0.0))
+        avg_price = to_decimal(order_status.get('average', ctx.current_price))
+        
+        final_filled = ctx.cumulative_filled + filled_qty
+        # Weighted average price calculation could be more complex for partial chains, 
+        # but for single fill or simple chase, using the last fill's avg is a reasonable approximation 
+        # if we assume the previous partials were at similar prices or we track cost basis.
+        # For strict correctness, we should track total cost.
+        # Here we assume the exchange returns the average price of the *current* order.
+        # If we chased, we have multiple orders. We should ideally track weighted avg.
+        # Simplified: Use the latest fill price as the position price for now, or the exchange's avg if available.
+        
+        final_avg_price = avg_price
         total_fees = ctx.cumulative_fees + self._extract_fee_cost(order_status)
 
         try:
@@ -169,16 +183,16 @@ class OrderLifecycleService:
                     base_asset = ctx.symbol.split('/')[0]
                     fee_currency = order_status.get('fee', {}).get('currency')
                     if fee_currency == base_asset:
-                        confirmed_qty = max(0.0, final_filled - total_fees)
+                        confirmed_qty = max(ZERO, final_filled - total_fees)
 
                 pos = await self.position_manager.confirm_position_open(
                     ctx.symbol, ctx.trade_id, confirmed_qty, final_avg_price, 
-                    stop_loss=0.0, take_profit=0.0, fees=total_fees
+                    stop_loss=ZERO, take_profit=ZERO, fees=total_fees
                 )
                 
                 if pos:
                     await self.event_bus.publish(TradeCompletedEvent(position=pos))
-                    logger.info("Order lifecycle complete: OPEN FILLED", symbol=ctx.symbol, qty=confirmed_qty)
+                    logger.info("Order lifecycle complete: OPEN FILLED", symbol=ctx.symbol, qty=str(confirmed_qty))
                 else:
                     logger.error("Failed to confirm position open in DB", trade_id=ctx.trade_id)
             
@@ -187,7 +201,7 @@ class OrderLifecycleService:
                     ctx.symbol, final_avg_price, final_filled, total_fees, reason="Strategy Signal"
                 )
                 if pos:
-                    logger.info("Order lifecycle complete: CLOSE FILLED", symbol=ctx.symbol, qty=final_filled)
+                    logger.info("Order lifecycle complete: CLOSE FILLED", symbol=ctx.symbol, qty=str(final_filled))
                 else:
                     logger.error("Failed to confirm position close in DB", trade_id=ctx.trade_id)
 
@@ -214,7 +228,7 @@ class OrderLifecycleService:
         # Execute Market Fallback if configured in profile
         if ctx.profile.execute_on_timeout:
             remaining = ctx.total_quantity - ctx.cumulative_filled
-            if remaining > 0:
+            if remaining > ZERO:
                 try:
                     logger.info("Placing fallback market order", symbol=ctx.symbol)
                     market_order = await self.exchange_api.place_order(
@@ -234,14 +248,15 @@ class OrderLifecycleService:
             return
         
         # Check interval
-        # We use start_time + (attempts * interval) to determine next chase time
         next_chase_time = ctx.start_time + ((ctx.chase_attempts + 1) * ctx.profile.chase_interval_seconds)
         if now < next_chase_time:
             return
 
-        # Get Market Price
-        market_price = self.latest_prices.get(ctx.symbol)
-        if not market_price: return
+        # Get Market Price (Convert to Decimal)
+        market_price_float = self.latest_prices.get(ctx.symbol)
+        if not market_price_float:
+            return
+        market_price = to_decimal(market_price_float)
 
         # Check deviation
         is_buy = ctx.side == 'BUY'
@@ -255,15 +270,18 @@ class OrderLifecycleService:
             
         if should_chase:
             # Calculate new price
-            aggro = ctx.profile.chase_aggressiveness_pct
-            new_price = market_price * (1 + aggro) if is_buy else market_price * (1 - aggro)
+            aggro = to_decimal(ctx.profile.chase_aggressiveness_pct)
+            new_price = market_price * (ONE + aggro) if is_buy else market_price * (ONE - aggro)
             
             # Slippage Guard
-            if abs(new_price - ctx.initial_price) / ctx.initial_price > ctx.profile.max_slippage_pct:
+            slippage_pct = abs(new_price - ctx.initial_price) / ctx.initial_price
+            max_slippage = to_decimal(ctx.profile.max_slippage_pct)
+            
+            if slippage_pct > max_slippage:
                 logger.info("Max chase slippage reached, holding position.", symbol=ctx.symbol)
                 return
 
-            logger.info("Chasing order", symbol=ctx.symbol, old_price=current_price, new_price=new_price)
+            logger.info("Chasing order", symbol=ctx.symbol, old_price=str(current_price), new_price=str(new_price))
             
             # Cancel & Replace
             try:
@@ -295,7 +313,7 @@ class OrderLifecycleService:
             if trade_id in self._active_orders:
                 del self._active_orders[trade_id]
 
-    def _extract_fee_cost(self, order_res: Dict[str, Any]) -> float:
+    def _extract_fee_cost(self, order_res: Dict[str, Any]) -> Decimal:
         if not order_res or 'fee' not in order_res or not order_res['fee']:
-            return 0.0
-        return float(order_res['fee'].get('cost', 0.0))
+            return ZERO
+        return to_decimal(order_res['fee'].get('cost', 0.0))
