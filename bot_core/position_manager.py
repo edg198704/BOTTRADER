@@ -2,6 +2,7 @@ import datetime
 import asyncio
 import enum
 import json
+import os
 from typing import List, Optional, Dict, Any, TYPE_CHECKING
 from decimal import Decimal
 
@@ -80,8 +81,7 @@ class RiskState(Base):
 
 class PositionManager:
     """
-    Manages trading positions with an In-Memory Source of Truth and Asynchronous Persistence.
-    Uses granular per-symbol locking to maximize concurrency.
+    Manages trading positions with an In-Memory Source of Truth, Async Persistence, and Synchronous WAL.
     """
     def __init__(self, config: DatabaseConfig, initial_capital: float, alert_system: Optional['AlertSystem'] = None):
         self.engine = create_engine(f'sqlite:///{config.path}')
@@ -105,13 +105,16 @@ class PositionManager:
         
         # Concurrency Control
         self._symbol_locks: Dict[str, asyncio.Lock] = {}
-        self._global_lock = asyncio.Lock() # For portfolio-wide ops
+        self._global_lock = asyncio.Lock() 
         
         # Persistence Queue
         self._persist_queue = asyncio.Queue()
         self._persistence_task = None
         
-        logger.info("PositionManager initialized (In-Memory + Async Persistence).")
+        # WAL Configuration
+        self.wal_path = "execution_wal.log"
+        
+        logger.info("PositionManager initialized (In-Memory + Async Persistence + WAL).")
 
     def _get_lock(self, symbol: str) -> asyncio.Lock:
         if symbol not in self._symbol_locks:
@@ -119,12 +122,47 @@ class PositionManager:
         return self._symbol_locks[symbol]
 
     async def initialize(self):
-        # Load initial state from DB synchronously to warm up cache
+        # 1. Replay WAL to recover any lost pending positions
+        await self._run_in_executor(self._replay_wal_sync)
+        
+        # 2. Load initial state from DB
         await self._run_in_executor(self._load_state_sync)
+        
         self._persistence_task = asyncio.create_task(self._persistence_worker())
         logger.info("PositionManager state initialized.", 
                     realized_pnl=self._realized_pnl, 
                     cached_positions=len(self._position_cache))
+
+    def _replay_wal_sync(self):
+        """Replays the Write-Ahead Log to recover pending positions not yet in DB."""
+        if not os.path.exists(self.wal_path):
+            return
+            
+        logger.info("Replaying WAL...")
+        session = self.SessionLocal()
+        try:
+            with open(self.wal_path, 'r') as f:
+                for line in f:
+                    try:
+                        record = json.loads(line)
+                        if record['type'] == 'PENDING_ENTRY':
+                            # Check if exists in DB
+                            exists = session.query(Position).filter(Position.trade_id == record['trade_id']).first()
+                            if not exists:
+                                logger.warning(f"Recovering pending position from WAL: {record['trade_id']}")
+                                pos = Position(
+                                    symbol=record['symbol'], side=record['side'], quantity=ZERO, entry_price=ZERO,
+                                    status=PositionStatus.PENDING, order_id=record['order_id'], trade_id=record['trade_id'],
+                                    decision_price=to_decimal(record['decision_price']), creation_timestamp=datetime.datetime.fromisoformat(record['timestamp']),
+                                    trailing_ref_price=ZERO, trailing_stop_active=False,
+                                    breakeven_active=False, strategy_metadata=record.get('metadata'), fees=ZERO
+                                )
+                                session.add(pos)
+                    except Exception as e:
+                        logger.error(f"WAL Replay error on line: {line}", error=str(e))
+            session.commit()
+        finally:
+            session.close()
 
     def _load_state_sync(self):
         session = self.SessionLocal()
@@ -171,7 +209,6 @@ class PositionManager:
             logger.error("Reconciliation failed: Could not fetch exchange balance", error=str(e))
             return
 
-        # Snapshot keys to avoid modification during iteration
         symbols = list(self._position_cache.keys())
         
         for symbol in symbols:
@@ -183,7 +220,6 @@ class PositionManager:
                 base_asset = symbol.split('/')[0]
                 held_balance = balances.get(base_asset, {}).get('total', ZERO)
                 
-                # Tolerance for dust (5% mismatch allowed)
                 if held_balance < (pos.quantity * Dec("0.95")):
                     logger.critical("Phantom position detected! Closing in DB.", symbol=symbol, db_qty=pos.quantity, exchange_qty=held_balance)
                     await self.close_position(symbol, pos.entry_price, reason="Reconciliation: Phantom Position")
@@ -195,7 +231,7 @@ class PositionManager:
                     await self.confirm_position_close(symbol, current_price, diff, ZERO, reason="Reconciliation: Quantity Adjustment")
 
     async def _run_in_executor(self, func, *args):
-        loop = asyncio.get_running_loop()
+        loop = asyncio.get_running_loop() 
         return await loop.run_in_executor(None, func, *args)
 
     # --- Risk State Management ---
@@ -276,7 +312,6 @@ class PositionManager:
             session.close()
 
     async def get_open_position(self, symbol: str) -> Optional[Position]:
-        # No lock needed for simple read of atomic dict
         pos = self._position_cache.get(symbol)
         if pos and pos.status == PositionStatus.OPEN:
             return pos
@@ -307,12 +342,30 @@ class PositionManager:
                 breakeven_active=False, strategy_metadata=metadata_json, fees=ZERO
             )
             
-            # Update Memory Immediately
+            # 1. Write to WAL (Synchronous & Fsync)
+            await self._run_in_executor(self._write_wal_sync, {
+                'type': 'PENDING_ENTRY',
+                'symbol': symbol, 'side': side, 'order_id': order_id, 'trade_id': trade_id,
+                'decision_price': str(decision_price), 'timestamp': Clock.now().isoformat(),
+                'metadata': metadata_json
+            })
+
+            # 2. Update Memory
             self._position_cache[symbol] = new_position
             
-            # Queue Persistence
+            # 3. Queue DB Persistence
             self._persist_queue.put_nowait((self._persist_new_position_sync, (new_position,)))
             return new_position
+
+    def _write_wal_sync(self, record: Dict[str, Any]):
+        try:
+            with open(self.wal_path, 'a') as f:
+                f.write(json.dumps(record) + "\n")
+                f.flush()
+                os.fsync(f.fileno()) # Critical: Ensure data hits disk
+        except Exception as e:
+            logger.critical("WAL Write Failed!", error=str(e))
+            raise # If WAL fails, we must not proceed
 
     def _persist_new_position_sync(self, position: Position):
         session = self.SessionLocal()
@@ -364,7 +417,6 @@ class PositionManager:
             if pos.decision_price and pos.decision_price > 0:
                 slippage = (entry_price - pos.decision_price) / pos.decision_price
 
-            # Update Memory
             pos.status = PositionStatus.OPEN
             pos.quantity = quantity
             pos.entry_price = entry_price
@@ -376,8 +428,6 @@ class PositionManager:
             pos.execution_latency_ms = latency
             pos.slippage_pct = slippage
 
-            # Queue Persistence
-            # We pass a dict of updates to avoid detaching/attaching issues with SQLAlchemy objects across threads
             updates = {
                 'status': PositionStatus.OPEN, 'quantity': quantity, 'entry_price': entry_price,
                 'stop_loss_price': stop_loss, 'take_profit_price': take_profit, 'trailing_ref_price': entry_price,
@@ -429,7 +479,6 @@ class PositionManager:
                 return None
 
             if filled_qty < (pos.quantity * Dec("0.999")):
-                # Partial Close Logic
                 gross_pnl = (exit_price - pos.entry_price) * filled_qty
                 if pos.side == 'SELL': gross_pnl = -gross_pnl
                 
@@ -438,16 +487,13 @@ class PositionManager:
                 total_chunk_fees = entry_fees_chunk + fees
                 net_pnl = gross_pnl - total_chunk_fees
 
-                # Update Memory (Reduce Size)
                 pos.quantity -= filled_qty
                 pos.fees -= entry_fees_chunk
                 self._realized_pnl += net_pnl
                 
-                # Persist Partial Close (Create a closed chunk record + update open pos)
                 self._persist_queue.put_nowait((self._persist_partial_close_sync, (symbol, pos.order_id, filled_qty, exit_price, net_pnl, total_chunk_fees, reason)))
                 return pos
             else:
-                # Full Close
                 gross_pnl = (exit_price - pos.entry_price) * pos.quantity
                 if pos.side == 'SELL': gross_pnl = -gross_pnl
 
@@ -460,11 +506,9 @@ class PositionManager:
                 pos.pnl = net_pnl
                 pos.exit_reason = reason
                 
-                # Remove from Cache
                 del self._position_cache[symbol]
                 self._realized_pnl += net_pnl
 
-                # Persist
                 updates = {
                     'status': PositionStatus.CLOSED, 'close_price': exit_price, 'close_timestamp': pos.close_timestamp,
                     'pnl': net_pnl, 'fees': pos.fees, 'exit_reason': reason
@@ -483,13 +527,11 @@ class PositionManager:
     def _persist_partial_close_sync(self, symbol: str, order_id: str, qty: Decimal, price: Decimal, pnl: Decimal, fees: Decimal, reason: str):
         session = self.SessionLocal()
         try:
-            # 1. Update Open Position
             pos = session.query(Position).filter(Position.symbol == symbol, Position.order_id == order_id).first()
             if pos:
                 pos.quantity -= qty
-                pos.fees -= (fees - fees) # Simplified logic, actual fee tracking needs split
+                pos.fees -= (fees - fees) 
                 
-                # 2. Create Closed Chunk
                 chunk = Position(
                     symbol=symbol, side=pos.side, quantity=qty, entry_price=pos.entry_price,
                     status=PositionStatus.CLOSED, order_id=pos.order_id, trade_id=pos.trade_id,
@@ -525,7 +567,6 @@ class PositionManager:
             session.close()
 
     async def close_position(self, symbol: str, close_price: Decimal, reason: str = "Unknown", actual_filled_qty: Optional[Decimal] = None, fees: Decimal = ZERO) -> Optional[Position]:
-        # Wrapper for manual close that delegates to confirm_position_close logic
         async with self._get_lock(symbol):
             pos = self._position_cache.get(symbol)
             if not pos:
@@ -628,7 +669,6 @@ class PositionManager:
     def get_portfolio_value(self, latest_prices: Dict[str, float], open_positions: List[Position]) -> Decimal:
         unrealized_pnl = ZERO
         for pos in open_positions:
-            # Convert float price to Decimal for calculation
             current_price = to_decimal(latest_prices.get(pos.symbol, float(pos.entry_price)))
             pnl = (current_price - pos.entry_price) * pos.quantity
             if pos.side == 'SELL':
