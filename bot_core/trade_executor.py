@@ -263,10 +263,6 @@ class TradeExecutor:
             await self.position_manager.update_pending_order_id(symbol, trade_id, exchange_order_id)
 
         # 7. Handoff to Lifecycle Service
-        # Convert back to float for lifecycle context if needed, or keep as Decimal if context supports it.
-        # ActiveOrderContext expects floats in the current definition, but we should probably update it or cast.
-        # For now, casting to float for the context object to avoid breaking that file, 
-        # assuming lifecycle manager handles the polling logic which is less precision-critical than the ledger.
         ctx = ActiveOrderContext(
             trade_id=trade_id,
             symbol=symbol,
