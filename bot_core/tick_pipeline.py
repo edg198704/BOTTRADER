@@ -77,6 +77,7 @@ class TickPipeline:
 
             # Stage 4: Execution Initiation
             if ctx.signal: 
+                # This is now non-blocking (returns INITIATED immediately)
                 ctx.execution_result = await self.trade_executor.execute_trade_signal(ctx.signal, ctx.df, ctx.position)
                 if ctx.execution_result and self.metrics_writer:
                     # Log the initiation of the trade
