@@ -99,10 +99,17 @@ async def main():
         alert_system=alert_system
     )
     
-    strategy = get_strategy(config)
+    # Initialize Metrics Writer (InfluxDB)
+    metrics_writer = InfluxDBMetrics(
+        url=os.getenv('INFLUXDB_URL'), 
+        token=os.getenv('INFLUXDB_TOKEN'), 
+        org=os.getenv('INFLUXDB_ORG'), 
+        bucket=os.getenv('INFLUXDB_BUCKET')
+    )
+
+    strategy = get_strategy(config, metrics_writer)
     order_sizer = OrderSizer()
     health_checker = HealthChecker()
-    metrics_writer = InfluxDBMetrics(url=os.getenv('INFLUXDB_URL'), token=os.getenv('INFLUXDB_TOKEN'), org=os.getenv('INFLUXDB_ORG'), bucket=os.getenv('INFLUXDB_BUCKET'))
 
     position_monitor = PositionMonitor(
         config=config,
@@ -187,13 +194,14 @@ async def main():
         if bot.shared_bot_state.get('status') != 'stopped':
             await bot.stop()
         await telegram_bot.stop()
+        await metrics_writer.close()
 
 def get_exchange_api(config: BotConfig) -> ExchangeAPI:
     if config.exchange.name == "MockExchange":
         return MockExchangeAPI()
     return CCXTExchangeAPI(config.exchange)
 
-def get_strategy(config: BotConfig) -> TradingStrategy:
+def get_strategy(config: BotConfig, metrics_writer: Optional[InfluxDBMetrics] = None) -> TradingStrategy:
     logger = get_logger(__name__)
     strategy_name = config.strategy.params.name
     strategy_params = config.strategy.params
@@ -201,7 +209,7 @@ def get_strategy(config: BotConfig) -> TradingStrategy:
         strategy_class = getattr(strategy_module, strategy_name)
         if not issubclass(strategy_class, TradingStrategy):
             raise TypeError(f"Strategy '{strategy_name}' is not a valid subclass of TradingStrategy.")
-        return strategy_class(strategy_params)
+        return strategy_class(strategy_params, metrics_writer)
     except AttributeError:
         logger.critical(f"Strategy class '{strategy_name}' not found.")
         raise ValueError(f"Unknown strategy: {strategy_name}")
