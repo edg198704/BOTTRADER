@@ -1,21 +1,39 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 from datetime import datetime, timezone
 from typing import Literal, Optional, Dict, Any, List, Union
-from decimal import Decimal, getcontext, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Decimal, getcontext, ROUND_DOWN, ROUND_HALF_UP, InvalidOperation
 
 # --- Global Precision Settings ---
 getcontext().prec = 28
 
-ZERO = Decimal("0")
-ONE = Decimal("1")
+# Type Alias for Financial Calculations
+Dec = Decimal
 
-def to_decimal(value: Union[float, str, int, Decimal]) -> Decimal:
-    """Safely converts a value to Decimal, handling float artifacts via string conversion."""
+ZERO = Dec("0")
+ONE = Dec("1")
+
+def to_decimal(value: Union[float, str, int, Decimal, None]) -> Decimal:
+    """
+    Safely converts a value to Decimal, handling float artifacts via string conversion.
+    Returns ZERO if input is None.
+    """
+    if value is None:
+        return ZERO
     if isinstance(value, Decimal):
         return value
     if isinstance(value, float):
+        # Convert to string first to avoid float precision artifacts
+        return Decimal(f"{value:.20f}".rstrip('0').rstrip('.'))
+    try:
         return Decimal(str(value))
-    return Decimal(value)
+    except InvalidOperation:
+        return ZERO
+
+def safe_div(numerator: Decimal, denominator: Decimal, precision: Decimal = ZERO) -> Decimal:
+    """Safe division returning ZERO on DivisionByZero."""
+    if denominator == ZERO:
+        return ZERO
+    return numerator / denominator
 
 class TradeSignal(BaseModel):
     """
@@ -30,6 +48,9 @@ class TradeSignal(BaseModel):
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     strategy_name: str
     metadata: Dict[str, Any] = {}
+
+    class Config:
+        arbitrary_types_allowed = True
 
 class AIInferenceResult(BaseModel):
     """
