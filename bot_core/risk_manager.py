@@ -9,7 +9,7 @@ from bot_core.config import RiskManagementConfig
 from bot_core.logger import get_logger
 from bot_core.position_manager import Position
 from bot_core.utils import Clock
-from bot_core.common import to_decimal, ZERO, ONE
+from bot_core.common import to_decimal, ZERO, ONE, Dec
 
 if TYPE_CHECKING:
     from bot_core.monitoring import AlertSystem
@@ -149,7 +149,7 @@ class PositionSizer:
         profit_factor = to_decimal(ensemble.get('profit_factor', 0.0))
         
         if win_rate <= ZERO or profit_factor <= ZERO: return base_risk
-        if win_rate >= ONE: return base_risk * Decimal("2.0")
+        if win_rate >= ONE: return base_risk * Dec("2.0")
         
         r_ratio = profit_factor * (ONE - win_rate) / win_rate
         if r_ratio <= ZERO: return base_risk
@@ -158,7 +158,7 @@ class PositionSizer:
         kelly_fraction = to_decimal(self.config.kelly_fraction)
         
         # Cap Kelly at 5x base risk or 5% total equity for safety
-        max_risk = min(base_risk * Decimal("5.0"), Decimal("0.05"))
+        max_risk = min(base_risk * Dec("5.0"), Dec("0.05"))
         return max(ZERO, min(kelly * kelly_fraction, max_risk))
 
     def _apply_confidence(self, risk_pct: Decimal, confidence: Optional[float], threshold: Optional[float]) -> Decimal:
@@ -381,7 +381,7 @@ class RiskManager:
         )
         
         if self.current_drawdown < -0.05:
-            qty *= Decimal("0.75")
+            qty *= Dec("0.75")
             
         return qty
 
@@ -397,10 +397,10 @@ class RiskManager:
                 buffer = atr * to_decimal(self.config.swing_buffer_atr_multiplier)
                 if side == 'BUY':
                     low_min = to_decimal(window['low'].min())
-                    return min(entry_price * Decimal("0.99"), low_min - buffer)
+                    return min(entry_price * Dec("0.99"), low_min - buffer)
                 else:
                     high_max = to_decimal(window['high'].max())
-                    return max(entry_price * Decimal("1.01"), high_max + buffer)
+                    return max(entry_price * Dec("1.01"), high_max + buffer)
 
         mult = to_decimal(self.sizer._get_regime_param('atr_stop_multiplier', market_regime))
         dist = (atr * mult) if atr > ZERO else (entry_price * to_decimal(self.config.stop_loss_fallback_pct))
@@ -456,15 +456,15 @@ class RiskManager:
             return None, None, False
 
         base_multiplier = to_decimal(self.config.atr_trailing_multiplier)
-        if regime == 'volatile': base_multiplier *= Decimal("1.5")
-        elif regime == 'bull' and pos.side == 'BUY': base_multiplier *= Decimal("0.8")
-        elif regime == 'bear' and pos.side == 'SELL': base_multiplier *= Decimal("0.8")
+        if regime == 'volatile': base_multiplier *= Dec("1.5")
+        elif regime == 'bull' and pos.side == 'BUY': base_multiplier *= Dec("0.8")
+        elif regime == 'bear' and pos.side == 'SELL': base_multiplier *= Dec("0.8")
 
         roi_pct = ZERO
         if pos.entry_price > ZERO:
             roi_pct = (current_price - pos.entry_price) / pos.entry_price if pos.side == 'BUY' else (pos.entry_price - current_price) / pos.entry_price
         
-        acceleration = max(ZERO, (roi_pct * 100) * Decimal("0.1"))
+        acceleration = max(ZERO, (roi_pct * 100) * Dec("0.1"))
         final_multiplier = max(ONE, base_multiplier - acceleration)
         distance = (atr * final_multiplier) if atr > ZERO else (current_price * to_decimal(self.config.trailing_stop_pct))
 
@@ -479,7 +479,7 @@ class RiskManager:
         else:
             new_ref = min(current_ref, current_price)
             potential_stop = new_ref + distance
-            if potential_stop < (pos.stop_loss_price or Decimal('Infinity')):
+            if potential_stop < (pos.stop_loss_price or Dec('Infinity')):
                 new_stop = potential_stop
 
         activated = pos.trailing_stop_active or (roi_pct >= to_decimal(self.config.trailing_stop_activation_pct))
