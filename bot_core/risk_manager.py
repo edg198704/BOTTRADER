@@ -3,6 +3,7 @@ from typing import List, Optional, Any, Dict, TYPE_CHECKING, Tuple
 from datetime import datetime, timedelta
 import asyncio
 import numpy as np
+import os
 from decimal import Decimal
 
 from bot_core.config import RiskManagementConfig
@@ -27,6 +28,10 @@ class RiskRule(ABC):
 
 class CircuitBreakerRule(RiskRule):
     async def check(self, symbol: str, open_positions: List[Position], context: 'RiskManager') -> Tuple[bool, str]:
+        # External Kill Switch Check
+        if os.path.exists("STOP_TRADING"):
+            return False, "MANUAL KILL SWITCH ACTIVE (STOP_TRADING file detected)"
+            
         if context.circuit_breaker_halted:
             return False, "Circuit Breaker Active"
         if context.daily_loss_halted:
@@ -295,7 +300,7 @@ class RiskManager:
 
     @property
     def is_halted(self) -> bool:
-        return self.circuit_breaker_halted or self.daily_loss_halted
+        return self.circuit_breaker_halted or self.daily_loss_halted or os.path.exists("STOP_TRADING")
 
     async def run_metrics_loop(self):
         self.running = True
