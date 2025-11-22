@@ -40,6 +40,75 @@ class TickContext:
     def mark_stage(self, name: str):
         self.stages[name] = (time.perf_counter() - self.start_time) * 1000
 
+class SymbolProcessor:
+    """
+    Actor-like class responsible for processing ticks for a specific symbol sequentially.
+    Implements Conflation: If the system is busy, older ticks in the queue are discarded 
+    in favor of the newest one to ensure real-time relevance.
+    """
+    def __init__(self, symbol: str, bot: 'TradingBot'):
+        self.symbol = symbol
+        self.bot = bot
+        # Conflation queue: Size 1 ensures we only ever hold the LATEST tick pending.
+        self._queue = asyncio.Queue(maxsize=1) 
+        self._task: Optional[asyncio.Task] = None
+        self._running = False
+
+    async def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._task = asyncio.create_task(self._process_loop(), name=f"Processor-{self.symbol}")
+        logger.info(f"SymbolProcessor started for {self.symbol}")
+
+    async def stop(self):
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        logger.info(f"SymbolProcessor stopped for {self.symbol}")
+
+    def on_tick(self):
+        """
+        Called when a new tick is available.
+        Non-blocking. Drops old tick if busy (Conflation).
+        """
+        if not self._running:
+            return
+
+        try:
+            # If queue is full, remove the old item (conflation)
+            if self._queue.full():
+                try:
+                    self._queue.get_nowait()
+                    self._queue.task_done()
+                except asyncio.QueueEmpty:
+                    pass
+            
+            self._queue.put_nowait(time.perf_counter())
+        except Exception as e:
+            logger.error(f"Error queuing tick for {self.symbol}", error=str(e))
+
+    async def _process_loop(self):
+        while self._running:
+            try:
+                # Wait for a tick signal
+                start_time = await self._queue.get()
+                
+                # Process
+                ctx = TickContext(symbol=self.symbol, start_time=start_time)
+                await self.bot._process_tick_pipeline(ctx)
+                
+                self._queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in processor loop for {self.symbol}", error=str(e), exc_info=True)
+                self.bot.watchdog.record_error(f"Processor-{self.symbol}")
+
 class TradingBot:
     """
     Central Orchestrator. Manages the lifecycle of all sub-components and the main event loop.
@@ -74,7 +143,8 @@ class TradingBot:
         self.market_details: Dict[str, Dict[str, Any]] = {}
         self.processed_candles: Dict[str, pd.Timestamp] = {}
         
-        self._symbol_locks: Dict[str, asyncio.Lock] = {}
+        # Symbol Processors (Actors)
+        self.processors: Dict[str, SymbolProcessor] = {}
         
         self.process_executor = ProcessPoolExecutor(max_workers=2)
         
@@ -101,11 +171,6 @@ class TradingBot:
             'strategy': self.strategy
         })
 
-    def _get_symbol_lock(self, symbol: str) -> asyncio.Lock:
-        if symbol not in self._symbol_locks:
-            self._symbol_locks[symbol] = asyncio.Lock()
-        return self._symbol_locks[symbol]
-
     async def setup(self):
         logger.info("Setting up TradingBot components...")
         if isinstance(self.strategy, AIEnsembleStrategy):
@@ -120,6 +185,10 @@ class TradingBot:
         logger.info("Warming up strategy...")
         await self.strategy.warmup(self.config.strategy.symbols)
         
+        # Initialize Processors
+        for symbol in self.config.strategy.symbols:
+            self.processors[symbol] = SymbolProcessor(symbol, self)
+
         # Event Subscriptions
         self.event_bus.subscribe(MarketDataEvent, self.on_market_data)
         self.event_bus.subscribe(TradeCompletedEvent, self.strategy.on_trade_complete)
@@ -142,6 +211,10 @@ class TradingBot:
         
         await self.setup()
 
+        # Start Processors
+        for proc in self.processors.values():
+            await proc.start()
+
         self.service_manager.register("DataHandler", self.data_handler.run(), critical=True)
         self.service_manager.register("PositionMonitor", self.position_monitor.run(), critical=True)
         self.service_manager.register("Watchdog", self.watchdog.run(), critical=True)
@@ -155,74 +228,62 @@ class TradingBot:
 
     async def on_market_data(self, event: MarketDataEvent):
         set_correlation_id()
-        # Fire and forget tick processing
-        asyncio.create_task(self.process_symbol_tick(event.symbol))
+        # Dispatch to the specific symbol processor
+        if event.symbol in self.processors:
+            self.processors[event.symbol].on_tick()
 
-    async def process_symbol_tick(self, symbol: str):
+    async def _process_tick_pipeline(self, ctx: TickContext):
         # 1. Fast Fail on Risk Halt or Circuit Breaker
         if self.risk_manager.is_halted or self.watchdog._circuit_breaker.tripped:
             return
 
         # 2. Latency Guard
-        latency = self.data_handler.get_latency(symbol)
+        latency = self.data_handler.get_latency(ctx.symbol)
         if latency > 10.0:
-            logger.warning("Skipping tick due to high latency", symbol=symbol, latency=f"{latency:.2f}s")
+            logger.warning("Skipping tick due to high latency", symbol=ctx.symbol, latency=f"{latency:.2f}s")
             if self.metrics_writer:
-                await self.metrics_writer.write_metric('data_latency_skip', fields={'latency': latency}, tags={'symbol': symbol})
+                await self.metrics_writer.write_metric('data_latency_skip', fields={'latency': latency}, tags={'symbol': ctx.symbol})
             return
 
-        lock = self._get_symbol_lock(symbol)
-        if lock.locked():
-            # Drop tick if busy (Backpressure)
-            return
-
-        ctx = TickContext(symbol=symbol, start_time=time.perf_counter())
-        
         try:
-            async with lock:
-                await asyncio.wait_for(self._process_tick_pipeline(ctx), timeout=15.0)
-        except asyncio.TimeoutError:
-            logger.error("Tick processing timed out", symbol=symbol)
-            self.watchdog.record_error("TickTimeout")
+            # Stage 1: Data Fetch
+            ctx.df = self.data_handler.get_market_data(ctx.symbol, include_forming=False)
+            if ctx.df is None or ctx.df.empty: return
+            
+            last_ts = ctx.df.index[-1]
+            if self.processed_candles.get(ctx.symbol) == last_ts:
+                return # Already processed this candle
+            
+            if ctx.symbol not in self.latest_prices:
+                return
+
+            ctx.mark_stage('data_fetch')
+
+            # Stage 2: Position Fetch
+            ctx.position = await self.position_manager.get_open_position(ctx.symbol)
+            ctx.mark_stage('position_fetch')
+
+            # Stage 3: Strategy Analysis
+            ctx.signal = await self.strategy.analyze_market(ctx.symbol, ctx.df, ctx.position)
+            ctx.mark_stage('strategy_analysis')
+
+            # Stage 4: Execution
+            if ctx.signal: 
+                ctx.execution_result = await self.trade_executor.execute_trade_signal(ctx.signal, ctx.df, ctx.position)
+                if ctx.execution_result and self.metrics_writer:
+                    await self.metrics_writer.write_metric('trade_execution', fields=ctx.execution_result.dict())
+                ctx.mark_stage('execution')
+            
+            self.processed_candles[ctx.symbol] = last_ts
+            ctx.mark_stage('total_duration')
+
         except Exception as e:
-            logger.error(f"Critical error processing tick for {symbol}", error=str(e), exc_info=True)
+            logger.error(f"Critical error processing tick for {ctx.symbol}", error=str(e), exc_info=True)
             self.watchdog.record_error("TickError")
         finally:
-            self.watchdog.register_heartbeat(symbol)
+            self.watchdog.register_heartbeat(ctx.symbol)
             if self.metrics_writer and ctx.stages:
-                await self.metrics_writer.write_metric('tick_pipeline', fields=ctx.stages, tags={'symbol': symbol})
-
-    async def _process_tick_pipeline(self, ctx: TickContext):
-        # Stage 1: Data Fetch
-        ctx.df = self.data_handler.get_market_data(ctx.symbol, include_forming=False)
-        if ctx.df is None or ctx.df.empty: return
-        
-        last_ts = ctx.df.index[-1]
-        if self.processed_candles.get(ctx.symbol) == last_ts:
-            return # Already processed this candle
-        
-        if ctx.symbol not in self.latest_prices:
-            return
-
-        ctx.mark_stage('data_fetch')
-
-        # Stage 2: Position Fetch
-        ctx.position = await self.position_manager.get_open_position(ctx.symbol)
-        ctx.mark_stage('position_fetch')
-
-        # Stage 3: Strategy Analysis
-        ctx.signal = await self.strategy.analyze_market(ctx.symbol, ctx.df, ctx.position)
-        ctx.mark_stage('strategy_analysis')
-
-        # Stage 4: Execution
-        if ctx.signal: 
-            ctx.execution_result = await self.trade_executor.execute_trade_signal(ctx.signal, ctx.df, ctx.position)
-            if ctx.execution_result and self.metrics_writer:
-                await self.metrics_writer.write_metric('trade_execution', fields=ctx.execution_result.dict())
-            ctx.mark_stage('execution')
-        
-        self.processed_candles[ctx.symbol] = last_ts
-        ctx.mark_stage('total_duration')
+                await self.metrics_writer.write_metric('tick_pipeline', fields=ctx.stages, tags={'symbol': ctx.symbol})
 
     async def _monitoring_loop(self):
         reconcile_counter = 0
@@ -301,6 +362,11 @@ class TradingBot:
     async def stop(self):
         logger.info("Stopping TradingBot...")
         self.shared_bot_state['status'] = 'stopping'
+        
+        # Stop processors first to stop ingesting new ticks
+        for proc in self.processors.values():
+            await proc.stop()
+            
         await self.service_manager.stop_all()
         await self.watchdog.stop()
         await self.data_handler.stop()
