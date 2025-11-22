@@ -2,10 +2,11 @@ from enum import Enum
 import pandas as pd
 import numpy as np
 import asyncio
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams
+from bot_core.data_handler import DataHandler
 
 logger = get_logger(__name__)
 
@@ -61,7 +62,6 @@ class MarketRegimeDetector:
             return np.log(RS) / np.log(len(chunk))
 
         # Apply rolling window
-        # Note: rolling().apply() can be slow for very large DFs, but acceptable for training batches
         return returns.rolling(window=window).apply(get_hurst, raw=True)
 
     def add_regime_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -174,7 +174,6 @@ class MarketRegimeDetector:
         regimes[volatile_mask] = MarketRegime.VOLATILE.value
         
         # Overwrite with Inefficient/Mean Reverting Logic
-        # If inefficient OR mean reverting, force Sideways (unless extremely volatile)
         chop_mask = inefficient_mask | mean_reverting_mask
         regimes[chop_mask & ~volatile_mask] = MarketRegime.SIDEWAYS.value
         regimes[chop_mask & volatile_mask] = MarketRegime.VOLATILE.value
@@ -207,32 +206,28 @@ class MarketRegimeDetector:
                 df = self.add_regime_features(df)
 
             # 2. Determine Dominant Regime (Hysteresis)
-            # Look back N candles to find the mode
             window_size = mr_config.regime_confirmation_window
             if len(df) >= window_size:
                 tail_df = df.iloc[-window_size:]
             else:
                 tail_df = df
             
-            # Reuse vectorized logic for consistency
             regime_series = self.get_regime_series(tail_df)
             
             if not regime_series.empty:
-                # Get the most frequent regime in the window
                 dominant_regime_str = regime_series.mode()[0]
                 regime = MarketRegime(dominant_regime_str)
             else:
                 regime = MarketRegime.SIDEWAYS
 
-            # 3. Calculate Confidence Metrics based on the LATEST candle (Current State)
-            # We need the raw metrics of the last candle to determine how strong the signal is right now
+            # 3. Calculate Confidence Metrics based on the LATEST candle
             last_row = df.iloc[-1]
             trend_strength = last_row['regime_trend']
             efficiency = last_row['regime_efficiency']
             hurst = last_row['regime_hurst']
             rsi_val = last_row[rsi_col] if rsi_col in df.columns else 50
 
-            # Determine Thresholds (for confidence calc)
+            # Determine Thresholds
             trend_thresh = mr_config.trend_strength_threshold
             vol_thresh = mr_config.volatility_multiplier
             eff_thresh = mr_config.efficiency_threshold
@@ -248,7 +243,6 @@ class MarketRegimeDetector:
             trend_conf = min(1.0, abs(trend_strength) / (trend_thresh * 2)) if trend_thresh > 0 else 0.0
             rsi_conf = abs(rsi_val - 50) / 50
             
-            # Hurst boosts confidence if it aligns with trend (H > 0.55)
             hurst_boost = 0.0
             if hurst > mr_config.hurst_trending_threshold:
                 hurst_boost = (hurst - mr_config.hurst_trending_threshold) * 2.0
@@ -256,26 +250,69 @@ class MarketRegimeDetector:
             confidence = (trend_conf * 0.5) + (rsi_conf * 0.2) + (efficiency * 0.1) + (hurst_boost * 0.2)
 
             # 4. Apply Hysteresis Penalty
-            # If the dominant regime (voting result) differs from the immediate single-candle regime,
-            # it means we are likely in a transition or noise. Reduce confidence.
-            
-            # Calculate immediate regime for comparison
             immediate_regime_series = self.get_regime_series(df.iloc[-1:])
             if not immediate_regime_series.empty:
                 immediate_regime_str = immediate_regime_series.iloc[0]
                 if immediate_regime_str != regime.value:
-                    # Transition detected: Penalize confidence
                     confidence *= 0.8
 
             result = {
                 'regime': regime.value, 
                 'confidence': round(confidence, 2),
                 'thresholds': {'trend': round(trend_thresh, 5), 'vol': round(vol_thresh, 3), 'eff': round(eff_thresh, 2), 'hurst': round(hurst, 2)},
-                'enriched_df': df # Return enriched DF for downstream use
+                'enriched_df': df
             }
-            logger.debug("Market regime detected", symbol=symbol, result={k:v for k,v in result.items() if k != 'enriched_df'})
             return result
             
         except Exception as e:
             logger.error("Error in regime detection", symbol=symbol, error=str(e))
             return {'regime': MarketRegime.UNKNOWN.value, 'confidence': 0.0, 'enriched_df': df}
+
+class RegimeTracker:
+    """
+    Background service that continuously updates market regime state.
+    Allows strategies to query regime instantly without blocking.
+    """
+    def __init__(self, config: AIEnsembleStrategyParams, data_handler: DataHandler):
+        self.config = config
+        self.data_handler = data_handler
+        self.detector = MarketRegimeDetector(config)
+        self._current_regimes: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+
+    async def start(self):
+        self._running = True
+        self._task = asyncio.create_task(self._update_loop(), name="RegimeTracker")
+        logger.info("RegimeTracker service started.")
+
+    async def stop(self):
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try: await self._task
+            except asyncio.CancelledError: pass
+        logger.info("RegimeTracker service stopped.")
+
+    async def get_regime(self, symbol: str) -> Dict[str, Any]:
+        async with self._lock:
+            return self._current_regimes.get(symbol, {'regime': MarketRegime.UNKNOWN.value, 'confidence': 0.0})
+
+    async def _update_loop(self):
+        interval = self.config.market_regime.update_interval_seconds
+        while self._running:
+            try:
+                for symbol in self.config.symbols:
+                    df = self.data_handler.get_market_data(symbol)
+                    if df is not None and not df.empty:
+                        res = await self.detector.detect_regime(symbol, df)
+                        async with self._lock:
+                            self._current_regimes[symbol] = res
+                
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Error in RegimeTracker loop", error=str(e))
+                await asyncio.sleep(5)
