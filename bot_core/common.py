@@ -4,8 +4,8 @@ from typing import Literal, Optional, Dict, Any, Union
 from decimal import Decimal, getcontext, ROUND_DOWN, InvalidOperation
 
 # --- Global Precision Settings ---
-# Set global precision to 28 places (standard for financial compute)
-getcontext().prec = 28
+# Set global precision to 50 places (Quantum Standard)
+getcontext().prec = 50
 getcontext().rounding = ROUND_DOWN
 
 # Type Alias for Financial Calculations
@@ -16,7 +16,7 @@ ONE = Dec("1")
 
 def setup_math_context():
     """Ensures the Decimal context is configured correctly for the process."""
-    getcontext().prec = 28
+    getcontext().prec = 50
     getcontext().rounding = ROUND_DOWN
 
 setup_math_context()
