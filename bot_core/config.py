@@ -64,7 +64,7 @@ class MarketRegimeConfig(BaseModel):
     trend_strength_threshold: float = 0.015
     volatility_multiplier: float = 1.5
     trend_fast_ma_col: str = "sma_fast"
-    trend_slow_ma_col: str = "sma_slow"
+    trend_slow_ma_col: "sma_slow"
     volatility_col: str = "atr"
     rsi_col: str = "rsi"
     use_adx_filter: bool = False
@@ -175,7 +175,8 @@ class AIEnsembleStrategyParams(StrategyParamsBase):
     exit_confidence_threshold: float = Field(0.5, ge=0.0, le=1.0)
     model_path: str
     use_regime_filter: bool
-    retrain_interval_hours: int
+    # Decoupled Training Settings
+    model_monitor_interval_seconds: int = 60
     training_data_limit: int = 5000
     signal_cooldown_candles: int = 1
     inference_workers: int = 2
@@ -220,7 +221,7 @@ class ExecutionConfig(BaseModel):
     execute_on_timeout: bool
     post_only: bool = False
     max_entry_spread_pct: float = 0.001
-    max_impact_cost_pct: float = 0.005 # New: Max estimated impact cost (slippage) allowed based on order book depth
+    max_impact_cost_pct: float = 0.005
 
 class DataHandlerConfig(BaseModel):
     history_limit: int
