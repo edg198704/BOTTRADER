@@ -33,73 +33,75 @@ This manual guides a non-programmer through deploying the Quantum Trading Bot on
 
 ## 3. Configuration
 
-1. Create the environment file:
+1. **Create the Configuration File**:
+   Copy the example environment file to a real one.
+   ```bash
+   cp .env.example .env
+   ```
+
+2. **Edit the Configuration**:
+   Open the file in the nano editor.
    ```bash
    nano .env
    ```
-2. Paste the following content (adjust keys if you have them, otherwise leave dummy values for testing):
-   ```env
-   # Exchange Keys (Required for Live Trading, ignored for Mock)
-   BOT_EXCHANGE_API_KEY=your_api_key_here
-   BOT_EXCHANGE_API_SECRET=your_api_secret_here
-   
-   # Telegram (Optional)
-   BOT_TELEGRAM_BOT_TOKEN=your_telegram_token_here
-   
-   # InfluxDB (Do not change unless you know what you are doing)
-   DOCKER_INFLUXDB_INIT_USERNAME=admin
-   DOCKER_INFLUXDB_INIT_PASSWORD=quantum_secure_password
-   DOCKER_INFLUXDB_INIT_ORG=quantum_org
-   DOCKER_INFLUXDB_INIT_BUCKET=bot_metrics
-   DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=my-super-secret-auth-token
-   
-   # Bot Internal Config
-   INFLUXDB_URL=http://influxdb:8086
-   INFLUXDB_TOKEN=my-super-secret-auth-token
-   INFLUXDB_ORG=quantum_org
-   INFLUXDB_BUCKET=bot_metrics
-   ```
-3. Press `Ctrl+O`, `Enter` to save, then `Ctrl+X` to exit.
+
+3. **Fill in your Details**:
+   - **Exchange Keys**: If you are trading live, enter your API Key and Secret. For testing, you can leave them or use dummy values if using `MockExchange` in `config_enterprise.yaml`.
+   - **Telegram**: Enter your Bot Token and Admin Chat ID to receive alerts.
+   - **InfluxDB**: You can leave the default values for `DOCKER_INFLUXDB_...` unless you have a specific reason to change them.
+
+4. **Save and Exit**:
+   - Press `Ctrl+O`, then `Enter` to save.
+   - Press `Ctrl+X` to exit.
 
 ## 4. Deployment
 
-1. Build and start the containers:
+1. **Build and Start**:
+   Run the following command to build the AI container and start the database services.
    ```bash
    docker-compose up -d --build
    ```
-   *This may take a few minutes as it downloads dependencies and compiles the AI engine.*
+   *Note: The first run may take 5-10 minutes to download the AI libraries (PyTorch).* 
 
-2. **CRITICAL STEP: Initial AI Training**
-   The bot starts with no brain. You must train it once before it can trade.
+2. **Verify Status**:
+   Check if the containers are running:
+   ```bash
+   docker-compose ps
+   ```
+   You should see `quantum_bot`, `quantum_influxdb`, and `quantum_grafana` with status `Up`.
+
+3. **Initial AI Training (Crucial)**:
+   The bot needs to train its brain before it can trade. Run this command inside the container:
    ```bash
    docker-compose exec trading_bot python train_bot.py
    ```
-   *Wait for this to complete. It will download data and train the Ensemble models.*
+   *Wait for the success message indicating models have been saved.*
 
-3. Restart the bot to load the new models:
+4. **Restart Bot**:
+   Apply the new models by restarting the bot service:
    ```bash
    docker-compose restart trading_bot
    ```
 
 ## 5. Monitoring & Control
 
-### View Logs
-To see what the bot is doing in real-time:
+### View Live Logs
+To see the bot's decision-making process in real-time:
 ```bash
 docker-compose logs -f trading_bot
 ```
-(Press `Ctrl+C` to exit logs)
+(Press `Ctrl+C` to exit the log view. The bot keeps running in the background.)
 
 ### Access Grafana Dashboard
 1. Open your web browser.
 2. Go to: [http://localhost:3000](http://localhost:3000)
 3. Login with:
    - **User:** `admin`
-   - **Password:** `admin` (You will be asked to change this)
-4. Navigate to **Dashboards > Quantum Institutional Dashboard**.
+   - **Password:** `admin` (Skip password change if prompted for local dev)
+4. Navigate to **Dashboards > Quantum Institutional Dashboard** to view real-time equity, AI confidence, and market regimes.
 
 ### Stop the Bot
-To stop all services:
+To stop all services safely:
 ```bash
 docker-compose down
 ```
