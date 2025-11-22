@@ -30,7 +30,7 @@ except ImportError:
         def softmax(x, dim=1): return x
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
+    def __init__(self, d_model: int, max_len: int = 5000):
         super().__init__()
         if not TORCH_AVAILABLE:
             return
@@ -45,22 +45,22 @@ class PositionalEncoding(nn.Module):
         # Register as buffer (not a learnable parameter, but part of state_dict)
         self.register_buffer('pe', pe)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: (batch_size, seq_len, d_model)
         # pe slice: (seq_len, d_model)
         # We unsqueeze pe to (1, seq_len, d_model) for broadcasting
         return x + self.pe[:x.size(1), :].unsqueeze(0)
 
 class Chomp1d(nn.Module):
-    def __init__(self, chomp_size):
+    def __init__(self, chomp_size: int):
         super(Chomp1d, self).__init__()
         self.chomp_size = chomp_size
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x[:, :, :-self.chomp_size].contiguous()
 
 class TemporalBlock(nn.Module):
-    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2):
+    def __init__(self, n_inputs: int, n_outputs: int, kernel_size: int, stride: int, dilation: int, padding: int, dropout: float = 0.2):
         super(TemporalBlock, self).__init__()
         self.conv1 = nn.utils.weight_norm(nn.Conv1d(n_inputs, n_outputs, kernel_size,
                                            stride=stride, padding=padding, dilation=dilation))
@@ -86,7 +86,7 @@ class TemporalBlock(nn.Module):
         if self.downsample is not None:
             self.downsample.weight.data.normal_(0, 0.01)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.net(x)
         res = x if self.downsample is None else self.downsample(x)
         return self.relu(out + res)
@@ -96,7 +96,7 @@ class TCNPredictor(nn.Module):
     Temporal Convolutional Network (TCN) for Time Series Classification.
     Replaces standard LSTM for better gradient flow and parallelization.
     """
-    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2):
+    def __init__(self, num_inputs: int, num_channels: list, kernel_size: int = 2, dropout: float = 0.2):
         super(TCNPredictor, self).__init__()
         if not TORCH_AVAILABLE:
             raise ImportError("PyTorch is not available.")
@@ -113,7 +113,7 @@ class TCNPredictor(nn.Module):
         self.network = nn.Sequential(*layers)
         self.fc = nn.Linear(num_channels[-1], 3) # 3 classes: Sell, Hold, Buy
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: (batch, seq_len, features) -> (batch, features, seq_len) for Conv1d
         x = x.transpose(1, 2)
         y = self.network(x)
@@ -126,7 +126,7 @@ class AttentionNetwork(nn.Module):
     Residual Transformer Block Architecture optimized for Time Series.
     Uses the last sequence element's embedding for prediction instead of global averaging.
     """
-    def __init__(self, input_dim, hidden_dim, num_layers, nhead, dropout):
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, nhead: int, dropout: float):
         super().__init__()
         if not TORCH_AVAILABLE:
             raise ImportError("PyTorch is not available.")
@@ -143,7 +143,7 @@ class AttentionNetwork(nn.Module):
         self.ln = nn.LayerNorm(hidden_dim)
         self.fc = nn.Linear(hidden_dim, 3) # 0: sell, 1: hold, 2: buy
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (batch, seq_len, input_dim)
         x = self.embedding(x)
         x = self.pos_encoder(x)
