@@ -64,7 +64,7 @@ class MarketRegimeConfig(BaseModel):
     trend_strength_threshold: float = 0.015
     volatility_multiplier: float = 1.5
     trend_fast_ma_col: str = "sma_fast"
-    trend_slow_ma_col: "sma_slow"
+    trend_slow_ma_col: str = "sma_slow"
     volatility_col: str = "atr"
     rsi_col: str = "rsi"
     use_adx_filter: bool = False
@@ -175,7 +175,6 @@ class AIEnsembleStrategyParams(StrategyParamsBase):
     exit_confidence_threshold: float = Field(0.5, ge=0.0, le=1.0)
     model_path: str
     use_regime_filter: bool
-    # Decoupled Training Settings
     model_monitor_interval_seconds: int = 60
     training_data_limit: int = 5000
     signal_cooldown_candles: int = 1
@@ -207,21 +206,59 @@ class ExchangeConfig(BaseModel):
     maker_fee_pct: float = 0.001
     taker_fee_pct: float = 0.001
 
-class ExecutionConfig(BaseModel):
-    default_order_type: str
-    limit_offset_type: Literal['FIXED', 'ATR'] = 'FIXED'
-    limit_price_offset_pct: float
-    limit_offset_atr_multiplier: float = 1.0
-    order_fill_timeout_seconds: int
-    use_order_chasing: bool
-    chase_interval_seconds: int
+class ExecutionProfile(BaseModel):
+    """Defines behavior for a specific execution urgency."""
+    order_type: Literal['LIMIT', 'MARKET']
+    limit_offset_pct: float  # Positive = Passive, Negative = Aggressive
+    use_chasing: bool
+    chase_interval_seconds: float
     max_chase_attempts: int
     chase_aggressiveness_pct: float
-    max_chase_slippage_pct: float = 0.02
+    max_slippage_pct: float
     execute_on_timeout: bool
-    post_only: bool = False
+    post_only: bool
+
+class ExecutionConfig(BaseModel):
+    """Dynamic Execution Configuration."""
+    default_profile: str = "neutral"
     max_entry_spread_pct: float = 0.001
     max_impact_cost_pct: float = 0.005
+    order_fill_timeout_seconds: int = 45
+    
+    # Profiles for different urgencies
+    profiles: Dict[str, ExecutionProfile] = {
+        "passive": ExecutionProfile(
+            order_type="LIMIT", limit_offset_pct=0.0005, use_chasing=True, 
+            chase_interval_seconds=10.0, max_chase_attempts=3, chase_aggressiveness_pct=0.0001, 
+            max_slippage_pct=0.005, execute_on_timeout=False, post_only=True
+        ),
+        "neutral": ExecutionProfile(
+            order_type="LIMIT", limit_offset_pct=0.0, use_chasing=True, 
+            chase_interval_seconds=5.0, max_chase_attempts=5, chase_aggressiveness_pct=0.0002, 
+            max_slippage_pct=0.01, execute_on_timeout=True, post_only=False
+        ),
+        "aggressive": ExecutionProfile(
+            order_type="LIMIT", limit_offset_pct=-0.0005, use_chasing=True, 
+            chase_interval_seconds=2.0, max_chase_attempts=5, chase_aggressiveness_pct=0.0005, 
+            max_slippage_pct=0.02, execute_on_timeout=True, post_only=False
+        ),
+        "sniper": ExecutionProfile(
+            order_type="MARKET", limit_offset_pct=0.0, use_chasing=False, 
+            chase_interval_seconds=0.0, max_chase_attempts=0, chase_aggressiveness_pct=0.0, 
+            max_slippage_pct=0.03, execute_on_timeout=False, post_only=False
+        )
+    }
+
+    # Legacy fields for backward compatibility (mapped to 'neutral' profile internally if needed)
+    default_order_type: str = "LIMIT"
+    limit_price_offset_pct: float = 0.0
+    use_order_chasing: bool = True
+    chase_interval_seconds: int = 5
+    max_chase_attempts: int = 3
+    chase_aggressiveness_pct: float = 0.0002
+    max_chase_slippage_pct: float = 0.01
+    execute_on_timeout: bool = False
+    post_only: bool = False
 
 class DataHandlerConfig(BaseModel):
     history_limit: int
