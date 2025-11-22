@@ -6,22 +6,18 @@ services:
     container_name: quantum_influxdb
     ports:
       - "8086:8086"
-    environment:
-      - DOCKER_INFLUXDB_INIT_MODE=setup
-      - DOCKER_INFLUXDB_INIT_USERNAME=${DOCKER_INFLUXDB_INIT_USERNAME:-admin}
-      - DOCKER_INFLUXDB_INIT_PASSWORD=${DOCKER_INFLUXDB_INIT_PASSWORD:-quantum_secure_password}
-      - DOCKER_INFLUXDB_INIT_ORG=${DOCKER_INFLUXDB_INIT_ORG:-quantum_org}
-      - DOCKER_INFLUXDB_INIT_BUCKET=${DOCKER_INFLUXDB_INIT_BUCKET:-bot_metrics}
-      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${DOCKER_INFLUXDB_INIT_ADMIN_TOKEN:-my-super-secret-auth-token}
+    env_file:
+      - .env
     volumes:
       - influxdb_data:/var/lib/influxdb2
     networks:
       - quantum_net
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "influx", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   grafana:
     image: grafana/grafana:latest
@@ -41,6 +37,7 @@ services:
       - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
     networks:
       - quantum_net
+    restart: unless-stopped
 
   trading_bot:
     build: .
@@ -48,20 +45,20 @@ services:
     depends_on:
       influxdb:
         condition: service_healthy
-    environment:
-      - INFLUXDB_URL=http://influxdb:8086
-      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-my-super-secret-auth-token}
-      - INFLUXDB_ORG=${INFLUXDB_ORG:-quantum_org}
-      - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-bot_metrics}
-      - BOT_EXCHANGE_API_KEY=${BOT_EXCHANGE_API_KEY}
-      - BOT_EXCHANGE_API_SECRET=${BOT_EXCHANGE_API_SECRET}
-      - BOT_TELEGRAM_BOT_TOKEN=${BOT_TELEGRAM_BOT_TOKEN}
+    env_file:
+      - .env
     volumes:
       - ./logs:/app/logs
       - ./models:/app/models
       - ./position_ledger.db:/app/position_ledger.db
+      - ./optimizer_state.json:/app/optimizer_state.json
     networks:
       - quantum_net
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
 
 volumes:
   influxdb_data:
