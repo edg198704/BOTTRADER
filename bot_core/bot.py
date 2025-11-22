@@ -68,13 +68,27 @@ class TradingBot:
         })
 
     async def setup(self):
+        # 1. Pre-flight Exchange Check
+        logger.info("Performing pre-flight exchange checks...")
+        try:
+            await self.exchange_api.get_balance()
+            logger.info("Exchange connection verified.")
+        except Exception as e:
+            logger.critical("Failed to connect to exchange during setup.", error=str(e))
+            raise
+
+        # 2. Component Setup
         if isinstance(self.strategy, AIEnsembleStrategy): self.strategy.data_fetcher = self.data_handler
         self.position_monitor.set_strategy(self.strategy)
         await self._load_market_details()
         await self.position_manager.reconcile_positions(self.exchange_api, self.latest_prices)
         await self.strategy.warmup(self.config.strategy.symbols)
+        
+        # 3. Initialize Processors
         for symbol in self.config.strategy.symbols:
             self.processors[symbol] = SymbolProcessor(symbol, self.tick_pipeline)
+        
+        # 4. Event Subscriptions
         self.event_bus.subscribe(MarketDataEvent, self.on_market_data)
         self.event_bus.subscribe(TradeCompletedEvent, self.strategy.on_trade_complete)
 
@@ -91,13 +105,14 @@ class TradingBot:
         await self.setup()
         for proc in self.processors.values(): await proc.start()
 
+        # Register all background services
         self.service_manager.register("DataHandler", self.data_handler.run(), critical=True)
         self.service_manager.register("PositionMonitor", self.position_monitor.run(), critical=True)
         self.service_manager.register("OrderLifecycle", self.order_lifecycle_service.start(), critical=True)
         self.service_manager.register("Watchdog", self.watchdog.run(), critical=True)
         self.service_manager.register("RiskMetrics", self.risk_manager.run_metrics_loop(), critical=False)
-        self.service_manager.register("Monitoring", self._monitoring_loop(), critical=False)
-        self.service_manager.register("Retraining", self._retraining_loop(), critical=False)
+        self.service_manager.register("PortfolioMonitor", self._portfolio_monitoring_service(), critical=False)
+        self.service_manager.register("ModelRetrainer", self._model_retraining_service(), critical=False)
         self.service_manager.register("Optimizer", self.optimizer.run(), critical=False)
 
         self.service_manager.start_all()
@@ -107,9 +122,10 @@ class TradingBot:
         set_correlation_id()
         if event.symbol in self.processors: self.processors[event.symbol].on_tick()
 
-    async def _monitoring_loop(self):
+    async def _portfolio_monitoring_service(self):
+        """Service to monitor portfolio health and reconcile state periodically."""
         reconcile_counter = 0
-        while not self.service_manager._shutdown_event.is_set():
+        while True:
             try:
                 reconcile_counter += 1
                 if reconcile_counter >= 2:
@@ -128,17 +144,21 @@ class TradingBot:
                 self.shared_bot_state.update({'portfolio_equity': val, 'open_positions_count': len(open_pos), 'daily_pnl': pnl})
                 if self.metrics_writer:
                     await self.metrics_writer.write_metric('portfolio', fields={'equity': val, 'daily_pnl': pnl, 'open_positions': len(open_pos)})
-            except asyncio.CancelledError: break
-            except Exception: pass
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Error in PortfolioMonitor service", error=str(e))
+            
             await asyncio.sleep(60)
 
     async def _liquidate_all_positions(self, reason: str):
         open_pos = await self.position_manager.get_all_open_positions()
         await asyncio.gather(*[self.trade_executor.close_position(pos, reason) for pos in open_pos])
 
-    async def _retraining_loop(self):
-        await asyncio.sleep(60)
-        while not self.service_manager._shutdown_event.is_set():
+    async def _model_retraining_service(self):
+        """Service to handle periodic AI model retraining."""
+        await asyncio.sleep(60) # Initial delay
+        while True:
             try:
                 for symbol in self.config.strategy.symbols:
                     if self.strategy.needs_retraining(symbol):
@@ -147,8 +167,11 @@ class TradingBot:
                         if df is not None and not df.empty:
                             await self.strategy.retrain(symbol, df, self.process_executor)
                 await asyncio.sleep(300)
-            except asyncio.CancelledError: break
-            except Exception: await asyncio.sleep(300)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Error in ModelRetrainer service", error=str(e))
+                await asyncio.sleep(300)
 
     async def _close_position(self, position: Position, reason: str):
         await self.trade_executor.close_position(position, reason)
