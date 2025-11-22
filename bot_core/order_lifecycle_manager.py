@@ -8,7 +8,7 @@ from decimal import Decimal
 from bot_core.logger import get_logger
 from bot_core.config import ExecutionConfig, ExecutionProfile
 from bot_core.exchange_api import ExchangeAPI
-from bot_core.position_manager import PositionManager
+from bot_core.position_manager import PositionManager, PositionStatus
 from bot_core.event_system import EventBus, TradeCompletedEvent
 from bot_core.utils import Clock
 from bot_core.common import to_decimal, ZERO, ONE
@@ -41,8 +41,7 @@ class OrderLifecycleService:
     """
     Asynchronous service that manages the lifecycle of active orders in the background.
     Decouples execution monitoring from the signal generation pipeline.
-    Implements Adaptive Polling and Smart Chasing based on Execution Profiles.
-    Uses Decimal for all financial calculations.
+    Implements Adaptive Polling, Smart Chasing, and Startup Reconciliation.
     """
     def __init__(self, 
                  exchange_api: ExchangeAPI, 
@@ -77,6 +76,96 @@ class OrderLifecycleService:
             except asyncio.CancelledError:
                 pass
         logger.info("OrderLifecycleService stopped.")
+
+    async def reconcile_recovery(self):
+        """
+        CRITICAL: Rebuilds in-memory state from DB and Exchange on startup.
+        Handles 'Zombie' orders that were left active during a crash/restart.
+        """
+        logger.info("Starting Order Lifecycle Reconciliation...")
+        
+        # 1. Fetch all PENDING positions (Orders initiated but not confirmed open)
+        pending_positions = await self.position_manager.get_pending_positions()
+        
+        # 2. Fetch all OPEN positions (To check for active closing orders)
+        open_positions = await self.position_manager.get_all_open_positions()
+        
+        recovery_count = 0
+        
+        # --- Recover Pending Entries ---
+        for pos in pending_positions:
+            logger.info(f"Reconciling PENDING position {pos.trade_id} for {pos.symbol}...")
+            
+            # Try to find the order on the exchange using the deterministic trade_id (ClientOrderId)
+            order = await self.exchange_api.fetch_order_by_client_id(pos.symbol, pos.trade_id)
+            
+            if not order:
+                # If order not found and it's old (> 5 min), mark as failed.
+                # If it's very recent, it might be a lag, but on startup, we assume > 5 min.
+                logger.warning(f"Order {pos.trade_id} not found on exchange. Marking FAILED.")
+                await self.position_manager.mark_position_failed(pos.symbol, pos.trade_id, "Reconciliation: Order Not Found")
+                continue
+            
+            # Reconstruct Context
+            profile = self.config.profiles.get(self.config.default_profile)
+            
+            ctx = ActiveOrderContext(
+                trade_id=pos.trade_id,
+                symbol=pos.symbol,
+                side=pos.side,
+                total_quantity=pos.quantity if pos.quantity > ZERO else to_decimal(order['filled']),
+                initial_price=pos.decision_price or to_decimal(order['price']),
+                strategy_metadata={},
+                current_order_id=order['id'],
+                current_price=to_decimal(order['price']),
+                profile=profile,
+                intent='OPEN',
+                cumulative_filled=to_decimal(order['filled']),
+                start_time=time.time() # Reset timer
+            )
+            
+            await self.register_order(ctx)
+            recovery_count += 1
+
+        # --- Recover Active Closing Orders ---
+        for pos in open_positions:
+            if pos.closing_order_id:
+                logger.info(f"Reconciling CLOSING order {pos.closing_order_id} for {pos.symbol}...")
+                order = await self.exchange_api.fetch_order(pos.closing_order_id, pos.symbol)
+                
+                if not order or order['status'] in ['CANCELED', 'REJECTED', 'EXPIRED']:
+                    # If closing order is dead, clear the flag so RiskManager can retry if needed
+                    # For now, we just log. PositionMonitor will handle new exits.
+                    continue
+                
+                if order['status'] == 'FILLED':
+                    # Handle missed fill event
+                    fees = to_decimal(order.get('fee', {}).get('cost', 0))
+                    await self.position_manager.confirm_position_close(
+                        pos.symbol, to_decimal(order['average']), to_decimal(order['filled']), fees, "Reconciliation: Found Filled Close"
+                    )
+                    continue
+
+                # If still OPEN, resume monitoring
+                profile = self.config.profiles.get('neutral')
+                ctx = ActiveOrderContext(
+                    trade_id=f"close_{pos.trade_id}_recovered",
+                    symbol=pos.symbol,
+                    side='SELL' if pos.side == 'BUY' else 'BUY',
+                    total_quantity=to_decimal(order['amount'] if 'amount' in order else pos.quantity),
+                    initial_price=to_decimal(order['price']),
+                    strategy_metadata={},
+                    current_order_id=order['id'],
+                    current_price=to_decimal(order['price']),
+                    profile=profile,
+                    intent='CLOSE',
+                    cumulative_filled=to_decimal(order['filled']),
+                    start_time=time.time()
+                )
+                await self.register_order(ctx)
+                recovery_count += 1
+
+        logger.info(f"Reconciliation Complete. Recovered {recovery_count} active contexts.")
 
     async def register_order(self, context: ActiveOrderContext):
         """Registers a new order to be managed by the service."""
@@ -139,7 +228,6 @@ class OrderLifecycleService:
                 return
             
             elif status in ['CANCELED', 'REJECTED', 'EXPIRED']:
-                # If canceled but not by us (or rejected), we might need to handle it.
                 await self._handle_failure(ctx, f"Order {status}")
                 return
 
@@ -159,19 +247,10 @@ class OrderLifecycleService:
 
     async def _finalize_fill(self, ctx: ActiveOrderContext, order_status: Dict[str, Any]):
         """Handles a completely filled order (or chain of orders)."""
-        # Calculate totals using Decimal
         filled_qty = to_decimal(order_status.get('filled', 0.0))
         avg_price = to_decimal(order_status.get('average', ctx.current_price))
         
         final_filled = ctx.cumulative_filled + filled_qty
-        # Weighted average price calculation could be more complex for partial chains, 
-        # but for single fill or simple chase, using the last fill's avg is a reasonable approximation 
-        # if we assume the previous partials were at similar prices or we track cost basis.
-        # For strict correctness, we should track total cost.
-        # Here we assume the exchange returns the average price of the *current* order.
-        # If we chased, we have multiple orders. We should ideally track weighted avg.
-        # Simplified: Use the latest fill price as the position price for now, or the exchange's avg if available.
-        
         final_avg_price = avg_price
         total_fees = ctx.cumulative_fees + self._extract_fee_cost(order_status)
 
@@ -219,13 +298,11 @@ class OrderLifecycleService:
     async def _handle_timeout(self, ctx: ActiveOrderContext):
         logger.info("Order timed out", trade_id=ctx.trade_id)
         
-        # Cancel current
         try:
             await self.exchange_api.cancel_order(ctx.current_order_id, ctx.symbol)
         except Exception:
             pass
 
-        # Execute Market Fallback if configured in profile
         if ctx.profile.execute_on_timeout:
             remaining = ctx.total_quantity - ctx.cumulative_filled
             if remaining > ZERO:
@@ -247,18 +324,15 @@ class OrderLifecycleService:
         if ctx.chase_attempts >= ctx.profile.max_chase_attempts:
             return
         
-        # Check interval
         next_chase_time = ctx.start_time + ((ctx.chase_attempts + 1) * ctx.profile.chase_interval_seconds)
         if now < next_chase_time:
             return
 
-        # Get Market Price (Convert to Decimal)
         market_price_float = self.latest_prices.get(ctx.symbol)
         if not market_price_float:
             return
         market_price = to_decimal(market_price_float)
 
-        # Check deviation
         is_buy = ctx.side == 'BUY'
         current_price = ctx.current_price
         
@@ -269,11 +343,9 @@ class OrderLifecycleService:
             should_chase = True
             
         if should_chase:
-            # Calculate new price
             aggro = to_decimal(ctx.profile.chase_aggressiveness_pct)
             new_price = market_price * (ONE + aggro) if is_buy else market_price * (ONE - aggro)
             
-            # Slippage Guard
             slippage_pct = abs(new_price - ctx.initial_price) / ctx.initial_price
             max_slippage = to_decimal(ctx.profile.max_slippage_pct)
             
@@ -283,11 +355,10 @@ class OrderLifecycleService:
 
             logger.info("Chasing order", symbol=ctx.symbol, old_price=str(current_price), new_price=str(new_price))
             
-            # Cancel & Replace
             try:
                 await self.exchange_api.cancel_order(ctx.current_order_id, ctx.symbol)
                 
-                remaining = ctx.total_quantity - ctx.cumulative_filled # Approx
+                remaining = ctx.total_quantity - ctx.cumulative_filled
                 
                 ctx.chase_attempts += 1
                 new_order = await self.exchange_api.place_order(
@@ -295,11 +366,9 @@ class OrderLifecycleService:
                     extra_params={'clientOrderId': f"{ctx.trade_id}_chase_{ctx.chase_attempts}"}
                 )
                 
-                # Update Context
                 ctx.current_order_id = new_order['orderId']
                 ctx.current_price = new_price
                 
-                # Update DB if it's an opening order
                 if ctx.intent == 'OPEN':
                     await self.position_manager.update_pending_order_id(ctx.symbol, ctx.trade_id, new_order['orderId'])
                 elif ctx.intent == 'CLOSE':
