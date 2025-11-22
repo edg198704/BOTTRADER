@@ -1,7 +1,8 @@
 import time
+import asyncio
 import pandas as pd
 from typing import Dict, Any, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from bot_core.logger import get_logger
 from bot_core.position_manager import PositionManager, Position
@@ -21,10 +22,7 @@ class TickContext:
     position: Optional[Position] = None
     signal: Optional[TradeSignal] = None
     execution_result: Optional[TradeExecutionResult] = None
-    stages: Dict[str, float] = None
-
-    def __post_init__(self):
-        self.stages = {}
+    stages: Dict[str, float] = field(default_factory=dict)
 
     def mark_stage(self, name: str):
         self.stages[name] = (time.perf_counter() - self.start_time) * 1000
@@ -95,3 +93,47 @@ class TickPipeline:
             self.watchdog.register_heartbeat(symbol)
             if self.metrics_writer and ctx.stages:
                 await self.metrics_writer.write_metric('tick_pipeline', fields=ctx.stages, tags={'symbol': symbol})
+
+class SymbolProcessor:
+    """
+    Manages the processing loop for a specific symbol using an Actor-like pattern.
+    Decouples tick arrival from processing to handle backpressure via conflation.
+    """
+    def __init__(self, symbol: str, pipeline: TickPipeline):
+        self.symbol = symbol
+        self.pipeline = pipeline
+        self._queue = asyncio.Queue(maxsize=1) 
+        self._task: Optional[asyncio.Task] = None
+        self._running = False
+
+    async def start(self):
+        if self._running: return
+        self._running = True
+        self._task = asyncio.create_task(self._process_loop(), name=f"Processor-{self.symbol}")
+
+    async def stop(self):
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try: await self._task
+            except asyncio.CancelledError: pass
+
+    def on_tick(self):
+        if not self._running: return
+        try:
+            # Conflation: If queue is full, drop the old tick and replace with new one
+            if self._queue.full():
+                try: self._queue.get_nowait(); self._queue.task_done()
+                except asyncio.QueueEmpty: pass
+            self._queue.put_nowait(time.perf_counter())
+        except Exception: pass
+
+    async def _process_loop(self):
+        while self._running:
+            try:
+                start_time = await self._queue.get()
+                await self.pipeline.run(self.symbol, start_time)
+                self._queue.task_done()
+            except asyncio.CancelledError: break
+            except Exception as e:
+                logger.error(f"Error in processor loop for {self.symbol}", error=str(e))
