@@ -149,21 +149,42 @@ class AIEnsembleStrategy(TradingStrategy):
 
     def _check_technical_guardrails(self, symbol: str, df: pd.DataFrame, action: str) -> bool:
         """
-        Deterministic safety checks to prevent AI from trading into extreme conditions.
+        Configuration-driven safety checks to prevent AI from trading into extreme conditions.
         """
+        if not self.ai_config.guardrails.enabled:
+            return True
+            
         if df is None or df.empty: return False
         last_row = df.iloc[-1]
+        guards = self.ai_config.guardrails
         
-        # RSI Guardrail
+        # 1. RSI Guardrail
         if 'rsi' in df.columns:
             rsi = last_row['rsi']
-            if action == 'BUY' and rsi > 85:
+            if action == 'BUY' and rsi > guards.rsi_overbought:
                 logger.info(f"Signal rejected by RSI Guardrail (Overbought: {rsi:.2f})", symbol=symbol)
                 return False
-            if action == 'SELL' and rsi < 15:
+            if action == 'SELL' and rsi < guards.rsi_oversold:
                 logger.info(f"Signal rejected by RSI Guardrail (Oversold: {rsi:.2f})", symbol=symbol)
                 return False
-                
+        
+        # 2. ADX Trend Strength
+        if guards.adx_min_strength > 0 and 'adx' in df.columns:
+            adx = last_row['adx']
+            if adx < guards.adx_min_strength:
+                logger.info(f"Signal rejected by ADX Guardrail (Weak Trend: {adx:.2f})", symbol=symbol)
+                return False
+
+        # 3. Volume Percentile Check (Liquidity)
+        if guards.min_volume_percentile > 0 and 'volume' in df.columns:
+            # Check if current volume is extremely low compared to recent history
+            recent_vol = df['volume'].iloc[-50:]
+            if not recent_vol.empty:
+                vol_percentile = (last_row['volume'] >= recent_vol).mean()
+                if vol_percentile < guards.min_volume_percentile:
+                    logger.info(f"Signal rejected by Volume Guardrail (Low Liquidity)", symbol=symbol)
+                    return False
+
         return True
 
     async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[TradeSignal]:
