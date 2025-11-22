@@ -129,10 +129,7 @@ class AIFeatureEngineeringConfig(BaseModel):
     frac_diff_d: float = 0.4
     frac_diff_thres: float = 1e-4
     use_leader_features: bool = False
-    
-    # --- Order Book Features (New) ---
     use_order_book_features: bool = False
-    
     use_feature_selection: bool = True
     max_active_features: int = 20
     scaling_method: Literal['zscore', 'robust'] = 'zscore'
@@ -215,7 +212,6 @@ class DataHandlerConfig(BaseModel):
     history_limit: int
     update_interval_multiplier: float
     ticker_update_interval_seconds: float = 2.0
-    # --- Order Book Settings (New) ---
     order_book_depth: int = 20
 
 class StrategyConfig(BaseModel):
@@ -253,6 +249,13 @@ class BreakevenConfig(BaseModel):
     activation_pct: float = 0.015
     buffer_pct: float = 0.001
 
+class VaRConfig(BaseModel):
+    enabled: bool = True
+    confidence_level: float = 0.95
+    lookback_periods: int = 100
+    max_portfolio_var_pct: float = 0.02  # Max acceptable Portfolio VaR (e.g., 2% of equity)
+    method: Literal['historical', 'parametric'] = 'historical'
+
 class RiskManagementConfig(BaseModel):
     max_position_size_usd: float
     max_position_size_portfolio_pct: float = 1.0
@@ -289,6 +292,7 @@ class RiskManagementConfig(BaseModel):
     time_based_exit: TimeBasedExitConfig = TimeBasedExitConfig()
     correlation: CorrelationConfig = CorrelationConfig()
     breakeven: BreakevenConfig = BreakevenConfig()
+    var: VaRConfig = VaRConfig()
 
 class DatabaseConfig(BaseModel):
     path: str
