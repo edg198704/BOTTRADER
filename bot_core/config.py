@@ -61,6 +61,7 @@ class TechnicalGuardrailsConfig(BaseModel):
     require_trend_alignment: bool = False
 
 class MarketRegimeConfig(BaseModel):
+    update_interval_seconds: int = 60
     trend_strength_threshold: float = 0.015
     volatility_multiplier: float = 1.5
     trend_fast_ma_col: str = "sma_fast"
