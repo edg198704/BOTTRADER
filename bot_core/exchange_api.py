@@ -15,8 +15,6 @@ from bot_core.common import to_decimal, ZERO, Dec
 
 logger = get_logger(__name__)
 
-# --- Custom Exchange Exceptions ---
-
 class BotExchangeError(Exception):
     pass
 
@@ -25,8 +23,6 @@ class BotInsufficientFundsError(BotExchangeError):
 
 class BotInvalidOrderError(BotExchangeError):
     pass
-
-# --- Caching Utilities ---
 
 class BalanceCache:
     def __init__(self, ttl_seconds: float = 2.0):
@@ -46,74 +42,37 @@ class BalanceCache:
             self.data = data
             self.last_update = time.time()
 
-# ----------------------------------
-
 class ExchangeAPI(abc.ABC):
-    """Abstract Base Class for interacting with a cryptocurrency exchange."""
-
     @abc.abstractmethod
-    async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[float]]:
-        # Returns OHLCV as floats (Analysis usually prefers floats for numpy speed)
-        pass
-
+    async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[float]]: pass
     @abc.abstractmethod
-    async def get_ticker_data(self, symbol: str) -> Dict[str, Any]:
-        # Returns Decimal for pricing fields
-        pass
-
+    async def get_ticker_data(self, symbol: str) -> Dict[str, Any]: pass
     @abc.abstractmethod
-    async def get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-        # Returns Decimal for pricing fields
-        pass
-
+    async def get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]: pass
     @abc.abstractmethod
-    async def fetch_order_book(self, symbol: str, limit: int = 5) -> Dict[str, Any]:
-        # Returns Decimal for prices and volumes
-        pass
-
+    async def fetch_order_book(self, symbol: str, limit: int = 5) -> Dict[str, Any]: pass
     @abc.abstractmethod
-    async def place_order(self, symbol: str, side: str, order_type: str, quantity: Decimal, price: Optional[Decimal] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]:
-        pass
-    
+    async def place_order(self, symbol: str, side: str, order_type: str, quantity: Decimal, price: Optional[Decimal] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]: pass
     @abc.abstractmethod
-    async def fetch_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
-        pass
-
+    async def fetch_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]: pass
     @abc.abstractmethod
-    async def fetch_order_by_client_id(self, symbol: str, client_order_id: str) -> Optional[Dict[str, Any]]:
-        pass
-
+    async def fetch_order_by_client_id(self, symbol: str, client_order_id: str) -> Optional[Dict[str, Any]]: pass
     @abc.abstractmethod
-    async def fetch_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
-        pass
-
+    async def fetch_open_orders(self, symbol: str) -> List[Dict[str, Any]]: pass
     @abc.abstractmethod
-    async def fetch_recent_orders(self, symbol: str, limit: int = 10) -> List[Dict[str, Any]]:
-        pass
-
+    async def fetch_recent_orders(self, symbol: str, limit: int = 10) -> List[Dict[str, Any]]: pass
     @abc.abstractmethod
-    async def cancel_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
-        pass
-
+    async def cancel_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]: pass
     @abc.abstractmethod
-    async def cancel_all_orders(self, symbol: str) -> List[Dict[str, Any]]:
-        pass
-
+    async def cancel_all_orders(self, symbol: str) -> List[Dict[str, Any]]: pass
     @abc.abstractmethod
-    async def get_balance(self) -> Dict[str, Dict[str, Decimal]]:
-        pass
-
+    async def get_balance(self) -> Dict[str, Dict[str, Decimal]]: pass
     @abc.abstractmethod
-    async def fetch_market_details(self, symbol: str) -> Optional[Dict[str, Any]]:
-        pass
-
+    async def fetch_market_details(self, symbol: str) -> Optional[Dict[str, Any]]: pass
     @abc.abstractmethod
-    async def close(self):
-        pass
+    async def close(self): pass
 
 class MockExchangeAPI(ExchangeAPI):
-    """A mock implementation of ExchangeAPI for testing and development."""
-
     def __init__(self, initial_balances: Optional[Dict[str, float]] = None):
         raw_balances = initial_balances if initial_balances is not None else {"USDT": 10000.0, "BTC": 0.0}
         self.balances = {k: to_decimal(v) for k, v in raw_balances.items()}
@@ -158,7 +117,6 @@ class MockExchangeAPI(ExchangeAPI):
     async def fetch_order_book(self, symbol: str, limit: int = 5) -> Dict[str, Any]:
         price = self.last_price
         spread = price * Dec("0.0005")
-        # Return Decimals in order book
         bids = [[price - spread/2 - to_decimal(i)*Dec("0.1"), Dec("1.0")] for i in range(limit)]
         asks = [[price + spread/2 + to_decimal(i)*Dec("0.1"), Dec("1.0")] for i in range(limit)]
         return {'symbol': symbol, 'bids': bids, 'asks': asks, 'timestamp': int(time.time()*1000)}
@@ -166,7 +124,6 @@ class MockExchangeAPI(ExchangeAPI):
     async def place_order(self, symbol: str, side: str, order_type: str, quantity: Decimal, price: Optional[Decimal] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]:
         self.order_id_counter += 1
         order_id = f"mock_order_{self.order_id_counter}"
-        
         order = {
             'id': order_id,
             'symbol': symbol,
@@ -179,27 +136,22 @@ class MockExchangeAPI(ExchangeAPI):
             'average': ZERO,
             'timestamp': int(time.time() * 1000)
         }
-        
         if extra_params and 'clientOrderId' in extra_params:
             order['clientOrderId'] = extra_params['clientOrderId']
-
         self.open_orders[order_id] = order
         return {"orderId": order_id, "status": "OPEN"}
 
     async def fetch_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
         order = self.open_orders.get(order_id)
         if not order: return None
-
         if order['status'] == 'OPEN':
             fill_price = self.last_price
             can_fill = False
             order_price = order['price']
-            
             if order['type'] == 'MARKET': can_fill = True
             elif order['type'] == 'LIMIT':
                 if order['side'] == 'BUY' and fill_price <= order_price: can_fill = True; fill_price = order_price
                 elif order['side'] == 'SELL' and fill_price >= order_price: can_fill = True; fill_price = order_price
-
             if can_fill:
                 base, quote = symbol.split('/')
                 cost = order['quantity'] * fill_price
@@ -210,7 +162,6 @@ class MockExchangeAPI(ExchangeAPI):
                 else:
                     self.balances[base] -= order['quantity']
                     self.balances[quote] = self.balances.get(quote, ZERO) + (cost - fee)
-                
                 order['status'] = 'FILLED'
                 order['filled'] = order['quantity']
                 order['average'] = fill_price
@@ -259,7 +210,6 @@ class MockExchangeAPI(ExchangeAPI):
     async def close(self): pass
 
 class CCXTExchangeAPI(ExchangeAPI):
-    """Concrete implementation for a real exchange using ccxt with caching and circuit breaker."""
     def __init__(self, config: ExchangeConfig):
         exchange_class = getattr(ccxt, config.name.lower(), None)
         if not exchange_class:
@@ -276,7 +226,6 @@ class CCXTExchangeAPI(ExchangeAPI):
         self._cache_keys: Deque[str] = deque()
         self._balance_cache = BalanceCache(ttl_seconds=2.0)
 
-        # Circuit Breaker State
         self._circuit_open = False
         self._circuit_open_until = 0.0
         self._failure_count = 0
@@ -313,7 +262,6 @@ class CCXTExchangeAPI(ExchangeAPI):
                     self._circuit_open = False
                     self._failure_count = 0
                     logger.info("Exchange Circuit Breaker Reset")
-            
             try:
                 result = await func(*args, **kwargs)
                 self._failure_count = 0
@@ -347,7 +295,6 @@ class CCXTExchangeAPI(ExchangeAPI):
     async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[float]]:
         if limit <= 1000:
             return await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        
         duration = self.exchange.parse_timeframe(timeframe) * 1000
         now = self.exchange.milliseconds()
         since = now - int(limit * duration * 1.1)
@@ -391,7 +338,6 @@ class CCXTExchangeAPI(ExchangeAPI):
 
     async def fetch_order_book(self, symbol: str, limit: int = 5) -> Dict[str, Any]:
         ob = await self.exchange.fetch_order_book(symbol, limit=limit)
-        # Convert bids/asks to Decimal
         bids = [[to_decimal(p), to_decimal(v)] for p, v in ob.get('bids', [])]
         asks = [[to_decimal(p), to_decimal(v)] for p, v in ob.get('asks', [])]
         return {'symbol': symbol, 'bids': bids, 'asks': asks, 'timestamp': ob.get('timestamp')}
@@ -399,10 +345,8 @@ class CCXTExchangeAPI(ExchangeAPI):
     async def place_order(self, symbol: str, side: str, order_type: str, quantity: Decimal, price: Optional[Decimal] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]:
         try:
             params = extra_params or {}
-            # Convert Decimal to float for CCXT (it expects floats)
             qty_float = float(quantity)
             price_float = float(price) if price else None
-
             if order_type.upper() == 'MARKET':
                 order = await self.exchange.create_market_order(symbol, side.lower(), qty_float, params=params)
             elif order_type.upper() == 'LIMIT':
@@ -410,10 +354,8 @@ class CCXTExchangeAPI(ExchangeAPI):
                 order = await self.exchange.create_limit_order(symbol, side.lower(), qty_float, price_float, params=params)
             else:
                 raise ValueError(f"Unsupported order type: {order_type}")
-            
             if 'clientOrderId' in params and order.get('id'):
                 self._cache_order_id(params['clientOrderId'], order['id'])
-            
             return self._normalize_order(order)
         except InsufficientFunds as e:
             raise BotInsufficientFundsError(str(e)) from e
@@ -421,7 +363,6 @@ class CCXTExchangeAPI(ExchangeAPI):
             raise BotInvalidOrderError(str(e)) from e
 
     def _normalize_order(self, order: Dict[str, Any]) -> Dict[str, Any]:
-        """Converts CCXT order response to Decimal-based dictionary."""
         status_map = {'open': 'OPEN', 'closed': 'FILLED', 'canceled': 'CANCELED', 'rejected': 'REJECTED', 'expired': 'EXPIRED'}
         return {
             'id': order.get('id'),
@@ -433,7 +374,8 @@ class CCXTExchangeAPI(ExchangeAPI):
             'side': order.get('side'),
             'type': order.get('type'),
             'clientOrderId': order.get('clientOrderId'),
-            'fee': order.get('fee')
+            'fee': order.get('fee'),
+            'amount': to_decimal(order.get('amount', 0.0))
         }
 
     async def fetch_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
@@ -443,16 +385,19 @@ class CCXTExchangeAPI(ExchangeAPI):
         except OrderNotFound: return None
 
     async def fetch_order_by_client_id(self, symbol: str, client_order_id: str) -> Optional[Dict[str, Any]]:
+        # 1. Check Cache
         if client_order_id in self._order_id_cache:
             exchange_id = self._order_id_cache[client_order_id]
             return await self.fetch_order(exchange_id, symbol)
 
+        # 2. Check Open Orders
         open_orders = await self.fetch_open_orders(symbol)
         for order in open_orders:
             if order.get('clientOrderId') == client_order_id:
                 self._cache_order_id(client_order_id, order['id'])
                 return order
         
+        # 3. Check Recent Orders (Closed/Filled)
         if self.exchange.has.get('fetchOrders'):
             recent = await self.exchange.fetch_orders(symbol, limit=50)
             for order in recent:
@@ -490,9 +435,7 @@ class CCXTExchangeAPI(ExchangeAPI):
 
     async def get_balance(self) -> Dict[str, Dict[str, Decimal]]:
         cached = await self._balance_cache.get()
-        if cached:
-            return cached
-        
+        if cached: return cached
         balance = await self.exchange.fetch_balance()
         total = balance.get('total', {})
         decimal_total = {k: {"free": to_decimal(balance[k]['free']), "total": to_decimal(v)} for k, v in total.items()}
