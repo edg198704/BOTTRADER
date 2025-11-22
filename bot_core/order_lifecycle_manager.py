@@ -1,7 +1,7 @@
 import asyncio
 import time
 import uuid
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Literal
 from dataclasses import dataclass, field
 
 from bot_core.logger import get_logger
@@ -25,6 +25,7 @@ class ActiveOrderContext:
     current_order_id: str
     current_price: float
     
+    intent: Literal['OPEN', 'CLOSE'] = 'OPEN'
     cumulative_filled: float = 0.0
     cumulative_fees: float = 0.0
     start_time: float = field(default_factory=time.time)
@@ -78,6 +79,7 @@ class OrderLifecycleService:
         logger.info("Registered order for lifecycle management", 
                     trade_id=context.trade_id, 
                     symbol=context.symbol, 
+                    intent=context.intent,
                     order_id=context.current_order_id)
 
     async def _monitor_loop(self):
@@ -114,13 +116,6 @@ class OrderLifecycleService:
                 return
 
             status = order_status.get('status', 'UNKNOWN')
-            filled_chunk = order_status.get('filled', 0.0)
-            avg_price = order_status.get('average', 0.0) or ctx.current_price
-            fee_cost = self._extract_fee_cost(order_status)
-
-            # Update Context with incremental progress (simplified for total tracking)
-            # Note: CCXT usually returns cumulative filled. We need to handle replacements carefully.
-            # Here we assume 'filled' is for the *current* order ID.
             
             # 2. Handle Terminal States
             if status == 'FILLED':
@@ -130,7 +125,6 @@ class OrderLifecycleService:
             elif status in ['CANCELED', 'REJECTED', 'EXPIRED']:
                 # If canceled but not by us (or rejected), we might need to handle it.
                 # For now, treat as failed unless we are in the middle of a chase logic which handles its own cancels.
-                # However, this loop handles the *result* of the chase.
                 await self._handle_failure(ctx, f"Order {status}")
                 return
 
@@ -153,43 +147,38 @@ class OrderLifecycleService:
         """Handles a completely filled order (or chain of orders)."""
         # Calculate totals
         final_filled = ctx.cumulative_filled + order_status.get('filled', 0.0)
-        
-        # Weighted average price calculation
-        current_cost = order_status.get('filled', 0.0) * (order_status.get('average', 0.0) or ctx.current_price)
-        prev_cost = ctx.cumulative_filled * ctx.current_price # Approx
-        # Better: we should track cumulative cost in context. 
-        # For simplicity in this refactor, we trust the final fill details if it's a single order,
-        # or approximate if chased. 
-        
         final_avg_price = order_status.get('average', ctx.current_price)
         total_fees = ctx.cumulative_fees + self._extract_fee_cost(order_status)
 
-        # DB Update
         try:
-            # Adjust qty for fees if BUY and fee in base asset
-            confirmed_qty = final_filled
-            if ctx.side == 'BUY':
-                base_asset = ctx.symbol.split('/')[0]
-                fee_currency = order_status.get('fee', {}).get('currency')
-                if fee_currency == base_asset:
-                    confirmed_qty = max(0.0, final_filled - total_fees)
+            if ctx.intent == 'OPEN':
+                # Adjust qty for fees if BUY and fee in base asset
+                confirmed_qty = final_filled
+                if ctx.side == 'BUY':
+                    base_asset = ctx.symbol.split('/')[0]
+                    fee_currency = order_status.get('fee', {}).get('currency')
+                    if fee_currency == base_asset:
+                        confirmed_qty = max(0.0, final_filled - total_fees)
 
-            stop_loss = 0.0 # Should be calculated or passed. 
-            # In this architecture, we might need to recalculate SL/TP based on actual fill price.
-            # For now, we use placeholders or 0.0, relying on PositionMonitor to set them if missing,
-            # OR we can calculate them here if we inject RiskManager. 
-            # To keep it simple, we assume PositionManager can handle updates or we pass 0 and let Monitor fix it.
+                pos = await self.position_manager.confirm_position_open(
+                    ctx.symbol, ctx.trade_id, confirmed_qty, final_avg_price, 
+                    stop_loss=0.0, take_profit=0.0, fees=total_fees
+                )
+                
+                if pos:
+                    await self.event_bus.publish(TradeCompletedEvent(position=pos))
+                    logger.info("Order lifecycle complete: OPEN FILLED", symbol=ctx.symbol, qty=confirmed_qty)
+                else:
+                    logger.error("Failed to confirm position open in DB", trade_id=ctx.trade_id)
             
-            pos = await self.position_manager.confirm_position_open(
-                ctx.symbol, ctx.trade_id, confirmed_qty, final_avg_price, 
-                stop_loss=0.0, take_profit=0.0, fees=total_fees
-            )
-            
-            if pos:
-                await self.event_bus.publish(TradeCompletedEvent(position=pos))
-                logger.info("Order lifecycle complete: FILLED", symbol=ctx.symbol, qty=confirmed_qty)
-            else:
-                logger.error("Failed to confirm position open in DB", trade_id=ctx.trade_id)
+            elif ctx.intent == 'CLOSE':
+                pos = await self.position_manager.confirm_position_close(
+                    ctx.symbol, final_avg_price, final_filled, total_fees, reason="Strategy Signal"
+                )
+                if pos:
+                    logger.info("Order lifecycle complete: CLOSE FILLED", symbol=ctx.symbol, qty=final_filled)
+                else:
+                    logger.error("Failed to confirm position close in DB", trade_id=ctx.trade_id)
 
         except Exception as e:
             logger.critical("Critical error finalizing fill", error=str(e))
@@ -198,7 +187,8 @@ class OrderLifecycleService:
 
     async def _handle_failure(self, ctx: ActiveOrderContext, reason: str):
         logger.warning("Order lifecycle failed", reason=reason, trade_id=ctx.trade_id)
-        await self.position_manager.mark_position_failed(ctx.symbol, ctx.trade_id, reason)
+        if ctx.intent == 'OPEN':
+            await self.position_manager.mark_position_failed(ctx.symbol, ctx.trade_id, reason)
         await self._remove_context(ctx.trade_id)
 
     async def _handle_timeout(self, ctx: ActiveOrderContext):
@@ -213,7 +203,6 @@ class OrderLifecycleService:
         # Execute Market Fallback if configured
         if self.config.execute_on_timeout:
             remaining = ctx.total_quantity - ctx.cumulative_filled
-            # Simple check for min limits would go here
             if remaining > 0:
                 try:
                     logger.info("Placing fallback market order", symbol=ctx.symbol)
@@ -221,8 +210,6 @@ class OrderLifecycleService:
                         ctx.symbol, ctx.side, 'MARKET', remaining, 
                         extra_params={'clientOrderId': f"{ctx.trade_id}_fallback"}
                     )
-                    # We treat the market order as the final state immediately for simplicity in this loop
-                    # Ideally, we'd track it too, but market orders usually fill instantly.
                     if market_order and market_order.get('status') == 'FILLED':
                         await self._finalize_fill(ctx, market_order)
                         return
@@ -263,8 +250,6 @@ class OrderLifecycleService:
             # Cancel & Replace
             try:
                 await self.exchange_api.cancel_order(ctx.current_order_id, ctx.symbol)
-                # Note: We should check filled qty of canceled order here to update cumulative
-                # For brevity, we assume atomic replacement logic or subsequent fetch updates it.
                 
                 remaining = ctx.total_quantity - ctx.cumulative_filled # Approx
                 
@@ -278,8 +263,11 @@ class OrderLifecycleService:
                 ctx.current_order_id = new_order['orderId']
                 ctx.current_price = new_price
                 
-                # Update DB
-                await self.position_manager.update_pending_order_id(ctx.symbol, ctx.trade_id, new_order['orderId'])
+                # Update DB if it's an opening order
+                if ctx.intent == 'OPEN':
+                    await self.position_manager.update_pending_order_id(ctx.symbol, ctx.trade_id, new_order['orderId'])
+                elif ctx.intent == 'CLOSE':
+                    await self.position_manager.register_closing_order(ctx.symbol, new_order['orderId'])
                 
             except Exception as e:
                 logger.error("Failed to chase order", error=str(e))
