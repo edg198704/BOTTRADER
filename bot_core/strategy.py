@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import json
 import os
-from typing import Dict, Any, Optional, List, Set, Tuple
+from typing import Dict, Any, Optional, List, Set, Tuple, Literal
 from datetime import datetime, timedelta
 from concurrent.futures import Executor
 from collections import deque
@@ -88,7 +88,7 @@ class SimpleMACrossoverStrategy(TradingStrategy):
             if bull: action = 'BUY'
             elif bear: action = 'SELL'
             
-        return TradeSignal(symbol=symbol, action=action, strategy_name=self.config.name, confidence=1.0) if action else None
+        return TradeSignal(symbol=symbol, action=action, strategy_name=self.config.name, confidence=1.0, urgency='neutral') if action else None
 
     async def retrain(self, symbol, df, executor): pass
     def needs_retraining(self, symbol): return False
@@ -112,7 +112,6 @@ class AIEnsembleStrategy(TradingStrategy):
     async def warmup(self, symbols: List[str]):
         await self.state.load()
         await self.ensemble_learner.warmup_models(symbols)
-        # Initialize timestamps for hot-swapping
         for symbol in symbols:
             self._update_model_ts(symbol)
 
@@ -144,11 +143,9 @@ class AIEnsembleStrategy(TradingStrategy):
         return self.ai_config.training_data_limit
 
     def needs_retraining(self, symbol: str) -> bool:
-        # Deprecated in favor of external training
         return False
 
     async def retrain(self, symbol: str, df: pd.DataFrame, executor: Executor):
-        # Deprecated in favor of external training
         logger.warning("Internal retraining called but is deprecated. Use train_bot.py instead.")
 
     def _check_technical_guardrails(self, symbol: str, df: pd.DataFrame, action: str) -> bool:
@@ -182,15 +179,30 @@ class AIEnsembleStrategy(TradingStrategy):
                     return False
         return True
 
+    def _determine_urgency(self, confidence: float, threshold: float, regime: str) -> Literal['passive', 'neutral', 'aggressive', 'sniper']:
+        """Calculates execution urgency based on signal strength and market conditions."""
+        surplus = confidence - threshold
+        
+        if regime == 'volatile':
+            if surplus > 0.15: return 'sniper' # High confidence in volatility -> Get in NOW
+            if surplus > 0.05: return 'aggressive'
+            return 'neutral'
+        
+        elif regime in ['bull', 'bear']:
+            if surplus > 0.10: return 'aggressive'
+            return 'neutral'
+            
+        else: # Sideways
+            if surplus > 0.15: return 'neutral'
+            return 'passive' # Try to capture spread in chop
+
     async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[TradeSignal]:
         if not self.ensemble_learner.is_trained: return None
         
-        # Circuit Breaker Check
         if self._circuit_breaker_failures.get(symbol, 0) > 5:
             logger.warning(f"Strategy Circuit Breaker active for {symbol}. Skipping inference.")
             return None
 
-        # Data Sufficiency Check
         min_required = self.ai_config.features.normalization_window + self.ai_config.features.sequence_length
         if len(df) < min_required:
             return None
@@ -241,6 +253,8 @@ class AIEnsembleStrategy(TradingStrategy):
             if not self._check_technical_guardrails(symbol, df, final_action):
                 return None
 
+            urgency = self._determine_urgency(pred.confidence, threshold, regime)
+
             self.state.last_signal_time[symbol] = Clock.now()
             asyncio.create_task(self.state.save())
             meta = {
@@ -250,7 +264,7 @@ class AIEnsembleStrategy(TradingStrategy):
                 'individual_predictions': pred.individual_predictions,
                 'top_features': pred.top_features
             }
-            return TradeSignal(symbol=symbol, action=final_action, regime=regime, confidence=pred.confidence, strategy_name=self.config.name, metadata=meta)
+            return TradeSignal(symbol=symbol, action=final_action, regime=regime, confidence=pred.confidence, urgency=urgency, strategy_name=self.config.name, metadata=meta)
         return None
 
     async def on_trade_complete(self, event: TradeCompletedEvent):
@@ -279,4 +293,3 @@ class AIEnsembleStrategy(TradingStrategy):
                 accuracy = sum(history) / len(history)
                 if accuracy < self.ai_config.performance.min_accuracy:
                     logger.warning(f"Drift Detected for {symbol}. Accuracy: {accuracy:.2f}. Consider retraining.")
-                    # We no longer trigger retrain here, just log. External monitor handles retraining schedules.
