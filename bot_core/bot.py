@@ -19,6 +19,7 @@ from bot_core.event_system import EventBus, MarketDataEvent, TradeCompletedEvent
 from bot_core.services import ServiceManager
 from bot_core.tick_pipeline import TickPipeline, SymbolProcessor
 from bot_core.order_lifecycle_manager import OrderLifecycleService
+from bot_core.ai.regime_detector import RegimeTracker
 
 logger = get_logger(__name__)
 
@@ -57,6 +58,12 @@ class TradingBot:
         self.processors: Dict[str, SymbolProcessor] = {}
         self.process_executor = ProcessPoolExecutor(max_workers=2)
         
+        # Initialize Regime Tracker if applicable
+        self.regime_tracker: Optional[RegimeTracker] = None
+        if isinstance(self.strategy, AIEnsembleStrategy):
+            self.regime_tracker = RegimeTracker(config.strategy.params, data_handler)
+            self.strategy.regime_tracker = self.regime_tracker
+
         self._initialize_shared_state()
         logger.info("TradingBot orchestrator initialized.")
 
@@ -120,6 +127,9 @@ class TradingBot:
         self.service_manager.register("PortfolioMonitor", self._portfolio_monitoring_service(), critical=False)
         self.service_manager.register("ModelMonitor", self._model_monitor_service(), critical=False)
         self.service_manager.register("Optimizer", self.optimizer.run(), critical=False)
+        
+        if self.regime_tracker:
+            self.service_manager.register("RegimeTracker", self.regime_tracker.start(), critical=True)
 
         self.service_manager.start_all()
         await self.service_manager.monitor()
@@ -195,6 +205,7 @@ class TradingBot:
         await self.position_monitor.stop()
         await self.risk_manager.stop()
         await self.optimizer.stop()
+        if self.regime_tracker: await self.regime_tracker.stop()
         await self.strategy.close()
         if self.exchange_api: await self.exchange_api.close()
         if self.position_manager: self.position_manager.close()
