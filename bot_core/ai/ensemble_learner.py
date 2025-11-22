@@ -46,9 +46,6 @@ class InputSanitizer:
         return np.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
 
 class PurgedTimeSeriesSplit:
-    """
-    Time Series Split with Embargo to prevent leakage.
-    """
     def __init__(self, n_splits: int = 5, embargo_pct: float = 0.01):
         self.n_splits = n_splits
         self.embargo_pct = embargo_pct
@@ -83,7 +80,6 @@ def probabilistic_sharpe_ratio(returns: np.ndarray, benchmark: float = 0.0) -> f
 # --- Model Adapters ---
 
 class BaseModelAdapter(ABC):
-    """Abstract base class for unified model interaction."""
     @abstractmethod
     def fit(self, X_train: np.ndarray, y_train: np.ndarray, X_val: np.ndarray, y_val: np.ndarray) -> None:
         pass
@@ -122,7 +118,6 @@ class SklearnAdapter(BaseModelAdapter):
     def get_feature_importance(self) -> Optional[np.ndarray]:
         if hasattr(self.model, 'feature_importances_'):
             return self.model.feature_importances_
-        # Handle VotingClassifier
         if hasattr(self.model, 'estimators_'):
             imps = []
             for _, est in self.model.estimators_:
@@ -214,13 +209,11 @@ class TorchAdapter(BaseModelAdapter):
         self.model.eval()
         X_seq = self._create_sequences(X)
         if len(X_seq) == 0:
-            # Fallback for insufficient history: return uniform prob
             return np.full((len(X), 3), 1.0/3.0)
 
         with torch.no_grad():
             probs = F.softmax(self.model(torch.FloatTensor(X_seq).to(self.device)), dim=1).cpu().numpy()
         
-        # Pad the beginning to match input length (since sequences consume history)
         pad_len = len(X) - len(probs)
         if pad_len > 0:
             padding = np.tile(probs[0], (pad_len, 1))
@@ -239,21 +232,16 @@ class TorchAdapter(BaseModelAdapter):
 # --- Main Classes ---
 
 class EnsembleModel:
-    """Container for loaded model artifacts and dynamic state."""
     def __init__(self, adapters: Dict[str, BaseModelAdapter], meta: Dict[str, Any], meta_model: Any = None, dynamic_state: Dict[str, Any] = None):
         self.adapters = adapters
         self.meta = meta
         self.meta_model = meta_model
-        # dynamic_state holds regime-specific weights: {'bull': {...}, 'bear': {...}, ...}
         self.dynamic_state = dynamic_state or {}
 
 class EnsembleTrainer:
-    """
-    Encapsulates the training logic for the ensemble model.
-    """
     def __init__(self, config: AIEnsembleStrategyParams):
         self.config = config
-        self.device = torch.device("cpu") # Train on CPU in background process to avoid CUDA context issues
+        self.device = torch.device("cpu")
 
     def _prepare_data(self, df: pd.DataFrame, leader_df: Optional[pd.DataFrame]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame, List[str]]:
         df_proc = FeatureProcessor.process_data(df, self.config, leader_df=leader_df)
@@ -271,17 +259,14 @@ class EnsembleTrainer:
     def _create_adapters(self, num_features: int) -> Dict[str, BaseModelAdapter]:
         hp = self.config.hyperparameters
         cw = 'balanced' if self.config.training.use_class_weighting else None
-        
         adapters = {}
         
-        # XGBoost
         xgb = XGBClassifier(n_estimators=hp.xgboost.n_estimators, max_depth=hp.xgboost.max_depth, 
                             learning_rate=hp.xgboost.learning_rate, subsample=hp.xgboost.subsample, 
                             colsample_bytree=hp.xgboost.colsample_bytree, random_state=42, 
                             use_label_encoder=False, eval_metric='logloss')
         adapters['gb'] = SklearnAdapter(xgb)
 
-        # Technical Ensemble
         rf = RandomForestClassifier(n_estimators=hp.random_forest.n_estimators, max_depth=hp.random_forest.max_depth, 
                                     min_samples_leaf=hp.random_forest.min_samples_leaf, class_weight=cw, random_state=42)
         lr = LogisticRegression(max_iter=hp.logistic_regression.max_iter, C=hp.logistic_regression.C, 
@@ -289,7 +274,6 @@ class EnsembleTrainer:
         voting = VotingClassifier(estimators=[('rf', rf), ('lr', lr)], voting='soft')
         adapters['technical'] = SklearnAdapter(voting)
 
-        # Deep Learning
         if ML_AVAILABLE:
             adapters['lstm'] = TorchAdapter(TCNPredictor, num_features, self.config, self.device)
             adapters['attention'] = TorchAdapter(AttentionNetwork, num_features, self.config, self.device)
@@ -311,12 +295,10 @@ class EnsembleTrainer:
             adapters = self._create_adapters(X.shape[1])
             val_preds = {}
 
-            # Train all models
             for name, adapter in adapters.items():
                 adapter.fit(X_train, y_train, X_val, y_val)
                 val_preds[name] = adapter.predict_proba(X_val)
 
-            # Optimize Weights (Static Base Weights)
             def loss_func(w):
                 ens = sum(w[i] * val_preds[k] for i, k in enumerate(val_preds.keys()))
                 return log_loss(y_val, np.clip(ens, 1e-15, 1-1e-15))
@@ -326,7 +308,6 @@ class EnsembleTrainer:
                            bounds=[(0,1)]*len(keys), constraints={'type':'eq', 'fun': lambda w: np.sum(w)-1})
             opt_weights = {k: float(res.x[i]) for i, k in enumerate(keys)}
 
-            # Meta-Model Training
             meta_model = None
             meta_metrics = {}
             if self.config.meta_labeling.enabled:
@@ -352,7 +333,6 @@ class EnsembleTrainer:
                     meta_metrics = {'precision': float(precision_score(y_meta, meta_val_preds, zero_division=0)), 
                                     'f1': float(f1_score(y_meta, meta_val_preds, zero_division=0))}
 
-            # Threshold Optimization
             ensemble_probs = sum(opt_weights[k] * val_preds[k] for k in keys)
             returns = df['close'].pct_change().loc[df_proc.index].values[val_idx][-len(ensemble_probs):]
             best_thresh, best_metric = self.config.confidence_threshold, -np.inf
@@ -364,7 +344,6 @@ class EnsembleTrainer:
                 metric = probabilistic_sharpe_ratio(sigs * returns) if self.config.training.use_probabilistic_sharpe else np.mean(sigs * returns)
                 if metric > best_metric: best_metric = metric; best_thresh = float(thresh)
 
-            # Save Artifacts
             save_dir = os.path.join(self.config.model_path, symbol.replace('/', '_'))
             os.makedirs(save_dir, exist_ok=True)
             
@@ -375,12 +354,8 @@ class EnsembleTrainer:
             }
             
             with open(os.path.join(save_dir, "metadata.json"), 'w') as f: json.dump(meta, f, indent=2)
-            
-            for name, adapter in adapters.items():
-                adapter.save(os.path.join(save_dir, f"{name}.model"))
-            
-            if meta_model:
-                joblib.dump(meta_model, os.path.join(save_dir, "meta_model.joblib"))
+            for name, adapter in adapters.items(): adapter.save(os.path.join(save_dir, f"{name}.model"))
+            if meta_model: joblib.dump(meta_model, os.path.join(save_dir, "meta_model.joblib"))
                 
             return True
         except Exception as e:
@@ -428,14 +403,9 @@ class EnsembleLearner:
     async def reload_models(self, symbol: str):
         if not ML_AVAILABLE: return
         loop = asyncio.get_running_loop()
-        
-        # Load static artifacts
         model_data = await loop.run_in_executor(self.executor, self._load_models_sync, symbol)
-        
-        # Load dynamic state (online weights)
         store = self._get_state_store(symbol)
         dynamic_state = await store.load()
-        
         if model_data: 
             model_data.dynamic_state = dynamic_state
             with self._lock:
@@ -446,22 +416,18 @@ class EnsembleLearner:
         if not os.path.exists(path): return None
         try:
             with open(os.path.join(path, "metadata.json")) as f: meta = json.load(f)
-            
             adapters = {}
             num_feat = meta['num_features']
             
             if os.path.exists(os.path.join(path, "gb.model")):
                 adapters['gb'] = SklearnAdapter(None)
                 adapters['gb'].load(os.path.join(path, "gb.model"))
-                
             if os.path.exists(os.path.join(path, "technical.model")):
                 adapters['technical'] = SklearnAdapter(None)
                 adapters['technical'].load(os.path.join(path, "technical.model"))
-                
             if os.path.exists(os.path.join(path, "lstm.model")):
                 adapters['lstm'] = TorchAdapter(TCNPredictor, num_feat, self.config, self.device)
                 adapters['lstm'].load(os.path.join(path, "lstm.model"))
-                
             if os.path.exists(os.path.join(path, "attention.model")):
                 adapters['attention'] = TorchAdapter(AttentionNetwork, num_feat, self.config, self.device)
                 adapters['attention'].load(os.path.join(path, "attention.model"))
@@ -492,7 +458,6 @@ class EnsembleLearner:
     def _predict_sync(self, df: pd.DataFrame, entry: EnsembleModel, regime: str, leader_df: pd.DataFrame, custom_weights: Dict) -> AIInferenceResult:
         adapters, meta, meta_model = entry.adapters, entry.meta, entry.meta_model
         
-        # Data Prep
         required_history = self.config.features.normalization_window + self.config.features.sequence_length + 50
         if len(df) > required_history:
             df_subset = df.iloc[-required_history:].copy()
@@ -511,7 +476,6 @@ class EnsembleLearner:
         
         X = InputSanitizer.sanitize(df_proc[feats].iloc[-1:].values)
         
-        # Determine Weights: Custom -> Regime Specific -> Base Static
         weights = custom_weights
         if not weights:
             if self.config.ensemble_weights.use_regime_specific_weights and regime in entry.dynamic_state:
@@ -526,12 +490,9 @@ class EnsembleLearner:
         for name, adapter in adapters.items():
             w = weights.get(name, 0.0)
             if w == 0: continue
-            
             probs = adapter.predict_proba(X)[0]
             votes['sell'] += probs[0] * w; votes['hold'] += probs[1] * w; votes['buy'] += probs[2] * w
             ind_preds[name] = probs.tolist()
-            
-            # Aggregate Feature Importance
             imp = adapter.get_feature_importance()
             if imp is not None and len(imp) == len(feats):
                 for i, feat_name in enumerate(feats):
@@ -546,13 +507,11 @@ class EnsembleLearner:
             regime_cols = ['regime_volatility', 'regime_trend']
             regime_indices = [feats.index(c) for c in regime_cols if c in feats]
             if regime_indices: meta_feats_list.append(X[:, regime_indices])
-            
             X_meta = np.hstack(meta_feats_list)
             meta_prob = meta_model.predict_proba(X_meta)[0, 1]
             if meta_prob < self.config.meta_labeling.probability_threshold:
                 base_confidence *= 0.5 
 
-        # Sort top features
         top_features = dict(sorted(feature_importances.items(), key=lambda item: item[1], reverse=True)[:5])
 
         return AIInferenceResult(
@@ -562,84 +521,49 @@ class EnsembleLearner:
         )
 
     def update_weights(self, symbol: str, trade_pnl: float, individual_predictions: Dict[str, List[float]], side: str, regime: str = 'unknown'):
-        """
-        Updates ensemble weights using Exponentiated Gradient or Momentum.
-        Persists the new state asynchronously.
-        """
         with self._lock:
             if symbol not in self.symbol_models or not individual_predictions: return
             entry = self.symbol_models[symbol]
-            
-            # Determine which weight vector to update
             target_regime = regime if self.config.ensemble_weights.use_regime_specific_weights else 'global'
             current_weights = entry.dynamic_state.get(target_regime, entry.meta['base_weights']).copy()
-            
             learning_rate = self.config.ensemble_weights.adaptive_weight_learning_rate
-            
-            # Calculate Reward (1 for correct direction, -1 for wrong)
-            # We use PnL sign as the ground truth
             reward = 1.0 if trade_pnl > 0 else -1.0
-            
-            # Target Index: 0=Sell, 2=Buy. 
-            # If we bought (side=BUY), we look at index 2. If we sold, index 0.
             target_idx = 2 if side == 'BUY' else 0
 
             new_weights = {}
             total_weight = 0.0
             
             if self.config.ensemble_weights.learning_algorithm == 'exponentiated_gradient':
-                # Exponentiated Gradient Update: w_{t+1} = w_t * exp(eta * reward_t)
-                # Here reward_t for a model is: Did it predict the right direction?
-                # We use the model's probability of the taken action as a proxy for its 'conviction'
-                
                 for model_name, probs in individual_predictions.items():
                     if model_name not in current_weights: continue
-                    
                     model_prob = probs[target_idx]
-                    # If trade won, reward models with high prob. If lost, penalize models with high prob.
-                    # Scaled reward: reward * (model_prob - 0.5) * 2  -> Range [-1, 1]
                     model_reward = reward * (model_prob - 0.5) * 2
-                    
                     w = current_weights[model_name] * np.exp(learning_rate * model_reward)
                     new_weights[model_name] = w
                     total_weight += w
             else:
-                # Momentum Update (Legacy)
                 momentum_key = f"{target_regime}_momentum"
                 momentum = entry.dynamic_state.get(momentum_key, {k: 0.0 for k in current_weights})
                 beta = 0.9
-                
                 for model_name, probs in individual_predictions.items():
                     if model_name not in current_weights: continue
                     prob_correct = probs[target_idx]
-                    # Gradient points towards 1.0 if won, 0.0 if lost
                     target = 1.0 if trade_pnl > 0 else 0.0
                     grad = learning_rate * (target - prob_correct)
-                    
                     v = momentum.get(model_name, 0.0)
                     new_v = beta * v + (1 - beta) * grad
                     momentum[model_name] = new_v
-                    
                     w = max(0.01, min(current_weights[model_name] + new_v, 1.0))
                     new_weights[model_name] = w
                     total_weight += w
-                
                 entry.dynamic_state[momentum_key] = momentum
 
-            # Normalize
             if total_weight > 0:
                 for k in new_weights: new_weights[k] /= total_weight
             else:
-                # Fallback to uniform if weights collapse
                 uni = 1.0 / len(new_weights)
                 for k in new_weights: new_weights[k] = uni
 
-            # Update State
             entry.dynamic_state[target_regime] = new_weights
-            
-            # Persist
             store = self._get_state_store(symbol)
             asyncio.create_task(store.save(entry.dynamic_state))
-            
-            logger.info(f"Updated {target_regime} ensemble weights for {symbol}", 
-                        weights=new_weights, pnl=trade_pnl, algo=self.config.ensemble_weights.learning_algorithm)
