@@ -9,9 +9,9 @@ import ccxt.async_support as ccxt
 from ccxt.base.errors import NetworkError, ExchangeError, InsufficientFunds, OrderNotFound, NotSupported, InvalidOrder, RequestTimeout, RateLimitExceeded
 
 from bot_core.logger import get_logger
-from bot_core.utils import async_retry, Clock
-from bot_core.config import ExchangeConfig, BacktestConfig
-from bot_core.common import to_decimal, ZERO
+from bot_core.utils import async_retry
+from bot_core.config import ExchangeConfig
+from bot_core.common import to_decimal, ZERO, Dec
 
 logger = get_logger(__name__)
 
@@ -52,13 +52,13 @@ class ExchangeAPI(abc.ABC):
     """Abstract Base Class for interacting with a cryptocurrency exchange."""
 
     @abc.abstractmethod
-    async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[Any]]:
-        # Returns OHLCV as floats (for analysis)
+    async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[float]]:
+        # Returns OHLCV as floats (Analysis usually prefers floats for numpy speed)
         pass
 
     @abc.abstractmethod
     async def get_ticker_data(self, symbol: str) -> Dict[str, Any]:
-        # Returns floats for analysis
+        # Returns floats for analysis, but TradeExecutor should convert to Decimal for pricing
         pass
 
     @abc.abstractmethod
@@ -113,7 +113,6 @@ class MockExchangeAPI(ExchangeAPI):
     """A mock implementation of ExchangeAPI for testing and development."""
 
     def __init__(self, initial_balances: Optional[Dict[str, float]] = None):
-        # Convert initial balances to Decimal
         raw_balances = initial_balances if initial_balances is not None else {"USDT": 10000.0, "BTC": 0.0}
         self.balances = {k: to_decimal(v) for k, v in raw_balances.items()}
         self.order_id_counter = 0
@@ -121,10 +120,9 @@ class MockExchangeAPI(ExchangeAPI):
         self.open_orders: Dict[str, Dict[str, Any]] = {}
         logger.info("MockExchangeAPI initialized", initial_balances=self.balances)
 
-    async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[Any]]:
-        # Mock data generation (floats are fine for analysis)
+    async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[float]]:
         now = int(time.time() * 1000)
-        interval_ms = 60000 # Default 1m
+        interval_ms = 60000 
         ohlcv = []
         price = self.last_price
         for i in range(limit):
@@ -134,7 +132,7 @@ class MockExchangeAPI(ExchangeAPI):
             low = min(open_price, price) - random.uniform(0, 20)
             close_price = price
             volume = random.uniform(10, 100)
-            ohlcv.append([ts, open_price, high, low, close_price, volume])
+            ohlcv.append([float(ts), open_price, high, low, close_price, volume])
             price += random.uniform(-100, 100)
         self.last_price = price
         return ohlcv
@@ -343,8 +341,7 @@ class CCXTExchangeAPI(ExchangeAPI):
         await self._load_markets_if_needed()
         return self.exchange.markets.get(symbol)
 
-    async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[Any]]:
-        # Returns floats for analysis
+    async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> List[List[float]]:
         if limit <= 1000:
             return await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         
@@ -417,7 +414,7 @@ class CCXTExchangeAPI(ExchangeAPI):
             'side': order.get('side'),
             'type': order.get('type'),
             'clientOrderId': order.get('clientOrderId'),
-            'fee': order.get('fee') # Fee structure varies, keep as dict but values might need parsing if used
+            'fee': order.get('fee')
         }
 
     async def fetch_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
@@ -465,7 +462,7 @@ class CCXTExchangeAPI(ExchangeAPI):
     async def cancel_all_orders(self, symbol: str) -> List[Dict[str, Any]]:
         if self.exchange.has.get('cancelAllOrders'):
             await self.exchange.cancel_all_orders(symbol)
-            return [] # CCXT doesn't always return cancelled orders here
+            return [] 
         open_orders = await self.fetch_open_orders(symbol)
         results = []
         for order in open_orders:
@@ -479,7 +476,6 @@ class CCXTExchangeAPI(ExchangeAPI):
         
         balance = await self.exchange.fetch_balance()
         total = balance.get('total', {})
-        # Convert to Decimal
         decimal_total = {k: {"free": to_decimal(balance[k]['free']), "total": to_decimal(v)} for k, v in total.items()}
         await self._balance_cache.update(decimal_total)
         return decimal_total
