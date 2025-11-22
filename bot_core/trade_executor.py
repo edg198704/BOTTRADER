@@ -1,20 +1,21 @@
 import uuid
 import asyncio
+import os
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
-from decimal import Decimal
 from pydantic import BaseModel
+from decimal import Decimal
 
 from bot_core.logger import get_logger
 from bot_core.config import BotConfig, ExecutionProfile
-from bot_core.exchange_api import ExchangeAPI
+from bot_core.exchange_api import ExchangeAPI, BotInsufficientFundsError, BotInvalidOrderError
 from bot_core.position_manager import PositionManager, Position
 from bot_core.risk_manager import RiskManager
 from bot_core.order_sizer import OrderSizer
 from bot_core.order_lifecycle_manager import OrderLifecycleService, ActiveOrderContext
 from bot_core.monitoring import AlertSystem
 from bot_core.data_handler import DataHandler
-from bot_core.common import TradeSignal, Arith
+from bot_core.common import TradeSignal, to_decimal, ZERO
 
 logger = get_logger(__name__)
 
@@ -26,6 +27,86 @@ class TradeExecutionResult(BaseModel):
     order_id: str
     status: str
     metadata: Dict[str, Any] = {}
+
+class PreTradeValidator:
+    """Encapsulates all pre-trade validation logic."""
+    def __init__(self, config: BotConfig, data_handler: DataHandler, risk_manager: RiskManager):
+        self.config = config
+        self.data_handler = data_handler
+        self.risk_manager = risk_manager
+
+    def check_signal_ttl(self, signal: TradeSignal) -> bool:
+        signal_age = datetime.now(timezone.utc) - signal.generated_at
+        if signal_age > timedelta(seconds=60):
+            logger.warning("Signal rejected: TTL expired.", symbol=signal.symbol, age_seconds=signal_age.total_seconds())
+            return False
+        return True
+
+    def check_data_latency(self, symbol: str) -> bool:
+        latency = self.data_handler.get_latency(symbol)
+        max_latency = 5.0
+        if latency > max_latency:
+            logger.warning("Execution skipped: Data stale.", symbol=symbol, latency=latency, threshold=max_latency)
+            return False
+        return True
+
+    async def check_liquidity(self, symbol: str, current_price: Decimal) -> bool:
+        book = self.data_handler.get_latest_order_book(symbol)
+        if not book or not book.get('bids') or not book.get('asks'): 
+            logger.warning("Liquidity check failed: Empty order book.", symbol=symbol)
+            return False
+        
+        # Book prices are floats, convert for check
+        ask0 = to_decimal(book['asks'][0][0])
+        bid0 = to_decimal(book['bids'][0][0])
+        
+        spread = (ask0 - bid0) / current_price
+        if spread > to_decimal(self.config.execution.max_entry_spread_pct):
+            logger.warning("Spread too high.", symbol=symbol, spread=f"{spread:.4%}", limit=f"{self.config.execution.max_entry_spread_pct:.4%}")
+            return False
+        return True
+
+    async def check_impact_cost(self, symbol: str, side: str, quantity: Decimal, current_price: Decimal) -> bool:
+        book = self.data_handler.get_latest_order_book(symbol)
+        if not book: 
+            logger.warning("Impact check skipped: No order book.", symbol=symbol)
+            return True 
+        
+        levels = book['asks'] if side == 'BUY' else book['bids']
+        if not levels: return False
+        
+        remaining_qty = quantity
+        weighted_price_sum = ZERO
+        
+        for price_float, vol_float in levels:
+            price = to_decimal(price_float)
+            vol = to_decimal(vol_float)
+            
+            take = min(remaining_qty, vol)
+            weighted_price_sum += take * price
+            remaining_qty -= take
+            if remaining_qty <= ZERO: break
+            
+        if remaining_qty > ZERO:
+            logger.warning("Insufficient depth for order size.", symbol=symbol, qty=str(quantity), remaining=str(remaining_qty))
+            return False
+            
+        avg_fill_price = weighted_price_sum / quantity
+        impact_pct = abs(avg_fill_price - current_price) / current_price
+        
+        if impact_pct > to_decimal(self.config.execution.max_impact_cost_pct):
+            logger.warning("High impact cost detected.", symbol=symbol, impact=f"{impact_pct:.4%}", limit=f"{self.config.execution.max_impact_cost_pct:.4%}")
+            return False
+            
+        return True
+
+    async def check_risk_limits(self, symbol: str, position_manager: PositionManager) -> bool:
+        active_positions = await position_manager.get_all_active_positions()
+        allowed, reason = await self.risk_manager.validate_entry(symbol, active_positions)
+        if not allowed:
+            logger.info("Entry rejected by Risk Manager.", symbol=symbol, reason=reason)
+            return False
+        return True
 
 class TradeExecutor:
     """
@@ -54,6 +135,7 @@ class TradeExecutor:
         self.market_details = market_details
         self.data_handler = data_handler
         
+        self.validator = PreTradeValidator(config, data_handler, risk_manager)
         self._symbol_locks: Dict[str, asyncio.Lock] = {}
         logger.info("TradeExecutor initialized with atomic execution engine.")
 
@@ -69,17 +151,23 @@ class TradeExecutor:
         """
         Router for trade signals. Ensures atomic execution per symbol using Double-Check Locking.
         """
+        # 1. Basic Validation
+        if not self.validator.check_signal_ttl(signal):
+            return None
+        if not self.validator.check_data_latency(signal.symbol):
+            return None
+
         symbol = signal.symbol
         async with self._get_lock(symbol):
-            # 1. Re-fetch State (Double-Check Locking)
+            # 2. Re-fetch State (Double-Check Locking)
             current_position = await self.position_manager.get_open_position(symbol)
-            current_price_float = self.latest_prices.get(symbol)
             
-            if not current_price_float:
+            # Convert latest price to Decimal for execution logic
+            price_float = self.latest_prices.get(symbol)
+            if not price_float:
                 logger.warning("Execution skipped: No price data available.", symbol=symbol)
                 return None
-            
-            current_price = Arith.decimal(current_price_float)
+            current_price = to_decimal(price_float)
 
             # --- Entry Logic ---
             if not current_position:
@@ -101,30 +189,31 @@ class TradeExecutor:
         side = signal.action
         profile = self._get_execution_profile(signal.urgency)
 
-        # 1. Risk Sizing (Legacy RiskManager expects floats, we convert back and forth)
-        # In a full refactor, RiskManager would be Decimal-native.
+        # 1. Advanced Validation
+        if not await self.validator.check_liquidity(symbol, current_price):
+            return None
+        if not await self.validator.check_risk_limits(symbol, self.position_manager):
+            return None
+
+        # 2. Sizing Calculation
         active_positions = await self.position_manager.get_all_active_positions()
         portfolio_equity = self.position_manager.get_portfolio_value(self.latest_prices, active_positions)
+        stop_loss = self.risk_manager.calculate_stop_loss(side, current_price, df, market_regime=signal.regime)
         
-        # Calculate Stop Loss (Float)
-        stop_loss_float = self.risk_manager.calculate_stop_loss(side, float(current_price), df, market_regime=signal.regime)
-        
-        # Calculate Quantity (Float)
-        ideal_qty_float = self.risk_manager.calculate_position_size(
+        confidence_threshold = signal.metadata.get('effective_threshold')
+        ideal_quantity = self.risk_manager.calculate_position_size(
             symbol=symbol,
             portfolio_equity=portfolio_equity, 
-            entry_price=float(current_price), 
-            stop_loss_price=stop_loss_float, 
+            entry_price=current_price, 
+            stop_loss_price=stop_loss, 
             open_positions=active_positions,
             market_regime=signal.regime,
             confidence=signal.confidence,
-            confidence_threshold=signal.metadata.get('effective_threshold'),
+            confidence_threshold=confidence_threshold,
             model_metrics=signal.metadata.get('metrics')
         )
-        
-        ideal_quantity = Arith.decimal(ideal_qty_float)
 
-        # 2. Wallet & Exchange Constraints
+        # 3. Wallet & Exchange Constraints
         market_details = self.market_details.get(symbol)
         if not market_details:
             logger.error("Market details missing, aborting entry.", symbol=symbol)
@@ -132,28 +221,27 @@ class TradeExecutor:
 
         purchasing_power_qty = await self._get_purchasing_power_qty(symbol, side, current_price)
         capped_quantity = min(ideal_quantity, purchasing_power_qty)
+        final_quantity = self.order_sizer.adjust_order_quantity(symbol, capped_quantity, current_price, market_details)
         
-        # Adjust for precision (OrderSizer needs update to Decimal, assuming it handles floats for now, we cast)
-        # Ideally OrderSizer is also refactored. Here we do a safe cast.
-        final_quantity_float = self.order_sizer.adjust_order_quantity(symbol, float(capped_quantity), float(current_price), market_details)
-        final_quantity = Arith.decimal(final_quantity_float)
-        
-        if final_quantity <= 0:
+        if final_quantity <= ZERO:
+            logger.info("Quantity adjusted to zero (below limits or insufficient funds).", symbol=symbol)
             return None
 
-        # 3. Order Construction
+        # 4. Impact Cost Check (Final Qty)
+        if not await self.validator.check_impact_cost(symbol, side, final_quantity, current_price):
+            return None
+
+        # 5. Order Construction
         order_type = profile.order_type
         limit_price = None
         if order_type == 'LIMIT':
-            # Calculate limit price
-            offset = current_price * Arith.decimal(profile.limit_offset_pct)
-            limit_price = (current_price - offset) if side == 'BUY' else (current_price + offset)
+            limit_price = await self._calculate_limit_price(symbol, side, current_price, profile.limit_offset_pct)
 
-        # 4. Execution (Initial Placement)
-        trade_id = str(uuid.uuid4())
+        # 6. Execution (Initial Placement)
+        trade_id = str(uuid.uuid4()) # Unique ID for the entire trade lifecycle
         await self.position_manager.create_pending_position(
             symbol, side, trade_id, trade_id, 
-            decision_price=float(current_price), 
+            decision_price=current_price, 
             strategy_metadata=signal.metadata
         )
 
@@ -174,7 +262,11 @@ class TradeExecutor:
         if exchange_order_id != trade_id:
             await self.position_manager.update_pending_order_id(symbol, trade_id, exchange_order_id)
 
-        # 5. Handoff to Lifecycle Service
+        # 7. Handoff to Lifecycle Service
+        # Convert back to float for lifecycle context if needed, or keep as Decimal if context supports it.
+        # ActiveOrderContext expects floats in the current definition, but we should probably update it or cast.
+        # For now, casting to float for the context object to avoid breaking that file, 
+        # assuming lifecycle manager handles the polling logic which is less precision-critical than the ledger.
         ctx = ActiveOrderContext(
             trade_id=trade_id,
             symbol=symbol,
@@ -202,23 +294,23 @@ class TradeExecutor:
             if not fresh_pos: return
 
             close_side = 'SELL' if position.side == 'BUY' else 'BUY'
-            current_price = Arith.decimal(self.latest_prices.get(position.symbol, float(position.entry_price_dec)))
+            # Convert to Decimal
+            current_price = to_decimal(self.latest_prices.get(position.symbol, float(position.entry_price)))
             market_details = self.market_details.get(position.symbol)
             if not market_details: return
 
-            close_qty_float = self.order_sizer.adjust_order_quantity(position.symbol, float(position.quantity_dec), float(current_price), market_details)
-            close_qty = Arith.decimal(close_qty_float)
-            
-            if close_qty <= 0:
-                await self.position_manager.close_position(position.symbol, float(current_price), f"{reason} (Dust)")
+            close_qty = self.order_sizer.adjust_order_quantity(position.symbol, position.quantity, current_price, market_details)
+            if close_qty <= ZERO:
+                await self.position_manager.close_position(position.symbol, current_price, f"{reason} (Dust)")
                 return
 
+            # Closing is usually urgent, use Neutral or Aggressive profile
             profile = self._get_execution_profile('neutral')
+            
             order_type = profile.order_type
             limit_price = None
             if order_type == 'LIMIT':
-                offset = current_price * Arith.decimal(profile.limit_offset_pct)
-                limit_price = (current_price - offset) if close_side == 'BUY' else (current_price + offset)
+                limit_price = await self._calculate_limit_price(position.symbol, close_side, current_price, profile.limit_offset_pct)
             else:
                 order_type = 'MARKET'
 
@@ -249,6 +341,7 @@ class TradeExecutor:
                 )
                 
                 await self.order_lifecycle_service.register_order(ctx)
+                logger.info("Closing order placed and registered", symbol=position.symbol, order_id=exchange_order_id)
 
             except Exception as e:
                 logger.error("Close order placement failed.", error=str(e))
@@ -258,10 +351,20 @@ class TradeExecutor:
             base, quote = symbol.split('/')
             balances = await self.exchange_api.get_balance()
             if side == 'BUY':
-                free_quote = balances.get(quote, {}).get('free', Decimal(0))
-                fee_buffer = Decimal(1) + Arith.decimal(self.config.exchange.taker_fee_pct)
-                return (free_quote / fee_buffer) / price if free_quote > 0 else Decimal(0)
+                free_quote = balances.get(quote, {}).get('free', ZERO)
+                fee_mult = ONE + to_decimal(self.config.exchange.taker_fee_pct)
+                return (free_quote / fee_mult) / price if free_quote > ZERO else ZERO
             else:
-                return balances.get(base, {}).get('free', Decimal(0))
+                return balances.get(base, {}).get('free', ZERO)
         except Exception:
-            return Decimal(0)
+            return ZERO
+
+    async def _calculate_limit_price(self, symbol: str, side: str, current_price: Decimal, offset_pct: float) -> Decimal:
+        ticker = await self.exchange_api.get_ticker_data(symbol)
+        # Ticker data is float, convert
+        bid = to_decimal(ticker.get('bid')) if ticker.get('bid') else None
+        ask = to_decimal(ticker.get('ask')) if ticker.get('ask') else None
+        
+        ref_price = bid if side == 'BUY' and bid else (ask if side == 'SELL' and ask else current_price)
+        offset = ref_price * to_decimal(offset_pct)
+        return ref_price - offset if side == 'BUY' else ref_price + offset
