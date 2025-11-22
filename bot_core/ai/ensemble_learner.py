@@ -453,9 +453,9 @@ class EnsembleLearner:
             return AIInferenceResult(action='hold', confidence=0.0, model_version='none', active_weights={}, top_features={}, metrics={})
         
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self.executor, self._predict_sync, df, entry, regime, leader_df, custom_weights)
+        return await loop.run_in_executor(self.executor, self._predict_sync, df, entry, regime, leader_df, custom_weights, symbol)
 
-    def _predict_sync(self, df: pd.DataFrame, entry: EnsembleModel, regime: str, leader_df: pd.DataFrame, custom_weights: Dict) -> AIInferenceResult:
+    def _predict_sync(self, df: pd.DataFrame, entry: EnsembleModel, regime: str, leader_df: pd.DataFrame, custom_weights: Dict, symbol: str) -> AIInferenceResult:
         adapters, meta, meta_model = entry.adapters, entry.meta, entry.meta_model
         
         required_history = self.config.features.normalization_window + self.config.features.sequence_length + 50
@@ -476,6 +476,11 @@ class EnsembleLearner:
         
         X = InputSanitizer.sanitize(df_proc[feats].iloc[-1:].values)
         
+        # --- STRICT DIMENSION CHECK ---
+        if X.shape[1] != meta['num_features']:
+            logger.error(f"Feature mismatch for {symbol}. Expected {meta['num_features']}, got {X.shape[1]}")
+            return AIInferenceResult(action='hold', confidence=0.0, model_version='error', active_weights={}, top_features={}, metrics={})
+
         weights = custom_weights
         if not weights:
             if self.config.ensemble_weights.use_regime_specific_weights and regime in entry.dynamic_state:
