@@ -27,7 +27,7 @@ class StrategyStateManager:
         self.last_retrained_at = {}
         self.last_signal_time = {}
         self.force_retrain_flags = {}
-        self.accuracy_history = {} # symbol -> deque of (is_correct, timestamp)
+        self.accuracy_history = {}
 
     async def load(self):
         state = await self.persistence.load()
@@ -35,7 +35,6 @@ class StrategyStateManager:
         self.last_retrained_at = {k: datetime.fromisoformat(v) for k,v in state.get('last_retrained_at', {}).items()}
         self.last_signal_time = {k: datetime.fromisoformat(v) for k,v in state.get('last_signal_time', {}).items()}
         self.force_retrain_flags = state.get('force_retrain_flags', {})
-        # Load accuracy history (convert lists back to deques)
         hist = state.get('accuracy_history', {})
         for sym, data in hist.items():
             self.accuracy_history[sym] = deque(data, maxlen=self.config.performance.window_size)
@@ -102,6 +101,7 @@ class AIEnsembleStrategy(TradingStrategy):
         self.ensemble_learner = EnsembleLearner(config)
         self.regime_detector = MarketRegimeDetector(config)
         self.last_regime = {}
+        self._circuit_breaker_failures = {}
 
     async def close(self):
         await self.state.save()
@@ -132,7 +132,6 @@ class AIEnsembleStrategy(TradingStrategy):
         if symbol in self._training_in_progress: return
         self._training_in_progress.add(symbol)
         try:
-            # Enrich data before sending to process to ensure consistency
             regime_res = await self.regime_detector.detect_regime(symbol, df)
             df_enriched = regime_res.get('enriched_df', df)
             
@@ -146,9 +145,9 @@ class AIEnsembleStrategy(TradingStrategy):
             if success:
                 self.state.last_retrained_at[symbol] = Clock.now()
                 self.state.force_retrain_flags[symbol] = False
-                # Clear history on retrain to give new model a fresh start
                 if symbol in self.state.accuracy_history:
                     self.state.accuracy_history[symbol].clear()
+                self._circuit_breaker_failures[symbol] = 0
                 await self.ensemble_learner.reload_models(symbol)
                 logger.info(f"Retraining successful for {symbol}")
         finally:
@@ -156,17 +155,12 @@ class AIEnsembleStrategy(TradingStrategy):
             asyncio.create_task(self.state.save())
 
     def _check_technical_guardrails(self, symbol: str, df: pd.DataFrame, action: str) -> bool:
-        """
-        Configuration-driven safety checks to prevent AI from trading into extreme conditions.
-        """
         if not self.ai_config.guardrails.enabled:
             return True
-            
         if df is None or df.empty: return False
         last_row = df.iloc[-1]
         guards = self.ai_config.guardrails
         
-        # 1. RSI Guardrail
         if 'rsi' in df.columns:
             rsi = last_row['rsi']
             if action == 'BUY' and rsi > guards.rsi_overbought:
@@ -176,63 +170,63 @@ class AIEnsembleStrategy(TradingStrategy):
                 logger.info(f"Signal rejected by RSI Guardrail (Oversold: {rsi:.2f})", symbol=symbol)
                 return False
         
-        # 2. ADX Trend Strength
         if guards.adx_min_strength > 0 and 'adx' in df.columns:
             adx = last_row['adx']
             if adx < guards.adx_min_strength:
                 logger.info(f"Signal rejected by ADX Guardrail (Weak Trend: {adx:.2f})", symbol=symbol)
                 return False
 
-        # 3. Volume Percentile Check (Liquidity)
         if guards.min_volume_percentile > 0 and 'volume' in df.columns:
-            # Check if current volume is extremely low compared to recent history
             recent_vol = df['volume'].iloc[-50:]
             if not recent_vol.empty:
                 vol_percentile = (last_row['volume'] >= recent_vol).mean()
                 if vol_percentile < guards.min_volume_percentile:
                     logger.info(f"Signal rejected by Volume Guardrail (Low Liquidity)", symbol=symbol)
                     return False
-
         return True
 
     async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[TradeSignal]:
         if not self.ensemble_learner.is_trained: return None
         
-        # Detect Regime
+        # Circuit Breaker Check
+        if self._circuit_breaker_failures.get(symbol, 0) > 5:
+            logger.warning(f"Strategy Circuit Breaker active for {symbol}. Skipping inference.")
+            return None
+
         regime_res = await self.regime_detector.detect_regime(symbol, df)
         regime = regime_res.get('regime')
         self.last_regime[symbol] = regime
         df_enriched = regime_res.get('enriched_df', df)
 
-        # Cooldown check
         last_sig = self.state.last_signal_time.get(symbol)
         if last_sig and (Clock.now() - last_sig).total_seconds() < (self.ai_config.signal_cooldown_candles * 300):
             return None
 
-        # Predict
         leader_df = None
         if self.ai_config.market_leader_symbol and self.data_fetcher:
             leader_df = self.data_fetcher.get_market_data(self.ai_config.market_leader_symbol)
             
         pred = await self.ensemble_learner.predict(df_enriched, symbol, regime, leader_df)
+        
+        if pred.model_version == 'error':
+            self._circuit_breaker_failures[symbol] = self._circuit_breaker_failures.get(symbol, 0) + 1
+            return None
+        else:
+            self._circuit_breaker_failures[symbol] = 0
+
         if not pred.action or pred.action == 'hold': return None
 
-        # Threshold Logic
         is_exit = position and ((position.side == 'BUY' and pred.action == 'sell') or (position.side == 'SELL' and pred.action == 'buy'))
         threshold = self.ai_config.exit_confidence_threshold if is_exit else self.ai_config.confidence_threshold
-        
-        # Use optimized threshold if available and higher
         if pred.optimized_threshold and not is_exit:
             threshold = max(threshold, pred.optimized_threshold)
             
         if pred.confidence < threshold: return None
 
-        # Meta-Model Check (Double Confirmation)
         if pred.meta_probability is not None and pred.meta_probability < self.ai_config.meta_labeling.probability_threshold:
             logger.info(f"Signal rejected by Meta-Model for {symbol}", meta_prob=pred.meta_probability)
             return None
 
-        # Signal Generation
         final_action = None
         if position:
             if position.side == 'BUY' and pred.action == 'sell': final_action = 'SELL'
@@ -242,7 +236,6 @@ class AIEnsembleStrategy(TradingStrategy):
             elif pred.action == 'sell': final_action = 'SELL'
             
         if final_action:
-            # Apply Technical Guardrails
             if not self._check_technical_guardrails(symbol, df, final_action):
                 return None
 
@@ -252,18 +245,16 @@ class AIEnsembleStrategy(TradingStrategy):
                 'model_version': pred.model_version, 'confidence': pred.confidence, 
                 'regime': regime, 'metrics': pred.metrics, 'effective_threshold': threshold,
                 'meta_prob': pred.meta_probability,
-                'individual_predictions': pred.individual_predictions, # Pass for online learning
-                'top_features': pred.top_features # Pass for explainability
+                'individual_predictions': pred.individual_predictions,
+                'top_features': pred.top_features
             }
             return TradeSignal(symbol=symbol, action=final_action, regime=regime, confidence=pred.confidence, strategy_name=self.config.name, metadata=meta)
         return None
 
     async def on_trade_complete(self, event: TradeCompletedEvent):
-        """Callback for Online Learning and Drift Detection"""
         pos = event.position
         symbol = pos.symbol
         
-        # 1. Online Learning (Weight Updates)
         if self.ai_config.ensemble_weights.use_dynamic_weighting and pos.strategy_metadata:
             try:
                 meta = json.loads(pos.strategy_metadata)
@@ -274,7 +265,6 @@ class AIEnsembleStrategy(TradingStrategy):
             except Exception as e:
                 logger.error(f"Failed to process trade completion for AI learning: {e}")
 
-        # 2. Drift Detection (Performance Monitoring)
         if self.ai_config.performance.enabled:
             is_win = pos.pnl > 0
             if symbol not in self.state.accuracy_history:
@@ -282,9 +272,8 @@ class AIEnsembleStrategy(TradingStrategy):
             
             self.state.accuracy_history[symbol].append(is_win)
             
-            # Check accuracy
             history = self.state.accuracy_history[symbol]
-            if len(history) >= 10: # Minimum sample
+            if len(history) >= 10:
                 accuracy = sum(history) / len(history)
                 if accuracy < self.ai_config.performance.min_accuracy:
                     logger.warning(f"Drift Detected for {symbol}. Accuracy: {accuracy:.2f}. Triggering Retrain.")
