@@ -5,7 +5,7 @@ from typing import Dict, Any, Optional, List, Literal
 from dataclasses import dataclass, field
 
 from bot_core.logger import get_logger
-from bot_core.config import ExecutionConfig
+from bot_core.config import ExecutionConfig, ExecutionProfile
 from bot_core.exchange_api import ExchangeAPI
 from bot_core.position_manager import PositionManager
 from bot_core.event_system import EventBus, TradeCompletedEvent
@@ -24,11 +24,13 @@ class ActiveOrderContext:
     
     current_order_id: str
     current_price: float
+    profile: ExecutionProfile
     
     intent: Literal['OPEN', 'CLOSE'] = 'OPEN'
     cumulative_filled: float = 0.0
     cumulative_fees: float = 0.0
     start_time: float = field(default_factory=time.time)
+    last_poll_time: float = 0.0
     chase_attempts: int = 0
     status: str = 'OPEN'
     market_details: Dict[str, Any] = field(default_factory=dict)
@@ -37,6 +39,7 @@ class OrderLifecycleService:
     """
     Asynchronous service that manages the lifecycle of active orders in the background.
     Decouples execution monitoring from the signal generation pipeline.
+    Implements Adaptive Polling and Smart Chasing based on Execution Profiles.
     """
     def __init__(self, 
                  exchange_api: ExchangeAPI, 
@@ -86,28 +89,38 @@ class OrderLifecycleService:
         while self._running:
             try:
                 if not self._active_orders:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)
                     continue
 
                 # Snapshot keys to iterate safely
                 async with self._lock:
                     trade_ids = list(self._active_orders.keys())
 
+                now = time.time()
                 for trade_id in trade_ids:
-                    await self._process_order(trade_id)
+                    await self._process_order(trade_id, now)
                 
-                await asyncio.sleep(1) # Polling interval
+                await asyncio.sleep(0.1) # Fast tick for adaptive polling
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Error in OrderLifecycleService loop", error=str(e), exc_info=True)
                 await asyncio.sleep(5)
 
-    async def _process_order(self, trade_id: str):
+    async def _process_order(self, trade_id: str, now: float):
         async with self._lock:
             ctx = self._active_orders.get(trade_id)
         
         if not ctx: return
+
+        # Adaptive Polling: Poll new orders frequently (1s), older orders less frequently (3s)
+        age = now - ctx.start_time
+        poll_interval = 1.0 if age < 10 else 3.0
+        
+        if (now - ctx.last_poll_time) < poll_interval:
+            return
+
+        ctx.last_poll_time = now
 
         try:
             # 1. Fetch Status
@@ -124,21 +137,19 @@ class OrderLifecycleService:
             
             elif status in ['CANCELED', 'REJECTED', 'EXPIRED']:
                 # If canceled but not by us (or rejected), we might need to handle it.
-                # For now, treat as failed unless we are in the middle of a chase logic which handles its own cancels.
                 await self._handle_failure(ctx, f"Order {status}")
                 return
 
             # 3. Handle Open State (Chasing & Timeout)
             elif status == 'OPEN':
                 # Check Timeout
-                elapsed = time.time() - ctx.start_time
-                if elapsed > self.config.order_fill_timeout_seconds:
+                if age > self.config.order_fill_timeout_seconds:
                     await self._handle_timeout(ctx)
                     return
                 
                 # Check Chasing
-                if self.config.use_order_chasing:
-                    await self._check_and_chase(ctx)
+                if ctx.profile.use_chasing:
+                    await self._check_and_chase(ctx, now)
 
         except Exception as e:
             logger.error(f"Error processing order {trade_id}", error=str(e))
@@ -200,8 +211,8 @@ class OrderLifecycleService:
         except Exception:
             pass
 
-        # Execute Market Fallback if configured
-        if self.config.execute_on_timeout:
+        # Execute Market Fallback if configured in profile
+        if ctx.profile.execute_on_timeout:
             remaining = ctx.total_quantity - ctx.cumulative_filled
             if remaining > 0:
                 try:
@@ -218,8 +229,14 @@ class OrderLifecycleService:
 
         await self._handle_failure(ctx, "Timeout")
 
-    async def _check_and_chase(self, ctx: ActiveOrderContext):
-        if ctx.chase_attempts >= self.config.max_chase_attempts:
+    async def _check_and_chase(self, ctx: ActiveOrderContext, now: float):
+        if ctx.chase_attempts >= ctx.profile.max_chase_attempts:
+            return
+        
+        # Check interval
+        # We use start_time + (attempts * interval) to determine next chase time
+        next_chase_time = ctx.start_time + ((ctx.chase_attempts + 1) * ctx.profile.chase_interval_seconds)
+        if now < next_chase_time:
             return
 
         # Get Market Price
@@ -238,11 +255,12 @@ class OrderLifecycleService:
             
         if should_chase:
             # Calculate new price
-            aggro = self.config.chase_aggressiveness_pct
+            aggro = ctx.profile.chase_aggressiveness_pct
             new_price = market_price * (1 + aggro) if is_buy else market_price * (1 - aggro)
             
             # Slippage Guard
-            if abs(new_price - ctx.initial_price) / ctx.initial_price > self.config.max_chase_slippage_pct:
+            if abs(new_price - ctx.initial_price) / ctx.initial_price > ctx.profile.max_slippage_pct:
+                logger.info("Max chase slippage reached, holding position.", symbol=ctx.symbol)
                 return
 
             logger.info("Chasing order", symbol=ctx.symbol, old_price=current_price, new_price=new_price)
