@@ -9,6 +9,14 @@ from bot_core.config import AIEnsembleStrategyParams
 
 logger = get_logger(__name__)
 
+class InputSanitizer:
+    """Centralized logic for sanitizing input data for ML models."""
+    @staticmethod
+    def sanitize(X: np.ndarray) -> np.ndarray:
+        if X is None or X.size == 0: return X
+        # Replace NaNs with 0.0, and Infs with large finite numbers
+        return np.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
+
 class FeatureProcessor:
     """
     Encapsulates all feature engineering, normalization, and labeling logic.
