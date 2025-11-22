@@ -98,6 +98,9 @@ class BaseModelAdapter(ABC):
     @abstractmethod
     def load(self, path: str) -> None:
         pass
+    
+    def get_feature_importance(self) -> Optional[np.ndarray]:
+        return None
 
 class SklearnAdapter(BaseModelAdapter):
     def __init__(self, model: Any):
@@ -114,6 +117,21 @@ class SklearnAdapter(BaseModelAdapter):
 
     def load(self, path: str) -> None:
         self.model = joblib.load(path)
+        
+    def get_feature_importance(self) -> Optional[np.ndarray]:
+        if hasattr(self.model, 'feature_importances_'):
+            return self.model.feature_importances_
+        # Handle VotingClassifier
+        if hasattr(self.model, 'estimators_'):
+            imps = []
+            for _, est in self.model.estimators_:
+                if hasattr(est, 'feature_importances_'):
+                    imps.append(est.feature_importances_)
+                elif hasattr(est, 'coef_'):
+                    imps.append(np.abs(est.coef_[0]))
+            if imps:
+                return np.mean(imps, axis=0)
+        return None
 
 class TorchAdapter(BaseModelAdapter):
     def __init__(self, model_class: Any, input_dim: int, config: Any, device: torch.device):
@@ -218,6 +236,13 @@ class TorchAdapter(BaseModelAdapter):
         self.model.eval()
 
 # --- Main Classes ---
+
+class EnsembleModel:
+    """Container for loaded model artifacts."""
+    def __init__(self, adapters: Dict[str, BaseModelAdapter], meta: Dict[str, Any], meta_model: Any = None):
+        self.adapters = adapters
+        self.meta = meta
+        self.meta_model = meta_model
 
 class EnsembleTrainer:
     """
@@ -367,7 +392,7 @@ def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrateg
 class EnsembleLearner:
     def __init__(self, config: AIEnsembleStrategyParams):
         self.config = config
-        self.symbol_models = {}
+        self.symbol_models: Dict[str, EnsembleModel] = {}
         self.device = torch.device("cuda" if ML_AVAILABLE and torch.cuda.is_available() else "cpu")
         self.executor = ThreadPoolExecutor(max_workers=4)
         self._lock = threading.RLock()
@@ -394,12 +419,12 @@ class EnsembleLearner:
     async def reload_models(self, symbol: str):
         if not ML_AVAILABLE: return
         loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(self.executor, self._load_models_sync, symbol)
-        if data: 
+        model_data = await loop.run_in_executor(self.executor, self._load_models_sync, symbol)
+        if model_data: 
             with self._lock:
-                self.symbol_models[symbol] = data
+                self.symbol_models[symbol] = model_data
 
-    def _load_models_sync(self, symbol: str):
+    def _load_models_sync(self, symbol: str) -> Optional[EnsembleModel]:
         path = os.path.join(self.config.model_path, symbol.replace('/', '_'))
         if not os.path.exists(path): return None
         try:
@@ -408,8 +433,6 @@ class EnsembleLearner:
             adapters = {}
             num_feat = meta['num_features']
             
-            # Reconstruct adapters based on weights config
-            # Note: We load all available models that were saved
             if os.path.exists(os.path.join(path, "gb.model")):
                 adapters['gb'] = SklearnAdapter(None)
                 adapters['gb'].load(os.path.join(path, "gb.model"))
@@ -430,7 +453,7 @@ class EnsembleLearner:
             if os.path.exists(os.path.join(path, "meta_model.joblib")):
                 meta_model = joblib.load(os.path.join(path, "meta_model.joblib"))
                 
-            return {'adapters': adapters, 'meta': meta, 'meta_model': meta_model}
+            return EnsembleModel(adapters, meta, meta_model)
         except Exception as e:
             logger.error(f"Load failed for {symbol}: {e}")
             return None
@@ -439,7 +462,6 @@ class EnsembleLearner:
         await asyncio.gather(*[self.reload_models(s) for s in symbols])
 
     async def predict(self, df: pd.DataFrame, symbol: str, regime: str = None, leader_df: pd.DataFrame = None, custom_weights: Dict = None) -> AIInferenceResult:
-        # Optimization: Grab the model entry under lock, but process outside lock
         entry = None
         with self._lock:
             entry = self.symbol_models.get(symbol)
@@ -448,12 +470,10 @@ class EnsembleLearner:
             return AIInferenceResult(action='hold', confidence=0.0, model_version='none', active_weights={}, top_features={}, metrics={})
         
         loop = asyncio.get_running_loop()
-        # Pass the entry explicitly to avoid locking inside the thread
         return await loop.run_in_executor(self.executor, self._predict_sync, df, entry, leader_df, custom_weights)
 
-    def _predict_sync(self, df, entry, leader_df, custom_weights):
-        # No lock needed here as 'entry' is a local reference to the dictionary
-        adapters, meta, meta_model = entry['adapters'], entry['meta'], entry.get('meta_model')
+    def _predict_sync(self, df: pd.DataFrame, entry: EnsembleModel, leader_df: pd.DataFrame, custom_weights: Dict) -> AIInferenceResult:
+        adapters, meta, meta_model = entry.adapters, entry.meta, entry.meta_model
         
         # Data Prep
         required_history = self.config.features.normalization_window + self.config.features.sequence_length + 50
@@ -465,6 +485,9 @@ class EnsembleLearner:
             leader_subset = leader_df
 
         df_proc = FeatureProcessor.process_data(df_subset, self.config, leader_subset)
+        if df_proc.empty: 
+             return AIInferenceResult(action='hold', confidence=0.0, model_version='error', active_weights={}, top_features={}, metrics={})
+
         feats = meta.get('active_feature_columns')
         if not set(feats).issubset(df_proc.columns): 
             return AIInferenceResult(action='hold', confidence=0.0, model_version='error', active_weights={}, top_features={}, metrics={})
@@ -474,7 +497,8 @@ class EnsembleLearner:
         votes = {'buy': 0.0, 'sell': 0.0, 'hold': 0.0}
         weights = custom_weights or meta['optimized_weights']
         ind_preds = {}
-        
+        feature_importances = {}
+
         for name, adapter in adapters.items():
             w = weights.get(name, 0.0)
             if w == 0: continue
@@ -482,6 +506,12 @@ class EnsembleLearner:
             probs = adapter.predict_proba(X)[0]
             votes['sell'] += probs[0] * w; votes['hold'] += probs[1] * w; votes['buy'] += probs[2] * w
             ind_preds[name] = probs.tolist()
+            
+            # Aggregate Feature Importance
+            imp = adapter.get_feature_importance()
+            if imp is not None and len(imp) == len(feats):
+                for i, feat_name in enumerate(feats):
+                    feature_importances[feat_name] = feature_importances.get(feat_name, 0.0) + (imp[i] * w)
             
         best_action = max(votes, key=votes.get)
         base_confidence = votes[best_action]
@@ -498,9 +528,12 @@ class EnsembleLearner:
             if meta_prob < self.config.meta_labeling.probability_threshold:
                 base_confidence *= 0.5 
 
+        # Sort top features
+        top_features = dict(sorted(feature_importances.items(), key=lambda item: item[1], reverse=True)[:5])
+
         return AIInferenceResult(
             action=best_action, confidence=base_confidence, model_version=meta['timestamp'], 
-            active_weights=weights, top_features={}, metrics=meta['metrics'], 
+            active_weights=weights, top_features=top_features, metrics=meta['metrics'], 
             optimized_threshold=meta.get('optimized_threshold'), individual_predictions=ind_preds, meta_probability=meta_prob
         )
 
@@ -508,7 +541,7 @@ class EnsembleLearner:
         with self._lock:
             if symbol not in self.symbol_models or not individual_predictions: return
             entry = self.symbol_models[symbol]
-            meta = entry['meta']
+            meta = entry.meta
             current_weights = meta['optimized_weights']
             momentum = meta.get('weight_momentum', {k: 0.0 for k in current_weights})
             
