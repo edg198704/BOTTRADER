@@ -17,6 +17,7 @@ from bot_core.position_manager import Position
 from bot_core.utils import Clock, AsyncAtomicJsonStore
 from bot_core.common import TradeSignal, AIInferenceResult
 from bot_core.event_system import TradeCompletedEvent
+from bot_core.monitoring import InfluxDBMetrics
 
 logger = get_logger(__name__)
 
@@ -49,10 +50,11 @@ class StrategyStateManager:
         await self.persistence.save(state)
 
 class TradingStrategy(abc.ABC):
-    def __init__(self, config: StrategyParamsBase):
+    def __init__(self, config: StrategyParamsBase, metrics_writer: Optional[InfluxDBMetrics] = None):
         self.config = config
         self.data_fetcher = None
         self.regime_tracker: Optional[RegimeTracker] = None
+        self.metrics_writer = metrics_writer
 
     @abc.abstractmethod
     async def analyze_market(self, symbol: str, df: pd.DataFrame, position: Optional[Position]) -> Optional[TradeSignal]: pass
@@ -70,8 +72,8 @@ class TradingStrategy(abc.ABC):
     async def reload_models(self, symbol: str): pass
 
 class SimpleMACrossoverStrategy(TradingStrategy):
-    def __init__(self, config: SimpleMACrossoverStrategyParams):
-        super().__init__(config)
+    def __init__(self, config: SimpleMACrossoverStrategyParams, metrics_writer: Optional[InfluxDBMetrics] = None):
+        super().__init__(config, metrics_writer)
         self.fast_col = f"SMA_{config.fast_ma_period}"
         self.slow_col = f"SMA_{config.slow_ma_period}"
 
@@ -96,8 +98,8 @@ class SimpleMACrossoverStrategy(TradingStrategy):
     async def get_latest_regime(self, symbol): return None
 
 class AIEnsembleStrategy(TradingStrategy):
-    def __init__(self, config: AIEnsembleStrategyParams):
-        super().__init__(config)
+    def __init__(self, config: AIEnsembleStrategyParams, metrics_writer: Optional[InfluxDBMetrics] = None):
+        super().__init__(config, metrics_writer)
         self.ai_config = config
         self.state = StrategyStateManager(config)
         self.ensemble_learner = EnsembleLearner(config)
@@ -213,16 +215,9 @@ class AIEnsembleStrategy(TradingStrategy):
         regime_res = {'regime': 'unknown', 'confidence': 0.0, 'enriched_df': df}
         if self.regime_tracker:
             regime_res = await self.regime_tracker.get_regime(symbol)
-            # If enriched_df is missing in tracker result (it might be just metadata), use current df
-            # Ideally tracker should return enriched df, but for now we assume strategy can re-enrich or use raw
-            # To be safe, we use the df passed in, as it's the latest tick data.
-            # The tracker runs on its own schedule.
         
         regime = regime_res.get('regime', 'unknown')
         
-        # We need to ensure features are present. If tracker didn't enrich THIS df, we might need to.
-        # But FeatureProcessor handles raw DFs fine.
-
         last_sig = self.state.last_signal_time.get(symbol)
         if last_sig and (Clock.now() - last_sig).total_seconds() < (self.ai_config.signal_cooldown_candles * 300):
             return None
@@ -233,6 +228,15 @@ class AIEnsembleStrategy(TradingStrategy):
             
         pred = await self.ensemble_learner.predict(df, symbol, regime, leader_df)
         
+        # --- TELEMETRY INJECTION ---
+        if self.metrics_writer and pred.model_version != 'error':
+            await self.metrics_writer.write_ai_telemetry(
+                symbol=symbol, 
+                regime=regime, 
+                confidence=pred.confidence, 
+                features=pred.top_features
+            )
+
         if pred.model_version == 'error':
             self._circuit_breaker_failures[symbol] = self._circuit_breaker_failures.get(symbol, 0) + 1
             return None
