@@ -149,29 +149,58 @@ class PositionManager:
     async def reconcile_positions(self, exchange_api: 'ExchangeAPI', latest_prices: Dict[str, float]):
         logger.info("Starting position reconciliation...")
         
-        pending = await self.get_pending_positions()
-        for pos in pending:
-            if (Clock.now() - pos.creation_timestamp).total_seconds() > 300:
-                await self.mark_position_failed(pos.symbol, pos.order_id, "Reconciliation Timeout")
-
-        open_positions = await self.get_all_open_positions()
-        if not open_positions: 
+        # 1. Get Exchange State
+        try:
+            # For Spot, we use balances. For Futures, we would use fetch_positions.
+            # Assuming Spot/Margin mix based on config structure.
+            balances = await exchange_api.get_balance()
+        except Exception as e:
+            logger.error("Reconciliation failed: Could not fetch exchange balance", error=str(e))
             return
 
-        try:
-            balances = await exchange_api.get_balance()
-            for pos in open_positions:
-                base_asset = pos.symbol.split('/')[0]
-                if pos.side == 'BUY':
-                    held_balance = balances.get(base_asset, {}).get('total', 0.0)
-                    if held_balance < (pos.quantity * 0.90):
-                        logger.critical("Phantom position detected! Closing in DB.", symbol=pos.symbol, db_qty=pos.quantity, exchange_qty=held_balance)
-                        price = latest_prices.get(pos.symbol, pos.entry_price)
-                        await self.close_position(pos.symbol, price, reason="Reconciliation: Phantom Position")
-                        if self.alert_system:
-                            await self.alert_system.send_alert("CRITICAL", f"Phantom position closed for {pos.symbol}")
-        except Exception as e:
-            logger.error("Error during reconciliation", error=str(e))
+        # 2. Get DB State
+        open_positions = await self.get_all_open_positions()
+        db_map = {p.symbol: p for p in open_positions}
+        
+        # 3. Check for Phantoms (In DB, not in Exchange)
+        for symbol, pos in db_map.items():
+            base_asset = symbol.split('/')[0]
+            held_balance = balances.get(base_asset, {}).get('total', 0.0)
+            
+            # Tolerance for dust (5% mismatch allowed)
+            if held_balance < (pos.quantity * 0.95):
+                logger.critical("Phantom position detected! Closing in DB.", symbol=symbol, db_qty=pos.quantity, exchange_qty=held_balance)
+                # We close it in DB with a special reason, effectively "writing off" the position
+                await self.close_position(symbol, pos.entry_price, reason="Reconciliation: Phantom Position")
+                if self.alert_system:
+                    await self.alert_system.send_alert("CRITICAL", f"Phantom position detected and removed for {symbol}")
+            
+            # Check for Quantity Mismatch (Exchange has LESS than DB, but not zero)
+            elif held_balance < (pos.quantity * 0.99):
+                logger.warning("Quantity mismatch detected. Adjusting DB.", symbol=symbol, db_qty=pos.quantity, exchange_qty=held_balance)
+                # Adjust quantity in DB (Partial Close logic without PnL realization for the missing part? 
+                # Or just update? Updating is safer to reflect reality.)
+                # For simplicity in this architecture, we treat it as a partial close at current price.
+                diff = pos.quantity - held_balance
+                current_price = latest_prices.get(symbol, pos.entry_price)
+                await self.confirm_position_close(symbol, current_price, diff, 0.0, reason="Reconciliation: Quantity Adjustment")
+
+        # 4. Check for Shadows (In Exchange, not in DB)
+        # Note: On Spot, holding an asset doesn't always mean a "Position" (could be HODL).
+        # We log significant balances that are not tracked.
+        for asset, balance_data in balances.items():
+            total = balance_data.get('total', 0.0)
+            if total > 0:
+                # Construct potential symbol (e.g., BTC -> BTC/USDT)
+                # This is heuristic and depends on the quote currency used in config.
+                # Assuming USDT for now.
+                potential_symbol = f"{asset}/USDT"
+                if potential_symbol not in db_map and asset != 'USDT':
+                    # Check if value is significant (> $10)
+                    price = latest_prices.get(potential_symbol, 0.0)
+                    if price * total > 10.0:
+                        logger.warning("Shadow position detected (Untracked Balance).", asset=asset, amount=total, value_usd=price*total)
+                        # Optional: Auto-import logic could go here if configured.
 
     async def _run_in_executor(self, func, *args):
         loop = asyncio.get_running_loop()
