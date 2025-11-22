@@ -47,7 +47,6 @@ class PreTradeValidator:
             logger.warning("Liquidity check failed: Empty order book.", symbol=symbol)
             return False
         
-        # Book prices are floats/decimals, convert for check
         ask0 = to_decimal(book['asks'][0][0])
         bid0 = to_decimal(book['bids'][0][0])
         
@@ -155,7 +154,6 @@ class TradeExecutor:
             # 2. Re-fetch State (Double-Check Locking)
             current_position = await self.position_manager.get_open_position(symbol)
             
-            # Convert latest price to Decimal for execution logic
             price_float = self.latest_prices.get(symbol)
             if not price_float:
                 logger.warning("Execution skipped: No price data available.", symbol=symbol)
@@ -173,7 +171,6 @@ class TradeExecutor:
                 is_close_short = (signal.action == 'BUY') and current_position.side == 'SELL'
                 
                 if is_close_long or is_close_short:
-                    # Close is also fire-and-forget
                     asyncio.create_task(self.close_position(current_position, "Strategy Signal"))
                     return None
         return None
@@ -301,7 +298,6 @@ class TradeExecutor:
             if not fresh_pos: return
 
             close_side = 'SELL' if position.side == 'BUY' else 'BUY'
-            # Convert to Decimal
             current_price = to_decimal(self.latest_prices.get(position.symbol, float(position.entry_price)))
             market_details = self.market_details.get(position.symbol)
             if not market_details: return
@@ -311,7 +307,6 @@ class TradeExecutor:
                 await self.position_manager.close_position(position.symbol, current_price, f"{reason} (Dust)")
                 return
 
-            # Closing is usually urgent, use Neutral or Aggressive profile
             profile = self._get_execution_profile('neutral')
             
             order_type = profile.order_type
@@ -368,7 +363,6 @@ class TradeExecutor:
 
     async def _calculate_limit_price(self, symbol: str, side: str, current_price: Decimal, offset_pct: float) -> Decimal:
         ticker = await self.exchange_api.get_ticker_data(symbol)
-        # Ticker data is Decimal, safe to use
         bid = ticker.get('bid')
         ask = ticker.get('ask')
         
