@@ -38,9 +38,11 @@ class InfluxDBMetrics:
             logger.info("InfluxDB credentials not fully provided. Metrics disabled.")
 
     def _sanitize_field(self, value: Any) -> Union[float, int, str, bool]:
-        """Converts Decimal to float for InfluxDB compatibility."""
+        """Converts Decimal and other types to InfluxDB compatible types."""
         if isinstance(value, Decimal):
             return float(value)
+        if isinstance(value, (dict, list)):
+            return str(value)
         return value
 
     async def write_metric(self, measurement: str, fields: Dict[str, Any], tags: Dict[str, str] = None):
@@ -58,6 +60,20 @@ class InfluxDBMetrics:
             self.write_api.write(bucket=self.bucket, record=point)
         except Exception as e:
             logger.error("Failed to write metric to InfluxDB", measurement=measurement, error=str(e))
+
+    async def write_ai_telemetry(self, symbol: str, regime: str, confidence: float, features: Dict[str, float]):
+        """Specialized method for high-frequency AI telemetry."""
+        if not self.enabled: return
+        try:
+            point = Point("ai_telemetry").time(datetime.now(timezone.utc))
+            point.tag("symbol", symbol)
+            point.field("regime", regime)
+            point.field("confidence", float(confidence))
+            for fname, fval in features.items():
+                point.field(f"feat_{fname}", float(fval))
+            self.write_api.write(bucket=self.bucket, record=point)
+        except Exception as e:
+            logger.error("Failed to write AI telemetry", error=str(e))
 
     async def close(self):
         if self.enabled and self.client:
