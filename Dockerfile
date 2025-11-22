@@ -1,12 +1,17 @@
-# Stage 1: Builder
-FROM python:3.10-slim as builder
+FROM python:3.10-slim
 
-# Set environment variables
+# Set environment variables to prevent .pyc files and buffering
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies required for building Python packages (gcc, etc.)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Set the working directory in the container
+WORKDIR /app
+
+# Install system dependencies required for building Python packages
+# build-essential, gcc, python3-dev: Required for compiling numpy/pandas extensions
+# libffi-dev: Required for cryptography/SSL
+# curl: Useful for healthchecks
+RUN apt-get update && apt-get install -y \
     build-essential \
     gcc \
     python3-dev \
@@ -14,45 +19,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Create virtual environment
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Upgrade pip
-RUN pip install --upgrade pip setuptools wheel
-
-# Install dependencies
+# Copy requirements file first to leverage Docker cache
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# Stage 2: Runtime
-FROM python:3.10-slim
+# Install Python dependencies
+# 1. Upgrade pip to ensure compatibility
+# 2. Install requirements using the CPU-only index for PyTorch to save space/time
+# 3. --no-cache-dir reduces image size
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
 
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Install runtime dependencies (minimal)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy virtual environment from builder
-COPY --from=builder /opt/venv /opt/venv
-
-# Set working directory
-WORKDIR /app
-
-# Copy application code
+# Copy the rest of the application code
 COPY . .
 
-# Create directories for logs and data
-RUN mkdir -p logs models backtest_data
+# Ensure scripts are executable
+RUN chmod +x start_bot.sh setup.sh
 
-# Set permissions (optional, good practice)
-# RUN useradd -m botuser && chown -R botuser:botuser /app
-# USER botuser
-
-# Command to run the bot
+# Define the command to run the bot
 CMD ["python", "start_bot.py"]
