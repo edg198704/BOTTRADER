@@ -268,8 +268,9 @@ class AIEnsembleStrategy(TradingStrategy):
             try:
                 meta = json.loads(pos.strategy_metadata)
                 ind_preds = meta.get('individual_predictions')
+                regime = meta.get('regime', 'unknown')
                 if ind_preds:
-                    self.ensemble_learner.update_weights(symbol, pos.pnl, ind_preds, pos.side)
+                    self.ensemble_learner.update_weights(symbol, pos.pnl, ind_preds, pos.side, regime)
             except Exception as e:
                 logger.error(f"Failed to process trade completion for AI learning: {e}")
 
