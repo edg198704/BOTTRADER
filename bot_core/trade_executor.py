@@ -22,11 +22,14 @@ logger = get_logger(__name__)
 class TradeExecutionResult(BaseModel):
     symbol: str
     action: str
-    quantity: float
-    price: float
+    quantity: Decimal
+    price: Decimal
     order_id: str
     status: str
     metadata: Dict[str, Any] = {}
+
+    class Config:
+        arbitrary_types_allowed = True
 
 class PreTradeValidator:
     """Encapsulates all pre-trade validation logic."""
@@ -56,7 +59,7 @@ class PreTradeValidator:
             logger.warning("Liquidity check failed: Empty order book.", symbol=symbol)
             return False
         
-        # Book prices are floats, convert for check
+        # Book prices are floats/decimals, convert for check
         ask0 = to_decimal(book['asks'][0][0])
         bid0 = to_decimal(book['bids'][0][0])
         
@@ -78,9 +81,9 @@ class PreTradeValidator:
         remaining_qty = quantity
         weighted_price_sum = ZERO
         
-        for price_float, vol_float in levels:
-            price = to_decimal(price_float)
-            vol = to_decimal(vol_float)
+        for price_raw, vol_raw in levels:
+            price = to_decimal(price_raw)
+            vol = to_decimal(vol_raw)
             
             take = min(remaining_qty, vol)
             weighted_price_sum += take * price
@@ -163,7 +166,6 @@ class TradeExecutor:
             current_position = await self.position_manager.get_open_position(symbol)
             
             # Convert latest price to Decimal for execution logic
-            # Note: latest_prices contains floats from DataHandler. We convert here for precision math.
             price_float = self.latest_prices.get(symbol)
             if not price_float:
                 logger.warning("Execution skipped: No price data available.", symbol=symbol)
@@ -268,11 +270,11 @@ class TradeExecutor:
             trade_id=trade_id,
             symbol=symbol,
             side=side,
-            total_quantity=float(final_quantity),
-            initial_price=float(limit_price or current_price),
+            total_quantity=final_quantity,
+            initial_price=limit_price or current_price,
             strategy_metadata=signal.metadata,
             current_order_id=exchange_order_id,
-            current_price=float(limit_price or current_price),
+            current_price=limit_price or current_price,
             market_details=market_details,
             intent='OPEN',
             profile=profile
@@ -281,7 +283,7 @@ class TradeExecutor:
         await self.order_lifecycle_service.register_order(ctx)
 
         return TradeExecutionResult(
-            symbol=symbol, action=side, quantity=float(final_quantity), price=float(limit_price or current_price),
+            symbol=symbol, action=side, quantity=final_quantity, price=limit_price or current_price,
             order_id=exchange_order_id, status='PENDING', metadata=signal.metadata
         )
 
@@ -327,11 +329,11 @@ class TradeExecutor:
                     trade_id=close_trade_id,
                     symbol=position.symbol,
                     side=close_side,
-                    total_quantity=float(close_qty),
-                    initial_price=float(limit_price or current_price),
+                    total_quantity=close_qty,
+                    initial_price=limit_price or current_price,
                     strategy_metadata={},
                     current_order_id=exchange_order_id,
-                    current_price=float(limit_price or current_price),
+                    current_price=limit_price or current_price,
                     market_details=market_details,
                     intent='CLOSE',
                     profile=profile
