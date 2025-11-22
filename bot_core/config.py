@@ -218,12 +218,21 @@ class ExecutionProfile(BaseModel):
     execute_on_timeout: bool
     post_only: bool
 
+class ExecutionSafetyConfig(BaseModel):
+    """Configuration for the Idempotency Gateway and WAL."""
+    max_verification_attempts: int = 3
+    verification_delay_seconds: float = 1.0
+    wal_enabled: bool = True
+    wal_path: str = "execution_wal.log"
+    strict_idempotency: bool = True
+
 class ExecutionConfig(BaseModel):
     """Dynamic Execution Configuration."""
     default_profile: str = "neutral"
     max_entry_spread_pct: float = 0.001
     max_impact_cost_pct: float = 0.005
     order_fill_timeout_seconds: int = 45
+    safety: ExecutionSafetyConfig = ExecutionSafetyConfig()
     
     # Profiles for different urgencies
     profiles: Dict[str, ExecutionProfile] = {
@@ -249,7 +258,7 @@ class ExecutionConfig(BaseModel):
         )
     }
 
-    # Legacy fields for backward compatibility (mapped to 'neutral' profile internally if needed)
+    # Legacy fields for backward compatibility
     default_order_type: str = "LIMIT"
     limit_price_offset_pct: float = 0.0
     use_order_chasing: bool = True
