@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel
 
 from bot_core.logger import get_logger
-from bot_core.config import BotConfig
+from bot_core.config import BotConfig, ExecutionProfile
 from bot_core.exchange_api import ExchangeAPI, BotInsufficientFundsError, BotInvalidOrderError
 from bot_core.position_manager import PositionManager, Position
 from bot_core.risk_manager import RiskManager
@@ -136,6 +136,9 @@ class TradeExecutor:
             self._symbol_locks[symbol] = asyncio.Lock()
         return self._symbol_locks[symbol]
 
+    def _get_execution_profile(self, urgency: str) -> ExecutionProfile:
+        return self.config.execution.profiles.get(urgency, self.config.execution.profiles[self.config.execution.default_profile])
+
     async def execute_trade_signal(self, signal: TradeSignal, df_with_indicators: Any, position_snapshot: Optional[Position]) -> Optional[TradeExecutionResult]:
         """
         Router for trade signals. Ensures atomic execution per symbol using Double-Check Locking.
@@ -174,6 +177,7 @@ class TradeExecutor:
     async def _handle_entry(self, signal: TradeSignal, current_price: float, df: Any) -> Optional[TradeExecutionResult]:
         symbol = signal.symbol
         side = signal.action
+        profile = self._get_execution_profile(signal.urgency)
 
         # 1. Advanced Validation
         if not await self.validator.check_liquidity(symbol, current_price):
@@ -218,13 +222,13 @@ class TradeExecutor:
             return None
 
         # 5. Order Construction
-        order_type = self.config.execution.default_order_type
+        order_type = profile.order_type
         limit_price = None
         if order_type == 'LIMIT':
-            limit_price = await self._calculate_limit_price(symbol, side, current_price, df)
+            limit_price = await self._calculate_limit_price(symbol, side, current_price, profile.limit_offset_pct)
 
         # 6. Execution (Initial Placement)
-        trade_id = str(uuid.uuid4())
+        trade_id = str(uuid.uuid4()) # Unique ID for the entire trade lifecycle
         await self.position_manager.create_pending_position(
             symbol, side, trade_id, trade_id, 
             decision_price=current_price, 
@@ -233,8 +237,7 @@ class TradeExecutor:
 
         try:
             extra_params = {'clientOrderId': trade_id}
-            is_aggressive = signal.confidence >= 0.8
-            if self.config.execution.post_only and order_type == 'LIMIT' and not is_aggressive:
+            if profile.post_only and order_type == 'LIMIT':
                 extra_params['postOnly'] = True
 
             order_result = await self.exchange_api.place_order(
@@ -260,7 +263,8 @@ class TradeExecutor:
             current_order_id=exchange_order_id,
             current_price=limit_price or current_price,
             market_details=market_details,
-            intent='OPEN'
+            intent='OPEN',
+            profile=profile # Pass the profile for lifecycle management
         )
         
         await self.order_lifecycle_service.register_order(ctx)
@@ -285,10 +289,13 @@ class TradeExecutor:
                 await self.position_manager.close_position(position.symbol, current_price, f"{reason} (Dust)")
                 return
 
-            order_type = self.config.execution.default_order_type
+            # Closing is usually urgent, use Neutral or Aggressive profile
+            profile = self._get_execution_profile('neutral')
+            
+            order_type = profile.order_type
             limit_price = None
             if order_type == 'LIMIT':
-                limit_price = await self._calculate_limit_price(position.symbol, close_side, current_price, None)
+                limit_price = await self._calculate_limit_price(position.symbol, close_side, current_price, profile.limit_offset_pct)
             else:
                 order_type = 'MARKET'
 
@@ -314,7 +321,8 @@ class TradeExecutor:
                     current_order_id=exchange_order_id,
                     current_price=limit_price or current_price,
                     market_details=market_details,
-                    intent='CLOSE'
+                    intent='CLOSE',
+                    profile=profile
                 )
                 
                 await self.order_lifecycle_service.register_order(ctx)
@@ -335,8 +343,8 @@ class TradeExecutor:
         except Exception:
             return 0.0
 
-    async def _calculate_limit_price(self, symbol: str, side: str, current_price: float, df: Any) -> float:
+    async def _calculate_limit_price(self, symbol: str, side: str, current_price: float, offset_pct: float) -> float:
         ticker = await self.exchange_api.get_ticker_data(symbol)
         ref_price = ticker.get('bid' if side == 'BUY' else 'ask') or current_price
-        offset = ref_price * self.config.execution.limit_price_offset_pct
+        offset = ref_price * offset_pct
         return ref_price - offset if side == 'BUY' else ref_price + offset
