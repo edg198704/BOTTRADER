@@ -1,7 +1,6 @@
 import asyncio
 import time
 from typing import Dict, Any, Optional
-from dataclasses import dataclass
 from datetime import datetime, timezone
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor
@@ -15,30 +14,13 @@ from bot_core.config import BotConfig
 from bot_core.data_handler import DataHandler
 from bot_core.monitoring import HealthChecker, InfluxDBMetrics, AlertSystem, Watchdog
 from bot_core.position_monitor import PositionMonitor
-from bot_core.trade_executor import TradeExecutor, TradeExecutionResult
+from bot_core.trade_executor import TradeExecutor
 from bot_core.optimizer import StrategyOptimizer
 from bot_core.event_system import EventBus, MarketDataEvent, TradeCompletedEvent
 from bot_core.services import ServiceManager
-from bot_core.common import TradeSignal
+from bot_core.tick_pipeline import TickPipeline
 
 logger = get_logger(__name__)
-
-@dataclass
-class TickContext:
-    """Encapsulates the state of a single tick processing pipeline."""
-    symbol: str
-    start_time: float
-    df: Optional[pd.DataFrame] = None
-    position: Optional[Position] = None
-    signal: Optional[TradeSignal] = None
-    execution_result: Optional[TradeExecutionResult] = None
-    stages: Dict[str, float] = None
-
-    def __post_init__(self):
-        self.stages = {}
-
-    def mark_stage(self, name: str):
-        self.stages[name] = (time.perf_counter() - self.start_time) * 1000
 
 class SymbolProcessor:
     """
@@ -46,9 +28,9 @@ class SymbolProcessor:
     Implements Conflation: If the system is busy, older ticks in the queue are discarded 
     in favor of the newest one to ensure real-time relevance.
     """
-    def __init__(self, symbol: str, bot: 'TradingBot'):
+    def __init__(self, symbol: str, pipeline: TickPipeline):
         self.symbol = symbol
-        self.bot = bot
+        self.pipeline = pipeline
         # Conflation queue: Size 1 ensures we only ever hold the LATEST tick pending.
         self._queue = asyncio.Queue(maxsize=1) 
         self._task: Optional[asyncio.Task] = None
@@ -98,16 +80,14 @@ class SymbolProcessor:
                 # Wait for a tick signal
                 start_time = await self._queue.get()
                 
-                # Process
-                ctx = TickContext(symbol=self.symbol, start_time=start_time)
-                await self.bot._process_tick_pipeline(ctx)
+                # Process using the pipeline
+                await self.pipeline.run(self.symbol, start_time)
                 
                 self._queue.task_done()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in processor loop for {self.symbol}", error=str(e), exc_info=True)
-                self.bot.watchdog.record_error(f"Processor-{self.symbol}")
 
 class TradingBot:
     """
@@ -141,12 +121,6 @@ class TradingBot:
         self.start_time = datetime.now(timezone.utc)
         self.latest_prices = shared_latest_prices
         self.market_details: Dict[str, Dict[str, Any]] = {}
-        self.processed_candles: Dict[str, pd.Timestamp] = {}
-        
-        # Symbol Processors (Actors)
-        self.processors: Dict[str, SymbolProcessor] = {}
-        
-        self.process_executor = ProcessPoolExecutor(max_workers=2)
         
         # Initialize Watchdog
         self.watchdog = Watchdog(
@@ -156,6 +130,22 @@ class TradingBot:
             health_checker=health_checker,
             timeout_seconds=300
         )
+
+        # Initialize Tick Pipeline
+        self.tick_pipeline = TickPipeline(
+            data_handler=data_handler,
+            position_manager=position_manager,
+            strategy=strategy,
+            trade_executor=trade_executor,
+            watchdog=self.watchdog,
+            metrics_writer=metrics_writer,
+            latest_prices=shared_latest_prices
+        )
+        
+        # Symbol Processors (Actors)
+        self.processors: Dict[str, SymbolProcessor] = {}
+        
+        self.process_executor = ProcessPoolExecutor(max_workers=2)
         
         self._initialize_shared_state()
         logger.info("TradingBot orchestrator initialized.")
@@ -187,7 +177,7 @@ class TradingBot:
         
         # Initialize Processors
         for symbol in self.config.strategy.symbols:
-            self.processors[symbol] = SymbolProcessor(symbol, self)
+            self.processors[symbol] = SymbolProcessor(symbol, self.tick_pipeline)
 
         # Event Subscriptions
         self.event_bus.subscribe(MarketDataEvent, self.on_market_data)
@@ -231,59 +221,6 @@ class TradingBot:
         # Dispatch to the specific symbol processor
         if event.symbol in self.processors:
             self.processors[event.symbol].on_tick()
-
-    async def _process_tick_pipeline(self, ctx: TickContext):
-        # 1. Fast Fail on Risk Halt or Circuit Breaker
-        if self.risk_manager.is_halted or self.watchdog._circuit_breaker.tripped:
-            return
-
-        # 2. Latency Guard
-        latency = self.data_handler.get_latency(ctx.symbol)
-        if latency > 10.0:
-            logger.warning("Skipping tick due to high latency", symbol=ctx.symbol, latency=f"{latency:.2f}s")
-            if self.metrics_writer:
-                await self.metrics_writer.write_metric('data_latency_skip', fields={'latency': latency}, tags={'symbol': ctx.symbol})
-            return
-
-        try:
-            # Stage 1: Data Fetch
-            ctx.df = self.data_handler.get_market_data(ctx.symbol, include_forming=False)
-            if ctx.df is None or ctx.df.empty: return
-            
-            last_ts = ctx.df.index[-1]
-            if self.processed_candles.get(ctx.symbol) == last_ts:
-                return # Already processed this candle
-            
-            if ctx.symbol not in self.latest_prices:
-                return
-
-            ctx.mark_stage('data_fetch')
-
-            # Stage 2: Position Fetch
-            ctx.position = await self.position_manager.get_open_position(ctx.symbol)
-            ctx.mark_stage('position_fetch')
-
-            # Stage 3: Strategy Analysis
-            ctx.signal = await self.strategy.analyze_market(ctx.symbol, ctx.df, ctx.position)
-            ctx.mark_stage('strategy_analysis')
-
-            # Stage 4: Execution
-            if ctx.signal: 
-                ctx.execution_result = await self.trade_executor.execute_trade_signal(ctx.signal, ctx.df, ctx.position)
-                if ctx.execution_result and self.metrics_writer:
-                    await self.metrics_writer.write_metric('trade_execution', fields=ctx.execution_result.dict())
-                ctx.mark_stage('execution')
-            
-            self.processed_candles[ctx.symbol] = last_ts
-            ctx.mark_stage('total_duration')
-
-        except Exception as e:
-            logger.error(f"Critical error processing tick for {ctx.symbol}", error=str(e), exc_info=True)
-            self.watchdog.record_error("TickError")
-        finally:
-            self.watchdog.register_heartbeat(ctx.symbol)
-            if self.metrics_writer and ctx.stages:
-                await self.metrics_writer.write_metric('tick_pipeline', fields=ctx.stages, tags={'symbol': ctx.symbol})
 
     async def _monitoring_loop(self):
         reconcile_counter = 0
