@@ -16,7 +16,7 @@ from scipy.optimize import minimize
 from bot_core.logger import get_logger
 from bot_core.config import AIEnsembleStrategyParams
 from bot_core.ai.models import TCNPredictor, AttentionNetwork
-from bot_core.ai.feature_processor import FeatureProcessor
+from bot_core.ai.feature_processor import FeatureProcessor, InputSanitizer
 from bot_core.common import AIInferenceResult
 from bot_core.utils import AsyncAtomicJsonStore
 
@@ -31,21 +31,18 @@ try:
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import log_loss, accuracy_score, precision_score, f1_score
     from xgboost import XGBClassifier
+    from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
+    from sklearn.feature_selection import SelectFromModel
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
 
 logger = get_logger(__name__)
 
-# --- Utility Classes ---
-
-class InputSanitizer:
-    @staticmethod
-    def sanitize(X: np.ndarray) -> np.ndarray:
-        if X is None or X.size == 0: return X
-        return np.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
+# --- Utility Functions ---
 
 class PurgedTimeSeriesSplit:
+    """Time Series Split with Embargo to prevent leakage."""
     def __init__(self, n_splits: int = 5, embargo_pct: float = 0.01):
         self.n_splits = n_splits
         self.embargo_pct = embargo_pct
@@ -104,6 +101,8 @@ class SklearnAdapter(BaseModelAdapter):
         self.model = model
 
     def fit(self, X_train: np.ndarray, y_train: np.ndarray, X_val: np.ndarray, y_val: np.ndarray) -> None:
+        # Sklearn models typically don't use a separate validation set during fit unless wrapped
+        # We fit on the training set provided.
         self.model.fit(X_train, y_train)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
@@ -127,6 +126,8 @@ class SklearnAdapter(BaseModelAdapter):
                     imps.append(np.abs(est.coef_[0]))
             if imps:
                 return np.mean(imps, axis=0)
+        if hasattr(self.model, 'coef_'):
+            return np.abs(self.model.coef_[0])
         return None
 
 class TorchAdapter(BaseModelAdapter):
@@ -229,19 +230,127 @@ class TorchAdapter(BaseModelAdapter):
         self.model.load_state_dict(torch.load(path, map_location=self.device))
         self.model.eval()
 
-# --- Main Classes ---
+# --- Pipeline Components ---
 
-class EnsembleModel:
-    def __init__(self, adapters: Dict[str, BaseModelAdapter], meta: Dict[str, Any], meta_model: Any = None, dynamic_state: Dict[str, Any] = None):
-        self.adapters = adapters
-        self.meta = meta
-        self.meta_model = meta_model
-        self.dynamic_state = dynamic_state or {}
+class ModelFactory:
+    """Factory for creating model instances based on configuration."""
+    @staticmethod
+    def create_sklearn_model(name: str, config: AIEnsembleStrategyParams) -> Any:
+        hp = config.hyperparameters
+        cw = 'balanced' if config.training.use_class_weighting else None
+        
+        if name == 'xgboost':
+            return XGBClassifier(
+                n_estimators=hp.xgboost.n_estimators, max_depth=hp.xgboost.max_depth,
+                learning_rate=hp.xgboost.learning_rate, subsample=hp.xgboost.subsample,
+                colsample_bytree=hp.xgboost.colsample_bytree, random_state=42,
+                use_label_encoder=False, eval_metric='logloss'
+            )
+        elif name == 'random_forest':
+            return RandomForestClassifier(
+                n_estimators=hp.random_forest.n_estimators, max_depth=hp.random_forest.max_depth,
+                min_samples_leaf=hp.random_forest.min_samples_leaf, class_weight=cw, random_state=42
+            )
+        elif name == 'logistic_regression':
+            return LogisticRegression(
+                max_iter=hp.logistic_regression.max_iter, C=hp.logistic_regression.C,
+                class_weight=cw, random_state=42
+            )
+        elif name == 'voting':
+            rf = ModelFactory.create_sklearn_model('random_forest', config)
+            lr = ModelFactory.create_sklearn_model('logistic_regression', config)
+            return VotingClassifier(estimators=[('rf', rf), ('lr', lr)], voting='soft')
+        else:
+            raise ValueError(f"Unknown sklearn model: {name}")
+
+class HyperparameterTuner:
+    """Handles automated hyperparameter optimization."""
+    def __init__(self, config: AIEnsembleStrategyParams):
+        self.config = config
+
+    def tune(self, model: Any, X: np.ndarray, y: np.ndarray) -> Any:
+        if not self.config.training.auto_tune_models:
+            return model
+
+        # Define search spaces based on model type
+        param_dist = {}
+        if isinstance(model, XGBClassifier):
+            param_dist = {
+                'n_estimators': [100, 200, 300],
+                'max_depth': [3, 5, 7],
+                'learning_rate': [0.01, 0.05, 0.1, 0.2],
+                'subsample': [0.6, 0.8, 1.0],
+                'colsample_bytree': [0.6, 0.8, 1.0]
+            }
+        elif isinstance(model, RandomForestClassifier):
+            param_dist = {
+                'n_estimators': [100, 200],
+                'max_depth': [None, 10, 20],
+                'min_samples_leaf': [1, 2, 5, 10]
+            }
+        elif isinstance(model, LogisticRegression):
+            param_dist = {
+                'C': [0.1, 1.0, 10.0]
+            }
+        
+        if not param_dist:
+            return model
+
+        logger.info(f"Tuning hyperparameters for {type(model).__name__}...")
+        try:
+            # Use TimeSeriesSplit for CV to respect temporal order
+            tscv = TimeSeriesSplit(n_splits=3)
+            search = RandomizedSearchCV(
+                estimator=model, 
+                param_distributions=param_dist, 
+                n_iter=self.config.training.n_iter_search, 
+                cv=tscv, 
+                scoring='neg_log_loss', 
+                n_jobs=-1, 
+                random_state=42
+            )
+            search.fit(X, y)
+            logger.info(f"Best params for {type(model).__name__}: {search.best_params_}")
+            return search.best_estimator_
+        except Exception as e:
+            logger.warning(f"Hyperparameter tuning failed: {e}. Using default.")
+            return model
+
+class FeatureSelector:
+    """Handles dynamic feature selection."""
+    def __init__(self, config: AIEnsembleStrategyParams):
+        self.config = config
+
+    def select_features(self, X: np.ndarray, y: np.ndarray, feature_names: List[str]) -> Tuple[np.ndarray, List[str]]:
+        if not self.config.features.use_feature_selection:
+            return X, feature_names
+
+        logger.info("Running feature selection...")
+        try:
+            # Use a lightweight Random Forest for selection
+            selector_model = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42, n_jobs=-1)
+            selector_model.fit(X, y)
+            
+            # Select features based on importance threshold
+            selector = SelectFromModel(selector_model, max_features=self.config.features.max_active_features, prefit=True)
+            X_new = selector.transform(X)
+            
+            mask = selector.get_support()
+            selected_names = [name for name, selected in zip(feature_names, mask) if selected]
+            
+            logger.info(f"Selected {len(selected_names)} features out of {len(feature_names)}.")
+            return X_new, selected_names
+        except Exception as e:
+            logger.error(f"Feature selection failed: {e}. Using all features.")
+            return X, feature_names
 
 class EnsembleTrainer:
+    """Orchestrates the training pipeline."""
     def __init__(self, config: AIEnsembleStrategyParams):
         self.config = config
         self.device = torch.device("cpu")
+        self.tuner = HyperparameterTuner(config)
+        self.selector = FeatureSelector(config)
 
     def _prepare_data(self, df: pd.DataFrame, leader_df: Optional[pd.DataFrame]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame, List[str]]:
         df_proc = FeatureProcessor.process_data(df, self.config, leader_df=leader_df)
@@ -256,62 +365,65 @@ class EnsembleTrainer:
         t1_vals = t1.loc[common].values
         return X, y, t1_vals, df_proc, list(df_proc.columns)
 
-    def _create_adapters(self, num_features: int) -> Dict[str, BaseModelAdapter]:
-        hp = self.config.hyperparameters
-        cw = 'balanced' if self.config.training.use_class_weighting else None
-        adapters = {}
-        
-        xgb = XGBClassifier(n_estimators=hp.xgboost.n_estimators, max_depth=hp.xgboost.max_depth, 
-                            learning_rate=hp.xgboost.learning_rate, subsample=hp.xgboost.subsample, 
-                            colsample_bytree=hp.xgboost.colsample_bytree, random_state=42, 
-                            use_label_encoder=False, eval_metric='logloss')
-        adapters['gb'] = SklearnAdapter(xgb)
-
-        rf = RandomForestClassifier(n_estimators=hp.random_forest.n_estimators, max_depth=hp.random_forest.max_depth, 
-                                    min_samples_leaf=hp.random_forest.min_samples_leaf, class_weight=cw, random_state=42)
-        lr = LogisticRegression(max_iter=hp.logistic_regression.max_iter, C=hp.logistic_regression.C, 
-                                class_weight=cw, random_state=42)
-        voting = VotingClassifier(estimators=[('rf', rf), ('lr', lr)], voting='soft')
-        adapters['technical'] = SklearnAdapter(voting)
-
-        if ML_AVAILABLE:
-            adapters['lstm'] = TorchAdapter(TCNPredictor, num_features, self.config, self.device)
-            adapters['attention'] = TorchAdapter(AttentionNetwork, num_features, self.config, self.device)
-            
-        return adapters
-
     def train(self, symbol: str, df: pd.DataFrame, leader_df: Optional[pd.DataFrame] = None) -> bool:
         if not ML_AVAILABLE: return False
         try:
-            X, y, t1_vals, df_proc, active_feats = self._prepare_data(df, leader_df)
+            # 1. Data Prep
+            X_raw, y, t1_vals, df_proc, all_feats = self._prepare_data(df, leader_df)
             if len(np.unique(y)) < 2: return False
 
+            # 2. Feature Selection
+            X, active_feats = self.selector.select_features(X_raw, y, all_feats)
+
+            # 3. CV Split
             cv = PurgedTimeSeriesSplit(n_splits=self.config.training.cv_splits)
             splits = list(cv.split(X, groups=t1_vals))
             train_idx, val_idx = splits[-1]
             X_train, X_val = X[train_idx], X[val_idx]
             y_train, y_val = y[train_idx], y[val_idx]
 
-            adapters = self._create_adapters(X.shape[1])
-            val_preds = {}
+            # 4. Model Creation & Tuning
+            adapters = {}
+            
+            # XGBoost
+            xgb = ModelFactory.create_sklearn_model('xgboost', self.config)
+            xgb = self.tuner.tune(xgb, X_train, y_train)
+            adapters['gb'] = SklearnAdapter(xgb)
 
+            # Voting (RF + LR)
+            voting = ModelFactory.create_sklearn_model('voting', self.config)
+            # Note: Tuning VotingClassifier is complex, skipping for now or tune components separately
+            adapters['technical'] = SklearnAdapter(voting)
+
+            # Deep Learning Models
+            if ML_AVAILABLE:
+                adapters['lstm'] = TorchAdapter(TCNPredictor, X.shape[1], self.config, self.device)
+                adapters['attention'] = TorchAdapter(AttentionNetwork, X.shape[1], self.config, self.device)
+
+            # 5. Training & Validation Prediction
+            val_preds = {}
             for name, adapter in adapters.items():
                 adapter.fit(X_train, y_train, X_val, y_val)
                 val_preds[name] = adapter.predict_proba(X_val)
 
+            # 6. Ensemble Optimization (Stacking)
             def loss_func(w):
                 ens = sum(w[i] * val_preds[k] for i, k in enumerate(val_preds.keys()))
-                return log_loss(y_val, np.clip(ens, 1e-15, 1-1e-15))
+                # Add L2 regularization to weights to prevent overfitting to one model
+                reg = 0.01 * np.sum(w**2)
+                return log_loss(y_val, np.clip(ens, 1e-15, 1-1e-15)) + reg
 
             keys = list(val_preds.keys())
             res = minimize(loss_func, np.ones(len(keys))/len(keys), method='SLSQP', 
                            bounds=[(0,1)]*len(keys), constraints={'type':'eq', 'fun': lambda w: np.sum(w)-1})
             opt_weights = {k: float(res.x[i]) for i, k in enumerate(keys)}
 
+            # 7. Meta Labeling
             meta_model = None
             meta_metrics = {}
             if self.config.meta_labeling.enabled:
                 meta_feats_list = [val_preds[k] for k in keys]
+                # Inject Regime Features if available in selected features
                 regime_cols = ['regime_volatility', 'regime_trend']
                 regime_indices = [active_feats.index(c) for c in regime_cols if c in active_feats]
                 if regime_indices: meta_feats_list.append(X_val[:, regime_indices])
@@ -320,9 +432,10 @@ class EnsembleTrainer:
                 ensemble_probs = sum(opt_weights[k] * val_preds[k] for k in keys)
                 ensemble_preds = np.argmax(ensemble_probs, axis=1)
                 
+                # Meta-Target: 1 if ensemble was correct, 0 otherwise
                 y_meta = np.zeros_like(y_val)
-                y_meta[(ensemble_preds == 2) & (y_val == 2)] = 1
-                y_meta[(ensemble_preds == 0) & (y_val == 0)] = 1
+                y_meta[(ensemble_preds == 2) & (y_val == 2)] = 1 # Correct Buy
+                y_meta[(ensemble_preds == 0) & (y_val == 0)] = 1 # Correct Sell
                 
                 if len(np.unique(y_meta)) > 1:
                     meta_model = RandomForestClassifier(n_estimators=self.config.meta_labeling.n_estimators, 
@@ -333,6 +446,7 @@ class EnsembleTrainer:
                     meta_metrics = {'precision': float(precision_score(y_meta, meta_val_preds, zero_division=0)), 
                                     'f1': float(f1_score(y_meta, meta_val_preds, zero_division=0))}
 
+            # 8. Threshold Optimization
             ensemble_probs = sum(opt_weights[k] * val_preds[k] for k in keys)
             returns = df['close'].pct_change().loc[df_proc.index].values[val_idx][-len(ensemble_probs):]
             best_thresh, best_metric = self.config.confidence_threshold, -np.inf
@@ -344,6 +458,7 @@ class EnsembleTrainer:
                 metric = probabilistic_sharpe_ratio(sigs * returns) if self.config.training.use_probabilistic_sharpe else np.mean(sigs * returns)
                 if metric > best_metric: best_metric = metric; best_thresh = float(thresh)
 
+            # 9. Persistence
             save_dir = os.path.join(self.config.model_path, symbol.replace('/', '_'))
             os.makedirs(save_dir, exist_ok=True)
             
@@ -361,6 +476,15 @@ class EnsembleTrainer:
         except Exception as e:
             logger.error(f"Training failed for {symbol}: {e}", exc_info=True)
             return False
+
+# --- Main Interface ---
+
+class EnsembleModel:
+    def __init__(self, adapters: Dict[str, BaseModelAdapter], meta: Dict[str, Any], meta_model: Any = None, dynamic_state: Dict[str, Any] = None):
+        self.adapters = adapters
+        self.meta = meta
+        self.meta_model = meta_model
+        self.dynamic_state = dynamic_state or {}
 
 def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrategyParams, leader_df: Optional[pd.DataFrame] = None) -> bool:
     trainer = EnsembleTrainer(config)
