@@ -1,9 +1,10 @@
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
 from datetime import datetime, timezone
-from typing import Literal, Optional, Dict, Any, List, Union
-from decimal import Decimal, getcontext, ROUND_DOWN, ROUND_HALF_UP, InvalidOperation
+from typing import Literal, Optional, Dict, Any, Union
+from decimal import Decimal, getcontext, ROUND_DOWN, InvalidOperation
 
 # --- Global Precision Settings ---
+# Set global precision to 28 places (standard for financial compute)
 getcontext().prec = 28
 
 # Type Alias for Financial Calculations
@@ -12,24 +13,34 @@ Dec = Decimal
 ZERO = Dec("0")
 ONE = Dec("1")
 
+def setup_math_context():
+    """Ensures the Decimal context is configured correctly for the process."""
+    getcontext().prec = 28
+    getcontext().rounding = ROUND_DOWN
+
+setup_math_context()
+
 def to_decimal(value: Union[float, str, int, Decimal, None]) -> Decimal:
     """
     Safely converts a value to Decimal, handling float artifacts via string conversion.
-    Returns ZERO if input is None.
+    Returns ZERO if input is None or invalid.
     """
     if value is None:
         return ZERO
     if isinstance(value, Decimal):
         return value
+    if isinstance(value, int):
+        return Decimal(value)
     if isinstance(value, float):
-        # Convert to string first to avoid float precision artifacts
+        # Convert to string first to avoid float precision artifacts (e.g. 0.1 -> 0.10000000000000000555)
+        # We limit to 20 decimal places to strip garbage precision from floats
         return Decimal(f"{value:.20f}".rstrip('0').rstrip('.'))
     try:
         return Decimal(str(value))
     except InvalidOperation:
         return ZERO
 
-def safe_div(numerator: Decimal, denominator: Decimal, precision: Decimal = ZERO) -> Decimal:
+def safe_div(numerator: Decimal, denominator: Decimal) -> Decimal:
     """Safe division returning ZERO on DivisionByZero."""
     if denominator == ZERO:
         return ZERO
