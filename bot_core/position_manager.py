@@ -35,6 +35,7 @@ class Position(Base):
     entry_price = Column(Float, nullable=False)
     status = Column(SQLAlchemyEnum(PositionStatus), default=PositionStatus.OPEN, nullable=False, index=True)
     order_id = Column(String, nullable=True, index=True)
+    closing_order_id = Column(String, nullable=True, index=True)
     trade_id = Column(String, nullable=True)
     stop_loss_price = Column(Float, nullable=True)
     take_profit_price = Column(Float, nullable=True)
@@ -124,6 +125,8 @@ class PositionManager:
                         conn.execute(text("ALTER TABLE positions ADD COLUMN execution_latency_ms FLOAT"))
                     if 'slippage_pct' not in columns:
                         conn.execute(text("ALTER TABLE positions ADD COLUMN slippage_pct FLOAT"))
+                    if 'closing_order_id' not in columns:
+                        conn.execute(text("ALTER TABLE positions ADD COLUMN closing_order_id TEXT"))
                 
                 if not insp.has_table('risk_state'):
                     RiskState.__table__.create(self.engine)
@@ -144,20 +147,13 @@ class PositionManager:
                     cached_positions=len(self._position_cache))
 
     async def reconcile_positions(self, exchange_api: 'ExchangeAPI', latest_prices: Dict[str, float]):
-        """
-        Reconciles local database state with the exchange.
-        Detects phantom positions (in DB but not on exchange) and handles them.
-        """
         logger.info("Starting position reconciliation...")
         
-        # 1. Clear stuck PENDING positions
         pending = await self.get_pending_positions()
         for pos in pending:
-            # If pending for > 5 minutes, mark failed
             if (Clock.now() - pos.creation_timestamp).total_seconds() > 300:
                 await self.mark_position_failed(pos.symbol, pos.order_id, "Reconciliation Timeout")
 
-        # 2. Check OPEN positions against Exchange Balances
         open_positions = await self.get_all_open_positions()
         if not open_positions: 
             return
@@ -166,10 +162,8 @@ class PositionManager:
             balances = await exchange_api.get_balance()
             for pos in open_positions:
                 base_asset = pos.symbol.split('/')[0]
-                # Check if we actually hold the asset (for LONGs)
                 if pos.side == 'BUY':
                     held_balance = balances.get(base_asset, {}).get('total', 0.0)
-                    # Allow 10% tolerance for fees/dust
                     if held_balance < (pos.quantity * 0.90):
                         logger.critical("Phantom position detected! Closing in DB.", symbol=pos.symbol, db_qty=pos.quantity, exchange_qty=held_balance)
                         price = latest_prices.get(pos.symbol, pos.entry_price)
@@ -449,6 +443,110 @@ class PositionManager:
         finally:
             session.close()
 
+    async def register_closing_order(self, symbol: str, closing_order_id: str):
+        """Registers the order ID that is intended to close the position."""
+        async with self._db_lock:
+            await self._run_in_executor(self._register_closing_order_sync, symbol, closing_order_id)
+            if symbol in self._position_cache:
+                self._position_cache[symbol].closing_order_id = closing_order_id
+
+    def _register_closing_order_sync(self, symbol: str, closing_order_id: str):
+        session = self.SessionLocal()
+        try:
+            position = session.query(Position).filter(Position.symbol == symbol, Position.status == PositionStatus.OPEN).first()
+            if position:
+                position.closing_order_id = closing_order_id
+                session.commit()
+        except Exception as e:
+            logger.error("Failed to register closing order", symbol=symbol, error=str(e))
+            session.rollback()
+        finally:
+            session.close()
+
+    async def confirm_position_close(self, symbol: str, exit_price: float, filled_qty: float, fees: float, reason: str = "Filled") -> Optional[Position]:
+        """Confirms a position closure based on a filled closing order."""
+        async with self._db_lock:
+            closed_pos = await self._run_in_executor(self._confirm_position_close_sync, symbol, exit_price, filled_qty, fees, reason)
+            if closed_pos:
+                if closed_pos.status == PositionStatus.CLOSED:
+                    self._realized_pnl += closed_pos.pnl
+                    if symbol in self._position_cache:
+                        del self._position_cache[symbol]
+                    if self.alert_system:
+                        pnl_emoji = "🟢" if closed_pos.pnl >= 0 else "🔴"
+                        asyncio.run_coroutine_threadsafe(self.alert_system.send_alert(
+                            level='info',
+                            message=f"{pnl_emoji} Closed position for {symbol}",
+                            details={'symbol': symbol, 'net_pnl': f'{closed_pos.pnl:.2f}', 'reason': reason}
+                        ), asyncio.get_running_loop())
+                else:
+                    # Partial close, update cache
+                    self._position_cache[symbol] = closed_pos
+            return closed_pos
+
+    def _confirm_position_close_sync(self, symbol: str, exit_price: float, filled_qty: float, fees: float, reason: str) -> Optional[Position]:
+        session = self.SessionLocal()
+        try:
+            position = session.query(Position).filter(Position.symbol == symbol, Position.status == PositionStatus.OPEN).first()
+            if not position:
+                return None
+
+            # Handle Partial Fills
+            if filled_qty < (position.quantity * 0.999):
+                # Reduce Position
+                gross_pnl = (exit_price - position.entry_price) * filled_qty
+                if position.side == 'SELL':
+                    gross_pnl = -gross_pnl
+                
+                chunk_ratio = filled_qty / position.quantity
+                entry_fees_chunk = position.fees * chunk_ratio
+                total_chunk_fees = entry_fees_chunk + fees
+                net_pnl = gross_pnl - total_chunk_fees
+
+                # Create a closed record for the chunk
+                closed_chunk = Position(
+                    symbol=symbol, side=position.side, quantity=filled_qty, entry_price=position.entry_price,
+                    status=PositionStatus.CLOSED, order_id=position.order_id, trade_id=position.trade_id,
+                    open_timestamp=position.open_timestamp, close_timestamp=Clock.now(), close_price=exit_price,
+                    pnl=net_pnl, fees=total_chunk_fees, exit_reason=reason + " (Partial)"
+                )
+                session.add(closed_chunk)
+
+                # Update remaining position
+                position.quantity -= filled_qty
+                position.fees -= entry_fees_chunk
+                self._realized_pnl += net_pnl
+                
+                session.commit()
+                session.refresh(position)
+                session.expunge(position)
+                return position
+            else:
+                # Full Close
+                gross_pnl = (exit_price - position.entry_price) * position.quantity
+                if position.side == 'SELL':
+                    gross_pnl = -gross_pnl
+
+                position.fees += fees
+                net_pnl = gross_pnl - position.fees
+
+                position.status = PositionStatus.CLOSED
+                position.close_price = exit_price
+                position.close_timestamp = Clock.now()
+                position.pnl = net_pnl
+                position.exit_reason = reason
+                
+                session.commit()
+                session.refresh(position)
+                session.expunge(position)
+                return position
+        except Exception as e:
+            logger.error("Failed to confirm position close", symbol=symbol, error=str(e))
+            session.rollback()
+            return None
+        finally:
+            session.close()
+
     async def mark_position_failed(self, symbol: str, order_id: str, reason: str):
         async with self._db_lock:
             await self._run_in_executor(self._mark_position_failed_sync, symbol, order_id, reason)
@@ -473,6 +571,7 @@ class PositionManager:
             session.close()
 
     async def close_position(self, symbol: str, close_price: float, reason: str = "Unknown", actual_filled_qty: Optional[float] = None, fees: float = 0.0) -> Optional[Position]:
+        """Immediate close (e.g. for dust or reconciliation)."""
         async with self._db_lock:
             closed_pos = await self._run_in_executor(self._close_position_sync, symbol, close_price, reason, actual_filled_qty, fees)
             if closed_pos:
@@ -515,56 +614,6 @@ class PositionManager:
             return position
         except Exception as e:
             logger.error("Failed to close position", symbol=symbol, error=str(e))
-            session.rollback()
-            return None
-        finally:
-            session.close()
-
-    async def reduce_position(self, symbol: str, quantity: float, price: float, reason: str, fees: float = 0.0) -> Optional[Position]:
-        async with self._db_lock:
-            updated_pos = await self._run_in_executor(self._reduce_position_sync, symbol, quantity, price, reason, fees)
-            if updated_pos:
-                self._position_cache[symbol] = updated_pos
-            return updated_pos
-
-    def _reduce_position_sync(self, symbol: str, quantity: float, price: float, reason: str, fees: float) -> Optional[Position]:
-        session = self.SessionLocal()
-        try:
-            position = session.query(Position).filter(Position.symbol == symbol, Position.status == PositionStatus.OPEN).first()
-            if not position:
-                return None
-
-            if quantity >= (position.quantity * 0.999):
-                session.close()
-                return self._close_position_sync(symbol, price, reason, actual_filled_qty=quantity, fees=fees)
-
-            gross_pnl = (price - position.entry_price) * quantity
-            if position.side == 'SELL':
-                gross_pnl = -gross_pnl
-
-            chunk_ratio = quantity / position.quantity
-            entry_fees_chunk = position.fees * chunk_ratio
-            total_chunk_fees = entry_fees_chunk + fees
-            net_pnl = gross_pnl - total_chunk_fees
-
-            closed_chunk = Position(
-                symbol=symbol, side=position.side, quantity=quantity, entry_price=position.entry_price,
-                status=PositionStatus.CLOSED, order_id=position.order_id, trade_id=position.trade_id,
-                open_timestamp=position.open_timestamp, close_timestamp=Clock.now(), close_price=price,
-                pnl=net_pnl, fees=total_chunk_fees, exit_reason=reason
-            )
-            session.add(closed_chunk)
-
-            position.quantity -= quantity
-            position.fees -= entry_fees_chunk
-            self._realized_pnl += net_pnl
-            
-            session.commit()
-            session.refresh(position)
-            session.expunge(position)
-            return position
-        except Exception as e:
-            logger.error("Failed to reduce position", symbol=symbol, error=str(e))
             session.rollback()
             return None
         finally:
