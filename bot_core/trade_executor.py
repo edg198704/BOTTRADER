@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from bot_core.logger import get_logger
 from bot_core.config import BotConfig, ExecutionProfile
-from bot_core.exchange_api import ExchangeAPI, BotInsufficientFundsError, BotInvalidOrderError
+from bot_core.exchange_api import ExchangeAPI, BotInsufficientFundsError, BotInvalidOrderError, OrderStateUnknownError
 from bot_core.position_manager import PositionManager, Position
 from bot_core.risk_manager import RiskManager
 from bot_core.order_sizer import OrderSizer
@@ -258,12 +258,11 @@ class TradeExecutor:
                                  metadata: Dict[str, Any]):
         """Background task to handle the network I/O for order placement."""
         try:
-            extra_params = {'clientOrderId': trade_id}
-            if profile.post_only and order_type == 'LIMIT':
-                extra_params['postOnly'] = True
-
-            order_result = await self.exchange_api.place_order(
-                symbol, side, order_type, quantity, price=price, extra_params=extra_params
+            # Use the new Idempotent Gateway
+            order_result = await self.exchange_api.place_order_idempotent(
+                symbol, side, order_type, quantity, price, 
+                client_order_id=trade_id,
+                safety_config=self.config.execution.safety
             )
             
             exchange_order_id = order_result.get('orderId', trade_id)
@@ -287,6 +286,18 @@ class TradeExecutor:
             
             await self.order_lifecycle_service.register_order(ctx)
             logger.info("Order submitted successfully.", trade_id=trade_id, exchange_id=exchange_order_id)
+
+        except OrderStateUnknownError as e:
+            logger.critical("Order state unknown after max verification attempts!", trade_id=trade_id, error=str(e))
+            # Do NOT mark failed. Leave as PENDING. 
+            # The OrderLifecycleManager's reconciliation logic will eventually pick it up or expire it.
+            # We alert the human operator.
+            if self.alert_system:
+                asyncio.create_task(self.alert_system.send_alert(
+                    "CRITICAL", 
+                    f"Order State Unknown for {symbol}", 
+                    details={'trade_id': trade_id, 'error': str(e)}
+                ))
 
         except Exception as e:
             logger.error("Order placement failed in background task.", error=str(e), trade_id=trade_id)
@@ -318,6 +329,8 @@ class TradeExecutor:
 
             try:
                 extra_params = {'reduceOnly': True} if order_type == 'LIMIT' else {}
+                # Closing orders are less critical for idempotency (reduceOnly protects us), 
+                # but we still use standard placement.
                 order_result = await self.exchange_api.place_order(
                     position.symbol, close_side, order_type, close_qty, price=limit_price, extra_params=extra_params
                 )
