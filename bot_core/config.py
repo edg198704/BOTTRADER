@@ -28,11 +28,14 @@ class EnsembleWeightsConfig(BaseModel):
     use_stacking: bool = True
     optimization_method: str = 'slsqp'
     disagreement_penalty: float = 0.5
+    
+    # --- Online Learning Settings ---
     use_regime_specific_weights: bool = True
     use_dynamic_weighting: bool = True
     dynamic_window: int = 25
     dynamic_smoothing_factor: float = 0.1
     adaptive_weight_learning_rate: float = 0.05
+    learning_algorithm: Literal['momentum', 'exponentiated_gradient'] = 'exponentiated_gradient'
 
 class MetaLabelingConfig(BaseModel):
     enabled: bool = True
@@ -61,7 +64,7 @@ class MarketRegimeConfig(BaseModel):
     trend_strength_threshold: float = 0.015
     volatility_multiplier: float = 1.5
     trend_fast_ma_col: str = "sma_fast"
-    trend_slow_ma_col: "sma_slow"
+    trend_slow_ma_col: str = "sma_slow"
     volatility_col: str = "atr"
     rsi_col: str = "rsi"
     use_adx_filter: bool = False
@@ -217,6 +220,7 @@ class ExecutionConfig(BaseModel):
     execute_on_timeout: bool
     post_only: bool = False
     max_entry_spread_pct: float = 0.001
+    max_impact_cost_pct: float = 0.005 # New: Max estimated impact cost (slippage) allowed based on order book depth
 
 class DataHandlerConfig(BaseModel):
     history_limit: int
