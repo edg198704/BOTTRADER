@@ -15,21 +15,9 @@ from bot_core.order_sizer import OrderSizer
 from bot_core.order_lifecycle_manager import OrderLifecycleService, ActiveOrderContext
 from bot_core.monitoring import AlertSystem
 from bot_core.data_handler import DataHandler
-from bot_core.common import TradeSignal, to_decimal, ZERO
+from bot_core.common import TradeSignal, TradeExecutionResult, to_decimal, ZERO
 
 logger = get_logger(__name__)
-
-class TradeExecutionResult(BaseModel):
-    symbol: str
-    action: str
-    quantity: Decimal
-    price: Decimal
-    order_id: str
-    status: str
-    metadata: Dict[str, Any] = {}
-
-    class Config:
-        arbitrary_types_allowed = True
 
 class PreTradeValidator:
     """Encapsulates all pre-trade validation logic."""
@@ -115,6 +103,7 @@ class TradeExecutor:
     """
     Institutional-grade execution engine.
     Enforces strict pre-trade checks, atomic execution locking, and delegates lifecycle management.
+    Uses a Fire-and-Forget model for order placement to avoid blocking the tick pipeline.
     """
     def __init__(self,
                  config: BotConfig,
@@ -153,6 +142,7 @@ class TradeExecutor:
     async def execute_trade_signal(self, signal: TradeSignal, df_with_indicators: Any, position_snapshot: Optional[Position]) -> Optional[TradeExecutionResult]:
         """
         Router for trade signals. Ensures atomic execution per symbol using Double-Check Locking.
+        Initiates the trade asynchronously to prevent blocking the data pipeline.
         """
         # 1. Basic Validation
         if not self.validator.check_signal_ttl(signal):
@@ -175,7 +165,7 @@ class TradeExecutor:
             # --- Entry Logic ---
             if not current_position:
                 if signal.action in ['BUY', 'SELL']:
-                    return await self._handle_entry(signal, current_price, df_with_indicators)
+                    return await self._initiate_entry(signal, current_price, df_with_indicators)
             
             # --- Exit Logic ---
             elif current_position:
@@ -183,11 +173,12 @@ class TradeExecutor:
                 is_close_short = (signal.action == 'BUY') and current_position.side == 'SELL'
                 
                 if is_close_long or is_close_short:
-                    await self.close_position(current_position, "Strategy Signal")
+                    # Close is also fire-and-forget
+                    asyncio.create_task(self.close_position(current_position, "Strategy Signal"))
                     return None
         return None
 
-    async def _handle_entry(self, signal: TradeSignal, current_price: Decimal, df: Any) -> Optional[TradeExecutionResult]:
+    async def _initiate_entry(self, signal: TradeSignal, current_price: Decimal, df: Any) -> Optional[TradeExecutionResult]:
         symbol = signal.symbol
         side = signal.action
         profile = self._get_execution_profile(signal.urgency)
@@ -240,7 +231,7 @@ class TradeExecutor:
         if order_type == 'LIMIT':
             limit_price = await self._calculate_limit_price(symbol, side, current_price, profile.limit_offset_pct)
 
-        # 6. Execution (Initial Placement)
+        # 6. State Reservation (Synchronous/Fast)
         trade_id = str(uuid.uuid4()) # Unique ID for the entire trade lifecycle
         await self.position_manager.create_pending_position(
             symbol, side, trade_id, trade_id, 
@@ -248,44 +239,61 @@ class TradeExecutor:
             strategy_metadata=signal.metadata
         )
 
+        # 7. Background Execution (Fire-and-Forget)
+        asyncio.create_task(self._submit_order_task(
+            trade_id, symbol, side, order_type, final_quantity, limit_price, profile, market_details, signal.metadata
+        ))
+
+        return TradeExecutionResult(
+            symbol=symbol, action=side, quantity=final_quantity, price=limit_price or current_price,
+            trade_id=trade_id, status='INITIATED', metadata=signal.metadata
+        )
+
+    async def _submit_order_task(self, 
+                                 trade_id: str, 
+                                 symbol: str, 
+                                 side: str, 
+                                 order_type: str, 
+                                 quantity: Decimal, 
+                                 price: Optional[Decimal], 
+                                 profile: ExecutionProfile, 
+                                 market_details: Dict[str, Any],
+                                 metadata: Dict[str, Any]):
+        """Background task to handle the network I/O for order placement."""
         try:
             extra_params = {'clientOrderId': trade_id}
             if profile.post_only and order_type == 'LIMIT':
                 extra_params['postOnly'] = True
 
             order_result = await self.exchange_api.place_order(
-                symbol, side, order_type, final_quantity, price=limit_price, extra_params=extra_params
+                symbol, side, order_type, quantity, price=price, extra_params=extra_params
             )
+            
+            exchange_order_id = order_result.get('orderId', trade_id)
+            if exchange_order_id != trade_id:
+                await self.position_manager.update_pending_order_id(symbol, trade_id, exchange_order_id)
+
+            # Handoff to Lifecycle Service
+            ctx = ActiveOrderContext(
+                trade_id=trade_id,
+                symbol=symbol,
+                side=side,
+                total_quantity=quantity,
+                initial_price=price or ZERO,
+                strategy_metadata=metadata,
+                current_order_id=exchange_order_id,
+                current_price=price or ZERO,
+                market_details=market_details,
+                intent='OPEN',
+                profile=profile
+            )
+            
+            await self.order_lifecycle_service.register_order(ctx)
+            logger.info("Order submitted successfully.", trade_id=trade_id, exchange_id=exchange_order_id)
+
         except Exception as e:
-            logger.error("Order placement failed.", error=str(e))
+            logger.error("Order placement failed in background task.", error=str(e), trade_id=trade_id)
             await self.position_manager.mark_position_failed(symbol, trade_id, str(e))
-            return None
-
-        exchange_order_id = order_result.get('orderId', trade_id)
-        if exchange_order_id != trade_id:
-            await self.position_manager.update_pending_order_id(symbol, trade_id, exchange_order_id)
-
-        # 7. Handoff to Lifecycle Service
-        ctx = ActiveOrderContext(
-            trade_id=trade_id,
-            symbol=symbol,
-            side=side,
-            total_quantity=final_quantity,
-            initial_price=limit_price or current_price,
-            strategy_metadata=signal.metadata,
-            current_order_id=exchange_order_id,
-            current_price=limit_price or current_price,
-            market_details=market_details,
-            intent='OPEN',
-            profile=profile
-        )
-        
-        await self.order_lifecycle_service.register_order(ctx)
-
-        return TradeExecutionResult(
-            symbol=symbol, action=side, quantity=final_quantity, price=limit_price or current_price,
-            order_id=exchange_order_id, status='PENDING', metadata=signal.metadata
-        )
 
     async def close_position(self, position: Position, reason: str):
         async with self._get_lock(position.symbol):
