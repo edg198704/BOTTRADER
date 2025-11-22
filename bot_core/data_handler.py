@@ -281,16 +281,16 @@ class DataHandler:
 
     async def update_symbol_data(self, symbol: str):
         try:
-            # 1. Determine fetch requirements
+            # 1. Determine fetch requirements (Read-only check)
             current_len = 0
             last_ts = None
             
-            # Read-only check (safe without lock for simple len/index access usually, but lock is safer)
-            # We'll grab lock briefly or assume eventual consistency for the check
-            if symbol in self._raw_buffers:
-                current_len = len(self._raw_buffers[symbol])
+            # Optimization: Access without lock first (eventual consistency is fine here)
+            raw_buf = self._raw_buffers.get(symbol)
+            if raw_buf is not None:
+                current_len = len(raw_buf)
                 if current_len > 0:
-                    last_ts = self._raw_buffers[symbol].index[-1]
+                    last_ts = raw_buf.index[-1]
 
             fetch_limit = 5
             is_recovery = False
@@ -357,9 +357,6 @@ class DataHandler:
                         self._raw_buffers[symbol] = latest_df
                 else:
                     # OPTIMIZED INCREMENTAL UPDATE
-                    # Only append rows that are strictly newer than what we have,
-                    # or update the last row if it matches (forming candle update).
-                    
                     last_buffer_ts = current_buffer.index[-1]
                     
                     # 1. New candles (strictly greater timestamp)
@@ -367,13 +364,9 @@ class DataHandler:
                     
                     # 2. Update forming candle (timestamp matches last buffer ts)
                     if last_buffer_ts in latest_df.index:
-                        # Update the last row in place using .iloc for speed
-                        # Note: We must ensure columns match. 
-                        # Assuming standard OHLCV columns.
                         forming_row = latest_df.loc[last_buffer_ts]
+                        # Update values directly using iloc for speed
                         idx_loc = len(current_buffer) - 1
-                        
-                        # Update values directly
                         current_buffer.iloc[idx_loc] = forming_row
                     
                     # 3. Append new rows if any
@@ -382,14 +375,12 @@ class DataHandler:
                     
                     # 4. Prune if too large (Ring Buffer logic)
                     if len(self._raw_buffers[symbol]) > self.max_training_buffer:
-                        # Slice from the end
                         self._raw_buffers[symbol] = self._raw_buffers[symbol].iloc[-self.max_training_buffer:]
 
                 # Inject OBI
                 if self.use_order_book:
                     if 'obi' not in self._raw_buffers[symbol].columns:
                         self._raw_buffers[symbol]['obi'] = 0.0
-                    # Update the last row's OBI
                     self._raw_buffers[symbol].iloc[-1, self._raw_buffers[symbol].columns.get_loc('obi')] = obi_val
 
             await self._process_analysis_window(symbol)
@@ -417,7 +408,6 @@ class DataHandler:
         self._update_latest_price(symbol, processed_df)
 
         # Emit event if new candle closed
-        # We check if the last closed candle timestamp has changed
         closed_df = self.get_market_data(symbol, include_forming=False)
         if closed_df is not None and not closed_df.empty:
             last_closed_ts = closed_df.index[-1]
