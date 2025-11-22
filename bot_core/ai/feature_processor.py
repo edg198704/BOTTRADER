@@ -73,7 +73,6 @@ class FeatureProcessor:
 
     @staticmethod
     def _add_order_book_features(df: pd.DataFrame) -> pd.DataFrame:
-        # OBI is already injected by DataHandler if enabled, but we ensure it exists
         if 'obi' not in df.columns:
             df = df.copy()
             df['obi'] = 0.0
@@ -81,32 +80,44 @@ class FeatureProcessor:
 
     @staticmethod
     def _apply_frac_diff(df: pd.DataFrame, d: float, thres: float) -> pd.DataFrame:
+        """
+        Applies Fractional Differentiation to the 'close' column.
+        Preserves memory by computing weights once and using convolution.
+        """
         df = df.copy()
         if 'close' not in df.columns: return df
         
-        # Weights calculation
-        w, k = [1.], 1
+        # 1. Calculate Weights
+        w = [1.0]
+        k = 1
         while True:
             w_k = -w[-1] / k * (d - k + 1)
-            if abs(w_k) < thres or len(w) >= 2000:
+            if abs(w_k) < thres or k >= 2000:
                 break
             w.append(w_k)
             k += 1
-        weights = np.array(w[::-1])
+        weights = np.array(w[::-1]) # Reverse for convolution
 
-        # Apply convolution
+        # 2. Apply Convolution
         close_vals = df['close'].values
         if len(close_vals) < len(weights):
             df['close_frac'] = np.nan
             return df
             
+        # 'valid' mode returns only points where signals completely overlap
         frac_diff = np.convolve(close_vals, weights, mode='valid')
+        
+        # 3. Pad with NaNs to match original length
         pad_len = len(close_vals) - len(frac_diff)
         df['close_frac'] = np.concatenate([np.full(pad_len, np.nan), frac_diff])
         return df
 
     @staticmethod
     def _stationarize_data(df: pd.DataFrame, cols_to_process: List[str]) -> pd.DataFrame:
+        """
+        Converts non-stationary price series to stationary returns.
+        Uses explicit column name matching instead of heuristic value checking.
+        """
         df_trans = df.copy()
         
         # Vectorized Volume Normalization
@@ -114,31 +125,23 @@ class FeatureProcessor:
             vol_ma = df_trans['volume'].rolling(window=50, min_periods=1).mean().replace(0, 1.0)
             df_trans['volume'] = df_trans['volume'] / vol_ma
 
-        price_keywords = ['upper', 'lower', 'sma', 'ema', 'wma', 'kama', 'mid', 'top', 'bot', 'open', 'high', 'low']
+        # Explicit Price Column Keywords
+        price_keywords = ['open', 'high', 'low', 'close', 'sma', 'ema', 'wma', 'kama', 'mid', 'top', 'bot', 'upper', 'lower']
         
         if 'close' in df_trans.columns:
             close_price = df_trans['close'].replace(0, 1e-8)
             
-            # Identify columns that look like prices
+            # Identify columns that are likely prices based on name
             price_cols = [c for c in cols_to_process 
                           if c in df_trans.columns 
                           and c != 'close' 
                           and c != 'obi'
                           and any(k in c.lower() for k in price_keywords)]
             
-            # Vectorized Stationarization for Price Columns
+            # Vectorized Stationarization: (Price / Close) - 1.0
+            # This normalizes all price indicators relative to the current close price
             if price_cols:
-                # Check if columns are roughly in the same magnitude as price (within 50%)
-                # We use the last value to check magnitude to avoid full series comparison overhead
-                last_close = close_price.iloc[-1]
-                valid_price_cols = []
-                for col in price_cols:
-                    last_val = df_trans[col].iloc[-1]
-                    if 0.5 < (last_val / last_close) < 1.5:
-                        valid_price_cols.append(col)
-                
-                if valid_price_cols:
-                    df_trans[valid_price_cols] = df_trans[valid_price_cols].div(close_price, axis=0) - 1.0
+                df_trans[price_cols] = df_trans[price_cols].div(close_price, axis=0) - 1.0
 
         return df_trans
 
@@ -157,6 +160,7 @@ class FeatureProcessor:
             leader_feats = pd.DataFrame(index=leader_df.index)
             leader_feats['leader_log_return'] = np.log(leader_df['close'] / leader_df['close'].shift(1).replace(0, np.nan))
             if 'rsi' in leader_df.columns: leader_feats['leader_rsi'] = leader_df['rsi']
+            # Align leader features to current df index
             df_proc = df_proc.join(leader_feats, how='left').ffill(limit=5)
 
         df_stat = FeatureProcessor._stationarize_data(df_proc, config.feature_columns)
@@ -240,36 +244,51 @@ class FeatureProcessor:
         if n_samples <= horizon:
             return pd.Series(1, index=df.index), pd.Series(df.index, index=df.index)
 
+        # Efficient sliding window view (memory efficient view, not copy)
         high_windows = sliding_window_view(high, window_shape=horizon)
         low_windows = sliding_window_view(low, window_shape=horizon)
         time_windows = sliding_window_view(timestamps, window_shape=horizon)
         
-        upper_barriers_aligned = upper_barriers[:high_windows.shape[0]].reshape(-1, 1)
-        lower_barriers_aligned = lower_barriers[:low_windows.shape[0]].reshape(-1, 1)
+        # Align barriers to the start of each window
+        # We only need to check the first N-horizon windows
+        valid_len = high_windows.shape[0]
+        upper_barriers = upper_barriers[:valid_len].reshape(-1, 1)
+        lower_barriers = lower_barriers[:valid_len].reshape(-1, 1)
         
-        hit_upper = high_windows >= upper_barriers_aligned
-        hit_lower = low_windows <= lower_barriers_aligned
+        # Boolean masks for barrier hits
+        hit_upper = high_windows >= upper_barriers
+        hit_lower = low_windows <= lower_barriers
         
+        # Find first index of hit (argmax returns 0 if no True, so we check any())
         upper_indices = np.argmax(hit_upper, axis=1)
         lower_indices = np.argmax(hit_lower, axis=1)
         
         any_upper = np.any(hit_upper, axis=1)
         any_lower = np.any(hit_lower, axis=1)
         
-        labels = np.ones(len(high_windows), dtype=int)
-        t1_vals = time_windows[:, -1].copy()
+        labels = np.ones(valid_len, dtype=int) # Default Hold (1)
+        t1_vals = time_windows[:, -1].copy() # Default to horizon end
         
+        # Logic: 
+        # If Upper hit first -> Buy (2)
+        # If Lower hit first -> Sell (0)
+        # If Both hit same candle -> Sell (Conservative)
+        
+        # Buy: Hit Upper AND (Not Hit Lower OR Upper < Lower)
         buy_mask = any_upper & (~any_lower | (upper_indices < lower_indices))
+        
+        # Sell: Hit Lower AND (Not Hit Upper OR Lower < Upper)
         sell_mask = any_lower & (~any_upper | (lower_indices < upper_indices))
         
         labels[buy_mask] = 2
         labels[sell_mask] = 0
         
-        row_indices = np.arange(len(labels))
+        # Set t1 (exit time) to the time of the barrier hit
+        row_indices = np.arange(valid_len)
         t1_vals[buy_mask] = time_windows[row_indices[buy_mask], upper_indices[buy_mask]]
         t1_vals[sell_mask] = time_windows[row_indices[sell_mask], lower_indices[sell_mask]]
         
-        result_index = df.index[:len(labels)]
+        result_index = df.index[:valid_len]
         
         return pd.Series(labels, index=result_index), pd.Series(t1_vals, index=result_index)
 
