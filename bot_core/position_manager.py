@@ -429,10 +429,7 @@ class PositionManager:
                 return None
 
             if filled_qty < (pos.quantity * Dec("0.999")):
-                # Partial Close Logic (Complex, simplified here for brevity: assume full close for now or implement split)
-                # For HFT simplicity, we often treat partials as reducing the open position size
-                # But here we will implement a basic reduction in memory and persist it
-                
+                # Partial Close Logic
                 gross_pnl = (exit_price - pos.entry_price) * filled_qty
                 if pos.side == 'SELL': gross_pnl = -gross_pnl
                 
@@ -529,8 +526,6 @@ class PositionManager:
 
     async def close_position(self, symbol: str, close_price: Decimal, reason: str = "Unknown", actual_filled_qty: Optional[Decimal] = None, fees: Decimal = ZERO) -> Optional[Position]:
         # Wrapper for manual close that delegates to confirm_position_close logic
-        # In a real scenario, this would place an order first. 
-        # This method assumes the order is already filled or is a forced logical close.
         async with self._get_lock(symbol):
             pos = self._position_cache.get(symbol)
             if not pos:
@@ -633,6 +628,7 @@ class PositionManager:
     def get_portfolio_value(self, latest_prices: Dict[str, float], open_positions: List[Position]) -> Decimal:
         unrealized_pnl = ZERO
         for pos in open_positions:
+            # Convert float price to Decimal for calculation
             current_price = to_decimal(latest_prices.get(pos.symbol, float(pos.entry_price)))
             pnl = (current_price - pos.entry_price) * pos.quantity
             if pos.side == 'SELL':
