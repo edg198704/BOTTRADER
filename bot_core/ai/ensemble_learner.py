@@ -439,20 +439,20 @@ class EnsembleLearner:
         await asyncio.gather(*[self.reload_models(s) for s in symbols])
 
     async def predict(self, df: pd.DataFrame, symbol: str, regime: str = None, leader_df: pd.DataFrame = None, custom_weights: Dict = None) -> AIInferenceResult:
-        with self._lock:
-            if symbol not in self.symbol_models: 
-                return AIInferenceResult(action='hold', confidence=0.0, model_version='none', active_weights={}, top_features={}, metrics={})
-        
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self.executor, self._predict_sync, df, symbol, leader_df, custom_weights)
-
-    def _predict_sync(self, df, symbol, leader_df, custom_weights):
+        # Optimization: Grab the model entry under lock, but process outside lock
+        entry = None
         with self._lock:
             entry = self.symbol_models.get(symbol)
             
         if not entry:
             return AIInferenceResult(action='hold', confidence=0.0, model_version='none', active_weights={}, top_features={}, metrics={})
+        
+        loop = asyncio.get_running_loop()
+        # Pass the entry explicitly to avoid locking inside the thread
+        return await loop.run_in_executor(self.executor, self._predict_sync, df, entry, leader_df, custom_weights)
 
+    def _predict_sync(self, df, entry, leader_df, custom_weights):
+        # No lock needed here as 'entry' is a local reference to the dictionary
         adapters, meta, meta_model = entry['adapters'], entry['meta'], entry.get('meta_model')
         
         # Data Prep
