@@ -20,8 +20,7 @@ ujson>=5.8.0
 aiofiles>=23.1.0
 
 # AI & Machine Learning
-# Using standard torch. For smaller image, one could use the cpu-only index, 
-# but standard is safer for general compatibility unless specified.
+# Note: Dockerfile handles the --extra-index-url for CPU version
 torch>=2.0.1
 scikit-learn>=1.3.0
 xgboost>=1.7.6
