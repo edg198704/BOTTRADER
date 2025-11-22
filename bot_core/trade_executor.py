@@ -182,7 +182,8 @@ class TradeExecutor:
             strategy_metadata=signal.metadata,
             current_order_id=exchange_order_id,
             current_price=limit_price or current_price,
-            market_details=market_details
+            market_details=market_details,
+            intent='OPEN'
         )
         
         await self.order_lifecycle_service.register_order(ctx)
@@ -220,9 +221,12 @@ class TradeExecutor:
                     position.symbol, close_side, order_type, close_qty, price=limit_price, extra_params=extra_params
                 )
                 
-                # For closing, we also use the lifecycle service to ensure it fills
-                # We reuse the trade_id from the position or generate a new one for the closing trade
                 close_trade_id = f"close_{position.trade_id}_{int(datetime.now().timestamp())}"
+                exchange_order_id = order_result.get('orderId')
+                
+                # Register the closing order ID with the position for tracking
+                if exchange_order_id:
+                    await self.position_manager.register_closing_order(position.symbol, exchange_order_id)
                 
                 ctx = ActiveOrderContext(
                     trade_id=close_trade_id,
@@ -231,33 +235,14 @@ class TradeExecutor:
                     total_quantity=close_qty,
                     initial_price=limit_price or current_price,
                     strategy_metadata={},
-                    current_order_id=order_result.get('orderId'),
+                    current_order_id=exchange_order_id,
                     current_price=limit_price or current_price,
-                    market_details=market_details
+                    market_details=market_details,
+                    intent='CLOSE'
                 )
-                # Note: The Lifecycle Service needs logic to handle 'closing' updates (PositionManager.close_position)
-                # For this refactor, we assume the service handles 'confirm_position_open' which might need adaptation
-                # or we keep closing synchronous for simplicity? 
-                # BETTER: We let the service handle it. The service calls 'confirm_position_open'. 
-                # But wait, closing is different. 
-                # To keep this refactor clean and safe, we will keep closing logic simple or assume the service can handle it.
-                # Given the complexity, let's keep closing 'fire and forget' via the service, but we need to ensure
-                # the service knows it's a closing trade. 
-                # Actually, for closing, simple chasing is often enough. 
-                # Let's register it. The service will call 'confirm_position_open' which might fail if no pending pos.
-                # We need to update the service to handle closing. 
-                # FOR NOW: We will rely on the service's generic fill logic, but we might need to patch PositionManager to handle 'confirm' on existing open positions?
-                # No, PositionManager.confirm_position_open expects PENDING.
-                # So for closing, we should probably stick to a simpler loop or update the service.
-                # DECISION: To avoid over-complicating the JSON response, we will use the service but acknowledge 
-                # that PositionManager needs to handle the fill correctly. 
-                # Actually, let's just use the service and assume we'd add a 'is_closing' flag in a real scenario.
-                # For this output, I will register it, but note that the service calls 'confirm_position_open'.
-                # This implies we need a PENDING position for the close. 
-                # Let's create a PENDING close position? No, that breaks the model.
-                # FALLBACK: For closing, we will just place the order and let the exchange fill it. 
-                # The PositionManager reconciliation loop will catch the closed position eventually.
-                pass
+                
+                await self.order_lifecycle_service.register_order(ctx)
+                logger.info("Closing order placed and registered", symbol=position.symbol, order_id=exchange_order_id)
 
             except Exception as e:
                 logger.error("Close order placement failed.", error=str(e))
