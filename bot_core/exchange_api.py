@@ -58,15 +58,17 @@ class ExchangeAPI(abc.ABC):
 
     @abc.abstractmethod
     async def get_ticker_data(self, symbol: str) -> Dict[str, Any]:
-        # Returns floats for analysis, but TradeExecutor should convert to Decimal for pricing
+        # Returns Decimal for pricing fields
         pass
 
     @abc.abstractmethod
     async def get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        # Returns Decimal for pricing fields
         pass
 
     @abc.abstractmethod
     async def fetch_order_book(self, symbol: str, limit: int = 5) -> Dict[str, Any]:
+        # Returns Decimal for prices and volumes
         pass
 
     @abc.abstractmethod
@@ -116,7 +118,7 @@ class MockExchangeAPI(ExchangeAPI):
         raw_balances = initial_balances if initial_balances is not None else {"USDT": 10000.0, "BTC": 0.0}
         self.balances = {k: to_decimal(v) for k, v in raw_balances.items()}
         self.order_id_counter = 0
-        self.last_price = 30000.0
+        self.last_price = Dec("30000.0")
         self.open_orders: Dict[str, Dict[str, Any]] = {}
         logger.info("MockExchangeAPI initialized", initial_balances=self.balances)
 
@@ -124,7 +126,7 @@ class MockExchangeAPI(ExchangeAPI):
         now = int(time.time() * 1000)
         interval_ms = 60000 
         ohlcv = []
-        price = self.last_price
+        price = float(self.last_price)
         for i in range(limit):
             ts = now - (limit - i - 1) * interval_ms
             open_price = price + random.uniform(-50, 50)
@@ -134,12 +136,12 @@ class MockExchangeAPI(ExchangeAPI):
             volume = random.uniform(10, 100)
             ohlcv.append([float(ts), open_price, high, low, close_price, volume])
             price += random.uniform(-100, 100)
-        self.last_price = price
+        self.last_price = to_decimal(price)
         return ohlcv
 
     async def get_ticker_data(self, symbol: str) -> Dict[str, Any]:
-        self.last_price += random.uniform(-100, 100)
-        spread = self.last_price * 0.0005
+        self.last_price += to_decimal(random.uniform(-100, 100))
+        spread = self.last_price * Dec("0.0005")
         return {
             "symbol": symbol, 
             "last": self.last_price,
@@ -155,9 +157,10 @@ class MockExchangeAPI(ExchangeAPI):
 
     async def fetch_order_book(self, symbol: str, limit: int = 5) -> Dict[str, Any]:
         price = self.last_price
-        spread = price * 0.0005
-        bids = [[price - spread/2 - i*0.1, 1.0] for i in range(limit)]
-        asks = [[price + spread/2 + i*0.1, 1.0] for i in range(limit)]
+        spread = price * Dec("0.0005")
+        # Return Decimals in order book
+        bids = [[price - spread/2 - to_decimal(i)*Dec("0.1"), Dec("1.0")] for i in range(limit)]
+        asks = [[price + spread/2 + to_decimal(i)*Dec("0.1"), Dec("1.0")] for i in range(limit)]
         return {'symbol': symbol, 'bids': bids, 'asks': asks, 'timestamp': int(time.time()*1000)}
 
     async def place_order(self, symbol: str, side: str, order_type: str, quantity: Decimal, price: Optional[Decimal] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]:
@@ -169,7 +172,7 @@ class MockExchangeAPI(ExchangeAPI):
             'symbol': symbol,
             'side': side.upper(),
             'type': order_type.upper(),
-            'price': price if price else to_decimal(self.last_price),
+            'price': price if price else self.last_price,
             'quantity': quantity,
             'status': 'OPEN',
             'filled': ZERO,
@@ -188,7 +191,7 @@ class MockExchangeAPI(ExchangeAPI):
         if not order: return None
 
         if order['status'] == 'OPEN':
-            fill_price = to_decimal(self.last_price)
+            fill_price = self.last_price
             can_fill = False
             order_price = order['price']
             
@@ -200,7 +203,7 @@ class MockExchangeAPI(ExchangeAPI):
             if can_fill:
                 base, quote = symbol.split('/')
                 cost = order['quantity'] * fill_price
-                fee = cost * to_decimal("0.001")
+                fee = cost * Dec("0.001")
                 if order['side'] == "BUY":
                     self.balances[quote] -= (cost + fee)
                     self.balances[base] = self.balances.get(base, ZERO) + order['quantity']
@@ -365,22 +368,38 @@ class CCXTExchangeAPI(ExchangeAPI):
 
     async def get_ticker_data(self, symbol: str) -> Dict[str, Any]:
         t = await self.exchange.fetch_ticker(symbol)
-        return {"symbol": symbol, "last": t.get('last'), "bid": t.get('bid'), "ask": t.get('ask')}
+        return {
+            "symbol": symbol, 
+            "last": to_decimal(t.get('last')), 
+            "bid": to_decimal(t.get('bid')), 
+            "ask": to_decimal(t.get('ask'))
+        }
 
     async def get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
         if self.exchange.has['fetchTickers']:
             raw = await self.exchange.fetch_tickers(symbols)
-            return {s: {"symbol": s, "last": t.get('last'), "bid": t.get('bid'), "ask": t.get('ask')} for s, t in raw.items() if s in symbols}
+            return {
+                s: {
+                    "symbol": s, 
+                    "last": to_decimal(t.get('last')), 
+                    "bid": to_decimal(t.get('bid')), 
+                    "ask": to_decimal(t.get('ask'))
+                } for s, t in raw.items() if s in symbols
+            }
         else:
             return {s: await self.get_ticker_data(s) for s in symbols}
 
     async def fetch_order_book(self, symbol: str, limit: int = 5) -> Dict[str, Any]:
-        return await self.exchange.fetch_order_book(symbol, limit=limit)
+        ob = await self.exchange.fetch_order_book(symbol, limit=limit)
+        # Convert bids/asks to Decimal
+        bids = [[to_decimal(p), to_decimal(v)] for p, v in ob.get('bids', [])]
+        asks = [[to_decimal(p), to_decimal(v)] for p, v in ob.get('asks', [])]
+        return {'symbol': symbol, 'bids': bids, 'asks': asks, 'timestamp': ob.get('timestamp')}
 
     async def place_order(self, symbol: str, side: str, order_type: str, quantity: Decimal, price: Optional[Decimal] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]:
         try:
             params = extra_params or {}
-            # Convert Decimal to float for CCXT
+            # Convert Decimal to float for CCXT (it expects floats)
             qty_float = float(quantity)
             price_float = float(price) if price else None
 
