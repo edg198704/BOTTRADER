@@ -3,11 +3,13 @@ from typing import List, Optional, Any, Dict, TYPE_CHECKING, Tuple
 from datetime import datetime, timedelta
 import asyncio
 import numpy as np
+from decimal import Decimal
 
 from bot_core.config import RiskManagementConfig
 from bot_core.logger import get_logger
 from bot_core.position_manager import Position
 from bot_core.utils import Clock
+from bot_core.common import to_decimal, ZERO, ONE
 
 if TYPE_CHECKING:
     from bot_core.monitoring import AlertSystem
@@ -60,7 +62,6 @@ class CorrelationRule(RiskRule):
         if not context.config.correlation.enabled:
             return True, "OK"
         
-        # Use cached correlations for O(1) check
         cached_corrs = context.cached_correlations.get(symbol, {})
         for pos_symbol, corr_value in cached_corrs.items():
             if corr_value > context.config.correlation.max_correlation:
@@ -69,12 +70,10 @@ class CorrelationRule(RiskRule):
         return True, "OK"
 
 class VaRCheckRule(RiskRule):
-    """Checks if the portfolio is already breaching VaR limits using cached metrics."""
     async def check(self, symbol: str, open_positions: List[Position], context: 'RiskManager') -> Tuple[bool, str]:
         if not context.config.var.enabled:
             return True, "OK"
         
-        # Use cached VaR for O(1) check
         current_var_pct = context.cached_portfolio_var_pct
         limit_pct = context.config.var.max_portfolio_var_pct
         
@@ -93,21 +92,21 @@ class PositionSizer:
 
     def calculate(self, 
                   symbol: str, 
-                  equity: float, 
-                  entry_price: float, 
-                  stop_loss: float, 
+                  equity: Decimal, 
+                  entry_price: Decimal, 
+                  stop_loss: Decimal, 
                   open_positions: List[Position], 
                   regime: Optional[str],
                   confidence: Optional[float],
                   confidence_threshold: Optional[float],
-                  metrics: Optional[Dict]) -> float:
+                  metrics: Optional[Dict]) -> Decimal:
         
-        if entry_price <= 0 or stop_loss <= 0: return 0.0
+        if entry_price <= ZERO or stop_loss <= ZERO: return ZERO
         risk_per_unit = abs(entry_price - stop_loss)
-        if risk_per_unit == 0: return 0.0
+        if risk_per_unit == ZERO: return ZERO
 
         # 1. Base Risk
-        base_risk_pct = self._get_regime_param('risk_per_trade_pct', regime)
+        base_risk_pct = to_decimal(self._get_regime_param('risk_per_trade_pct', regime))
         
         # 2. Kelly Criterion
         risk_pct = self._apply_kelly(base_risk_pct, metrics)
@@ -142,70 +141,83 @@ class PositionSizer:
             if override is not None: return override
         return default
 
-    def _apply_kelly(self, base_risk: float, metrics: Optional[Dict]) -> float:
+    def _apply_kelly(self, base_risk: Decimal, metrics: Optional[Dict]) -> Decimal:
         if not self.config.use_kelly_criterion or not metrics:
             return base_risk
         ensemble = metrics.get('ensemble', metrics)
-        win_rate = ensemble.get('win_rate', 0.0)
-        profit_factor = ensemble.get('profit_factor', 0.0)
-        if win_rate <= 0 or profit_factor <= 0: return base_risk
-        if win_rate >= 1.0: return base_risk * 2.0
-        r_ratio = profit_factor * (1.0 - win_rate) / win_rate
-        if r_ratio <= 0: return base_risk
-        kelly = win_rate - (1.0 - win_rate) / r_ratio
-        return max(0.0, min(kelly * self.config.kelly_fraction, base_risk * 5.0, 0.05))
+        win_rate = to_decimal(ensemble.get('win_rate', 0.0))
+        profit_factor = to_decimal(ensemble.get('profit_factor', 0.0))
+        
+        if win_rate <= ZERO or profit_factor <= ZERO: return base_risk
+        if win_rate >= ONE: return base_risk * Decimal("2.0")
+        
+        r_ratio = profit_factor * (ONE - win_rate) / win_rate
+        if r_ratio <= ZERO: return base_risk
+        
+        kelly = win_rate - (ONE - win_rate) / r_ratio
+        kelly_fraction = to_decimal(self.config.kelly_fraction)
+        
+        # Cap Kelly at 5x base risk or 5% total equity for safety
+        max_risk = min(base_risk * Decimal("5.0"), Decimal("0.05"))
+        return max(ZERO, min(kelly * kelly_fraction, max_risk))
 
-    def _apply_confidence(self, risk_pct: float, confidence: Optional[float], threshold: Optional[float]) -> float:
+    def _apply_confidence(self, risk_pct: Decimal, confidence: Optional[float], threshold: Optional[float]) -> Decimal:
         if self.config.confidence_scaling_factor <= 0 or not confidence or not threshold:
             return risk_pct
-        if confidence <= threshold: return risk_pct
-        surplus = confidence - threshold
-        scaler = 1.0 + (surplus * self.config.confidence_scaling_factor)
-        return risk_pct * min(scaler, self.config.max_confidence_risk_multiplier)
+        
+        conf_dec = to_decimal(confidence)
+        thresh_dec = to_decimal(threshold)
+        
+        if conf_dec <= thresh_dec: return risk_pct
+        
+        surplus = conf_dec - thresh_dec
+        scaler = ONE + (surplus * to_decimal(self.config.confidence_scaling_factor))
+        max_mult = to_decimal(self.config.max_confidence_risk_multiplier)
+        return risk_pct * min(scaler, max_mult)
 
-    def _apply_correlation_penalty(self, symbol: str, risk_pct: float) -> float:
+    def _apply_correlation_penalty(self, symbol: str, risk_pct: Decimal) -> Decimal:
         if not self.config.correlation.enabled: return risk_pct
         
-        # Use cached correlations
         cached_corrs = self.risk_manager.cached_correlations.get(symbol, {})
         max_corr = 0.0
         if cached_corrs:
             max_corr = max(cached_corrs.values())
         
         if max_corr > (self.config.correlation.max_correlation * 0.8):
-            return risk_pct * self.config.correlation.penalty_factor
+            return risk_pct * to_decimal(self.config.correlation.penalty_factor)
         return risk_pct
 
-    def _apply_portfolio_cap(self, risk_usd: float, equity: float, open_positions: List[Position]) -> float:
+    def _apply_portfolio_cap(self, risk_usd: Decimal, equity: Decimal, open_positions: List[Position]) -> Decimal:
         if self.config.max_portfolio_risk_pct <= 0: return risk_usd
-        current_risk = sum(abs(p.entry_price - (p.stop_loss_price or p.entry_price)) * p.quantity for p in open_positions)
-        max_risk = equity * self.config.max_portfolio_risk_pct
-        return min(risk_usd, max(0.0, max_risk - current_risk))
+        
+        current_risk = ZERO
+        for p in open_positions:
+            sl = p.stop_loss_price or p.entry_price
+            current_risk += abs(p.entry_price - sl) * p.quantity
+            
+        max_risk = equity * to_decimal(self.config.max_portfolio_risk_pct)
+        return min(risk_usd, max(ZERO, max_risk - current_risk))
 
-    def _apply_var_cap(self, symbol: str, risk_usd: float, equity: float) -> float:
+    def _apply_var_cap(self, symbol: str, risk_usd: Decimal, equity: Decimal) -> Decimal:
         if not self.config.var.enabled: return risk_usd
         
         current_var_pct = self.risk_manager.cached_portfolio_var_pct
         max_var_pct = self.config.var.max_portfolio_var_pct
         
         if current_var_pct >= max_var_pct:
-            return 0.0 # No more risk budget
-            
-        # Simplified Marginal VaR check: 
-        # If we have budget, allow trade. 
-        # Ideally we'd calculate marginal VaR here, but for speed we rely on the background loop
-        # to catch up and the hard cap above to prevent massive over-allocation.
+            return ZERO
         return risk_usd
 
-    def _apply_hard_caps(self, symbol: str, qty: float, equity: float, price: float) -> float:
-        max_by_pct = (equity * self.config.max_position_size_portfolio_pct) / price
-        max_by_usd = self.config.max_position_size_usd / price
-        liquidity_cap = float('inf')
+    def _apply_hard_caps(self, symbol: str, qty: Decimal, equity: Decimal, price: Decimal) -> Decimal:
+        max_by_pct = (equity * to_decimal(self.config.max_position_size_portfolio_pct)) / price
+        max_by_usd = to_decimal(self.config.max_position_size_usd) / price
+        liquidity_cap = Decimal('Infinity')
+        
         if self.config.max_volume_participation_pct > 0:
             df = self.data_handler.get_market_data(symbol)
             if df is not None and 'volume' in df.columns:
                 avg_vol = df['volume'].iloc[-self.config.volume_lookback_periods:].mean()
-                liquidity_cap = avg_vol * self.config.max_volume_participation_pct
+                liquidity_cap = to_decimal(avg_vol) * to_decimal(self.config.max_volume_participation_pct)
         
         return min(qty, max_by_pct, max_by_usd, liquidity_cap)
 
@@ -228,7 +240,6 @@ class RiskManager:
         
         self.liquidation_needed = False
         
-        # --- Cached Metrics (Thread-Safe via Async Loop) ---
         self.cached_portfolio_var_pct: float = 0.0
         self.cached_correlations: Dict[str, Dict[str, float]] = {}
         self._metrics_lock = asyncio.Lock()
@@ -249,7 +260,7 @@ class RiskManager:
     async def initialize(self):
         state = await self.position_manager.get_portfolio_state()
         if state:
-            self.peak_portfolio_value = state['peak_equity']
+            self.peak_portfolio_value = float(state['peak_equity'])
         await self._load_state()
 
     async def _load_state(self):
@@ -276,7 +287,6 @@ class RiskManager:
         return self.circuit_breaker_halted or self.daily_loss_halted
 
     async def run_metrics_loop(self):
-        """Background task to pre-calculate heavy risk metrics (VaR, Correlations)."""
         self.running = True
         logger.info("Starting Risk Metrics background loop.")
         while self.running:
@@ -286,8 +296,6 @@ class RiskManager:
                 break
             except Exception as e:
                 logger.error("Error in Risk Metrics loop", error=str(e))
-            
-            # Run periodically (e.g., every 5 seconds)
             await asyncio.sleep(5)
 
     async def stop(self):
@@ -295,21 +303,16 @@ class RiskManager:
         logger.info("RiskManager stopped.")
 
     async def _recalculate_portfolio_metrics(self):
-        """Performs heavy statistical calculations off the critical path."""
         open_positions = await self.position_manager.get_all_open_positions()
         
-        # 1. Calculate VaR
+        # VaR Calculation (using floats for statistical estimation)
         var_val = self._calculate_portfolio_var_internal(open_positions)
-        portfolio_val = self.position_manager.get_portfolio_value({}, open_positions) # Approx
+        portfolio_val = float(self.position_manager.get_portfolio_value({}, open_positions))
         var_pct = var_val / portfolio_val if portfolio_val > 0 else 0.0
         
-        # 2. Calculate Correlations
         corrs = {}
         if self.config.correlation.enabled and len(open_positions) > 0:
             symbols = list(set([p.symbol for p in open_positions]))
-            # Also include symbols we might trade (from config? hard to know here, so we focus on open pos)
-            # Ideally we'd correlate candidate symbols too, but that requires knowing them.
-            # We'll just correlate open positions against each other for now.
             for i, sym_a in enumerate(symbols):
                 corrs[sym_a] = {}
                 for sym_b in symbols:
@@ -317,12 +320,10 @@ class RiskManager:
                     c = self.data_handler.get_correlation(sym_a, sym_b, self.config.correlation.lookback_periods)
                     corrs[sym_a][sym_b] = c
 
-        # Atomic Update
         async with self._metrics_lock:
             self.cached_portfolio_var_pct = var_pct
             self.cached_correlations = corrs
             
-        # Log if high risk
         if var_pct > self.config.var.max_portfolio_var_pct * 0.8:
             logger.warning("Portfolio VaR is high", var_pct=f"{var_pct:.2%}")
 
@@ -349,7 +350,7 @@ class RiskManager:
         
         for pos in open_positions:
             if pos.symbol in aligned_returns:
-                pos_value = pos.quantity * pos.entry_price
+                pos_value = float(pos.quantity * pos.entry_price)
                 portfolio_pnl_history += (pos_value * aligned_returns[pos.symbol])
         
         var_threshold = (1.0 - self.config.var.confidence_level) * 100
@@ -365,14 +366,14 @@ class RiskManager:
 
     def calculate_position_size(self, 
                                 symbol: str, 
-                                portfolio_equity: float, 
-                                entry_price: float, 
-                                stop_loss_price: float, 
+                                portfolio_equity: Decimal, 
+                                entry_price: Decimal, 
+                                stop_loss_price: Decimal, 
                                 open_positions: List[Position], 
                                 market_regime: Optional[str] = None,
                                 confidence: Optional[float] = None,
                                 confidence_threshold: Optional[float] = None,
-                                model_metrics: Optional[Dict[str, Any]] = None) -> float:
+                                model_metrics: Optional[Dict[str, Any]] = None) -> Decimal:
         
         qty = self.sizer.calculate(
             symbol, portfolio_equity, entry_price, stop_loss_price, 
@@ -380,43 +381,45 @@ class RiskManager:
         )
         
         if self.current_drawdown < -0.05:
-            qty *= 0.75
+            qty *= Decimal("0.75")
             
         return qty
 
-    def calculate_stop_loss(self, side: str, entry_price: float, df: Any, market_regime: Optional[str] = None) -> float:
-        atr = 0.0
+    def calculate_stop_loss(self, side: str, entry_price: Decimal, df: Any, market_regime: Optional[str] = None) -> Decimal:
+        atr = ZERO
         if df is not None and self.config.atr_column_name in df.columns:
-            atr = df[self.config.atr_column_name].iloc[-1]
+            atr = to_decimal(df[self.config.atr_column_name].iloc[-1])
             
         if self.config.stop_loss_type == 'SWING' and df is not None:
             lookback = self.config.swing_lookback
             if len(df) >= lookback:
                 window = df.iloc[-lookback:]
-                buffer = atr * self.config.swing_buffer_atr_multiplier
+                buffer = atr * to_decimal(self.config.swing_buffer_atr_multiplier)
                 if side == 'BUY':
-                    return min(entry_price * 0.99, window['low'].min() - buffer)
+                    low_min = to_decimal(window['low'].min())
+                    return min(entry_price * Decimal("0.99"), low_min - buffer)
                 else:
-                    return max(entry_price * 1.01, window['high'].max() + buffer)
+                    high_max = to_decimal(window['high'].max())
+                    return max(entry_price * Decimal("1.01"), high_max + buffer)
 
-        mult = self.sizer._get_regime_param('atr_stop_multiplier', market_regime)
-        dist = (atr * mult) if atr > 0 else (entry_price * self.config.stop_loss_fallback_pct)
+        mult = to_decimal(self.sizer._get_regime_param('atr_stop_multiplier', market_regime))
+        dist = (atr * mult) if atr > ZERO else (entry_price * to_decimal(self.config.stop_loss_fallback_pct))
         return entry_price - dist if side == 'BUY' else entry_price + dist
 
-    def calculate_take_profit(self, side: str, entry: float, sl: float, market_regime: Optional[str], confidence: Optional[float], confidence_threshold: Optional[float]) -> float:
+    def calculate_take_profit(self, side: str, entry: Decimal, sl: Decimal, market_regime: Optional[str], confidence: Optional[float], confidence_threshold: Optional[float]) -> Decimal:
         risk = abs(entry - sl)
-        rr = self.sizer._get_regime_param('reward_to_risk_ratio', market_regime)
+        rr = to_decimal(self.sizer._get_regime_param('reward_to_risk_ratio', market_regime))
         
         if self.config.confidence_rr_scaling_factor > 0 and confidence and confidence_threshold and confidence > confidence_threshold:
-            surplus = confidence - confidence_threshold
-            scaler = 1.0 + (surplus * self.config.confidence_rr_scaling_factor)
-            rr *= min(scaler, self.config.max_confidence_rr_multiplier)
+            surplus = to_decimal(confidence - confidence_threshold)
+            scaler = ONE + (surplus * to_decimal(self.config.confidence_rr_scaling_factor))
+            rr *= min(scaler, to_decimal(self.config.max_confidence_rr_multiplier))
             
         dist = risk * rr
         return entry + dist if side == 'BUY' else entry - dist
 
-    async def update_trade_outcome(self, symbol: str, pnl: float):
-        if pnl < 0:
+    async def update_trade_outcome(self, symbol: str, pnl: Decimal):
+        if pnl < ZERO:
             self.symbol_consecutive_losses[symbol] = self.symbol_consecutive_losses.get(symbol, 0) + 1
             if self.symbol_consecutive_losses[symbol] >= self.config.max_consecutive_losses:
                 self.symbol_cooldowns[symbol] = Clock.now() + timedelta(minutes=self.config.consecutive_loss_cooldown_minutes)
@@ -425,12 +428,13 @@ class RiskManager:
             self.symbol_consecutive_losses[symbol] = 0
         await self._save_symbol_state(symbol)
 
-    async def update_portfolio_risk(self, portfolio_value: float, daily_pnl: float):
-        if self.peak_portfolio_value is None or portfolio_value > self.peak_portfolio_value:
-            self.peak_portfolio_value = portfolio_value
+    async def update_portfolio_risk(self, portfolio_value: Decimal, daily_pnl: Decimal):
+        pv_float = float(portfolio_value)
+        if self.peak_portfolio_value is None or pv_float > self.peak_portfolio_value:
+            self.peak_portfolio_value = pv_float
             await self.position_manager.update_portfolio_high_water_mark(portfolio_value)
             
-        self.current_drawdown = (portfolio_value - self.peak_portfolio_value) / self.peak_portfolio_value
+        self.current_drawdown = (pv_float - self.peak_portfolio_value) / self.peak_portfolio_value
         
         if self.current_drawdown < self.config.circuit_breaker_threshold:
             if not self.circuit_breaker_halted:
@@ -441,28 +445,28 @@ class RiskManager:
             self.circuit_breaker_halted = False
             logger.info("Circuit breaker reset.")
             
-        if self.config.max_daily_loss_usd > 0 and daily_pnl < -self.config.max_daily_loss_usd:
+        if self.config.max_daily_loss_usd > 0 and daily_pnl < -to_decimal(self.config.max_daily_loss_usd):
             if not self.daily_loss_halted:
                 self.daily_loss_halted = True
                 self.liquidation_needed = self.config.close_positions_on_halt
                 logger.critical("MAX DAILY LOSS REACHED.")
 
-    def calculate_dynamic_trailing_stop(self, pos: Position, current_price: float, atr: float, regime: str) -> Tuple[Optional[float], Optional[float], bool]:
+    def calculate_dynamic_trailing_stop(self, pos: Position, current_price: Decimal, atr: Decimal, regime: str) -> Tuple[Optional[Decimal], Optional[Decimal], bool]:
         if not self.config.use_trailing_stop:
             return None, None, False
 
-        base_multiplier = self.config.atr_trailing_multiplier
-        if regime == 'volatile': base_multiplier *= 1.5
-        elif regime == 'bull' and pos.side == 'BUY': base_multiplier *= 0.8
-        elif regime == 'bear' and pos.side == 'SELL': base_multiplier *= 0.8
+        base_multiplier = to_decimal(self.config.atr_trailing_multiplier)
+        if regime == 'volatile': base_multiplier *= Decimal("1.5")
+        elif regime == 'bull' and pos.side == 'BUY': base_multiplier *= Decimal("0.8")
+        elif regime == 'bear' and pos.side == 'SELL': base_multiplier *= Decimal("0.8")
 
-        roi_pct = 0.0
-        if pos.entry_price > 0:
+        roi_pct = ZERO
+        if pos.entry_price > ZERO:
             roi_pct = (current_price - pos.entry_price) / pos.entry_price if pos.side == 'BUY' else (pos.entry_price - current_price) / pos.entry_price
         
-        acceleration = max(0.0, (roi_pct * 100) * 0.1)
-        final_multiplier = max(1.0, base_multiplier - acceleration)
-        distance = (atr * final_multiplier) if atr > 0 else (current_price * self.config.trailing_stop_pct)
+        acceleration = max(ZERO, (roi_pct * 100) * Decimal("0.1"))
+        final_multiplier = max(ONE, base_multiplier - acceleration)
+        distance = (atr * final_multiplier) if atr > ZERO else (current_price * to_decimal(self.config.trailing_stop_pct))
 
         new_stop, new_ref = None, None
         current_ref = pos.trailing_ref_price or pos.entry_price
@@ -470,25 +474,25 @@ class RiskManager:
         if pos.side == 'BUY':
             new_ref = max(current_ref, current_price)
             potential_stop = new_ref - distance
-            if potential_stop > (pos.stop_loss_price or 0.0):
+            if potential_stop > (pos.stop_loss_price or ZERO):
                 new_stop = potential_stop
         else:
             new_ref = min(current_ref, current_price)
             potential_stop = new_ref + distance
-            if potential_stop < (pos.stop_loss_price or float('inf')):
+            if potential_stop < (pos.stop_loss_price or Decimal('Infinity')):
                 new_stop = potential_stop
 
-        activated = pos.trailing_stop_active or (roi_pct >= self.config.trailing_stop_activation_pct)
+        activated = pos.trailing_stop_active or (roi_pct >= to_decimal(self.config.trailing_stop_activation_pct))
         if not activated:
             return None, new_ref, False
 
         return new_stop, new_ref, True
 
-    def check_time_based_exit(self, pos: Position, price: float) -> bool:
+    def check_time_based_exit(self, pos: Position, price: Decimal) -> bool:
         if not self.config.time_based_exit.enabled: return False
         duration = Clock.now() - pos.open_timestamp
         if duration.total_seconds() > (self.config.time_based_exit.max_hold_time_hours * 3600):
             pnl_pct = (price - pos.entry_price) / pos.entry_price
             if pos.side == 'SELL': pnl_pct = -pnl_pct
-            return pnl_pct < self.config.time_based_exit.threshold_pct
+            return pnl_pct < to_decimal(self.config.time_based_exit.threshold_pct)
         return False
