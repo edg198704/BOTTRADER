@@ -74,3 +74,19 @@ class AIInferenceResult(BaseModel):
     optimized_threshold: Optional[float] = None
     individual_predictions: Dict[str, Any] = {}
     meta_probability: Optional[float] = None
+
+class TradeExecutionResult(BaseModel):
+    """
+    Result of a trade initiation request.
+    Since execution is async, 'status' indicates if the process started successfully.
+    """
+    symbol: str
+    action: str
+    quantity: Decimal
+    price: Optional[Decimal]
+    trade_id: str
+    status: Literal['INITIATED', 'REJECTED', 'ERROR']
+    metadata: Dict[str, Any] = {}
+
+    class Config:
+        arbitrary_types_allowed = True
