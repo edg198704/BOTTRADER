@@ -15,7 +15,6 @@ logger = get_logger(__name__)
 
 @dataclass
 class TickContext:
-    """Encapsulates the state of a single tick processing pipeline."""
     symbol: str
     start_time: float
     df: Optional[pd.DataFrame] = None
@@ -33,7 +32,7 @@ class TickContext:
 class TickPipeline:
     """
     Encapsulates the logic for processing a single tick for a single symbol.
-    Orchestrates Data -> Position -> Strategy -> Execution.
+    Orchestrates Data -> Position -> Strategy -> Execution (Async Initiation).
     """
     def __init__(self, 
                  data_handler: DataHandler,
@@ -78,12 +77,13 @@ class TickPipeline:
             ctx.signal = await self.strategy.analyze_market(symbol, ctx.df, ctx.position)
             ctx.mark_stage('strategy_analysis')
 
-            # Stage 4: Execution
+            # Stage 4: Execution Initiation
             if ctx.signal: 
                 ctx.execution_result = await self.trade_executor.execute_trade_signal(ctx.signal, ctx.df, ctx.position)
                 if ctx.execution_result and self.metrics_writer:
-                    await self.metrics_writer.write_metric('trade_execution', fields=ctx.execution_result.dict())
-                ctx.mark_stage('execution')
+                    # Log the initiation of the trade
+                    await self.metrics_writer.write_metric('trade_initiated', fields=ctx.execution_result.dict())
+                ctx.mark_stage('execution_init')
             
             self.processed_candles[symbol] = last_ts
             ctx.mark_stage('total_duration')
