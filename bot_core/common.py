@@ -5,11 +5,13 @@ from typing import Literal, Optional, Dict, Any, List, Union
 class TradeSignal(BaseModel):
     """
     Standardized signal object passed from Strategy to Bot/Executor.
+    Includes execution urgency to guide the Execution Engine.
     """
     symbol: str
     action: Literal['BUY', 'SELL']
     regime: Optional[str] = None
     confidence: float = 0.0
+    urgency: Literal['passive', 'neutral', 'aggressive', 'sniper'] = 'neutral'
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     strategy_name: str
     metadata: Dict[str, Any] = {}
