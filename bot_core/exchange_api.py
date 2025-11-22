@@ -10,7 +10,7 @@ from ccxt.base.errors import NetworkError, ExchangeError, InsufficientFunds, Ord
 
 from bot_core.logger import get_logger
 from bot_core.utils import async_retry
-from bot_core.config import ExchangeConfig
+from bot_core.config import ExchangeConfig, ExecutionSafetyConfig
 from bot_core.common import to_decimal, ZERO, Dec
 
 logger = get_logger(__name__)
@@ -22,6 +22,10 @@ class BotInsufficientFundsError(BotExchangeError):
     pass
 
 class BotInvalidOrderError(BotExchangeError):
+    pass
+
+class OrderStateUnknownError(BotExchangeError):
+    """Raised when the state of an order cannot be verified after a timeout."""
     pass
 
 class BalanceCache:
@@ -53,6 +57,8 @@ class ExchangeAPI(abc.ABC):
     async def fetch_order_book(self, symbol: str, limit: int = 5) -> Dict[str, Any]: pass
     @abc.abstractmethod
     async def place_order(self, symbol: str, side: str, order_type: str, quantity: Decimal, price: Optional[Decimal] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]: pass
+    @abc.abstractmethod
+    async def place_order_idempotent(self, symbol: str, side: str, order_type: str, quantity: Decimal, price: Optional[Decimal], client_order_id: str, safety_config: ExecutionSafetyConfig) -> Dict[str, Any]: pass
     @abc.abstractmethod
     async def fetch_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]: pass
     @abc.abstractmethod
@@ -140,6 +146,10 @@ class MockExchangeAPI(ExchangeAPI):
             order['clientOrderId'] = extra_params['clientOrderId']
         self.open_orders[order_id] = order
         return {"orderId": order_id, "status": "OPEN"}
+
+    async def place_order_idempotent(self, symbol: str, side: str, order_type: str, quantity: Decimal, price: Optional[Decimal], client_order_id: str, safety_config: ExecutionSafetyConfig) -> Dict[str, Any]:
+        # Mock exchange is always reliable, just call place_order
+        return await self.place_order(symbol, side, order_type, quantity, price, extra_params={'clientOrderId': client_order_id})
 
     async def fetch_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
         order = self.open_orders.get(order_id)
@@ -245,9 +255,11 @@ class CCXTExchangeAPI(ExchangeAPI):
             exceptions=(NetworkError, ExchangeError, RequestTimeout, RateLimitExceeded)
         )
         
+        # NOTE: place_order is EXCLUDED from auto-retry to prevent double-spending.
+        # It is handled by place_order_idempotent.
         methods = [
             'get_market_data', 'get_ticker_data', 'get_tickers', 'fetch_order_book',
-            'place_order', 'fetch_order', 'fetch_open_orders', 'fetch_recent_orders',
+            'fetch_order', 'fetch_open_orders', 'fetch_recent_orders',
             'cancel_order', 'cancel_all_orders', 'fetch_market_details'
         ]
         for method in methods:
@@ -343,6 +355,7 @@ class CCXTExchangeAPI(ExchangeAPI):
         return {'symbol': symbol, 'bids': bids, 'asks': asks, 'timestamp': ob.get('timestamp')}
 
     async def place_order(self, symbol: str, side: str, order_type: str, quantity: Decimal, price: Optional[Decimal] = None, extra_params: Dict[str, Any] = None) -> Dict[str, Any]:
+        # Direct placement without auto-retry. Used by place_order_idempotent.
         try:
             params = extra_params or {}
             qty_float = float(quantity)
@@ -361,6 +374,49 @@ class CCXTExchangeAPI(ExchangeAPI):
             raise BotInsufficientFundsError(str(e)) from e
         except InvalidOrder as e:
             raise BotInvalidOrderError(str(e)) from e
+
+    async def place_order_idempotent(self, symbol: str, side: str, order_type: str, quantity: Decimal, price: Optional[Decimal], client_order_id: str, safety_config: ExecutionSafetyConfig) -> Dict[str, Any]:
+        """
+        Executes an order with strict idempotency guarantees.
+        If a timeout occurs, it verifies the order status before retrying.
+        """
+        attempts = 0
+        max_attempts = safety_config.max_verification_attempts
+        
+        while attempts < max_attempts:
+            try:
+                # 1. Attempt Placement
+                return await self.place_order(
+                    symbol, side, order_type, quantity, price, 
+                    extra_params={'clientOrderId': client_order_id}
+                )
+            except (NetworkError, RequestTimeout) as e:
+                logger.warning(f"Order placement timed out. Verifying state... (Attempt {attempts+1}/{max_attempts})", error=str(e))
+                
+                # 2. Verification Phase
+                # Wait briefly to allow exchange to process potential previous request
+                await asyncio.sleep(safety_config.verification_delay_seconds)
+                
+                try:
+                    existing_order = await self.fetch_order_by_client_id(symbol, client_order_id)
+                    if existing_order:
+                        logger.info("Order verification successful: Order was placed.", order_id=existing_order['id'])
+                        return existing_order
+                    else:
+                        logger.info("Order verification: Order NOT found. Retrying placement.")
+                        # Order not found, safe to retry loop
+                        attempts += 1
+                        continue
+                except Exception as verify_error:
+                    logger.error("Order verification failed due to network error.", error=str(verify_error))
+                    # If we can't verify, we can't retry safely. 
+                    # We must assume the state is unknown.
+                    raise OrderStateUnknownError(f"Could not verify order {client_order_id} after timeout: {str(verify_error)}")
+            except Exception as e:
+                # Logic errors (InsufficientFunds, etc) should raise immediately
+                raise e
+        
+        raise OrderStateUnknownError(f"Max attempts reached for order {client_order_id}. State unknown.")
 
     def _normalize_order(self, order: Dict[str, Any]) -> Dict[str, Any]:
         status_map = {'open': 'OPEN', 'closed': 'FILLED', 'canceled': 'CANCELED', 'rejected': 'REJECTED', 'expired': 'EXPIRED'}
