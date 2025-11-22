@@ -3,6 +3,7 @@ import asyncio
 import enum
 import json
 import os
+import threading
 from typing import List, Optional, Dict, Any, TYPE_CHECKING
 from decimal import Decimal
 
@@ -113,6 +114,8 @@ class PositionManager:
         
         # WAL Configuration
         self.wal_path = "execution_wal.log"
+        self._wal_file = None
+        self._wal_lock = threading.Lock()
         
         logger.info("PositionManager initialized (In-Memory + Async Persistence + WAL).")
 
@@ -128,6 +131,9 @@ class PositionManager:
         # 2. Load initial state from DB
         await self._run_in_executor(self._load_state_sync)
         
+        # 3. Open WAL file handle for appending
+        self._wal_file = open(self.wal_path, 'a')
+
         self._persistence_task = asyncio.create_task(self._persistence_worker())
         logger.info("PositionManager state initialized.", 
                     realized_pnl=self._realized_pnl, 
@@ -342,7 +348,7 @@ class PositionManager:
                 breakeven_active=False, strategy_metadata=metadata_json, fees=ZERO
             )
             
-            # 1. Write to WAL (Synchronous & Fsync)
+            # 1. Write to WAL (Synchronous & Fsync) - Optimized
             await self._run_in_executor(self._write_wal_sync, {
                 'type': 'PENDING_ENTRY',
                 'symbol': symbol, 'side': side, 'order_id': order_id, 'trade_id': trade_id,
@@ -358,14 +364,21 @@ class PositionManager:
             return new_position
 
     def _write_wal_sync(self, record: Dict[str, Any]):
-        try:
-            with open(self.wal_path, 'a') as f:
-                f.write(json.dumps(record) + "\n")
-                f.flush()
-                os.fsync(f.fileno()) # Critical: Ensure data hits disk
-        except Exception as e:
-            logger.critical("WAL Write Failed!", error=str(e))
-            raise # If WAL fails, we must not proceed
+        with self._wal_lock:
+            try:
+                if self._wal_file and not self._wal_file.closed:
+                    self._wal_file.write(json.dumps(record) + "\n")
+                    self._wal_file.flush()
+                    os.fsync(self._wal_file.fileno()) # Critical: Ensure data hits disk
+                else:
+                    # Fallback if file is closed (should not happen in normal op)
+                    with open(self.wal_path, 'a') as f:
+                        f.write(json.dumps(record) + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+            except Exception as e:
+                logger.critical("WAL Write Failed!", error=str(e))
+                raise # If WAL fails, we must not proceed
 
     def _persist_new_position_sync(self, position: Position):
         session = self.SessionLocal()
@@ -679,5 +692,17 @@ class PositionManager:
     def close(self):
         if self._persistence_task:
             self._persistence_task.cancel()
+        
+        # Close WAL file handle safely
+        with self._wal_lock:
+            if self._wal_file:
+                try:
+                    self._wal_file.flush()
+                    os.fsync(self._wal_file.fileno())
+                    self._wal_file.close()
+                except Exception as e:
+                    logger.error("Error closing WAL file", error=str(e))
+                self._wal_file = None
+
         self.engine.dispose()
         logger.info("PositionManager database connection closed.")
