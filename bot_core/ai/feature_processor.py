@@ -34,6 +34,15 @@ class FeatureProcessor:
         return cols
 
     @staticmethod
+    def validate_inputs(df: pd.DataFrame) -> bool:
+        """Checks if the DataFrame is sufficient for processing."""
+        if df is None or df.empty:
+            return False
+        if len(df) < 50:
+            return False
+        return True
+
+    @staticmethod
     def _add_time_features(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         dt_series = df['timestamp'] if 'timestamp' in df.columns else df.index.to_series()
@@ -56,8 +65,13 @@ class FeatureProcessor:
     @staticmethod
     def _add_volatility_features(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        log_hl = np.log(df['high'] / df['low'].replace(0, 1e-8))
-        log_co = np.log(df['close'] / df['open'].replace(0, 1e-8))
+        # Handle division by zero or log of zero safely
+        high_low = (df['high'] / df['low'].replace(0, 1e-8)).replace(0, 1e-8)
+        close_open = (df['close'] / df['open'].replace(0, 1e-8)).replace(0, 1e-8)
+        
+        log_hl = np.log(high_low)
+        log_co = np.log(close_open)
+        
         df['volatility_gk'] = np.sqrt(0.5 * log_hl**2 - (2 * np.log(2) - 1) * log_co**2)
         return df
 
@@ -65,7 +79,8 @@ class FeatureProcessor:
     def _add_microstructure_features(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         const = 1.0 / (4.0 * np.log(2.0))
-        log_hl = np.log(df['high'] / df['low'].replace(0, 1e-8))
+        high_low = (df['high'] / df['low'].replace(0, 1e-8)).replace(0, 1e-8)
+        log_hl = np.log(high_low)
         df['volatility_parkinson'] = np.sqrt(const * log_hl**2)
 
         abs_return = df['close'].pct_change().abs()
@@ -157,8 +172,12 @@ class FeatureProcessor:
 
     @staticmethod
     def process_data(df: pd.DataFrame, config: AIEnsembleStrategyParams, leader_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+        if not FeatureProcessor.validate_inputs(df):
+            return pd.DataFrame()
+
         df_proc = df.copy()
         
+        # 1. Generate Base Features
         if config.features.use_time_features: df_proc = FeatureProcessor._add_time_features(df_proc)
         if config.features.use_price_action_features: df_proc = FeatureProcessor._add_price_action_features(df_proc)
         if config.features.use_volatility_estimators: df_proc = FeatureProcessor._add_volatility_features(df_proc)
@@ -166,16 +185,21 @@ class FeatureProcessor:
         if config.features.use_order_book_features: df_proc = FeatureProcessor._add_order_book_features(df_proc)
         if config.features.use_frac_diff: df_proc = FeatureProcessor._apply_frac_diff(df_proc, config.features.frac_diff_d, config.features.frac_diff_thres)
 
+        # 2. Inject Leader Features (Strict Alignment)
         if config.features.use_leader_features and leader_df is not None and not leader_df.empty:
             leader_feats = pd.DataFrame(index=leader_df.index)
             leader_feats['leader_log_return'] = np.log(leader_df['close'] / leader_df['close'].shift(1).replace(0, np.nan))
             if 'rsi' in leader_df.columns: leader_feats['leader_rsi'] = leader_df['rsi']
-            # Align leader features to current df index
-            df_proc = df_proc.join(leader_feats, how='left').ffill(limit=5)
+            
+            # Reindex leader features to match the main dataframe's index exactly
+            # forward fill to handle slight timestamp mismatches, but limit to 5 periods to avoid stale data
+            leader_aligned = leader_feats.reindex(df_proc.index, method='ffill', limit=5)
+            df_proc = df_proc.join(leader_aligned)
 
+        # 3. Stationarize
         df_stat = FeatureProcessor._stationarize_data(df_proc, config.feature_columns)
         
-        # Select and Lag
+        # 4. Select and Lag
         cols = list(config.feature_columns)
         if config.features.use_leader_features: cols.extend(["leader_log_return", "leader_rsi"])
         if config.features.use_order_book_features: cols.append("obi")
@@ -191,9 +215,14 @@ class FeatureProcessor:
                     for i in range(1, depth + 1):
                         subset[f"{col}_lag_{i}"] = subset[col].shift(i)
 
+        # 5. Clean Infinite/NaN values created by log/div operations
+        subset.replace([np.inf, -np.inf], np.nan, inplace=True)
         subset.dropna(inplace=True)
         
-        # Normalize
+        # 6. Normalize
+        if subset.empty:
+            return subset
+
         window = config.features.normalization_window
         if config.features.scaling_method == 'robust':
             median = subset.rolling(window=window).median()
@@ -204,9 +233,10 @@ class FeatureProcessor:
             std = subset.rolling(window=window).std()
             normalized = (subset - mean) / std.replace(0, 1e-8)
             
+        normalized.replace([np.inf, -np.inf], np.nan, inplace=True)
         normalized.dropna(inplace=True)
         
-        # Enforce Order
+        # 7. Enforce Column Order
         expected = FeatureProcessor.get_feature_names(config)
         final_cols = [c for c in expected if c in normalized.columns]
         return normalized[final_cols]
