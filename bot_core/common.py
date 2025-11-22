@@ -6,6 +6,7 @@ from decimal import Decimal, getcontext, ROUND_DOWN, InvalidOperation
 # --- Global Precision Settings ---
 # Set global precision to 28 places (standard for financial compute)
 getcontext().prec = 28
+getcontext().rounding = ROUND_DOWN
 
 # Type Alias for Financial Calculations
 Dec = Decimal
@@ -32,19 +33,13 @@ def to_decimal(value: Union[float, str, int, Decimal, None]) -> Decimal:
     if isinstance(value, int):
         return Decimal(value)
     if isinstance(value, float):
-        # Convert to string first to avoid float precision artifacts (e.g. 0.1 -> 0.10000000000000000555)
+        # Convert to string first to avoid float precision artifacts
         # We limit to 20 decimal places to strip garbage precision from floats
         return Decimal(f"{value:.20f}".rstrip('0').rstrip('.'))
     try:
         return Decimal(str(value))
-    except InvalidOperation:
+    except (InvalidOperation, ValueError):
         return ZERO
-
-def safe_div(numerator: Decimal, denominator: Decimal) -> Decimal:
-    """Safe division returning ZERO on DivisionByZero."""
-    if denominator == ZERO:
-        return ZERO
-    return numerator / denominator
 
 class TradeSignal(BaseModel):
     """
