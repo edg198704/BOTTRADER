@@ -81,14 +81,20 @@ class TradingBot:
         if isinstance(self.strategy, AIEnsembleStrategy): self.strategy.data_fetcher = self.data_handler
         self.position_monitor.set_strategy(self.strategy)
         await self._load_market_details()
+        
+        # 3. State Reconciliation (CRITICAL)
+        # Recover any pending orders or state mismatches before processing new ticks
         await self.position_manager.reconcile_positions(self.exchange_api, self.latest_prices)
+        await self.order_lifecycle_service.reconcile_recovery()
+        
+        # 4. Strategy Warmup
         await self.strategy.warmup(self.config.strategy.symbols)
         
-        # 3. Initialize Processors
+        # 5. Initialize Processors
         for symbol in self.config.strategy.symbols:
             self.processors[symbol] = SymbolProcessor(symbol, self.tick_pipeline)
         
-        # 4. Event Subscriptions
+        # 6. Event Subscriptions
         self.event_bus.subscribe(MarketDataEvent, self.on_market_data)
         self.event_bus.subscribe(TradeCompletedEvent, self.strategy.on_trade_complete)
 
