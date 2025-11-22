@@ -27,7 +27,7 @@ class StrategyStateManager:
         self.last_retrained_at = {}
         self.last_signal_time = {}
         self.force_retrain_flags = {}
-        self.accuracy_history = {}
+        self.accuracy_history = {} # symbol -> deque of (is_correct, timestamp)
 
     async def load(self):
         state = await self.persistence.load()
@@ -35,12 +35,17 @@ class StrategyStateManager:
         self.last_retrained_at = {k: datetime.fromisoformat(v) for k,v in state.get('last_retrained_at', {}).items()}
         self.last_signal_time = {k: datetime.fromisoformat(v) for k,v in state.get('last_signal_time', {}).items()}
         self.force_retrain_flags = state.get('force_retrain_flags', {})
+        # Load accuracy history (convert lists back to deques)
+        hist = state.get('accuracy_history', {})
+        for sym, data in hist.items():
+            self.accuracy_history[sym] = deque(data, maxlen=self.config.performance.window_size)
 
     async def save(self):
         state = {
             'last_retrained_at': {k: v.isoformat() for k,v in self.last_retrained_at.items()},
             'last_signal_time': {k: v.isoformat() for k,v in self.last_signal_time.items()},
-            'force_retrain_flags': self.force_retrain_flags
+            'force_retrain_flags': self.force_retrain_flags,
+            'accuracy_history': {k: list(v) for k,v in self.accuracy_history.items()}
         }
         await self.persistence.save(state)
 
@@ -141,6 +146,9 @@ class AIEnsembleStrategy(TradingStrategy):
             if success:
                 self.state.last_retrained_at[symbol] = Clock.now()
                 self.state.force_retrain_flags[symbol] = False
+                # Clear history on retrain to give new model a fresh start
+                if symbol in self.state.accuracy_history:
+                    self.state.accuracy_history[symbol].clear()
                 await self.ensemble_learner.reload_models(symbol)
                 logger.info(f"Retraining successful for {symbol}")
         finally:
@@ -244,22 +252,40 @@ class AIEnsembleStrategy(TradingStrategy):
                 'model_version': pred.model_version, 'confidence': pred.confidence, 
                 'regime': regime, 'metrics': pred.metrics, 'effective_threshold': threshold,
                 'meta_prob': pred.meta_probability,
-                'individual_predictions': pred.individual_predictions # Pass for online learning
+                'individual_predictions': pred.individual_predictions, # Pass for online learning
+                'top_features': pred.top_features # Pass for explainability
             }
             return TradeSignal(symbol=symbol, action=final_action, regime=regime, confidence=pred.confidence, strategy_name=self.config.name, metadata=meta)
         return None
 
     async def on_trade_complete(self, event: TradeCompletedEvent):
-        """Callback for Online Learning"""
-        if not self.ai_config.ensemble_weights.use_dynamic_weighting: return
-        
+        """Callback for Online Learning and Drift Detection"""
         pos = event.position
-        if not pos.strategy_metadata: return
+        symbol = pos.symbol
         
-        try:
-            meta = json.loads(pos.strategy_metadata)
-            ind_preds = meta.get('individual_predictions')
-            if ind_preds:
-                self.ensemble_learner.update_weights(pos.symbol, pos.pnl, ind_preds, pos.side)
-        except Exception as e:
-            logger.error(f"Failed to process trade completion for AI learning: {e}")
+        # 1. Online Learning (Weight Updates)
+        if self.ai_config.ensemble_weights.use_dynamic_weighting and pos.strategy_metadata:
+            try:
+                meta = json.loads(pos.strategy_metadata)
+                ind_preds = meta.get('individual_predictions')
+                if ind_preds:
+                    self.ensemble_learner.update_weights(symbol, pos.pnl, ind_preds, pos.side)
+            except Exception as e:
+                logger.error(f"Failed to process trade completion for AI learning: {e}")
+
+        # 2. Drift Detection (Performance Monitoring)
+        if self.ai_config.performance.enabled:
+            is_win = pos.pnl > 0
+            if symbol not in self.state.accuracy_history:
+                self.state.accuracy_history[symbol] = deque(maxlen=self.ai_config.performance.window_size)
+            
+            self.state.accuracy_history[symbol].append(is_win)
+            
+            # Check accuracy
+            history = self.state.accuracy_history[symbol]
+            if len(history) >= 10: # Minimum sample
+                accuracy = sum(history) / len(history)
+                if accuracy < self.ai_config.performance.min_accuracy:
+                    logger.warning(f"Drift Detected for {symbol}. Accuracy: {accuracy:.2f}. Triggering Retrain.")
+                    self.state.force_retrain_flags[symbol] = True
+                    asyncio.create_task(self.state.save())
