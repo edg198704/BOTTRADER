@@ -270,6 +270,7 @@ class OrderLifecycleService:
                 )
                 
                 if pos:
+                    # CRITICAL FIX: Use keyword arguments for TradeCompletedEvent
                     await self.event_bus.publish(TradeCompletedEvent(position=pos))
                     logger.info("Order lifecycle complete: OPEN FILLED", symbol=ctx.symbol, qty=str(confirmed_qty))
                 else:
