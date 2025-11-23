@@ -5,7 +5,8 @@ import sys
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 
-# FORCE FLUSH IMMEDIATELY
+# FORCE FLUSH IMMEDIATELY & CONFIGURE LOGGING
+logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s - %(levelname)s - %(message)s')
 print("--- QUANTUM BOT TRAINING MODULE INITIALIZING ---", flush=True)
 
 try:
