@@ -1,28 +1,31 @@
 FROM python:3.10-slim
 
-# Set environment variables
+# Prevent Python from writing pyc files and buffering stdout
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Set work directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install system dependencies required for building Python packages (pandas-ta, etc.)
+RUN apt-get update && apt-get install -y \
     build-essential \
-    curl \
+    gcc \
     git \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# Copy requirements first to leverage Docker cache
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy project
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Copy the rest of the application
 COPY . .
 
-# Make scripts executable
-RUN chmod +x setup.sh start_bot.sh
+# Create a non-root user for security
+RUN useradd -m trader && chown -R trader:trader /app
+USER trader
 
-# Default command
-CMD ["./start_bot.sh"]
+CMD ["python", "start_bot.py"]
