@@ -24,5 +24,5 @@ COPY . .
 # Make scripts executable
 RUN chmod +x setup.sh start_bot.sh
 
-# Default command
+# Default commands
 CMD ["./start_bot.sh"]
