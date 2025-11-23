@@ -370,6 +370,7 @@ class DataHandler:
             if last_emitted is None or last_closed_ts > last_emitted:
                 self._last_emitted_candle_ts[symbol] = last_closed_ts
                 if self.event_bus:
+                    # CRITICAL FIX: Use keyword arguments for MarketDataEvent
                     await self.event_bus.publish(MarketDataEvent(symbol=symbol, data=closed_df))
 
     async def _calculate_indicators_async(self, df: pd.DataFrame) -> pd.DataFrame:
