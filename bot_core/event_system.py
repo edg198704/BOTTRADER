@@ -14,16 +14,16 @@ class Event:
 
 @dataclass(kw_only=True)
 class MarketDataEvent(Event):
-    symbol: str
-    data: Any  # Carries the DataFrame or Tick data
+    symbol: str = ""  # Add default value
+    data: Any = None  # Add default value
 
 @dataclass(kw_only=True)
 class SignalEvent(Event):
-    signal: TradeSignal
+    signal: TradeSignal = None  # Add default value if TradeSignal allows None
 
 @dataclass(kw_only=True)
 class TradeCompletedEvent(Event):
-    position: Position
+    position: Position = None  # Add default value if Position allows None
 
 class EventBus:
     """
@@ -32,14 +32,14 @@ class EventBus:
     """
     def __init__(self):
         self._subscribers: Dict[Type[Event], List[Callable[[Event], Awaitable[None]]]] = {}
-
+    
     def subscribe(self, event_type: Type[Event], handler: Callable[[Event], Awaitable[None]]):
         """Registers an async handler for a specific event type."""
         if event_type not in self._subscribers:
             self._subscribers[event_type] = []
         self._subscribers[event_type].append(handler)
         logger.debug(f"Subscribed handler {handler.__name__} to {event_type.__name__}")
-
+    
     async def publish(self, event: Event, wait: bool = False):
         """
         Publishes an event to all subscribers.
@@ -54,7 +54,6 @@ class EventBus:
             handlers = self._subscribers[event_type]
             if not handlers:
                 return
-
             if wait:
                 # Execute all handlers concurrently and wait for completion
                 await asyncio.gather(*[self._safe_execute(h, event) for h in handlers], return_exceptions=True)
@@ -62,7 +61,7 @@ class EventBus:
                 # Fire and forget: Schedule tasks on the loop
                 for handler in handlers:
                     asyncio.create_task(self._safe_execute(handler, event))
-
+    
     async def _safe_execute(self, handler: Callable[[Event], Awaitable[None]], event: Event):
         """Executes a handler with exception isolation."""
         try:
