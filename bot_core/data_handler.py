@@ -4,7 +4,7 @@ import time
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Any
-import pandas_ta as ta
+import pandas_ta_classic as ta
 from concurrent.futures import ThreadPoolExecutor
 
 from bot_core.logger import get_logger
