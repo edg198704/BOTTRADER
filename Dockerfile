@@ -1,31 +1,23 @@
 FROM python:3.10-slim
 
-# Prevent Python from writing pyc files and buffering stdout
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-
-WORKDIR /app
-
-# Install system dependencies required for building Python packages (pandas-ta, etc.)
+# System dependencies
+# git: required for installing packages from git repositories
+# gcc, build-essential: required for compiling python extensions
 RUN apt-get update && apt-get install -y \
-    build-essential \
-    gcc \
     git \
+    gcc \
+    build-essential \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first to leverage Docker cache
-COPY requirements.txt .
+WORKDIR /app
 
 # Install Python dependencies
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application
+# Copy application code
 COPY . .
 
-# Create a non-root user for security
-RUN useradd -m trader && chown -R trader:trader /app
-USER trader
-
+# Default command
 CMD ["python", "start_bot.py"]
