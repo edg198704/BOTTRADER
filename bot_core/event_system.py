@@ -8,20 +8,20 @@ from bot_core.position_manager import Position
 
 logger = get_logger(__name__)
 
-@dataclass
+@dataclass(kw_only=True)
 class Event:
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
-@dataclass
+@dataclass(kw_only=True)
 class MarketDataEvent(Event):
     symbol: str
     data: Any  # Carries the DataFrame or Tick data
 
-@dataclass
+@dataclass(kw_only=True)
 class SignalEvent(Event):
     signal: TradeSignal
 
-@dataclass
+@dataclass(kw_only=True)
 class TradeCompletedEvent(Event):
     position: Position
 
