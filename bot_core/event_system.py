@@ -14,16 +14,16 @@ class Event:
 
 @dataclass(kw_only=True)
 class MarketDataEvent(Event):
-    symbol: str = ""  # Add default value
-    data: Any = None  # Add default value
+    symbol: str = ""  # DEBE tener default
+    data: Any = None  # DEBE tener default
 
 @dataclass(kw_only=True)
 class SignalEvent(Event):
-    signal: TradeSignal = None  # Add default value if TradeSignal allows None
+    signal: TradeSignal = None
 
 @dataclass(kw_only=True)
 class TradeCompletedEvent(Event):
-    position: Position = None  # Add default value if Position allows None
+    position: Position = None
 
 class EventBus:
     """
