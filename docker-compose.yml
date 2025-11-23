@@ -1,3 +1,5 @@
+version: "3.9"
+
 services:
   influxdb:
     image: influxdb:2.7
@@ -13,7 +15,7 @@ services:
       - quantum_net
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "influx", "ping"]
+      test: ["CMD", "curl", "-f", "http://localhost:8086/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -39,7 +41,7 @@ services:
     restart: unless-stopped
 
   trading_bot:
-    build: 
+    build:
       context: .
       dockerfile: Dockerfile
     container_name: quantum_bot
@@ -58,11 +60,6 @@ services:
     networks:
       - quantum_net
     restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-          cpus: '2.0'
 
 volumes:
   influxdb_data:

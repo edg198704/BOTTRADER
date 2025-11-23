@@ -1,34 +1,41 @@
+# Base image
 FROM python:3.10-slim
 
 # Set working directory
 WORKDIR /app
 
-# Set environment variables
+# Environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 # Install system dependencies
-# 'git' is required for installing pandas-ta from source
-# 'build-essential' is required for compiling some python extensions
 RUN apt-get update && apt-get install -y \
     build-essential \
     git \
     gcc \
     libffi-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first to leverage Docker cache
 COPY requirements.txt .
+ARG GITHUB_TOKEN
+ENV GITHUB_TOKEN=${GITHUB_TOKEN}
+# Upgrade pip
+RUN pip install --upgrade pip setuptools wheel
 
 # Install Python dependencies
-# We use the CPU version of PyTorch to keep the image size manageable
+# pandas-ta from zip to avoid git issues
 RUN pip install --no-cache-dir -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
 
 # Copy the rest of the application
 COPY . .
 
-# Create necessary directories for data persistence
+# Create necessary directories
 RUN mkdir -p logs models backtest_data
 
-# Command to run the bot
+# Expose ports (optional, if your bot has a web dashboard)
+# EXPOSE 8080
+
+# Run the bot
 CMD ["python", "start_bot.py"]

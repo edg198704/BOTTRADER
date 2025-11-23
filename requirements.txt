@@ -1,18 +1,14 @@
-# Core System
 setuptools>=68.0.0
 wheel>=0.40.0
 
-# Data & Math
-numpy>=1.24.3,<2.0.0
+numpy>=1.24.3  # Remove the <2.0.0 constraint
 pandas>=2.0.3
 scipy>=1.10.1
-
-# Exchange & Trading
 ccxt>=4.0.0
-# Using development branch for latest features and fixes not yet on PyPI
-pandas-ta @ git+https://github.com/twopirllc/pandas-ta.git@development
 
-# Database & Config
+# pandas-ta-classic: actively maintained community fork
+pandas-ta-classic
+
 SQLAlchemy>=2.0.19
 pydantic>=2.1.1
 PyYAML>=6.0.1
@@ -20,14 +16,11 @@ python-dotenv>=1.0.0
 ujson>=5.8.0
 aiofiles>=23.1.0
 
-# AI & Machine Learning
-# Note: Dockerfile handles the --extra-index-url for CPU version
 torch>=2.0.1
 scikit-learn>=1.3.0
 xgboost>=1.7.6
 joblib>=1.3.1
 
-# Monitoring & Infrastructure
 influxdb-client>=1.36.1
 psutil>=5.9.5
 python-telegram-bot>=20.4
