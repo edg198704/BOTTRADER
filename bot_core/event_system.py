@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Dict, Callable, Awaitable, Type, Any, Optional
 from bot_core.logger import get_logger
@@ -7,34 +8,26 @@ from bot_core.position_manager import Position
 
 logger = get_logger(__name__)
 
-
+@dataclass(kw_only=True)
 class Event:
     """Base event class"""
-    def __init__(self, timestamp: Optional[datetime] = None):
-        self.timestamp = timestamp or datetime.now(timezone.utc)
+    timestamp: Optional[datetime] = field(default_factory=lambda: datetime.now(timezone.utc))
 
-
+@dataclass(kw_only=True)
 class MarketDataEvent(Event):
     """Market data event"""
-    def __init__(self, symbol: str, data: Any, timestamp: Optional[datetime] = None):
-        super().__init__(timestamp)
-        self.symbol = symbol
-        self.data = data
+    symbol: str
+    data: Any
 
-
+@dataclass(kw_only=True)
 class SignalEvent(Event):
     """Signal event"""
-    def __init__(self, signal: TradeSignal, timestamp: Optional[datetime] = None):
-        super().__init__(timestamp)
-        self.signal = signal
+    signal: TradeSignal
 
-
+@dataclass(kw_only=True)
 class TradeCompletedEvent(Event):
     """Trade completed event"""
-    def __init__(self, position: Position, timestamp: Optional[datetime] = None):
-        super().__init__(timestamp)
-        self.position = position
-
+    position: Position
 
 class EventBus:
     """
