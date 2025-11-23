@@ -37,5 +37,11 @@ else
     exit 1
 fi
 
+# Initialize database file to prevent Docker volume errors
+if [ ! -f "position_ledger.db" ]; then
+    echo "Initializing position_ledger.db..."
+    touch position_ledger.db
+fi
+
 echo "Setup complete. You can now run the bot using ./start_bot.sh"
 echo "To deactivate the virtual environment, run 'deactivate'."
