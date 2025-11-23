@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import asyncio
 import threading
+import sys
+import traceback
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Tuple, Optional, List, Union
 from datetime import datetime
@@ -19,6 +21,8 @@ from bot_core.ai.models import TCNPredictor, AttentionNetwork
 from bot_core.ai.feature_processor import FeatureProcessor, InputSanitizer
 from bot_core.common import AIInferenceResult
 from bot_core.utils import AsyncAtomicJsonStore
+
+logger = get_logger(__name__)
 
 # ML Imports with safe fallbacks
 try:
@@ -34,10 +38,10 @@ try:
     from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
     from sklearn.feature_selection import SelectFromModel
     ML_AVAILABLE = True
-except ImportError:
+except ImportError as e:
+    logger.warning(f"ML Libraries missing: {e}. AI features will be disabled.")
+    print(f"[WARNING] ML Libraries missing: {e}", flush=True)
     ML_AVAILABLE = False
-
-logger = get_logger(__name__)
 
 # --- Utility Functions ---
 
@@ -366,7 +370,11 @@ class EnsembleTrainer:
         return X, y, t1_vals, df_proc, list(df_proc.columns)
 
     def train(self, symbol: str, df: pd.DataFrame, leader_df: Optional[pd.DataFrame] = None) -> bool:
-        if not ML_AVAILABLE: return False
+        if not ML_AVAILABLE:
+            logger.error("Cannot train: ML libraries are missing.")
+            print("[ERROR] Cannot train: ML libraries are missing.", flush=True)
+            return False
+            
         try:
             # 1. Data Prep
             X_raw, y, t1_vals, df_proc, all_feats = self._prepare_data(df, leader_df)
@@ -475,6 +483,8 @@ class EnsembleTrainer:
             return True
         except Exception as e:
             logger.error(f"Training failed for {symbol}: {e}", exc_info=True)
+            print(f"[ERROR] Training failed for {symbol}: {e}", flush=True)
+            traceback.print_exc()
             return False
 
 # --- Main Interface ---
@@ -487,8 +497,15 @@ class EnsembleModel:
         self.dynamic_state = dynamic_state or {}
 
 def train_ensemble_task(symbol: str, df: pd.DataFrame, config: AIEnsembleStrategyParams, leader_df: Optional[pd.DataFrame] = None) -> bool:
-    trainer = EnsembleTrainer(config)
-    return trainer.train(symbol, df, leader_df)
+    # Ensure stdout is flushed in worker process
+    sys.stdout.flush()
+    try:
+        trainer = EnsembleTrainer(config)
+        return trainer.train(symbol, df, leader_df)
+    except Exception as e:
+        print(f"[FATAL WORKER ERROR] {e}", flush=True)
+        traceback.print_exc()
+        return False
 
 class EnsembleLearner:
     def __init__(self, config: AIEnsembleStrategyParams):
